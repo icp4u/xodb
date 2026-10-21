@@ -3,7 +3,7 @@
 const std = @import("std");
 const c = @import("../c.zig").api;
 const Session = @import("session.zig").Session;
-const eval = @import("evaluate.zig");
+const eval = @import("../debug/evaluate.zig");
 const cache = @import("runtime_types.zig");
 const A = std.mem.Allocator;
 fn text(g: *const c.struct_xjai_graph, at: u32) []const u8 {

@@ -1,7 +1,7 @@
 //! Arena-owned adapter result. C owns canonical samples and comparison state.
 const c = @import("../c.zig").api;
 pub const Capture = struct {
-    runtime_identity: ?@import("runtime_binding.zig").Identity = null,
+    runtime_identity: ?@import("types.zig").Identity = null,
     scope: c.struct_xlw_scope,
     expression: [:0]const u8,
     observation: c.enum_xlw_observation = c.XLW_INCOMPLETE,

@@ -5,6 +5,7 @@
  * no withdrawn joins); per-record and per-publication costs are printed as
  * evidence only. */
 #include "check.h"
+#include "xrt_arch_syscalls.h"
 #include "xrt_fdflow_count.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,9 +13,9 @@
 #include <sys/syscall.h>
 #include <time.h>
 #if defined(__x86_64__) && !defined(__ILP32__)
-_Static_assert(SYS_read == 0 && SYS_write == 1 && SYS_close == 3, "x86 io/close");
-_Static_assert(SYS_clone == 56 && SYS_execve == 59 && SYS_openat == 257, "x86 process");
-_Static_assert(SYS_exit_group == 231 && SYS_getpid == 39, "x86 exit/getpid");
+_Static_assert(SYS_read == XRT_X86_64_NR_read && SYS_write == XRT_X86_64_NR_write && SYS_close == XRT_X86_64_NR_close, "x86 io/close");
+_Static_assert(SYS_clone == XRT_X86_64_NR_clone && SYS_execve == XRT_X86_64_NR_execve && SYS_openat == XRT_X86_64_NR_openat, "x86 process");
+_Static_assert(SYS_exit_group == XRT_X86_64_NR_exit_group && SYS_getpid == XRT_X86_64_NR_getpid, "x86 exit/getpid");
 #endif
 
 enum { SERVER = 500, PARENT = 1000, ROWS = 262144, THREADS = 65536, PROCESSES = 16384 };

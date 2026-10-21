@@ -11,6 +11,7 @@ def audit(client, pid, log, operation):
         return {p.name:(p/'schedstat').read_text().split()[0] for p in Path(f'/proc/{pid}/task').iterdir()}
     registers=client.inspect('get_registers',tid=pid)
     generation=client.session()['generation']
+    cache_before=client.session().get('remote_read_cache')
     before=scheduled()
     observers={client.p.pid}
     # Shared-session adapters already supply the collector as p.pid.
@@ -44,7 +45,13 @@ def audit(client, pid, log, operation):
     forbidden=[k for k in calls if k in ('process_vm_writev','pwrite64','pwritev','pwritev2','kill','tgkill','tkill') or
         k.startswith(('ptrace:PTRACE_POKE','ptrace:PTRACE_SET')) or k in ('ptrace:PTRACE_CONT','ptrace:PTRACE_SINGLESTEP','ptrace:PTRACE_SYSCALL')]
     assert not forbidden,calls
-    assert any(k in calls for k in ('process_vm_readv','pread64','ptrace:PTRACE_PEEKDATA')),calls
+    physical=sum(calls.get(k,0) for k in ('process_vm_readv','pread64','ptrace:PTRACE_PEEKDATA'))
+    cache_after=client.session().get('remote_read_cache')
+    hits=cache_after['hits']-cache_before['hits'] if cache_before else 0
+    requests=cache_after['requests']-cache_before['requests'] if cache_before else physical
+    # Local targets have no cache counters and must still perform a real read.
+    assert physical or hits>0,(calls,cache_before,cache_after)
     assert scheduled()==before
     assert client.inspect('get_registers',tid=pid)==registers and client.session()['generation']==generation
-    return {'syscalls':calls,'registers_generation_schedstat_unchanged':True}
+    return {'syscalls':calls,'cache_hits':hits,'read_requests':requests,
+            'registers_generation_schedstat_unchanged':True}

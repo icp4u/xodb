@@ -10,14 +10,51 @@ from helpers.tasks import children as task_children
 # Tests never adopt or start the user's Ghidra sidecar; the sidecar tests set their own.
 os.environ.setdefault('XODB_GHIDRA_SIDECAR', 'off')
 
+def with_runtime_agent(options, executable):
+    """Prefix options with the C agent when a lane asks for it.
+
+    XODB_TEST_RUNTIME_AGENT is the release-check agent lane, the same switch
+    tests/helpers/input.py reads for a GUI launch. It applies to a launch and
+    to an attach. XODB_RUNTIME_AGENT is the older per-test switch and applies
+    only to a launch. When a launch sets it, that agent wins: the test chose
+    a proxy or a specific binary. A core file, a capture, an overview, a packet
+    capture, a mitmproxy flow and the Redot debugger stay on the path the
+    caller named. An option list that already names the agent is left alone.
+    """
+    options = list(options)
+    if any(option in options for option in (
+            '--runtime-agent', '--core', '--open-capture', '--open-profile',
+            '--compare-capture', '--runtime-ssh', '--gdb-remote',
+            '--overview', '--open-pcap', '--open-mitmproxy', '--redot-debugger',
+            '--open-frames', '--open-observation', '--browse-observation', '--decompile')):
+        return options
+    agent = os.environ.get('XODB_RUNTIME_AGENT') if executable is not None else None
+    if not agent:
+        agent = os.environ.get('XODB_TEST_RUNTIME_AGENT')
+    if not agent:
+        return options
+    return ['--runtime-agent', agent, *options]
+
+
+def runtime_agent_args():
+    """Arguments for a launcher that builds its own xodb command.
+
+    The lane switch and the older per-test switch name the same agent. A
+    caller that already put --runtime-agent in its own list should not call
+    this. An empty result leaves the command in-process.
+    """
+    agent = os.environ.get('XODB_RUNTIME_AGENT') or os.environ.get('XODB_TEST_RUNTIME_AGENT')
+    if not agent:
+        return []
+    return ['--runtime-agent', str(Path(agent).resolve())]
+
+
 class Client:
     reply_seconds = 5  # subclasses that build their own process skip __init__
     def __init__(self, scope, executable='./zig-out/bin/xodb-m1-fixture', args=(), options=(), reply_seconds=5):
         self.transcript = []
         self.reply_seconds = reply_seconds
-        agent = os.environ.get('XODB_RUNTIME_AGENT') if executable is not None else None
-        if agent and '--runtime-agent' not in options:
-            options = ['--runtime-agent', agent, *options]
+        options = with_runtime_agent(options, executable)
         self.runtime_agent = '--runtime-agent' in options
         self.p = subprocess.Popen([os.environ.get('XODB_BIN', './zig-out/bin/xodb'), '--headless', '--mcp', '--agent-scope', scope, *options, *(['--', executable, *args] if executable is not None else [])], bufsize=0, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.id = 0

@@ -225,7 +225,7 @@ pub fn main(args: []const [:0]const u8) !void {
                 const r = radio.reportBetween(scratch.allocator(), m, line_from, line_to, redact) catch continue;
                 say(a, "  [{d:>4.0} s] {d} samples ({d:.0}/s, lag {d:.0} ms; clock: {d} TSF steps, {d} held back; watchdog: {d} re-triggers, {d} re-arms; {d} malformed) pings {d}/{d} lost: {s}\n", .{ @as(f32, @floatFromInt(line_to - from)) / 1e9, r.spectral.window_samples, r.spectral.rate_hz, r.spectral.lag_ms, r.spectral.tsf_steps, r.spectral.rejected, r.spectral.retriggers, r.spectral.rearms, r.spectral.malformed, r.ping.lost, r.ping.sent, r.words });
                 // The channel line describes the exact same five-second interval.
-                if (r.spectral.window_samples > 0) if (radio.channelsBetween(scratch.allocator(), m, line_from, line_to, null)) |cr| {
+                if (r.spectral.window_samples > 0) if (radio.channelsKnownBetween(scratch.allocator(), m, line_from, line_to, &r.verdict, null)) |cr| {
                     say(a, "         channels: {s}\n", .{cr.words});
                 } else |_| {};
             }
@@ -233,7 +233,7 @@ pub fn main(args: []const [:0]const u8) !void {
         const to = @min(fsx.monotonicNs(), end);
         const r = try radio.reportPhaseBetween(a, m, from, to, redact);
         try reports.append(a, r);
-        const cr = try radio.channelsPhaseBetween(a, m, from, to, null);
+        const cr = try radio.channelsPhaseKnownBetween(a, m, from, to, &r.verdict, null);
         try channel_reports.append(a, cr);
         if (!as_json) {
             out(a, "phase {d}: {s}\n  kind={s} confidence={d:.2} samples={d} rate={d:.0}/s r60={d:.2} r50={d:.2} half={d:.2} active={d:.2} floor={d:.0}dBm width={d:.1}MHz hop={d:.1}MHz coverage={d:.2} pings sent={d} lost={d}\n", .{ k + 1, r.words, r.kind, r.confidence, r.spectral.window_samples, r.spectral.rate_hz, r.verdict.r60, r.verdict.r50, if (r.verdict.r60 >= r.verdict.r50) r.verdict.r60half else r.verdict.r50half, r.verdict.active, r.verdict.floor_dbm, r.verdict.width_mhz, r.verdict.hop_mhz, r.verdict.coverage, r.ping.sent, r.ping.lost });

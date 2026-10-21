@@ -9,6 +9,7 @@
 #include "perf_internal.h"
 #include "remote_internal.h"
 #include "wire_target.h"
+#include "check.h"
 #include "perf_wire.h"
 #include <signal.h>
 #include <stdio.h>
@@ -16,9 +17,16 @@
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 static volatile uint64_t watched;
+/* A hot page with a marker the host reads at the first stop, and a zero-filled
+ * walk two pages past the cache cap (bss, so the binary stays small). */
+static unsigned char cache_bytes[4096] __attribute__((aligned(4096))) = {42};
+static unsigned char cache_walk[(XRT_READ_CACHE_PAGES + 2) * 4096] __attribute__((aligned(4096)));
+static uintptr_t boundary;
+static volatile uint64_t borrowed_value;
 #if defined(__x86_64__)
 __attribute__((naked, noinline)) static void marker(void)
 {
@@ -527,7 +535,7 @@ static void collectors(const char *agent, const char *self)
     xrt_perf_destroy(p);
     OK(xrt_target_destroy(t));
 }
-static int delayed_proxy(const char *agent, bool symbols)
+static int delayed_proxy(const char *agent, bool symbols, bool short_pages, bool legacy)
 {
     int pair[2];
     assert(!socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair));
@@ -555,8 +563,35 @@ static int delayed_proxy(const char *agent, bool symbols)
         assert(got == XRT_WIRE_OK);
         bool delay = symbols ? (frame.op == XRT_RPC_FILE_OPEN || frame.op == XRT_RPC_FILE_READ) :
             frame.op == XRT_RPC_READ && !delayed;
+        if (legacy) delay = false;
+        if (short_pages) {
+            delay = false;
+            if (frame.op == XRT_RPC_READ && frame.size >= 32) {
+                struct xrt_codec in = xrt_codec(body + 16, 8, true);
+                uint64_t amount = 0;
+                xrt_codec_u64(&in, &amount);
+                if (amount == 4096) {
+                    struct xrt_codec out = xrt_codec(body + 16, 8, false);
+                    amount = 8; // Simulate a readable prefix, not a full page.
+                    xrt_codec_u64(&out, &amount);
+                }
+            }
+        }
+        if (legacy && frame.op == XRT_RPC_HELLO && frame.size >= 32) {
+            struct xrt_codec out = xrt_codec(body + 16, 8, false);
+            uint64_t capabilities = 0;
+            xrt_codec_u64(&out, &capabilities);
+        }
         assert(xrt_wire_write(pair[0], &frame, body, 10000) == XRT_WIRE_OK);
         assert(xrt_wire_read(pair[0], &frame, body, XRT_WIRE_MAX_BODY, 10000) == XRT_WIRE_OK);
+        if (legacy && frame.op == XRT_RPC_HELLO && frame.size >= 36) {
+            struct xrt_codec in = xrt_codec(body + 28, 8, true);
+            uint64_t capabilities = 0;
+            xrt_codec_u64(&in, &capabilities);
+            capabilities &= ~XRT_RPC_CAP_ADDRESS_SPACE;
+            struct xrt_codec out = xrt_codec(body + 28, 8, false);
+            xrt_codec_u64(&out, &capabilities);
+        }
         if (delay) { usleep(symbols ? 35000 : 350000); delayed = true; }
         assert(xrt_wire_write(STDOUT_FILENO, &frame, body, 10000) == XRT_WIRE_OK);
     }
@@ -603,10 +638,214 @@ static void late_reply(const char *agent, const char *self)
     OK(xrt_target_destroy(target));
     puts("C discovery deadline: file requests defer; breakpoint installation and reads remain usable");
 }
+static struct xrt_read_cache_stats cache_stats(struct xrt_target *t)
+{
+    struct xrt_read_cache_stats s;
+    CHECK(xrt_target_read_cache_stats(t, &s));
+    return s;
+}
+static bool read_cache(const char *agent, const char *self, bool wrong)
+{
+    const char *transport[] = {agent, "--stdio", NULL};
+    struct xrt_target *t = NULL;
+    OK(xrt_target_remote(transport, &t));
+    const char *args[] = {self, "--cache-fixture", NULL};
+    OK(xrt_target_launch(t, args));
+    size_t got = 0;
+    uint64_t value = 0;
+    struct xrt_read_cache_stats before = cache_stats(t);
+    for (unsigned i = 0; i < 100; ++i) {
+        OK(xrt_target_read(t, (uintptr_t)cache_bytes, &value, 1, &got));
+        CHECK(got == 1 && (uint8_t)value == 42);
+    }
+    struct xrt_read_cache_stats after = cache_stats(t);
+    const bool oracle = after.rpc_reads - before.rpc_reads == (wrong ? 2u : 1u);
+    CHECK(after.hits - before.hits == 99);
+    value = 42;
+    OK(xrt_target_write(t, (uintptr_t)&watched, &value, sizeof(value)));
+    OK(xrt_target_read(t, (uintptr_t)&watched, &value, sizeof(value), &got));
+    CHECK(got == sizeof(value) && value == 42);
+    after = cache_stats(t);
+    value = 43;
+    OK(xrt_target_write(t, (uintptr_t)&watched, &value, sizeof(value)));
+    value = 0;
+    OK(xrt_target_read(t, (uintptr_t)&watched, &value, sizeof(value), &got));
+    CHECK(value == 43 && cache_stats(t).rpc_reads > after.rpc_reads);
+    if (xrt_arch_native()->machine == XRT_X86_64) {
+        after = cache_stats(t);
+        OK(xrt_target_register_write(t, view(t).pid, "rax", 3, 0));
+        OK(xrt_target_read(t, (uintptr_t)&watched, &value, sizeof(value), &got));
+        CHECK(value == 43 && cache_stats(t).rpc_reads > after.rpc_reads);
+    }
+    uint8_t original[4], visible[4];
+    size_t trap = xrt_arch_native()->trap_size;
+    OK(xrt_target_read(t, (uintptr_t)marker, original, trap, &got));
+    uint64_t bp;
+    after = cache_stats(t);
+    OK(xrt_target_breakpoint_set(t, (uintptr_t)marker, false, &bp));
+    OK(xrt_target_read(t, (uintptr_t)marker, visible, trap, &got));
+    CHECK(got == trap && !memcmp(original, visible, trap));
+    CHECK(cache_stats(t).rpc_reads > after.rpc_reads);
+    OK(xrt_target_continue(t));
+    OK(xrt_target_wait_stopped(t));
+    CHECK(view(t).threads[0].reason == XRT_STOP_BREAKPOINT);
+    OK(xrt_target_read(t, (uintptr_t)&watched, &value, sizeof(value), &got));
+    CHECK(value == 43);
+    const uint64_t generation = view(t).generation;
+    OK(xrt_target_continue(t));
+    OK(xrt_target_wait_stopped(t));
+    CHECK(view(t).generation != generation);
+    OK(xrt_target_read(t, (uintptr_t)&watched, &value, sizeof(value), &got));
+    CHECK(value == 44);
+    after = cache_stats(t);
+    OK(xrt_target_breakpoint_remove(t, bp));
+    OK(xrt_target_read(t, (uintptr_t)marker, visible, trap, &got));
+    CHECK(got == trap && !memcmp(original, visible, trap));
+    CHECK(cache_stats(t).rpc_reads > after.rpc_reads);
+    uintptr_t edge;
+    OK(xrt_target_read(t, (uintptr_t)&boundary, &edge, sizeof(edge), &got));
+    CHECK(edge != 0);
+    /* Exact cross-page reads preserve partial-prefix and unreadable behavior. */
+    unsigned char bytes[16];
+    OK(xrt_target_read(t, edge - 8, bytes, sizeof(bytes), &got));
+    CHECK(got == 8 && bytes[0] == 0x5a);
+    CHECK(xrt_target_read(t, edge, bytes, 1, &got) == XRT_MEMORY_UNREADABLE && !got);
+    OK(xrt_target_read(t, edge - 1, bytes, 1, &got));
+    CHECK(got == 1 && bytes[0] == 0x5a);
+    for (unsigned i = 0; i < XRT_READ_CACHE_PAGES + 2; ++i)
+        OK(xrt_target_read(t, (uintptr_t)cache_walk + i * 4096, bytes, 1, &got));
+    CHECK(cache_stats(t).allocated_bytes <= (uint64_t)XRT_READ_CACHE_PAGES * 4096);
+    OK(xrt_target_read(t, (uintptr_t)cache_bytes, bytes, 1, &got));
+    for (unsigned i = 0; i < XRT_READ_CACHE_PAGES + 2; ++i) {
+        OK(xrt_target_read(t, (uintptr_t)cache_walk + i * 4096, bytes, 1, &got));
+        after = cache_stats(t);
+        OK(xrt_target_read(t, (uintptr_t)cache_bytes, bytes, 1, &got));
+        CHECK(bytes[0] == 42 && cache_stats(t).rpc_reads == after.rpc_reads);
+    }
+    OK(xrt_target_destroy(t));
+    const char *partial_transport[] = {self, "--short-page-proxy", agent, NULL};
+    t = NULL;
+    OK(xrt_target_remote(partial_transport, &t));
+    OK(xrt_target_launch(t, args));
+    before = cache_stats(t);
+    for (unsigned i = 0; i < 2; ++i) {
+        OK(xrt_target_read(t, (uintptr_t)cache_bytes + 64, bytes, 1, &got));
+        CHECK(got == 1 && bytes[0] == 0);
+    }
+    after = cache_stats(t);
+    CHECK(after.rpc_reads - before.rpc_reads == 4 && after.hits == before.hits);
+    OK(xrt_target_destroy(t));
+    puts("remote read cache: page hits, bounded allocation, writes/registers, breakpoint originals, resume and partial reads pass");
+    return oracle;
+}
+/* The parent is stopped in its vfork event while the released child changes
+ * its address space. Pipes synchronize actual writes, not timing guesses. */
+static bool unstable_reads(const char *agent, bool exec_child, bool wrong)
+{
+    int go[2], ready[2];
+    CHECK(!pipe(go) && !pipe(ready));
+    const pid_t controller = getpid();
+    const pid_t fixture = fork();
+    CHECK(fixture >= 0);
+    if (!fixture) {
+        close(go[1]); close(ready[0]);
+        /* A failed CHECK in the controller must not strand this stopped
+         * fixture holding the runner's output pipe. */
+        CHECK(!prctl(PR_SET_PDEATHSIG, SIGKILL) && getppid() == controller);
+        CHECK(!prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY));
+        char byte;
+        CHECK(write(ready[1], "r", 1) == 1);
+        CHECK(read(go[0], &byte, 1) == 1);
+        const pid_t child = vfork();
+        CHECK(child >= 0);
+        if (!child) {
+            borrowed_value = 41;
+            if (write(ready[1], "a", 1) != 1 || read(go[0], &byte, 1) != 1) _exit(2);
+            borrowed_value = 42;
+            if (write(ready[1], "b", 1) != 1 || read(go[0], &byte, 1) != 1) _exit(3);
+            if (exec_child) execl("/bin/true", "true", (char *)0);
+            _exit(exec_child ? 4 : 0);
+        }
+        while (waitpid(child, NULL, 0) < 0) CHECK(errno == EINTR);
+        raise(SIGSTOP);
+        _exit(0);
+    }
+    close(go[0]); close(ready[1]);
+    char byte;
+    CHECK(read(ready[0], &byte, 1) == 1);
+    const char *transport[] = {agent, "--stdio", NULL};
+    struct xrt_target *t = NULL;
+    OK(xrt_target_remote(transport, &t));
+    OK(xrt_target_attach(t, fixture));
+    CHECK(!xrt_target_shared_vm(t) && !xrt_target_address_space_unstable(t));
+    OK(xrt_target_continue(t));
+    CHECK(write(go[1], "g", 1) == 1);
+    /* Don't consume the vfork event with want_run set: interrupt while the
+     * kernel holds it, so the ordinary release path parks the parent. */
+    const uint64_t deadline = xrt_now() + UINT64_C(5000000000);
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/stat", fixture);
+    for (;;) {
+        FILE *f = fopen(path, "r"); CHECK(f);
+        char state[512]; CHECK(fgets(state, sizeof(state), f)); fclose(f);
+        const char *end = strrchr(state, ')'); CHECK(end);
+        if (end[2] == 't') break;
+        CHECK(xrt_now() < deadline); usleep(1000);
+    }
+    OK(xrt_target_interrupt(t));
+    OK(xrt_target_wait_stopped(t));
+    CHECK(view(t).state == XRT_STOPPED && xrt_target_address_space_unstable(t));
+    CHECK(!xrt_target_shared_vm(t)); // Not a followed family; detach rules unchanged.
+    CHECK(read(ready[0], &byte, 1) == 1 && byte == 'a');
+    const uint64_t generation = view(t).generation;
+    const struct xrt_read_cache_stats before = cache_stats(t);
+    uint64_t value = 0; size_t size = 0;
+    OK(xrt_target_read(t, (uintptr_t)&borrowed_value, &value, sizeof(value), &size));
+    CHECK(size == sizeof(value) && value == 41);
+    CHECK(write(go[1], "g", 1) == 1);
+    CHECK(read(ready[0], &byte, 1) == 1 && byte == 'b');
+    OK(xrt_target_read(t, (uintptr_t)&borrowed_value, &value, sizeof(value), &size));
+    const bool fresh = size == sizeof(value) && value == (wrong ? 41u : 42u);
+    CHECK(view(t).generation == generation);
+    CHECK(cache_stats(t).hits == before.hits && cache_stats(t).rpc_reads == before.rpc_reads + 2);
+    CHECK(write(go[1], "g", 1) == 1);
+    OK(xrt_target_continue(t));
+    OK(xrt_target_wait_stopped(t));
+    CHECK(!xrt_target_address_space_unstable(t) && !xrt_target_shared_vm(t));
+    OK(xrt_target_read(t, (uintptr_t)&borrowed_value, &value, sizeof(value), &size));
+    CHECK(value == 42);
+    const struct xrt_read_cache_stats stable = cache_stats(t);
+    OK(xrt_target_read(t, (uintptr_t)&borrowed_value, &value, sizeof(value), &size));
+    CHECK(cache_stats(t).hits == stable.hits + 1 && cache_stats(t).rpc_reads == stable.rpc_reads);
+    OK(xrt_target_destroy(t));
+    CHECK(!kill(fixture, SIGKILL));
+    CHECK(waitpid(fixture, NULL, 0) == fixture);
+    close(go[1]); close(ready[0]);
+    return fresh;
+}
+static void legacy_reads(const char *agent, const char *self)
+{
+    const char *transport[] = {self, "--legacy-cache-proxy", agent, NULL};
+    const char *args[] = {self, "--cache-fixture", NULL};
+    struct xrt_target *t = NULL;
+    OK(xrt_target_remote(transport, &t));
+    OK(xrt_target_launch(t, args));
+    CHECK(xrt_target_address_space_unstable(t) && !xrt_target_shared_vm(t));
+    const struct xrt_read_cache_stats before = cache_stats(t);
+    unsigned char byte; size_t size;
+    for (unsigned i = 0; i < 2; ++i) {
+        OK(xrt_target_read(t, (uintptr_t)cache_bytes, &byte, 1, &size));
+        CHECK(size == 1 && byte == 42);
+    }
+    CHECK(cache_stats(t).rpc_reads == before.rpc_reads + 2 && cache_stats(t).hits == before.hits);
+    OK(xrt_target_destroy(t));
+}
 int main(int argc, char **argv)
 {
-    if (argc == 3 && !strcmp(argv[1], "--delay-proxy")) return delayed_proxy(argv[2], false);
-    if (argc == 3 && !strcmp(argv[1], "--symbol-delay-proxy")) return delayed_proxy(argv[2], true);
+    if (argc == 3 && !strcmp(argv[1], "--delay-proxy")) return delayed_proxy(argv[2], false, false, false);
+    if (argc == 3 && !strcmp(argv[1], "--symbol-delay-proxy")) return delayed_proxy(argv[2], true, false, false);
+    if (argc == 3 && !strcmp(argv[1], "--short-page-proxy")) return delayed_proxy(argv[2], false, true, false);
+    if (argc == 3 && !strcmp(argv[1], "--legacy-cache-proxy")) return delayed_proxy(argv[2], false, false, true);
     /* These synthetic tracees skip exit-time LeakSanitizer, whose helper
      * cannot ptrace an already-traced process. Memory accesses are still
      * instrumented; the controller, proxy and agent retain leak checks. */
@@ -615,6 +854,17 @@ int main(int argc, char **argv)
         for (unsigned i = 0; i < 80000000; ++i)
             value = value * 1664525 + 1013904223;
         _exit(value == 0);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--cache-fixture")) {
+        size_t page = (size_t)sysconf(_SC_PAGESIZE);
+        void *memory = mmap(NULL, page * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        CHECK(memory != MAP_FAILED);
+        memset(memory, 0x5a, page);
+        CHECK(!munmap((unsigned char *)memory + page, page));
+        boundary = (uintptr_t)memory + page;
+        void (*volatile fn)(void) = marker;
+        fn(); fn();
+        _exit(0);
     }
     if (argc == 2 && !strcmp(argv[1], "--fixture")) {
         /* ELFv2 direct calls in this file skip the global entry. The planted
@@ -636,7 +886,7 @@ int main(int argc, char **argv)
         waitpid(child, NULL, 0);
         _exit(0);
     }
-    assert(argc == 2);
+    CHECK(argc == 2 || (argc == 3 && (!strcmp(argv[2], "--cache") || !strcmp(argv[2], "--cache-wrong") || !strcmp(argv[2], "--unstable") || !strcmp(argv[2], "--unstable-wrong"))));
     alarm(30);
     char self[4096];
     ssize_t size = readlink("/proc/self/exe", self, sizeof(self) - 1);
@@ -647,6 +897,19 @@ int main(int argc, char **argv)
         return 0;
     }
     assert(prctl(PR_SET_CHILD_SUBREAPER, 1) == 0);
+    if (argc == 3 && !strncmp(argv[2], "--unstable", 10)) {
+        const bool good = unstable_reads(argv[1], false, !strcmp(argv[2], "--unstable-wrong"));
+        CHECK(unstable_reads(argv[1], true, false));
+        legacy_reads(argv[1], self);
+        CHECK(good);
+        puts("Remote cache: released vfork writes, exec/exit restore caching, legacy agents bypass: PASS");
+        return 0;
+    }
+    if (argc == 3) {
+        CHECK(read_cache(argv[1], self, !strcmp(argv[2], "--cache-wrong")));
+        return 0;
+    }
+    CHECK(read_cache(argv[1], self, false));
     late_reply(argv[1], self);
     struct xrt_target *slow = NULL;
     const char *transport[] = {self, "--symbol-delay-proxy", argv[1], NULL};

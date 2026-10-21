@@ -16,7 +16,7 @@ pub const Recovery = struct {
             // a missing device may be temporary (reset or driver reload).
             if (!self.initialized and (err == error.VulkanDeviceNotFound or err == error.VulkanDeviceCannotPresent)) return err;
             self.retry_at = now +| 1_000_000_000;
-            log.err(.render, "Renderer initialization failed: {s}; retrying, session retained\n", .{@errorName(err)});
+            log.err(.render, "xodb: vulkan: Renderer initialization failed: {s}; retrying, session retained\n", .{@errorName(err)});
             return false;
         };
         self.ready = true;

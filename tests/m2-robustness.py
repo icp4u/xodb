@@ -20,7 +20,8 @@ subprocess.run(['cc', '-O2', '-g', '-gdwarf-4', '-fno-omit-frame-pointer',
                env=env, check=True)
 
 def perf_fds(client):
-    return [p.name for p in Path(f'/proc/{client.p.pid}/fd').iterdir()
+    # The collector holds the event fds. That is this process, or the C agent.
+    return [p.name for p in Path(f'/proc/{client.collector_pid()}/fd').iterdir()
             if 'perf_event' in os.readlink(p)]
 
 for mode in ('thread', 'fork', 'burst', 'limit'):

@@ -14,9 +14,9 @@ fields; it has no place to type an expression. Own only:
 - `docs/research/expression-watch.md`
 - `docs/research/expression-watch/`
 
-Read `src/model/evaluate.zig` (parser and operators), `Session.evaluateExpression`,
+Read `src/debug/evaluate.zig` (parser and operators), `Session.evaluateExpression`,
 `Session.valueChildren`, `Session.locals` and `Session.investigateWrite` in
-`src/model/session.zig`, `src/model/value_view.zig`, the `evaluate_expression`
+`src/model/session.zig`, `src/debug/value_view.zig`, the `evaluate_expression`
 and `get_value_children` handlers in `src/mcp/server.zig`, the locals/registers
 pane and frame selection in `src/ui/workspace.zig`, and the text-field handling
 in `src/ui/capture_panel.zig` (T14) for keyboard editing conventions. Record

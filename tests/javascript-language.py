@@ -71,15 +71,18 @@ def audit(client, target, name):
         return {p.name:(p/'schedstat').read_text().split()[0] for p in tasks.iterdir()}
     registers = client.inspect('get_registers', tid=target.pid)
     generation = client.session()['generation']
+    cache_before = client.session().get('remote_read_cache')
     before = scheduled()
+    # With a runtime agent the agent, not the host, issues the target syscalls.
+    observer = client.collector_pid()
     tracer = subprocess.Popen(['strace','-f','-qq','-o',str(log),'-e',
         'trace=ptrace,process_vm_readv,process_vm_writev,pread64,pwrite64,pwritev,pwritev2,kill,tgkill,tkill',
-        '-p',str(client.p.pid)], stderr=subprocess.PIPE)
+        '-p',str(observer)], stderr=subprocess.PIPE)
     try:
         deadline = time.monotonic() + 10
         while True:
             assert tracer.poll() is None, tracer.stderr.read().decode()
-            status = Path(f'/proc/{client.p.pid}/status').read_text()
+            status = Path(f'/proc/{observer}/status').read_text()
             attached = next(int(line.split()[1]) for line in status.splitlines() if line.startswith('TracerPid:'))
             if attached == tracer.pid: break
             assert time.monotonic() < deadline, 'strace did not attach before the audit deadline'
@@ -99,7 +102,9 @@ def audit(client, target, name):
     forbidden = [k for k in calls if k in ('process_vm_writev','pwrite64','pwritev','pwritev2','kill','tgkill','tkill') or
         k.startswith(('ptrace:PTRACE_POKE','ptrace:PTRACE_SET')) or k in ('ptrace:PTRACE_CONT','ptrace:PTRACE_SINGLESTEP','ptrace:PTRACE_SYSCALL')]
     assert not forbidden, calls
-    assert any(k in calls for k in ('process_vm_readv','pread64','ptrace:PTRACE_PEEKDATA')), calls
+    cache_after = client.session().get('remote_read_cache')
+    cached = bool(cache_before and cache_after['hits'] > cache_before['hits'])
+    assert any(k in calls for k in ('process_vm_readv','pread64','ptrace:PTRACE_PEEKDATA')) or cached, (calls,cache_before,cache_after)
     assert scheduled() == before
     assert client.inspect('get_registers',tid=target.pid)==registers and client.session()['generation']==generation
     if args.output:

@@ -1,3 +1,4 @@
+//! Target-independent typed expressions over caller-supplied lookup and memory.
 const std = @import("std");
 pub const Kind = enum { signed, unsigned, boolean, float, pointer, array, structure, unknown };
 pub const Field = struct { name: []const u8, offset: u64, type: *const Type };
@@ -39,13 +40,13 @@ pub fn materialize(ctx: Context, value: Value) !Value {
         }
         var bytes: [8]u8 = @splat(0);
         @memcpy(bytes[0..size], data[0..size]);
-        v.bits = @import("../debug/location.zig").lowBits(bytes[0..size], ctx.endian);
+        v.bits = @import("location.zig").lowBits(bytes[0..size], ctx.endian);
     } else if (v.address) |address| {
         if (v.type.size == 0 or v.type.size > 8) return error.UnsupportedType;
         var bytes: [8]u8 = @splat(0);
         const size: usize = @intCast(v.type.size);
         if (try ctx.read(ctx.user, address, bytes[0..size]) != size) return error.MemoryUnreadable;
-        v.bits = @import("../debug/location.zig").lowBits(bytes[0..size], ctx.endian);
+        v.bits = @import("location.zig").lowBits(bytes[0..size], ctx.endian);
     }
     if (v.type.size == 0 or v.type.size > 8 or v.type.kind == .unknown) return error.UnsupportedType;
     if (v.type.size < 8) {

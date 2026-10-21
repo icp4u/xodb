@@ -61,7 +61,11 @@ try:
     reader = SimpleNamespace(p=SimpleNamespace(pid=c.collector_pid()), inspect=c.inspect, session=c.session)
     report['warm_audit'] = audit(reader, tid, w/'warm.strace', warm)
     calls = report['warm_audit']['syscalls']
-    assert calls.get('process_vm_readv') == 2 and not calls.get('pread64') and not calls.get('ptrace:PTRACE_PEEKDATA'), calls
+    # Only the two explicit reads are needed: selections reuse their evidence,
+    # regardless of whether those reads reach the target or its stopped cache.
+    assert report['warm_audit']['read_requests'] == 2, report['warm_audit']
+    # The cache can only remove target reads, never add file or word reads.
+    assert calls.get('process_vm_readv', 0) <= 2 and not calls.get('pread64') and not calls.get('ptrace:PTRACE_PEEKDATA'), calls
     report['warm_pair_ms'] = elapsed
     assert c.session()['generation']==generation and c.inspect('get_registers',tid=tid)==registers
     c.action('step_instruction', tid=tid)
@@ -72,7 +76,7 @@ try:
         native()
         c.inspect('read_memory', address=hex(pc), length=1)
     report['new_stop_audit'] = audit(reader, tid, w/'new-stop.strace', after_step)
-    assert report['new_stop_audit']['syscalls'].get('process_vm_readv',0)>2, report
+    assert report['new_stop_audit']['read_requests']>2, report
     report.update(status='pass', loadavg=os.getloadavg(), cpu_count=os.cpu_count(), anchor=segment['anchor'])
 except BaseException as exc:
     report.update(status='fail', error=repr(exc))

@@ -11,7 +11,7 @@ pub const SelectedKey = struct { session: u64 = 0, generation: u64, tid: i32, la
 pub const Key = struct { session: u64, generation: u64, revision: u64, metadata: u64, tid: i32, frame: usize, tab: tabs.Tab };
 pub const Entry = struct {
     thread: ?i32 = null,
-    identity: ?@import("../language/runtime_binding.zig").Identity = null,
+    identity: ?@import("../language/types.zig").Identity = null,
     present: bool = false,
     checked: bool = false,
     found: bool = false,

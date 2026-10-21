@@ -17,8 +17,9 @@ deny mcp-no-ui              mcp -> ui
 only render-leaf            render -> platform common c_ui config
 only platform-leaf          platform -> common c_ui
 
-# Providers get a narrow context, not the session.
-deny providers-no-session   language semq debug binary -> src/model/session.zig
+# Language providers get a narrow context, never the session; no exceptions.
+deny language-no-session    language -> src/model/session.zig
+deny providers-no-session   semq debug binary -> src/model/session.zig
 
 # The C runtime builds alone (src/runtime/Makefile, xodb-agent): it includes only
 # its own headers and the system's.

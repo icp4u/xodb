@@ -34,6 +34,35 @@ Press **Space** to reach `change_value`, **F11** to step into a source line (or 
 inspect registers, and **F10** to step over a source line. Omitting
 `--runtime-agent` uses the same C runtime in the host process.
 
+### Stopped remote reads
+
+`--runtime-agent` and `--runtime-ssh` retain up to 5120 lazily allocated 4 KiB
+pages (20 MiB per connection), replacing the least recently used page. Only
+complete successful reads of a fully stopped, non-shared target are cached, and
+only while no other process on the connection is running or has an unstable
+address space. A negotiated agent flag covers released vfork borrowers until
+their exec/exit is observed; this does not change the shared-VM family/detach
+flag. Older agents remain compatible but bypass the page cache because they
+cannot supply this evidence. Memory shared with an unrelated, untraced program
+still refreshes at the next control operation.
+Target identity, stop generation and image epoch scope reuse; all control
+mutations, including writes and breakpoint changes, discard it before execution.
+Cached pages contain the agent's normalized bytes, so software breakpoints still
+read as their original instructions. Incomplete page fetches fall back to the
+exact requested range; large and cross-page reads retain their partial-read
+semantics. Local ptrace and GDB-remote reads are unchanged. Upgrade the agent to
+enable stopped-page caching: the optional capability and snapshot suffix are
+negotiated without changing the wire version or replies to older hosts.
+
+MCP `get_session.remote_read_cache` reports connection-lifetime `requests`,
+`hits`, `rpc_reads`, `rpc_bytes` and `allocated_bytes` (null for other backends).
+Compare counter deltas across an inspection; speculative page fetches and exact
+fallbacks both count as RPC reads. Language `memory_reads` remains the logical
+reader count, not transport round trips. Elisp's zero-start MCP stack shares the
+generation/thread/image/metadata-scoped selection cache used by locals; explicit
+nonzero starts keep their original anchor scope. Initial symbol discovery still
+requires remote file operations and can be slower than warm frame selection.
+
 For a target machine, build with a normal C11 compiler and Linux development
 headers. The agent links libc, pthread and libatomic; it needs no Zig, Capstone,
 libdw, graphics libraries or generated bindings. Run from a source checkout:

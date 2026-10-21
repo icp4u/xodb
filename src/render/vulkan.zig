@@ -160,7 +160,7 @@ pub const Renderer = struct {
     failed_driver_len: usize = 0,
 
     pub fn init(self: *Renderer, window: *Window) !void {
-        if (takeEarly()) |ready| {
+        if (try takeEarly()) |ready| {
             self.* = ready;
             self.window = window;
             // Only a device that cannot present to this window starts over;
@@ -237,14 +237,32 @@ pub const Renderer = struct {
     /// chosen family presents to the window.
     fn prepare(self: *Renderer, display: ?select.Node) !void {
         errdefer self.deinit();
+        var filtered = early.filtered;
         const instance_made = self.createInstance();
         // The loader has read its variables; a child launched from now on
         // (on any thread) must not inherit them.
         earlyRestore();
-        try instance_made;
+        // As in init: when the display's driver gives no instance or no
+        // usable device, load every driver in this same attempt.
+        if (instance_made) |_| {} else |err| if (filtered) {
+            log.debug(.render, "Vulkan early loader filter gave no instance ({s}); loading every driver\n", .{@errorName(err)});
+            filtered = false;
+            try self.createInstance();
+        } else return err;
         phases.begin(.device);
         var found = try self.probe();
         defer found.deinit(std.heap.page_allocator);
+        if (filtered) if (for (found.items) |item| {
+            if (item.device.usable) break false;
+        } else true) {
+            log.debug(.render, "Vulkan early loader filter gave no usable device; loading every driver\n", .{});
+            found.deinit(std.heap.page_allocator);
+            found = .empty;
+            c.vkDestroyInstance(self.instance, null);
+            self.instance = null;
+            try self.createInstance();
+            found = try self.probe();
+        };
         const choice = try pick(found.items, display);
         self.physical = found.items[choice.index].physical;
         self.family = found.items[choice.index].family;
@@ -269,6 +287,9 @@ pub const Renderer = struct {
     /// The logical device for `physical` and `family`, and everything that
     /// needs only the device: queue, commands, sync, buffers, atlas, descriptors.
     fn createDevice(self: *Renderer) !void {
+        // The linear atlas need not allocate device-local storage, but an
+        // unusable memory inventory must be refused on either startup path.
+        _ = try self.memoryType(std.math.maxInt(u32), c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         const priority: f32 = 1;
         var queue_info = info(c.VkDeviceQueueCreateInfo, c.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO);
         queue_info.queueFamilyIndex = self.family;
@@ -548,7 +569,10 @@ pub const Renderer = struct {
         try created(c.vkCreateImageView(self.device, &create, null, view), view);
     }
     fn createAtlas(self: *Renderer) !void {
-        self.createLinearAtlas() catch {
+        self.createLinearAtlas() catch |err| {
+            // A capability mismatch may use the optimal atlas. Operational
+            // failures belong to renderer recovery, not a hidden second try.
+            if (err != error.LinearAtlasUnsupported and err != error.NoMemoryType) return err;
             if (self.atlas != null) c.vkDestroyImage(self.device, self.atlas, null);
             if (self.atlas_memory != null) c.vkFreeMemory(self.device, self.atlas_memory, null);
             self.atlas = null;
@@ -1427,7 +1451,7 @@ const Early = struct {
     display: ?select.Node = null,
     filtered: bool = false,
     layers_off: bool = false,
-    failed: bool = false,
+    failure: ?anyerror = null,
 };
 var early: Early = .{};
 /// Call once, before the window, in a process that will draw a GUI window,
@@ -1458,16 +1482,19 @@ fn earlyRestore() void {
 }
 fn earlyRun() void {
     early.renderer.prepare(early.display) catch |err| {
-        log.debug(.render, "Vulkan early setup failed: {s}; the window will set up Vulkan itself\n", .{@errorName(err)});
-        early.failed = true;
+        // Join publishes the error to the GUI's normal init/recovery owner.
+        early.failure = err;
     };
 }
-fn takeEarly() ?Renderer {
+fn takeEarly() !?Renderer {
     const thread = early.thread orelse return null;
     thread.join();
     early.thread = null;
-    if (early.failed) return null;
     defer early.renderer = .{};
+    if (early.failure) |err| {
+        early.failure = null;
+        return err;
+    }
     return early.renderer;
 }
 

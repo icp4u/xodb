@@ -51,14 +51,14 @@ pub fn Stack(comptime language: Tab) type {
 }
 pub fn read(comptime language: Tab, session: *model.Session, a: A, tid: i32) !Stack(language) {
     return switch (language) {
-        .python => @import("../language/python.zig").stack(session, a, tid, 0),
-        .perl => @import("../language/perl.zig").stack(session, a, tid, 0),
-        .lua => @import("../language/lua.zig").stack(session, a, tid, 0, null),
-        .javascript => @import("../language/javascript.zig").stack(session, a, tid, 0),
-        .ruby => @import("../language/ruby.zig").stack(session, a, tid, 0),
-        .go => @import("../language/go.zig").stack(session, a, tid, 0),
-        .elisp => @import("../language/elisp.zig").stack(session, a, tid, 0),
-        .gdscript => @import("../language/gdscript.zig").stack(session, a, tid, 0),
+        .python => @import("../language/python.zig").stack(&session.languageContext(), a, tid, 0),
+        .perl => @import("../language/perl.zig").stack(&session.languageContext(), a, tid, 0),
+        .lua => @import("../language/lua.zig").stack(&session.languageContext(), a, tid, 0, null),
+        .javascript => @import("../language/javascript.zig").stack(&session.languageContext(), a, tid, 0),
+        .ruby => @import("../language/ruby.zig").stack(&session.languageContext(), a, tid, 0),
+        .go => @import("../language/go.zig").stack(&session.languageContext(), a, tid, 0),
+        .elisp => @import("../language/elisp.zig").stack(&session.languageContext(), a, tid, 0),
+        .gdscript => @import("../language/gdscript.zig").stack(&session.languageContext(), a, tid, 0),
         else => unreachable,
     };
 }

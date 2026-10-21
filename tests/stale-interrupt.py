@@ -13,10 +13,11 @@ import json
 import subprocess
 import sys
 import time
+from client import runtime_agent_args
 
 xodb = sys.argv[1] if len(sys.argv) > 1 else "./zig-out/bin/xodb"
 fixture = sys.argv[2] if len(sys.argv) > 2 else "./zig-out/bin/xodb-fixture"
-app = subprocess.Popen([xodb, "--headless", "--mcp", "--agent-scope", "control", "--", fixture], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+app = subprocess.Popen([xodb, "--headless", "--mcp", "--agent-scope", "control", *runtime_agent_args(), "--", fixture], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
 serial = 0
 
 

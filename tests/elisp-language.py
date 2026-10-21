@@ -73,6 +73,7 @@ def audit(client, pid):
     path = w / 'readonly.strace'
     regs = client.inspect('get_registers', tid=pid)
     generation = client.session()['generation']
+    cache_before = client.session().get('remote_read_cache')
     before = {p.name: (p / 'schedstat').read_text().split()[0] for p in Path(f'/proc/{pid}/task').iterdir()}
     tracer = subprocess.Popen(['strace', '-f', '-qq', '-o', str(path), '-e',
                               'trace=ptrace,process_vm_readv,process_vm_writev,pread64,pwrite64,pwritev,pwritev2,kill,tgkill,tkill',
@@ -90,11 +91,16 @@ def audit(client, pid):
         tracer.wait(timeout=10)
         (w / 'strace.stderr').write_bytes(tracer.stderr.read())
     text = path.read_text()
-    assert re.search(r'process_vm_readv|pread64|PTRACE_PEEKDATA', text), text
+    physical = bool(re.search(r'process_vm_readv|pread64|PTRACE_PEEKDATA', text))
+    cache_after = client.session().get('remote_read_cache')
+    cached = bool(cache_before and cache_after['hits'] > cache_before['hits'])
+    # Cold agent reads are checked by remote-read-cache. Warm inspection may
+    # read normalized stop pages without another target syscall.
+    assert physical or cached, (text, cache_before, cache_after)
     assert not re.search(r'process_vm_writev\(|pwrite64\(|pwritev2?\(|(?:kill|tgkill|tkill)\(|PTRACE_(?:POKE\w*|SET\w*|CONT|SINGLESTEP|SYSCALL)\b', text), text
     after = {p.name: (p / 'schedstat').read_text().split()[0] for p in Path(f'/proc/{pid}/task').iterdir()}
     assert after == before and client.session()['generation'] == generation and client.inspect('get_registers', tid=pid) == regs
-    return {'target_runs': 0, 'target_mutations': 0, 'target_read_observed': True}
+    return {'target_runs': 0, 'target_mutations': 0, 'target_read_observed': physical, 'cache_read_observed': cached}
 
 results = []
 for mode, suffix, redefine in [('interpreted', 'el', False), ('bytecode', 'elc', False), ('native', 'eln', False), ('bytecode', 'elc', True), ('native', 'eln', True), ('interpreted', 'el', 'bytecode')]:

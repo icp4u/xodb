@@ -82,7 +82,7 @@ test "native locals view binds stop frame metadata and resolved locations" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var locals = [_]info.Local{.{ .name = "owned", .parameter = false, .value = .{ .type = &@import("../model/evaluate.zig").uint_type, .address = 0x20000000000001 } }};
+    var locals = [_]info.Local{.{ .name = "owned", .parameter = false, .value = .{ .type = &@import("../debug/evaluate.zig").uint_type, .address = 0x20000000000001 } }};
     const context = Context{ .session_id = 1, .generation = 2, .epoch = 3, .metadata_revision = 4, .debug_files = 0, .tid = 5, .frame = 0, .depth = 0, .pc = 6, .cfa = 7 };
     const view = identity(context, &locals);
     const args = try wire.value(a, .{ .view_id = view[0..] });

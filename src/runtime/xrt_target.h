@@ -157,6 +157,9 @@ enum xrt_status xrt_target_close(struct xrt_target *target);
 enum xrt_status xrt_target_reset(struct xrt_target *target);
 enum xrt_status xrt_target_set_following(struct xrt_target *target, bool enabled);
 bool xrt_target_shared_vm(const struct xrt_target *target);
+/* Read-cache evidence only; never changes detach/family ownership semantics.
+ * Remote targets without the negotiated evidence conservatively return true. */
+bool xrt_target_address_space_unstable(const struct xrt_target *target);
 const struct xrt_target *xrt_target_family_root(const struct xrt_target *target);
 enum xrt_status xrt_target_adopt(struct xrt_target *parent, int32_t pid, struct xrt_target *child,
                                  struct xrt_birth *birth);

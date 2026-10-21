@@ -41,6 +41,7 @@ below when those capabilities are intentionally unavailable.
 ./scripts/release-check gui --from gui-fdgraph # Resume at a step
 ./scripts/release-check affected             # Only the host and GUI steps that cover your uncommitted changes
 ./scripts/release-check affected --base REV  # ... or every change since REV
+./scripts/release-check host --agent-lane    # Eligible host steps through the local C agent
 ./scripts/release-check gui --jobs 4         # Up to four GUI steps at once, each on its own compositor
 ./scripts/release-check gui --slowest 10     # Also print the ten slowest steps
 ./scripts/release-check all --list --records # Whole step records: kind, needs, paths, serial, work
@@ -82,6 +83,30 @@ named in the final verdict line. A step that was moved to a periodic tier
 (`PERIODIC`, below) is selected only when a test script it runs changed. If
 nothing differs, it stops with an error instead of passing. It is a per-change check, not a replacement for the
 `gui` and `all` tiers.
+
+`host --agent-lane` runs every eligible host step through the local C agent
+(`zig-out/bin/xodb-agent`). One switch, `XODB_TEST_RUNTIME_AGENT`, is what
+`tests/client.py` and the GUI input helper already read. When a lane step
+runs, that switch points at a wrapper. The wrapper records one start and then
+executes the agent. A lane step that exits 0 without that record fails, so a
+passing test that never started the agent is not coverage. A step that already
+names the agent stays as it is. A step that cannot use the agent (a core file,
+a saved capture, an overview, a packet capture, a mitmproxy flow, the Redot debugger, GDB remote,
+macOS debugserver, a GUI compositor step, or a launcher that does not go
+through `tests/client.py`) is omitted and the reason is printed. A direct
+launcher is one of three: the C agent is the subject, an existing twin
+already runs it, or the step has no target for the C agent. `mcp.py`,
+`stale-interrupt.py`, `local-large-symbols.py`, and `fdactivity.py` read the
+switch and are lane steps. The memory view exits before an agent exists, and
+opening an observation archive rejects the agent, so those two stay omitted.
+A plain step whose script contains `--headless` or `--listen` fails classification.
+`tests/release-runner.py` quotes that gate flag and does not start the debugger, so it stays plain. The
+`periodic` tier schedules those host variants beside its own steps, so `all`
+does not run every live test twice. `affected` adds the variant of a step it
+already selected when the change is under `src/runtime/` or `src/remote/`, is a
+`src/model/remote_*` file, or is `src/mcp/remote.zig`, `src/target/runtime.zig`,
+`src/target/linux.zig`, `tests/client.py` or `tests/shared-sessions.py`. The shared
+session server in `tests/shared-sessions.py` follows the same switch.
 
 `--jobs N` runs up to N `gui` steps at once (default 1). Each has its own
 compositor, runtime directory and work directory. Build, unit and live steps,

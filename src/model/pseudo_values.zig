@@ -232,7 +232,7 @@ test "DWARF parameter order proves synthetic Ghidra parameter names" {
         .valid_start = 0x1000,
         .valid_end = 0x1010,
     };
-    const actual: debug_info.Local = .{ .name = "actual_name", .parameter = true, .parameter_ordinal = 0, .value = .{ .type = &@import("evaluate.zig").uint_type } };
+    const actual: debug_info.Local = .{ .name = "actual_name", .parameter = true, .parameter_ordinal = 0, .value = .{ .type = &@import("../debug/evaluate.zig").uint_type } };
     try std.testing.expect(identityAgrees(variable, actual));
     var wrong = actual;
     wrong.parameter_ordinal = 1;

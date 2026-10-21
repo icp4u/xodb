@@ -39,10 +39,15 @@ def main():
         binary = work/'check'
         compiler = ['clang', '-std=c11', '-O1', '-g', '-DNDEBUG', '-fno-sanitize-recover=all']
         if args.worker:
-            run('compile', compiler+['-fsanitize=address,undefined', '-ffunction-sections', '-fdata-sections',
+            # The runtime archive comes from src/runtime/runtime_sources.list, built with the same sanitizers.
+            sanitize = ['-fsanitize=address,undefined', '-ffunction-sections', '-fdata-sections']
+            library = work/'runtime/libxrt.a'
+            run('runtime', ['make', '-C', 'src/runtime', 'BUILD='+str(library.parent), '-j4', str(library)],
+                env=dict(os.environ, CC='clang', CFLAGS=' '.join(compiler[1:]+sanitize)), timeout=300)
+            run('compile', compiler+sanitize+[
                 'tests/macho-job.c', 'src/binary/macho.c', 'src/binary/macho_job.c',
                 'src/debug/macho_dwarf.c', 'src/debug/macho_object.c', 'src/debug/macho_unwind.c',
-                'src/runtime/files.c', '-Isrc/runtime', '-pthread', '-Wl,--gc-sections', '-o', str(binary)])
+                str(library), '-Isrc/runtime', '-pthread', '-ldl', '-latomic', '-Wl,--gc-sections', '-o', str(binary)])
             original = FIXTURES/'corpus/out/c/arm64-O2/cprog'
             data = original.read_bytes()
             at = 32

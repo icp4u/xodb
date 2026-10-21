@@ -11,7 +11,7 @@ const javascript = @import("../language/javascript.zig");
 const perl = @import("../language/perl.zig");
 const Capture = @import("../language/watch.zig").Capture;
 const A = std.mem.Allocator;
-const runtime_binding = @import("../language/runtime_binding.zig");
+const runtime_binding = @import("../language/binding_types.zig");
 const RuntimeEvidence = struct { id: u64, generation: u64, identity: runtime_binding.Identity };
 const Attempt = struct { id: u64, generation: u64, metadata: u64 };
 pub const State = struct {
@@ -43,11 +43,11 @@ pub const State = struct {
             return error.LanguageWatchLimit;
         }
         const capture = switch (language) {
-            .lua => try lua.createWatch(session, arena.allocator(), tid, segment, frame, expression, row),
-            .python => try python.createWatch(session, arena.allocator(), tid, segment, frame, expression, row),
-            .ruby => try ruby.createWatch(session, arena.allocator(), tid, segment, frame, expression, row),
-            .javascript => try javascript.createWatch(session, arena.allocator(), tid, segment, frame, expression, row),
-            .perl => try perl.createWatch(session, arena.allocator(), tid, segment, frame, expression, row),
+            .lua => try createLuaWatch(session, arena.allocator(), tid, segment, frame, expression, row),
+            .python => try createPythonWatch(session, arena.allocator(), tid, segment, frame, expression, row),
+            .ruby => try createRubyWatch(session, arena.allocator(), tid, segment, frame, expression, row),
+            .javascript => try createJavaScriptWatch(session, arena.allocator(), tid, segment, frame, expression, row),
+            .perl => try createPerlWatch(session, arena.allocator(), tid, segment, frame, expression, row),
             else => unreachable,
         };
         if (self.core == null) self.core = c.xlw_create() orelse return error.OutOfMemory;
@@ -117,11 +117,11 @@ pub const State = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const capture = (switch (scope.language) {
-                c.XLW_LUA => lua.observeWatch(session, arena.allocator(), tid.?, scope, std.mem.span(view.expression)),
-                c.XLW_PYTHON => python.observeWatch(session, arena.allocator(), tid.?, scope, std.mem.span(view.expression)),
-                c.XLW_RUBY => ruby.observeWatch(session, arena.allocator(), tid.?, scope, std.mem.span(view.expression)),
-                c.XLW_JAVASCRIPT => javascript.observeWatch(session, arena.allocator(), tid.?, scope, std.mem.span(view.expression)),
-                c.XLW_PERL => perl.observeWatch(session, arena.allocator(), tid.?, scope, std.mem.span(view.expression)),
+                c.XLW_LUA => observeLuaWatch(session, arena.allocator(), tid.?, scope, std.mem.span(view.expression)),
+                c.XLW_PYTHON => observePythonWatch(session, arena.allocator(), tid.?, scope, std.mem.span(view.expression)),
+                c.XLW_RUBY => observeRubyWatch(session, arena.allocator(), tid.?, scope, std.mem.span(view.expression)),
+                c.XLW_JAVASCRIPT => observeJavaScriptWatch(session, arena.allocator(), tid.?, scope, std.mem.span(view.expression)),
+                c.XLW_PERL => observePerlWatch(session, arena.allocator(), tid.?, scope, std.mem.span(view.expression)),
                 else => error.LanguageWatchRuntimeUnsupported,
             }) catch |err| {
                 if (session.target.snapshot().state != .stopped or session.target.snapshot().generation != snapshot.generation) return;
@@ -214,3 +214,70 @@ pub const Entry = struct {
     semantics: []const u8 = sample_semantics,
     identity: []const u8 = frame_identity,
 };
+
+// Selection caching and watch preparation belong to the owner, not the reader.
+// Preserve validation/allocation before cached reads and pass borrowed evidence.
+fn createLuaWatch(session: *Session, a: A, tid: i32, segment: usize, frame: usize, expression: ?[]const u8, row: ?usize) !Capture {
+    try session.languages.require(.lua);
+    const checked = try lua.watchExpression(a, expression, row);
+    const observed = try @import("language_selection.zig").cachedRead(.lua, session, tid);
+    return lua.createWatch(&session.languageContext(), a, observed, tid, segment, frame, checked, row);
+}
+fn observeLuaWatch(session: *Session, a: A, tid: i32, scope: c.struct_xlw_scope, expression: []const u8) !Capture {
+    try session.languages.require(.lua);
+    const checked = try a.dupeZ(u8, expression);
+    const observed = try @import("language_selection.zig").cachedRead(.lua, session, tid);
+    return lua.observeWatch(&session.languageContext(), a, observed, scope, checked);
+}
+
+fn createRubyWatch(session: *Session, a: A, tid: i32, segment: usize, frame: usize, expression: ?[]const u8, row: ?usize) !Capture {
+    try session.languages.require(.ruby);
+    const checked = try ruby.watchExpression(a, expression, row);
+    const observed = try @import("language_selection.zig").cachedRead(.ruby, session, tid);
+    return ruby.createWatch(&session.languageContext(), a, observed, tid, segment, frame, checked, row);
+}
+fn observeRubyWatch(session: *Session, a: A, tid: i32, scope: c.struct_xlw_scope, expression: []const u8) !Capture {
+    try session.languages.require(.ruby);
+    const checked = try a.dupeZ(u8, expression);
+    const observed = try @import("language_selection.zig").cachedRead(.ruby, session, tid);
+    return ruby.observeWatch(&session.languageContext(), a, observed, scope, checked);
+}
+
+fn createPythonWatch(session: *Session, a: A, tid: i32, segment: usize, frame: usize, expression: ?[]const u8, row: ?usize) !Capture {
+    try session.languages.require(.python);
+    const checked = try python.watchExpression(a, expression, row);
+    const observed = try @import("language_selection.zig").cachedRead(.python, session, tid);
+    return python.createWatch(&session.languageContext(), a, observed, tid, segment, frame, checked, row);
+}
+fn observePythonWatch(session: *Session, a: A, tid: i32, scope: c.struct_xlw_scope, expression: []const u8) !Capture {
+    try session.languages.require(.python);
+    const checked = try a.dupeZ(u8, expression);
+    const observed = @import("language_selection.zig").cachedRead(.python, session, tid);
+    return python.observeWatch(&session.languageContext(), a, observed, scope, checked);
+}
+
+fn createPerlWatch(session: *Session, a: A, tid: i32, segment: usize, frame: usize, expression: ?[]const u8, row: ?usize) !Capture {
+    try session.languages.require(.perl);
+    const checked = try perl.watchExpression(a, expression, row);
+    const observed = try @import("language_selection.zig").cachedRead(.perl, session, tid);
+    return perl.createWatch(&session.languageContext(), a, observed, tid, segment, frame, checked, row);
+}
+fn observePerlWatch(session: *Session, a: A, tid: i32, scope: c.struct_xlw_scope, expression: []const u8) !Capture {
+    try session.languages.require(.perl);
+    const checked = try a.dupeZ(u8, expression);
+    const observed = @import("language_selection.zig").cachedRead(.perl, session, tid);
+    return perl.observeWatch(&session.languageContext(), a, observed, scope, checked);
+}
+
+fn createJavaScriptWatch(session: *Session, a: A, tid: i32, segment: usize, frame: usize, expression: ?[]const u8, row: ?usize) !Capture {
+    try session.languages.require(.javascript);
+    const checked = try javascript.watchExpression(a, expression, row);
+    const observed = try @import("language_selection.zig").cachedRead(.javascript, session, tid);
+    return javascript.createWatch(&session.languageContext(), a, observed, tid, segment, frame, checked, row);
+}
+fn observeJavaScriptWatch(session: *Session, a: A, tid: i32, scope: c.struct_xlw_scope, expression: []const u8) !Capture {
+    try session.languages.require(.javascript);
+    const checked = try a.dupeZ(u8, expression);
+    const observed = try @import("language_selection.zig").cachedRead(.javascript, session, tid);
+    return javascript.observeWatch(&session.languageContext(), a, observed, scope, checked);
+}

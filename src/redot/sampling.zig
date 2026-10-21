@@ -9,12 +9,12 @@ pub fn capture(session: *model.Session, tid: i32) !*const profiler.Sample {
     const generation = session.target.snapshot().generation;
     const began = @import("../target/linux.zig").now();
     if (session.target.snapshot().state != .stopped) return error.NotStopped;
-    const counters = try gdscript.frameCounters(session);
+    const counters = try gdscript.frameCounters(&session.languageContext());
     const owned = try profiler.Owned(profiler.Sample).create();
     errdefer owned.destroy();
     const a = owned.arena.allocator();
     const native = try session.stack(a, tid, 64);
-    const stack = try gdscript.stackWithNative(session, a, tid, 0, native);
+    const stack = try gdscript.stackWithNative(&session.languageContext(), a, tid, 0, native);
     const frames = try a.alloc(profiler.Native, native.len);
     for (native, frames) |frame, *out| out.* = .{
         .index = frame.index,

@@ -1,4 +1,4 @@
-//! Bounded read-only aggregate views. Language/producer plus DWARF field
+//! Session-independent bounded aggregate views. Language/producer plus DWARF field
 //! metadata recognize slices; no hard-coded field offsets or target calls.
 const std = @import("std");
 const eval = @import("evaluate.zig");
@@ -79,7 +79,7 @@ pub fn sequence(ctx: eval.Context, v: eval.Value) !?Sequence {
     return .{ .address = p.bits, .count = n.bits, .element = child, .presentation = if (child.kind == .unsigned and child.size == 1) .bytes else .slice, .capacity = capacity };
 }
 pub const Preview = struct {
-    identity: ?@import("../language/runtime_binding.zig").Identity = null,
+    identity: ?@import("../language/types.zig").Identity = null,
     presentation: Presentation,
     data_address: u64,
     count: u64,
@@ -114,7 +114,7 @@ pub const ElispValue = struct {
     liveness: []const u8 = "unproved; consistent headers do not prove GC liveness or allocation extents",
     items: []const ElispItem,
 };
-pub const RubyValue = struct { value: @import("language_locals.zig").Value, tagged: u64, runtime_version: []const u8, runtime_build_id: []const u8, memory_reads: usize, memory_bytes: usize, liveness: []const u8 = "unproved; consistent tags do not prove GC liveness" };
+pub const RubyValue = struct { value: @import("../language/locals_types.zig").Value, tagged: u64, runtime_version: []const u8, runtime_build_id: []const u8, memory_reads: usize, memory_bytes: usize, liveness: []const u8 = "unproved; consistent tags do not prove GC liveness" };
 pub const LuaItem = struct { address: u64, key: []const u8, type: []const u8, display: []const u8, diagnostic: ?[]const u8, advisory: bool = false };
 pub const LuaValue = struct {
     advisory: bool = false,

@@ -1,16 +1,17 @@
 //! Retained-stop adapter for the C Emacs Lisp reader. No target evaluation.
 const std = @import("std");
 const c = @import("../c.zig").api;
-const model = @import("../model/session.zig");
-const Module = @import("../model/modules.zig").Module;
+const context_api = @import("context.zig");
+const Context = context_api.Context;
+const Module = context_api.Module;
 const A = std.mem.Allocator;
 fn read(ctx: ?*anyopaque, at: u64, out: ?*anyopaque, n: usize) callconv(.c) c_int {
-    const session: *model.Session = @ptrCast(@alignCast(ctx.?));
+    const session: *const Context = @ptrCast(@alignCast(ctx.?));
     const bytes: [*]u8 = @ptrCast(out.?);
-    return if ((session.target.readMemory(at, bytes[0..n]) catch return -1) == n) 0 else -1;
+    return if ((session.readMemory(at, bytes[0..n]) catch return -1) == n) 0 else -1;
 }
-fn reader(session: *model.Session) c.struct_xel_reader {
-    return .{ .context = session, .read = read, .reads = 0, .bytes = 0, .@"error" = null };
+fn reader(session: *const Context) c.struct_xel_reader {
+    return .{ .context = @constCast(session), .read = read, .reads = 0, .bytes = 0, .@"error" = null };
 }
 fn hex(a: A, value: u64) ![]const u8 {
     return std.fmt.allocPrint(a, "0x{x}", .{value});
@@ -27,24 +28,22 @@ fn buildId(a: A, layout: *const c.struct_xel_layout) ![]const u8 {
     }
     return out;
 }
-fn runtimeModule(session: *model.Session) !*Module {
+fn runtimeModule(session: *const Context) !Module {
     try session.languages.require(.elisp);
     // Initial profile: a standalone/static Emacs Lisp executable, identified by
     // kernel PHDR evidence. A shared-library runtime stays unavailable.
-    const runtime = @import("../target/runtime.zig");
-    var loader = std.mem.zeroes(runtime.c.struct_xrt_loader);
-    _ = runtime.c.xrt_target_loader(session.target.handle, &loader, null);
-    if (loader.main_phdr == 0) return error.ElispModuleIdentityUnavailable;
-    const module = session.modules.at(loader.main_phdr) catch return error.ElispModuleIdentityUnavailable;
+    const main_phdr = session.mainPhdr();
+    if (main_phdr == 0) return error.ElispModuleIdentityUnavailable;
+    const module = session.moduleAt(main_phdr) catch return error.ElispModuleIdentityUnavailable;
     if (module.symbols().findSymbol("emacs_version") == null or module.symbols().findSymbol("Fdebugger_trap") == null) return error.ElispStaticRuntimeUnavailable;
     return module;
 }
-fn constant(session: *model.Session, module: *Module, name: []const u8, expected: []const u8) !void {
+fn constant(session: *const Context, module: Module, name: []const u8, expected: []const u8) !void {
     const sym = module.symbols().findSymbol(name) orelse return error.ElispVersionUnavailable;
     if (!sym.hasAddress() or sym.size != expected.len + 1 or sym.size > 128) return error.ElispVersionUnsupported;
     var loaded: [128]u8 = undefined;
     const size: usize = @intCast(sym.size);
-    if (try session.target.readMemory(try module.runtimeAddress(sym.value), loaded[0..size]) != size) return error.ElispVersionUnavailable;
+    if (try session.readMemory(try module.runtimeAddress(sym.value), loaded[0..size]) != size) return error.ElispVersionUnavailable;
     if (loaded[size - 1] != 0 or !std.mem.eql(u8, loaded[0 .. size - 1], expected)) return error.ElispVersionUnsupported;
     for (0..module.image.header.segment_count) |i| {
         const seg = try module.image.segment(@intCast(i));
@@ -57,11 +56,11 @@ fn constant(session: *model.Session, module: *Module, name: []const u8, expected
     }
     return error.ElispVersionUnavailable;
 }
-fn profile(session: *model.Session, module: *Module) !*const c.struct_xel_layout {
-    if (session.target.snapshot().state != .stopped) return error.NotStopped;
+fn profile(session: *const Context, module: Module) !*const c.struct_xel_layout {
+    if (!session.snapshot().stopped) return error.NotStopped;
     // The reader is DWARF- and memory-driven; every 64-bit little-endian
     // target it has been proven on is listed. Others stay refused.
-    switch (session.target.arch()) {
+    switch (session.arch()) {
         .x86_64, .loongarch64 => {},
         else => return error.ElispArchitectureUnsupported,
     }
@@ -71,9 +70,9 @@ fn profile(session: *model.Session, module: *Module) !*const c.struct_xel_layout
     if (note.flags & 2 == 0 or note.size > 256) return error.ElispBuildIdUnavailable;
     const expected = try module.image.sectionData(note);
     var actual: [256]u8 = undefined;
-    if (try session.target.readMemory(try module.runtimeAddress(note.addr), actual[0..expected.len]) != expected.len or !std.mem.eql(u8, expected, actual[0..expected.len])) return error.ElispBuildIdMismatch;
+    if (try session.readMemory(try module.runtimeAddress(note.addr), actual[0..expected.len]) != expected.len or !std.mem.eql(u8, expected, actual[0..expected.len])) return error.ElispBuildIdMismatch;
     try constant(session, module, "emacs_version", c.XEL_VERSION);
-    if (module.elisp_layout == null) {
+    if (module.layouts.elisp == null) {
         const debug = module.debugInfo() catch |err| return if (err == error.DebugMetadataPending) err else error.ElispDwarfUnavailable;
         var layout: c.struct_xel_layout = undefined;
         if (c.xel_layout_build(debug.dwarf, id.ptr, id.len, c.XEL_VERSION, &layout)) |why| {
@@ -82,16 +81,16 @@ fn profile(session: *model.Session, module: *Module) !*const c.struct_xel_layout
             }
             return error.ElispLayoutUnsupported;
         }
-        module.elisp_layout = layout;
+        module.layouts.elisp = layout;
     }
-    return &module.elisp_layout.?;
+    return &module.layouts.elisp.?;
 }
-fn globalAddress(module: *Module, name: []const u8) !u64 {
+fn globalAddress(module: Module, name: []const u8) !u64 {
     const sym = module.symbols().findSymbol(name) orelse return error.ElispRuntimeSymbolsUnavailable;
     if (!sym.hasAddress()) return error.ElispRuntimeSymbolsUnavailable;
     return module.runtimeAddress(sym.value);
 }
-pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.zig").Description {
+pub fn describe(session: *const Context, a: A) !@import("types.zig").Description {
     try session.languages.require(.elisp);
     const module = try runtimeModule(session);
     const layout = try profile(session, module);
@@ -148,11 +147,11 @@ pub const Stack = struct {
     native_stack_incomplete: bool,
     basis: []const u8 = "main-thread specpdl; unique native argument bindings and bytecode saved-slot proofs when available; segment links otherwise; no target calls",
 };
-pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
+pub fn stack(session: *const Context, a: A, tid: i32, first: usize) !Stack {
     try session.languages.require(.elisp);
-    if (session.target.gdbRemoteInfo() != null) return error.ElispThreadAssociationUnproved;
-    const snap = session.target.snapshot();
-    if (snap.state != .stopped) return error.NotStopped;
+    if (session.isGdb()) return error.ElispThreadAssociationUnproved;
+    const snap = session.snapshot();
+    if (!snap.stopped) return error.NotStopped;
     const module = try runtimeModule(session);
     const layout = try profile(session, module);
     var context = try readContext(module);
@@ -173,7 +172,7 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
     for (native[first..]) |f| {
         const symbol = f.symbol orelse continue;
         if (!std.mem.eql(u8, symbol, "Ffuncall") and !std.mem.eql(u8, symbol, "exec_byte_code") and !std.mem.eql(u8, symbol, "eval_sub") and !std.mem.eql(u8, symbol, "funcall_lambda") and !std.mem.eql(u8, symbol, "funcall_subr") and !std.mem.eql(u8, symbol, "apply_lambda")) continue;
-        if ((session.modules.at(f.pc) catch continue) != module) continue;
+        if ((session.moduleAt(f.pc) catch continue).identity != module.identity) continue;
         try anchors.append(a, .{ .frame = f.index, .pc = try hex(a, f.pc), .symbol = try a.dupe(u8, symbol) });
         if (std.mem.eql(u8, symbol, "funcall_lambda") or std.mem.eql(u8, symbol, "apply_lambda")) {
             if (nativeActivation(session, a, module, native, f) catch |err| result: {
@@ -237,21 +236,21 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
         .memory_reads = r.reads,
         .memory_bytes = r.bytes,
     };
-    try session.target.expectGeneration(snap.generation);
+    try session.expectGeneration(snap.generation);
     return .{ .session_id = session.id, .generation = snap.generation, .tid = tid, .segments = segments, .native_stack_incomplete = native.len == 64 or native[native.len - 1].diagnostic != null };
 }
 
-fn nativeActivation(session: *model.Session, a: A, module: *Module, native: []const model.Frame, frame: model.Frame) !?c.struct_xel_activation {
+fn nativeActivation(session: *const Context, a: A, module: Module, native: []const context_api.Frame, frame: context_api.Frame) !?c.struct_xel_activation {
     // A saved backtrace can briefly outlive its callee while returning. Require
     // a live evaluator child; an object changed in place must agree with this
     // path as well as the unique argument storage.
     if (frame.index == 0) return null;
     var child = frame.index - 1;
     if (std.mem.eql(u8, frame.symbol orelse "", "apply_lambda") and std.mem.eql(u8, native[child].symbol orelse "", "funcall_lambda")) {
-        if (child == 0 or (session.modules.at(native[child].pc) catch return null) != module) return null;
+        if (child == 0 or (session.moduleAt(native[child].pc) catch return null).identity != module.identity) return null;
         child -= 1;
     }
-    if ((session.modules.at(native[child].pc) catch return null) != module) return null;
+    if ((session.moduleAt(native[child].pc) catch return null).identity != module.identity) return null;
     const symbol = native[child].symbol orelse return null;
     const kind: u32 = if (std.mem.eql(u8, symbol, "exec_byte_code")) c.XEL_BYTECODE else if (std.mem.eql(u8, symbol, "eval_sub") or std.mem.eql(u8, symbol, "Fprogn")) c.XEL_INTERPRETED else return null;
     const locals = try session.frameLocals(a, frame);
@@ -275,19 +274,19 @@ fn nativeActivation(session: *model.Session, a: A, module: *Module, native: []co
     return .{ .function = values[0] orelse return null, .args = values[1] orelse return null, .nargs = @bitCast(values[2] orelse return null), .native_frame = frame.index, .execution_kind = kind };
 }
 
-pub fn preview(session: *model.Session, a: A, value: @import("../model/evaluate.zig").Value) !?@import("../model/value_view.zig").Preview {
+pub fn preview(session: *const Context, a: A, value: @import("../debug/evaluate.zig").Value) !?@import("../debug/value_view.zig").Preview {
     if (!session.languages.on(.elisp)) return null;
-    const view = @import("../model/value_view.zig");
+    const view = @import("../debug/value_view.zig");
     if (value.availability != .available or !value.type.elisp_object or value.type.kind != .pointer or value.type.size != 8) return null;
-    const snap = session.target.snapshot();
+    const snap = session.snapshot();
     const module = try runtimeModule(session);
     const layout = try profile(session, module);
     var context = try readContext(module);
     var r = reader(session);
     const raw = try a.create(c.struct_xel_value);
     c.xel_value_read(layout, &r, &context, value.bits, raw);
-    const after = session.target.snapshot();
-    if (after.state != .stopped or after.generation != snap.generation) return error.StaleSnapshot;
+    const after = session.snapshot();
+    if (!after.stopped or after.generation != snap.generation) return error.StaleSnapshot;
     const items = try a.alloc(view.ElispItem, raw.item_count);
     for (raw.items[0..raw.item_count], items) |item, *out| out.* = .{
         .tagged = item.tagged,
@@ -308,17 +307,16 @@ pub fn preview(session: *model.Session, a: A, value: @import("../model/evaluate.
     };
 }
 
-fn readContext(module: *Module) !c.struct_xel_context {
+fn readContext(module: Module) !c.struct_xel_context {
     var context = std.mem.zeroes(c.struct_xel_context);
     context.lispsym = try globalAddress(module, "lispsym");
     inline for (.{ "USE_LSB_TAG", "GCTYPEBITS", "INTTYPEBITS", "VALMASK", "PSEUDOVECTOR_FLAG", "ARRAY_MARK_FLAG", "Qnil" }, 0..) |name, i|
         context.globals[i] = try globalAddress(module, name);
     return context;
 }
-const named = @import("../model/language_locals.zig");
-pub fn readLocals(session: *model.Session, a: A, tid: i32, segment: usize, frame: usize, start: usize, limit: usize) !named.Result {
+const named = @import("locals_types.zig");
+pub fn readLocals(session: *const Context, a: A, observed: Stack, tid: i32, segment: usize, frame: usize, start: usize, limit: usize) !named.Result {
     try session.languages.require(.elisp);
-    const observed = try @import("../model/language_selection.zig").cachedRead(.elisp, session, tid);
     if (segment != 0 or observed.segments.len != 1) return error.InvalidLanguageSegment;
     if (frame >= observed.segments[0].frames.len) return error.InvalidLanguageFrame;
     const module = try runtimeModule(session);
@@ -326,7 +324,7 @@ pub fn readLocals(session: *model.Session, a: A, tid: i32, segment: usize, frame
     var context = try readContext(module);
     var r = reader(session);
     const raw_stack = try a.create(c.struct_xel_stack);
-    c.xel_stack_main(layout, &r, &context, try globalAddress(module, "current_thread"), try globalAddress(module, "main_thread"), session.target.snapshot().pid, tid, raw_stack);
+    c.xel_stack_main(layout, &r, &context, try globalAddress(module, "current_thread"), try globalAddress(module, "main_thread"), session.snapshot().pid, tid, raw_stack);
     if (frame >= raw_stack.count or c.xel_stack_frames_available(raw_stack) == 0) return error.ElispBindingFrameUnavailable;
     const selected = observed.segments[0].frames[frame];
     if (raw_stack.frames[frame].record != try std.fmt.parseInt(u64, selected.record, 0) or
@@ -381,7 +379,7 @@ pub fn readLocals(session: *model.Session, a: A, tid: i32, segment: usize, frame
             .value = value,
         };
     }
-    try session.target.expectGeneration(observed.generation);
+    try session.expectGeneration(observed.generation);
     return .{
         .generation = observed.generation,
         .tid = tid,

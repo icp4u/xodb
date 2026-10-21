@@ -30,8 +30,10 @@ def audit(client, target, args):
     def scheduled():
         return {p.name:(p/'schedstat').read_text().split()[0] for p in Path(f'/proc/{target.pid}/task').iterdir()}
     regs = client.inspect('get_registers',tid=target.pid); generation = client.session()['generation']; before = scheduled()
+    cache_before = client.session().get('remote_read_cache')
     path = w/'readonly.strace'
-    observer = client.collector_pid() if a.agent else client.p.pid
+    # With a runtime agent the agent, not the host, issues the target syscalls.
+    observer = client.collector_pid()
     tracer = subprocess.Popen(['strace','-f','-qq','-o',str(path),'-e',
         'trace=ptrace,process_vm_readv,process_vm_writev,pread64,pwrite64,pwritev,pwritev2,kill,tgkill,tkill',
         '-p',str(observer)],stderr=subprocess.PIPE)
@@ -53,7 +55,9 @@ def audit(client, target, args):
         if tracer.poll() is None: tracer.send_signal(signal.SIGINT)
         tracer.wait(timeout=10)
     text = path.read_text()
-    assert re.search(r'process_vm_readv|pread64|PTRACE_PEEKDATA',text), text
+    cache_after = client.session().get('remote_read_cache')
+    cached = bool(cache_before and cache_after['hits'] > cache_before['hits'])
+    assert re.search(r'process_vm_readv|pread64|PTRACE_PEEKDATA',text) or cached, (text,cache_before,cache_after)
     assert not re.search(r'process_vm_writev\(|pwrite64\(|pwritev2?\(|(?:kill|tgkill|tkill)\(|PTRACE_(?:POKE\w*|SET\w*|CONT|SINGLESTEP|SYSCALL)\b',text), text
     assert scheduled()==before and client.session()['generation']==generation and client.inspect('get_registers',tid=target.pid)==regs
 results=[];resources=[]

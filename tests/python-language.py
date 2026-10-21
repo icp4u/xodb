@@ -329,12 +329,15 @@ def strace_audit(run, work, checks, expressions):
     def sched():
         return [Path(f'/proc/{pid}/task/{t}/schedstat').read_text().split()[0] for t in sorted(os.listdir(f'/proc/{pid}/task'))]
     regs0, gen0, s0 = run.c.inspect('get_registers', tid=run.tid), run.c.session()['generation'], sched()
-    st = subprocess.Popen(['strace', '-f', '-qq', '-o', str(log), '-e', 'trace=ptrace,process_vm_readv,process_vm_writev,pwrite64,pwritev,pwritev2,pread64,kill,tgkill,tkill', '-p', str(run.c.p.pid)], stderr=subprocess.PIPE)
+    cache_before = run.c.session().get('remote_read_cache')
+    # With a runtime agent the agent, not the host, issues the target syscalls.
+    observer = run.c.collector_pid()
+    st = subprocess.Popen(['strace', '-f', '-qq', '-o', str(log), '-e', 'trace=ptrace,process_vm_readv,process_vm_writev,pwrite64,pwritev,pwritev2,pread64,kill,tgkill,tkill', '-p', str(observer)], stderr=subprocess.PIPE)
     try:
         deadline = time.monotonic() + 10
         while True:
             assert st.poll() is None, st.stderr.read().decode()
-            status = Path(f'/proc/{run.c.p.pid}/status').read_text()
+            status = Path(f'/proc/{observer}/status').read_text()
             attached = next(int(line.split()[1]) for line in status.splitlines() if line.startswith('TracerPid:'))
             if attached == st.pid: break
             assert time.monotonic() < deadline, 'strace did not attach before the audit deadline'
@@ -361,7 +364,9 @@ def strace_audit(run, work, checks, expressions):
     forbidden = [k for k in calls if k in ('process_vm_writev', 'pwrite64', 'pwritev', 'pwritev2', 'kill', 'tgkill', 'tkill') or
                  k.startswith('ptrace:PTRACE_POKE') or k.startswith('ptrace:PTRACE_SET') or k in ('ptrace:PTRACE_CONT', 'ptrace:PTRACE_SINGLESTEP', 'ptrace:PTRACE_SYSCALL')]
     assert not forbidden and audit['registers_unchanged'] and audit['generation_unchanged'] and audit['schedstat_unchanged'], audit
-    assert any(k in calls for k in ('process_vm_readv', 'pread64', 'ptrace:PTRACE_PEEKDATA')), audit
+    cache_after = run.c.session().get('remote_read_cache')
+    cached = bool(cache_before and cache_after['hits'] > cache_before['hits'])
+    assert any(k in calls for k in ('process_vm_readv', 'pread64', 'ptrace:PTRACE_PEEKDATA')) or cached, (audit, cache_before, cache_after)
     checks.append('strace: stack%s reads issue reads only; target registers, generation and schedstat unchanged' % (' and value' if expressions else ''))
     return None
 

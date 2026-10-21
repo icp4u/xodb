@@ -988,7 +988,7 @@ fn remoteGui(owner: *@import("model/remote_worker.zig").Worker, window: *Window,
             renderer.init(window) catch |err| {
                 if (!renderer_started and (err == error.VulkanDeviceNotFound or err == error.VulkanDeviceCannotPresent)) return err;
                 workspace.status = @errorName(err);
-                log.err(.render, "Renderer initialization failed: {s}; retrying, target retained\n", .{@errorName(err)});
+                log.err(.render, "xodb: vulkan: Renderer initialization failed: {s}; retrying, target retained\n", .{@errorName(err)});
                 render_retry = now + std.time.ns_per_s;
                 continue;
             };
@@ -1484,13 +1484,14 @@ test {
     std.testing.refAllDecls(@import("mcp/overview_serve.zig"));
     std.testing.refAllDecls(@import("model/system_history.zig"));
     _ = @import("target/process_test.zig");
+    std.testing.refAllDecls(@import("target/lifecycle_test.zig"));
     std.testing.refAllDecls(@import("model/modules.zig"));
     std.testing.refAllDecls(@import("binary/apk.zig"));
     std.testing.refAllDecls(@import("model/disassembly.zig"));
     std.testing.refAllDecls(@import("model/analysis_ir.zig"));
     std.testing.refAllDecls(@import("profile/export.zig"));
-    std.testing.refAllDecls(@import("model/evaluate.zig"));
-    std.testing.refAllDecls(@import("model/value_view.zig"));
+    std.testing.refAllDecls(@import("debug/evaluate.zig"));
+    std.testing.refAllDecls(@import("debug/value_view.zig"));
     std.testing.refAllDecls(@import("debug/location.zig"));
     std.testing.refAllDecls(@import("debug/macho_unwind.zig"));
     std.testing.refAllDecls(@import("model/image_label.zig"));

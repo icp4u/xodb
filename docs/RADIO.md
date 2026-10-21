@@ -122,7 +122,9 @@ channels 1, 4, 7, 10, 13 and 14 (2402-2494 MHz, interiors overlapping by
 in one visit (the detector wants 20 mains periods and half a second). Every
 window is revisited within 3.6 s and watched 17% of the time; the plan says so
 in words ("sweep 2402-2494 MHz: 6 windows ..., each revisited within 3.6 s
-(17% of the time)"), and the views show each region's age.
+(17% of the time)"), and the views show each region's age. An oven visible in
+only one or two of those six windows on a busy band may miss the detector's
+period-separation margin and be reported as other activity.
 
 A focus narrows the plan: `--focus 2440-2470` (`--radio-focus`, or a drag in
 the panel) sweeps only the windows that cover the span; a span that one

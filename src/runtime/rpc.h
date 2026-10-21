@@ -18,6 +18,10 @@
  * original 16-byte response; old agents ignore the request and return 16. */
 #define XRT_RPC_HELLO_CAPABILITIES UINT64_C(1)
 #define XRT_RPC_CAP_SOURCE UINT64_C(1)
+/* HELLO arg[1] opts into this capability. When negotiated, each present
+ * snapshot is followed by an address_space_unstable bool. Old hosts keep
+ * their original reply shape; hosts without this evidence bypass read caches. */
+#define XRT_RPC_CAP_ADDRESS_SPACE UINT64_C(2)
 enum xrt_rpc_op {
     XRT_RPC_HELLO = 1,
     XRT_RPC_CREATE,

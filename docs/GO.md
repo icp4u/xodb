@@ -26,8 +26,11 @@ xodb. Agents ask `get_language_stack` with `language` `go`.
   A step over a call uses a return probe. On amd64 Go, g is R14. On aarch64
   Go, g is X28. On riscv64 Go, g is X27, and the register row names that
   column s11. On loong64 Go, g is R22, and the register row names that
-  column r22. That probe follows the goroutine by g and by the frame's
-  depth below `g.stack.hi`, which a stack copy keeps, so the step follows it
+  column r22. On ppc64le Go, g is R30, and the register row names that
+  column r30. The stack-pointer column is r1. s390x has no register row
+  here, so this probe has no g register on that architecture. That probe
+  follows the goroutine by g and by the frame's depth below `g.stack.hi`,
+  which a stack copy keeps, so the step follows it
   onto another thread after `morestack` preempts or grows the stack. A
   different g, or the same g in a deeper recursive frame, is not that return:
   the probe is planted again and the step continues. A non-Go frame is the

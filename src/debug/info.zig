@@ -5,7 +5,7 @@ const c = @import("../c.zig").api;
 const elf = @import("../binary/elf.zig");
 const loc = @import("location.zig");
 const image_budget = @import("../binary/snapshot.zig");
-const eval = @import("../model/evaluate.zig");
+const eval = @import("evaluate.zig");
 pub const Site = struct { path: []const u8, original_path: ?[]const u8 = null, line: u32, column: u32, address: u64, is_statement: bool, prologue_end: bool, discriminator: u32 };
 pub const Local = struct {
     name: []const u8,

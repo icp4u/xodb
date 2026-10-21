@@ -3,7 +3,7 @@ const log = @import("../log.zig");
 const Modules = @import("modules.zig").Modules;
 const info = @import("../debug/info.zig");
 const loc = @import("../debug/location.zig");
-const eval = @import("evaluate.zig");
+const eval = @import("../debug/evaluate.zig");
 const linux = @import("../target/linux.zig");
 const profile = @import("../profile/capture.zig");
 const archive = @import("../profile/archive.zig");
@@ -18,27 +18,9 @@ pub const Effect = @import("command.zig").Effect;
 /// still bind their ambient fields; migrated commands pass this explicitly.
 pub const Caller = @import("../service/authority.zig").Caller;
 pub const Audit = struct { sequence: u64, actor: Actor, client_id: ?u64 = null, action: []const u8, generation: u64, runtime_write: ?@import("runtime_writes.zig").Change = null };
-pub const Frame = struct {
-    architecture: @import("../target/arch.zig").Arch = .x86_64,
-    tid: i32 = 0,
-    index: usize,
-    pc: u64,
-    lookup_pc: u64,
-    registers: loc.RegisterSet,
-    cfa: ?u64 = null,
-    module_id: ?u64 = null,
-    symbol: ?[]const u8 = null,
-    source: ?info.Site = null,
-    unwind_method: ?[]const u8 = null,
-    inline_frames: []const info.Inline = &.{},
-    inline_diagnostic: ?[]const u8 = null,
-    diagnostic: ?[]const u8 = null,
-    pub fn jsonStringify(self: @This(), writer: anytype) !void {
-        try writer.write(.{ .index = self.index, .pc = self.pc, .lookup_pc = self.lookup_pc, .registers = self.registers[0..self.architecture.count()], .cfa = self.cfa, .module_id = self.module_id, .symbol = self.symbol, .source = self.source, .unwind_method = self.unwind_method, .inline_frames = self.inline_frames, .inline_diagnostic = self.inline_diagnostic, .diagnostic = self.diagnostic });
-    }
-};
-const value_view = @import("value_view.zig");
-pub const ValueSummary = struct { provider: ?[]const u8 = null, runtime_type: ?eval.RuntimeType = null, type: []const u8, kind: eval.Kind, size: u64, address: ?u64, bits: ?u64, display: []const u8, availability: eval.Availability, diagnostic: ?[]const u8 = null, language: eval.Language = .unknown, enumerator: ?[]const u8 = null, visualization: ?value_view.Preview = null, composite: bool = false, partial: bool = false };
+pub const Frame = @import("../debug/frame.zig").Frame;
+const value_view = @import("../debug/value_view.zig");
+pub const ValueSummary = @import("../language/value_types.zig").ValueSummary;
 /// Inspection borrows module strings. Evidence must own the entire value,
 /// including optional preview metadata and inline/source names, across exec.
 fn retainEvidence(a: std.mem.Allocator, value: anytype) std.mem.Allocator.Error!@TypeOf(value) {
@@ -106,10 +88,10 @@ fn ignoredMask(sig: i32) u8 {
 fn goSignalContext(bytes: []const u8) error{GoSignalContextUnreadable}!loc.RegisterSet {
     if (bytes.len < 176) return error.GoSignalContextUnreadable;
     const fields = [_]struct { dwarf: usize, at: usize }{
-        .{ .dwarf = 8, .at = 40 }, .{ .dwarf = 9, .at = 48 }, .{ .dwarf = 10, .at = 56 }, .{ .dwarf = 11, .at = 64 },
-        .{ .dwarf = 12, .at = 72 }, .{ .dwarf = 13, .at = 80 }, .{ .dwarf = 14, .at = 88 }, .{ .dwarf = 15, .at = 96 },
-        .{ .dwarf = 5, .at = 104 }, .{ .dwarf = 4, .at = 112 }, .{ .dwarf = 6, .at = 120 }, .{ .dwarf = 3, .at = 128 },
-        .{ .dwarf = 1, .at = 136 }, .{ .dwarf = 0, .at = 144 }, .{ .dwarf = 2, .at = 152 }, .{ .dwarf = 7, .at = 160 },
+        .{ .dwarf = 8, .at = 40 },   .{ .dwarf = 9, .at = 48 },  .{ .dwarf = 10, .at = 56 }, .{ .dwarf = 11, .at = 64 },
+        .{ .dwarf = 12, .at = 72 },  .{ .dwarf = 13, .at = 80 }, .{ .dwarf = 14, .at = 88 }, .{ .dwarf = 15, .at = 96 },
+        .{ .dwarf = 5, .at = 104 },  .{ .dwarf = 4, .at = 112 }, .{ .dwarf = 6, .at = 120 }, .{ .dwarf = 3, .at = 128 },
+        .{ .dwarf = 1, .at = 136 },  .{ .dwarf = 0, .at = 144 }, .{ .dwarf = 2, .at = 152 }, .{ .dwarf = 7, .at = 160 },
         .{ .dwarf = 16, .at = 168 },
     };
     var out: loc.RegisterSet = @splat(null);
@@ -117,6 +99,15 @@ fn goSignalContext(bytes: []const u8) error{GoSignalContextUnreadable}!loc.Regis
     return out;
 }
 pub const Session = struct {
+    /// Borrowed for one synchronous language inspection; never retain this view.
+    pub fn languageContext(self: *Session) @import("../language/context.zig").Context {
+        return .{ .id = self.id, .languages = self.languages, .user = self, .ops = &LanguageAccess.ops };
+    }
+    /// Owner-side module projection for runtime witness readers.
+    pub fn languageModule(module: *@import("modules.zig").Module) @import("../language/context.zig").Module {
+        return LanguageAccess.moduleView(module);
+    }
+
     id: u64,
     process_id: u64 = 1,
     process_tree: ?*@import("process_tree.zig").Tree = null,
@@ -130,7 +121,7 @@ pub const Session = struct {
     source_maps: @import("source_maps.zig").Maps = .{},
     metadata: @import("debug_metadata.zig").State = .{},
     language_tabs: @import("language_tabs.zig").State = .{},
-    language_bindings: @import("../language/runtime_binding.zig").State = .{},
+    language_bindings: @import("runtime_binding.zig").State = .{},
     language_watches: @import("language_watches.zig").State = .{},
     /// Cooperative Redot/Godot scene debugger peer for an owned launch.
     redot: @import("../redot/protocol.zig").Adapter = .{},
@@ -1398,12 +1389,15 @@ pub const Session = struct {
     /// riscv64 Go uses X27; the register row names that column s11.
     /// loong64 Go uses R22; the register row names that column r22.
     /// LoongArch also has an r14 column; that register is not g.
+    /// ppc64le Go uses R30; the register row names that column r30.
+    /// ppc64le also has an r14 column; that register is not g.
     fn goGRegister(self: *Session) ?[]const u8 {
         return switch (self.target.arch()) {
             .x86_64 => "r14",
             .aarch64 => "x28",
             .riscv64 => "s11",
             .loongarch64 => "r22",
+            .ppc64le => "r30",
             else => null,
         };
     }
@@ -2428,8 +2422,8 @@ pub const Session = struct {
             result.enumerator = label;
             result.display = try std.fmt.allocPrint(a, "{s} ({s})", .{ label, result.display });
         }
-        if (try @import("../language/go_values.zig").summarize(self, a, v, &result)) return result;
-        const elisp_preview = @import("../language/elisp.zig").preview(self, a, v) catch |err| blk: {
+        if (try @import("../language/go_values.zig").summarize(&self.languageContext(), a, v, &result)) return result;
+        const elisp_preview = @import("../language/elisp.zig").preview(&self.languageContext(), a, v) catch |err| blk: {
             result.diagnostic = @errorName(err);
             break :blk null;
         };
@@ -2439,7 +2433,7 @@ pub const Session = struct {
             result.diagnostic = shown.diagnostic;
             return result;
         }
-        const ruby_preview = @import("../language/ruby.zig").preview(self, a, v) catch |err| blk: {
+        const ruby_preview = @import("../language/ruby.zig").preview(&self.languageContext(), a, v) catch |err| blk: {
             result.diagnostic = @errorName(err);
             break :blk null;
         };
@@ -2449,7 +2443,7 @@ pub const Session = struct {
             result.diagnostic = shown.diagnostic;
             return result;
         }
-        const lua_preview = @import("../language/lua.zig").preview(self, a, v) catch |err| blk: {
+        const lua_preview = @import("../language/lua.zig").preview(&self.languageContext(), a, v) catch |err| blk: {
             result.diagnostic = @errorName(err);
             break :blk null;
         };
@@ -2459,7 +2453,7 @@ pub const Session = struct {
             result.diagnostic = shown.diagnostic;
             return result;
         }
-        const javascript_preview = @import("../language/javascript.zig").preview(self, a, v) catch |err| blk: {
+        const javascript_preview = @import("../language/javascript.zig").preview(&self.languageContext(), a, v) catch |err| blk: {
             result.diagnostic = @errorName(err);
             break :blk null;
         };
@@ -2469,7 +2463,7 @@ pub const Session = struct {
             result.diagnostic = shown.diagnostic;
             return result;
         }
-        const perl_preview = @import("../language/perl.zig").preview(self, a, v) catch |err| blk: {
+        const perl_preview = @import("../language/perl.zig").preview(&self.languageContext(), a, v) catch |err| blk: {
             result.diagnostic = @errorName(err);
             break :blk null;
         };
@@ -2480,7 +2474,7 @@ pub const Session = struct {
             result.diagnostic = shown.diagnostic;
             return result;
         }
-        const python_preview = @import("../language/python.zig").preview(self, a, v) catch |err| blk: {
+        const python_preview = @import("../language/python.zig").preview(&self.languageContext(), a, v) catch |err| blk: {
             result.diagnostic = @errorName(err);
             break :blk null;
         };
@@ -2521,11 +2515,11 @@ pub const Session = struct {
         };
         return .{ .endian = self.target.arch().endian(), .allocator = a, .user = self, .read = readTarget, .lookup = Stub.lookup };
     }
-    pub const ValueChild = struct { index: u64, name: []const u8, value: ValueSummary };
-    pub const ValuePage = struct { value: ValueSummary, presentation: value_view.Presentation, total: u64, start: u64, next: ?u64, children: []ValueChild, basis: []const u8 = value_view.basis };
+    pub const ValueChild = @import("../language/value_types.zig").ValueChild;
+    pub const ValuePage = @import("../language/value_types.zig").ValuePage;
     pub fn valueChildren(self: *Session, a: std.mem.Allocator, v: eval.Value, start: u64, limit: usize, raw: bool) !ValuePage {
         if (v.runtime_type != null) return @import("runtime_values.zig").children(self, a, v, start, limit);
-        if (!raw and @import("../language/go_values.zig").supported(v.type)) return @import("../language/go_values.zig").children(self, a, v, start, limit);
+        if (!raw and @import("../language/go_values.zig").supported(v.type)) return @import("../language/go_values.zig").children(&self.languageContext(), a, v, start, limit);
         const page = try value_view.children(self.valueContext(a), v, start, limit, raw);
         const children = try a.alloc(ValueChild, page.children.len);
         for (page.children, children) |child, *item| item.* = .{ .index = child.index, .name = child.name, .value = try self.summarize(a, child.value) };
@@ -2737,14 +2731,14 @@ test "agent capabilities and generation protect shared execution state" {
 test "linux sigcontext gprs map onto x86 dwarf registers" {
     var bytes: [176]u8 = @splat(0xaa);
     const fields = [_]struct { dwarf: usize, at: usize, value: u64 }{
-        .{ .dwarf = 8, .at = 40, .value = 0x8 }, .{ .dwarf = 9, .at = 48, .value = 0x9 },
-        .{ .dwarf = 10, .at = 56, .value = 0x10 }, .{ .dwarf = 11, .at = 64, .value = 0x11 },
-        .{ .dwarf = 12, .at = 72, .value = 0x12 }, .{ .dwarf = 13, .at = 80, .value = 0x13 },
-        .{ .dwarf = 14, .at = 88, .value = 0x14 }, .{ .dwarf = 15, .at = 96, .value = 0x15 },
-        .{ .dwarf = 5, .at = 104, .value = 0x5 }, .{ .dwarf = 4, .at = 112, .value = 0x4 },
-        .{ .dwarf = 6, .at = 120, .value = 0x6 }, .{ .dwarf = 3, .at = 128, .value = 0x3 },
-        .{ .dwarf = 1, .at = 136, .value = 0x1 }, .{ .dwarf = 0, .at = 144, .value = 0xa },
-        .{ .dwarf = 2, .at = 152, .value = 0x2 }, .{ .dwarf = 7, .at = 160, .value = 0x160 },
+        .{ .dwarf = 8, .at = 40, .value = 0x8 },        .{ .dwarf = 9, .at = 48, .value = 0x9 },
+        .{ .dwarf = 10, .at = 56, .value = 0x10 },      .{ .dwarf = 11, .at = 64, .value = 0x11 },
+        .{ .dwarf = 12, .at = 72, .value = 0x12 },      .{ .dwarf = 13, .at = 80, .value = 0x13 },
+        .{ .dwarf = 14, .at = 88, .value = 0x14 },      .{ .dwarf = 15, .at = 96, .value = 0x15 },
+        .{ .dwarf = 5, .at = 104, .value = 0x5 },       .{ .dwarf = 4, .at = 112, .value = 0x4 },
+        .{ .dwarf = 6, .at = 120, .value = 0x6 },       .{ .dwarf = 3, .at = 128, .value = 0x3 },
+        .{ .dwarf = 1, .at = 136, .value = 0x1 },       .{ .dwarf = 0, .at = 144, .value = 0xa },
+        .{ .dwarf = 2, .at = 152, .value = 0x2 },       .{ .dwarf = 7, .at = 160, .value = 0x160 },
         .{ .dwarf = 16, .at = 168, .value = 0x4a0b04 },
     };
     for (fields) |field| std.mem.writeInt(u64, bytes[field.at..][0..8], field.value, .little);
@@ -2842,3 +2836,165 @@ test "retained evidence owns enum and nested preview and frame strings" {
     try std.testing.expectEqualStrings("FIRST", saved_value.visualization.?.element_type);
     try std.testing.expectEqualStrings("FIRST", saved_frame.inline_frames[0].name);
 }
+
+// Owner-side callbacks for the borrowed provider context. These keep native
+// cache and metadata behavior on the same Session paths as other inspections.
+const language_view = @import("../language/context.zig");
+const LanguageAccess = struct {
+    fn owner(user: *anyopaque) *Session {
+        return @ptrCast(@alignCast(user));
+    }
+    fn readMemory(user: *anyopaque, at: u64, bytes: []u8) !usize {
+        return owner(user).target.readMemory(at, bytes);
+    }
+    fn snapshot(user: *anyopaque) language_view.Snapshot {
+        const snap = owner(user).target.snapshot();
+        return .{ .pid = snap.pid, .generation = snap.generation, .image_epoch = snap.image_epoch, .stopped = snap.state == .stopped };
+    }
+    fn arch(user: *anyopaque) @import("../target/arch.zig").Arch {
+        return owner(user).target.arch();
+    }
+    fn isGdb(user: *anyopaque) bool {
+        return owner(user).target.gdbRemoteInfo() != null;
+    }
+    fn mainPhdr(user: *anyopaque) u64 {
+        const rt = @import("../target/runtime.zig").c;
+        var loader = std.mem.zeroes(rt.struct_xrt_loader);
+        _ = rt.xrt_target_loader(owner(user).target.handle, &loader, null);
+        return loader.main_phdr;
+    }
+    fn expectGeneration(user: *anyopaque, generation: u64) !void {
+        return owner(user).target.expectGeneration(generation);
+    }
+    fn debugInfo(user: *anyopaque) !*info.Image {
+        const module: *@import("modules.zig").Module = @ptrCast(@alignCast(user));
+        return module.debugInfo();
+    }
+    fn moduleAt(user: *anyopaque, address: u64) !language_view.Module {
+        const module = try owner(user).modules.at(address);
+        return moduleView(module);
+    }
+    fn refreshMaps(user: *anyopaque) !void {
+        return owner(user).refreshMaps();
+    }
+    fn runtimeModuleAt(user: *anyopaque, address: u64) !language_view.Module {
+        return moduleView(try owner(user).modules.runtimeAt(address));
+    }
+    fn registerValue(user: *anyopaque, tid: i32, name: []const u8) !?u64 {
+        const registers = try owner(user).target.registers(tid);
+        return registers.named(name);
+    }
+    fn mappedRange(user: *anyopaque, address: u64) ?language_view.MemoryRange {
+        for (owner(user).modules.regions.items) |region| {
+            if (address >= region.start and address < region.end)
+                return .{ .start = region.start, .end = region.end };
+        }
+        return null;
+    }
+    fn moduleView(module: *@import("modules.zig").Module) language_view.Module {
+        return .{ .id = module.id, .identity = module, .image = &module.image, .symbol_image = module.symbols(), .bias = module.bias, .layouts = &module.layouts, .debug_allocator = module.debug_allocator, .has_debug_companion = module.debug_file != null, .debug_info = debugInfo };
+    }
+    fn symbolAt(user: *anyopaque, address: u64) !language_view.Symbol {
+        const symbol = try owner(user).modules.symbolAt(address);
+        return .{ .name = symbol.name, .offset = symbol.offset };
+    }
+    fn threadIdentity(user: *anyopaque, tid: i32) !u64 {
+        for (owner(user).target.threadSlice()) |thread| {
+            if (thread.tid == tid) return thread.id;
+        }
+        return error.InvalidThread;
+    }
+    fn liveThread(user: *anyopaque, tid: u64) ?i32 {
+        for (owner(user).target.threadSlice()) |thread| if (thread.state != .exited and @as(u64, @intCast(thread.tid)) == tid) return thread.tid;
+        return null;
+    }
+    fn sourceAt(user: *anyopaque, a: std.mem.Allocator, address: u64) !info.Site {
+        return owner(user).sourceAt(a, address);
+    }
+    fn mapSourcePath(user: *anyopaque, a: std.mem.Allocator, path: []const u8) ![]const u8 {
+        return owner(user).sourceMaps().forward(a, path);
+    }
+    fn summarize(user: *anyopaque, a: std.mem.Allocator, value: eval.Value) anyerror!ValueSummary {
+        return owner(user).summarize(a, value);
+    }
+    fn valueChildren(user: *anyopaque, a: std.mem.Allocator, value: eval.Value, start: u64, limit: usize, raw: bool) anyerror!Session.ValuePage {
+        return owner(user).valueChildren(a, value, start, limit, raw);
+    }
+    const binding = @import("runtime_binding.zig");
+    fn javascriptLayout(user: *anyopaque) !@import("../c.zig").api.struct_xjs_layout {
+        const session = owner(user);
+        return session.metadata.javascript(session);
+    }
+    fn writableRange(user: *anyopaque, address: u64, below: u64, above: u64) ?language_view.MemoryRange {
+        for (owner(user).modules.regions.items) |region| {
+            if (region.permissions[0] == 'r' and region.permissions[1] == 'w' and
+                address >= region.start and address - region.start >= below and address < region.end and region.end - address >= above)
+                return .{ .start = region.start, .end = region.end };
+        }
+        return null;
+    }
+    fn bindingView(bound: binding.Binding) language_view.Binding {
+        return .{ .python_stack = bound.python_stack, .budget = bound.budget, .module = moduleView(bound.module), .identity = bound.identity, .token = bound.token };
+    }
+    fn runtimeDiscover(user: *anyopaque, language: binding.Language) !void {
+        switch (language) {
+            inline else => |which| return binding.discover(which, owner(user)),
+        }
+    }
+    fn runtimeProcess(user: *anyopaque, language: binding.Language) !language_view.Binding {
+        return bindingView(try switch (language) {
+            inline else => |which| binding.process(which, owner(user)),
+        });
+    }
+    fn runtimeThread(user: *anyopaque, language: binding.Language, a: std.mem.Allocator, tid: i32, native: []const Frame, first: usize) !language_view.Binding {
+        return bindingView(try switch (language) {
+            inline else => |which| binding.thread(which, owner(user), a, tid, native, first),
+        });
+    }
+    fn runtimeRetained(user: *anyopaque, token: binding.Token) !language_view.Module {
+        return moduleView(try binding.retained(owner(user), token));
+    }
+    fn runtimeOwns(user: *anyopaque, module: language_view.Module, frame: Frame) bool {
+        const raw: *@import("modules.zig").Module = @ptrCast(@alignCast(module.identity));
+        return binding.owns(owner(user), raw, frame);
+    }
+    fn stack(user: *anyopaque, a: std.mem.Allocator, tid: i32, limit: usize) ![]language_view.Frame {
+        return owner(user).stack(a, tid, limit);
+    }
+    fn frameLocals(user: *anyopaque, a: std.mem.Allocator, frame: language_view.Frame) ![]info.Local {
+        return owner(user).frameLocals(a, frame);
+    }
+    fn evaluateInFrame(user: *anyopaque, a: std.mem.Allocator, frame: language_view.Frame, locals: []const info.Local, text: []const u8) !eval.Value {
+        return owner(user).evaluateInFrame(a, frame, locals, text);
+    }
+    const ops = language_view.Context.Ops{
+        .read_memory = readMemory,
+        .snapshot = snapshot,
+        .arch = arch,
+        .is_gdb = isGdb,
+        .main_phdr = mainPhdr,
+        .expect_generation = expectGeneration,
+        .module_at = moduleAt,
+        .refresh_maps = refreshMaps,
+        .runtime_module_at = runtimeModuleAt,
+        .register_value = registerValue,
+        .mapped_range = mappedRange,
+        .symbol_at = symbolAt,
+        .thread_identity = threadIdentity,
+        .live_thread = liveThread,
+        .source_at = sourceAt,
+        .map_source_path = mapSourcePath,
+        .summarize = summarize,
+        .value_children = valueChildren,
+        .javascript_layout = javascriptLayout,
+        .writable_range = writableRange,
+        .runtime_discover = runtimeDiscover,
+        .runtime_process = runtimeProcess,
+        .runtime_thread = runtimeThread,
+        .runtime_retained = runtimeRetained,
+        .runtime_owns = runtimeOwns,
+        .stack = stack,
+        .frame_locals = frameLocals,
+        .evaluate_in_frame = evaluateInFrame,
+    };
+};

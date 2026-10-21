@@ -59,7 +59,7 @@ def audit(client, target, args):
         return {p.name:(p/'schedstat').read_text().split()[0] for p in Path(f'/proc/{target.pid}/task').iterdir()}
     regs = client.inspect('get_registers',tid=target.pid); generation = client.session()['generation']; before = scheduled()
     path = w/'readonly.strace'
-    observer = client.collector_pid() if a.agent else client.p.pid
+    observer = client.collector_pid()
     tracer = subprocess.Popen(['strace','-f','-qq','-o',str(path),'-e',
         'trace=ptrace,process_vm_readv,process_vm_writev,pread64,pwrite64,pwritev,pwritev2,kill,tgkill,tkill',
         '-p',str(observer)],stderr=subprocess.PIPE)
@@ -97,7 +97,7 @@ for mode in ('plain','inspector'):
         client = Client('control',None,options=options)
         tool = next(t for t in client.call('tools/list')['result']['tools'] if t['name']=='get_language_locals')
         assert tool['annotations']['readOnlyHint'] and tool['annotations']['xodbSessionAccess']=='observer'
-        observer = client.collector_pid() if a.agent else client.p.pid
+        observer = client.collector_pid()
         measured = {'frontend':client.p.pid}
         if a.agent: measured['runtime_agent'] = observer
         before = {name:usage(pid) for name,pid in measured.items()}; started = time.monotonic()

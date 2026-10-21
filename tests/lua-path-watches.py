@@ -57,7 +57,7 @@ try:
                     extra=client.inspect('add_language_watch',**args,expression='object.child.value')['added']
                     client.inspect('evaluate_language_expression',**args,expression='object.missing')
                     client.inspect('remove_language_watch',generation=generation,id=extra)
-                adapter=SimpleNamespace(p=SimpleNamespace(pid=client.collector_pid() if a.agent else client.p.pid),inspect=client.inspect,session=client.session)
+                adapter=SimpleNamespace(p=SimpleNamespace(pid=client.collector_pid()),inspect=client.inspect,session=client.session)
                 result['readonly']=audit(adapter,target.pid,w/'paths.strace',observed)
         deadline=time.monotonic()+60
         while True:

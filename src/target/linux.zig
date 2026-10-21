@@ -282,6 +282,10 @@ pub const Target = struct {
     pub fn isRemote(self: *const Target) bool {
         return rt.xrt_target_is_remote(self.handle);
     }
+    pub fn readCacheStats(self: *const Target) ?rt.struct_xrt_read_cache_stats {
+        var stats: rt.struct_xrt_read_cache_stats = undefined;
+        return if (rt.xrt_target_read_cache_stats(self.handle, &stats)) stats else null;
+    }
     pub fn connectRemote(self: *Target, argv: []const [:0]const u8) !void {
         return self.connectRemoteCancel(argv, null);
     }
@@ -920,7 +924,6 @@ test "detach restores software and hardware breakpoints" {
 }
 
 test {
-    std.testing.refAllDecls(@import("lifecycle_test.zig"));
     std.testing.refAllDecls(arm_watch);
 }
 

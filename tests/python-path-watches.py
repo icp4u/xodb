@@ -81,7 +81,7 @@ def main():
                         extra = client.inspect('add_language_watch', **call_args, expression='root["player"]["score"]')['added']
                         client.inspect('evaluate_language_expression', **call_args, expression='root["absent"]')
                         client.inspect('remove_language_watch', generation=generation, id=extra)
-                    adapter = SimpleNamespace(p=SimpleNamespace(pid=client.collector_pid() if args.agent else client.p.pid), inspect=client.inspect, session=client.session)
+                    adapter = SimpleNamespace(p=SimpleNamespace(pid=client.collector_pid()), inspect=client.inspect, session=client.session)
                     result['readonly'] = audit(adapter, target.pid, work/'paths.strace', observe)
             deadline = time.monotonic()+60
             while True:

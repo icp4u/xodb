@@ -387,19 +387,27 @@ pub const ChannelsOut = struct {
 /// Per-channel power, occupancy, traffic and interferer impact over [from_ns, to_ns).
 /// `full` keeps the per-bucket spectrum (the panel); MCP leaves it out.
 pub fn channelsBetween(a: std.mem.Allocator, m: *Monitor, from_ns: u64, to_ns: u64, report_out: ?*channels.Report) !ChannelsOut {
-    return channelsBetweenMode(a, m, from_ns, to_ns, report_out, false);
+    return channelsBetweenMode(a, m, from_ns, to_ns, report_out, false, null);
+}
+/// As `channelsBetween`, using the headline verdict for this exact interval.
+pub fn channelsKnownBetween(a: std.mem.Allocator, m: *Monitor, from_ns: u64, to_ns: u64, known: *const detect.Verdict, report_out: ?*channels.Report) !ChannelsOut {
+    return channelsBetweenMode(a, m, from_ns, to_ns, report_out, false, known);
 }
 /// A phase channel report whose location is the union of five-second views.
 pub fn channelsPhaseBetween(a: std.mem.Allocator, m: *Monitor, from_ns: u64, to_ns: u64, report_out: ?*channels.Report) !ChannelsOut {
-    return channelsBetweenMode(a, m, from_ns, to_ns, report_out, true);
+    return channelsBetweenMode(a, m, from_ns, to_ns, report_out, true, null);
 }
-fn channelsBetweenMode(a: std.mem.Allocator, m: *Monitor, from_ns: u64, to_ns: u64, report_out: ?*channels.Report, windowed_location: bool) !ChannelsOut {
+/// As `channelsPhaseBetween`, using the phase headline's verdict.
+pub fn channelsPhaseKnownBetween(a: std.mem.Allocator, m: *Monitor, from_ns: u64, to_ns: u64, known: *const detect.Verdict, report_out: ?*channels.Report) !ChannelsOut {
+    return channelsBetweenMode(a, m, from_ns, to_ns, report_out, true, known);
+}
+fn channelsBetweenMode(a: std.mem.Allocator, m: *Monitor, from_ns: u64, to_ns: u64, report_out: ?*channels.Report, windowed_location: bool, known: ?*const detect.Verdict) !ChannelsOut {
     const w = try m.between(a, from_ns, to_ns);
     const dwells = try m.dwellsBetween(a, from_ns, to_ns);
     const r = if (windowed_location)
-        try channels.analyseWindowed(a, w.samples, dwells, from_ns, to_ns, fsx.monotonicNs(), null)
+        try channels.analyseWindowed(a, w.samples, dwells, from_ns, to_ns, fsx.monotonicNs(), known)
     else
-        try channels.analyse(a, w.samples, dwells, from_ns, to_ns, fsx.monotonicNs());
+        try channels.analyseKnown(a, w.samples, dwells, from_ns, to_ns, fsx.monotonicNs(), known);
     if (report_out) |o| o.* = r;
     const info = m.planInfo();
     var pb: [240]u8 = undefined;
@@ -574,7 +582,7 @@ test "a five-second headline and channel report use one localized interval" {
     const from = xs[0].mono_ns;
     const to = xs[xs.len - 1].mono_ns + 1;
     const headline = try reportBetween(aa, m, from, to, true);
-    const channel = try channelsBetween(aa, m, from, to, null);
+    const channel = try channelsKnownBetween(aa, m, from, to, &headline.verdict, null);
     try std.testing.expectEqualStrings("microwave_pulsed", headline.kind);
     try std.testing.expect(headline.verdict.location_resolved);
     try std.testing.expectEqual(@as(f32, @floatFromInt(channel.blast.?.lo_mhz)), headline.verdict.band_lo_mhz.?);
@@ -584,6 +592,31 @@ test "a five-second headline and channel report use one localized interval" {
         if (ch.impact == .blasted or ch.impact == .grazed) mask |= @as(u16, 1) << @intCast(ch.channel);
     }
     try std.testing.expectEqual(mask, headline.verdict.channels);
+}
+
+test "channel report keeps a known partial-window pulse when location is unresolved" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const m = try Monitor.start(a, .{ .roots = .{ .sys = "/nonexistent", .proc = "/nonexistent" } });
+    defer m.deinit();
+    m.samples = try monitor.Ring(monitor.Stamped).init(a, 1 << 16);
+    const p = sweep.plan(.{}, 1);
+    // No oven in this window's own samples: only the headline verdict can
+    // make the channel line report pulsing, so ignoring `known` fails here.
+    const xs = try channels.synthSweep(aa, p.windows.list(), 0.2, 1, false, 71);
+    m.mutex.lock();
+    for (xs) |x| m.samples.push(x);
+    m.mutex.unlock();
+    const from = xs[0].mono_ns;
+    const to = xs[xs.len - 1].mono_ns + 1;
+    const own = try channelsBetween(aa, m, from, to, null);
+    try std.testing.expect(std.mem.indexOf(u8, own.words, "location unresolved") == null);
+    const known = detect.Verdict{ .kind = .microwave_pulsed, .mains_hz = 60, .duty = 0.45 };
+    const channel = try channelsKnownBetween(aa, m, from, to, &known, null);
+    try std.testing.expect(std.mem.indexOf(u8, channel.words, "location unresolved this window") != null);
+    try std.testing.expect(std.mem.indexOf(u8, channel.words, "no microwave-like") == null);
 }
 
 test "an in-use card is never taken, even when chosen" {

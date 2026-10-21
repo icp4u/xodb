@@ -66,13 +66,16 @@ def compare(stack, truth, current_tid):
 def audit(client, pid, tid):
     """The read path issues only reads: no writes, resumes or signals."""
     regs = client.inspect('get_registers', tid=tid); generation = client.session()['generation']
+    cache_before = client.session().get('remote_read_cache')
     path = w / 'readonly.strace'
+    # With a runtime agent the agent, not the host, issues the target syscalls.
+    observer = client.collector_pid()
     tracer = subprocess.Popen(['strace', '-f', '-qq', '-o', str(path), '-e',
                                'trace=ptrace,process_vm_readv,process_vm_writev,pread64,pwrite64,pwritev,pwritev2,kill,tgkill,tkill',
-                               '-p', str(client.p.pid)], stderr=subprocess.PIPE)
+                               '-p', str(observer)], stderr=subprocess.PIPE)
     try:
         deadline = time.monotonic() + 10
-        while not re.search(r'^TracerPid:\s*' + str(tracer.pid) + r'\s*$', Path(f'/proc/{client.p.pid}/status').read_text(), re.M):
+        while not re.search(r'^TracerPid:\s*' + str(tracer.pid) + r'\s*$', Path(f'/proc/{observer}/status').read_text(), re.M):
             check(tracer.poll() is None and time.monotonic() < deadline, 'strace attach')
             time.sleep(.01)
         client.inspect('get_language_stack', tid=tid, language='go')
@@ -80,7 +83,9 @@ def audit(client, pid, tid):
         if tracer.poll() is None: tracer.send_signal(signal.SIGINT)
         tracer.wait(timeout=10)
     text = path.read_text()
-    check(re.search(r'process_vm_readv|pread64|PTRACE_PEEKDATA', text), text[:400])
+    cache_after = client.session().get('remote_read_cache')
+    cached = bool(cache_before and cache_after['hits'] > cache_before['hits'])
+    check(re.search(r'process_vm_readv|pread64|PTRACE_PEEKDATA', text) or cached, (text[:400], cache_before, cache_after))
     check(not re.search(r'process_vm_writev\(|pwrite64\(|pwritev2?\(|(?:kill|tgkill|tkill)\(|PTRACE_(?:POKE\w*|SET\w*|CONT|SINGLESTEP|SYSCALL)\b', text), text[:2000])
     check(client.session()['generation'] == generation and client.inspect('get_registers', tid=tid) == regs, 'state changed')
 

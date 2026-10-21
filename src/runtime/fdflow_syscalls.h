@@ -1,5 +1,6 @@
 #ifndef XODB_RUNTIME_FDFLOW_SYSCALLS_H
 #define XODB_RUNTIME_FDFLOW_SYSCALLS_H
+#include "xrt_arch_syscalls.h"
 /* Native syscall numbers for the architecture this binary is compiled for.
  * <sys/syscall.h> is the source. A name that header does not define is
  * omitted (the generic table has no open, pipe, dup2, fork, vfork, creat).
@@ -314,33 +315,33 @@
   XRT_FDFLOW_MUT_socketcall(X)
 
 #if defined(__x86_64__) && !defined(__ILP32__)
-/* x86-64 LP64 numbers. The count and churn tests spell SYS_*; these asserts
- * keep the macros equal to the numbers those tests used to write out. */
-_Static_assert(SYS_read == 0 && SYS_write == 1, "x86 read/write");
-_Static_assert(SYS_pread64 == 17 && SYS_pwrite64 == 18, "x86 pread/pwrite");
-_Static_assert(SYS_readv == 19 && SYS_writev == 20, "x86 readv/writev");
-_Static_assert(SYS_preadv == 295 && SYS_pwritev == 296, "x86 preadv/pwritev");
-_Static_assert(SYS_preadv2 == 327 && SYS_pwritev2 == 328, "x86 preadv2/pwritev2");
-_Static_assert(SYS_sendto == 44 && SYS_recvfrom == 45, "x86 sendto/recvfrom");
-_Static_assert(SYS_sendmsg == 46 && SYS_recvmsg == 47, "x86 sendmsg/recvmsg");
-_Static_assert(SYS_open == 2 && SYS_close == 3 && SYS_pipe == 22, "x86 open/close/pipe");
-_Static_assert(SYS_dup == 32 && SYS_dup2 == 33 && SYS_socket == 41, "x86 dup/socket");
-_Static_assert(SYS_accept == 43 && SYS_socketpair == 53, "x86 accept/socketpair");
-_Static_assert(SYS_clone == 56 && SYS_fork == 57 && SYS_vfork == 58, "x86 clone/fork");
-_Static_assert(SYS_execve == 59 && SYS_fcntl == 72 && SYS_creat == 85, "x86 exec/fcntl/creat");
-_Static_assert(SYS_openat == 257 && SYS_accept4 == 288, "x86 openat/accept4");
-_Static_assert(SYS_dup3 == 292 && SYS_pipe2 == 293 && SYS_recvmmsg == 299, "x86 dup3/pipe2");
-_Static_assert(SYS_execveat == 322, "x86 execveat");
-_Static_assert(SYS_io_uring_setup == 425 && SYS_io_uring_enter == 426 && SYS_io_uring_register == 427,
+/* The count and churn tests spell SYS_*. These asserts keep the host macros
+ * equal to the x86-64 row in xrt_arch_syscalls.h. */
+_Static_assert(SYS_read == XRT_X86_64_NR_read && SYS_write == XRT_X86_64_NR_write, "x86 read/write");
+_Static_assert(SYS_pread64 == XRT_X86_64_NR_pread64 && SYS_pwrite64 == XRT_X86_64_NR_pwrite64, "x86 pread/pwrite");
+_Static_assert(SYS_readv == XRT_X86_64_NR_readv && SYS_writev == XRT_X86_64_NR_writev, "x86 readv/writev");
+_Static_assert(SYS_preadv == XRT_X86_64_NR_preadv && SYS_pwritev == XRT_X86_64_NR_pwritev, "x86 preadv/pwritev");
+_Static_assert(SYS_preadv2 == XRT_X86_64_NR_preadv2 && SYS_pwritev2 == XRT_X86_64_NR_pwritev2, "x86 preadv2/pwritev2");
+_Static_assert(SYS_sendto == XRT_X86_64_NR_sendto && SYS_recvfrom == XRT_X86_64_NR_recvfrom, "x86 sendto/recvfrom");
+_Static_assert(SYS_sendmsg == XRT_X86_64_NR_sendmsg && SYS_recvmsg == XRT_X86_64_NR_recvmsg, "x86 sendmsg/recvmsg");
+_Static_assert(SYS_open == XRT_X86_64_NR_open && SYS_close == XRT_X86_64_NR_close && SYS_pipe == XRT_X86_64_NR_pipe, "x86 open/close/pipe");
+_Static_assert(SYS_dup == XRT_X86_64_NR_dup && SYS_dup2 == XRT_X86_64_NR_dup2 && SYS_socket == XRT_X86_64_NR_socket, "x86 dup/socket");
+_Static_assert(SYS_accept == XRT_X86_64_NR_accept && SYS_socketpair == XRT_X86_64_NR_socketpair, "x86 accept/socketpair");
+_Static_assert(SYS_clone == XRT_X86_64_NR_clone && SYS_fork == XRT_X86_64_NR_fork && SYS_vfork == XRT_X86_64_NR_vfork, "x86 clone/fork");
+_Static_assert(SYS_execve == XRT_X86_64_NR_execve && SYS_fcntl == XRT_X86_64_NR_fcntl && SYS_creat == XRT_X86_64_NR_creat, "x86 exec/fcntl/creat");
+_Static_assert(SYS_openat == XRT_X86_64_NR_openat && SYS_accept4 == XRT_X86_64_NR_accept4, "x86 openat/accept4");
+_Static_assert(SYS_dup3 == XRT_X86_64_NR_dup3 && SYS_pipe2 == XRT_X86_64_NR_pipe2 && SYS_recvmmsg == XRT_X86_64_NR_recvmmsg, "x86 dup3/pipe2");
+_Static_assert(SYS_execveat == XRT_X86_64_NR_execveat, "x86 execveat");
+_Static_assert(SYS_io_uring_setup == XRT_X86_64_NR_io_uring_setup && SYS_io_uring_enter == XRT_X86_64_NR_io_uring_enter && SYS_io_uring_register == XRT_X86_64_NR_io_uring_register,
                "x86 io_uring");
-_Static_assert(SYS_clone3 == 435 && SYS_close_range == 436, "x86 clone3/close_range");
-_Static_assert(SYS_openat2 == 437 && SYS_pidfd_getfd == 438, "x86 openat2/pidfd_getfd");
-_Static_assert(SYS_fstat == 5 && SYS_lseek == 8 && SYS_munmap == 11, "x86 compat aliases");
-_Static_assert(SYS_exit == 60 && SYS_exit_group == 231, "x86 exit/exit_group");
+_Static_assert(SYS_clone3 == XRT_X86_64_NR_clone3 && SYS_close_range == XRT_X86_64_NR_close_range, "x86 clone3/close_range");
+_Static_assert(SYS_openat2 == XRT_X86_64_NR_openat2 && SYS_pidfd_getfd == XRT_X86_64_NR_pidfd_getfd, "x86 openat2/pidfd_getfd");
+_Static_assert(SYS_fstat == XRT_X86_64_NR_fstat && SYS_lseek == XRT_X86_64_NR_lseek && SYS_munmap == XRT_X86_64_NR_munmap, "x86 compat aliases");
+_Static_assert(SYS_exit == XRT_X86_64_NR_exit && SYS_exit_group == XRT_X86_64_NR_exit_group, "x86 exit/exit_group");
 #if defined(SYS_fcntl64) || defined(SYS_recvmmsg_time64) || defined(SYS_socketcall)
 #error "x86-64 mutation set changed"
 #endif
-_Static_assert(SYS_uname == 63 && SYS_getuid == 102, "x86 harmless numbers");
+_Static_assert(SYS_uname == XRT_X86_64_NR_uname && SYS_getuid == XRT_X86_64_NR_getuid, "x86 harmless numbers");
 _Static_assert(XRT_FDFLOW_IO_COUNT == 14, "x86 keeps 14 IO calls");
 #endif
 #endif

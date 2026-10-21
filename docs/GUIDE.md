@@ -400,6 +400,7 @@ in one line that starts with `xodb: vulkan:`. Run it from a terminal and look fo
 | `driver ... failed to load` | A driver manifest names a library that Vulkan could not load; it may be stale or have a driver/library mismatch | Check the driver installation. A reboot hint appears only when the display GPU is also absent; if that followed a driver update, rebooting may help |
 | `rendering on X, which is not the display GPU (drm 226:1, Y)` | The compositor draws with Y, but xodb is on X. Some pairs can hand frames across, some show nothing | `--vk-device Y`, or drop a `--vk-device` / `XODB_VK_DEVICE` you set earlier |
 | `no Vulkan device matches "..."` | `--vk-device` or `XODB_VK_DEVICE` names nothing in the list printed below it | Use an index or a name from that list |
+| `Renderer initialization failed: ...; retrying, session retained` (or `target retained`) | Renderer setup failed; the debugger keeps its session or target and retries on a one-second timer. This line repeats on each failed attempt | Check the error and any driver messages above it. Leave the window open for recovery, or use `--vk-list` and try another `--vk-device` |
 | nothing | No confirmed device mismatch or driver loading failure was detected; automatically selected software and devices without DRM nodes do not imply a mismatch | `--vk-list`, then try each device |
 
 Three controls:

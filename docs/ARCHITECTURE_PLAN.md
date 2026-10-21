@@ -147,7 +147,7 @@ interactive desktop is selected implicitly.
 
 | Item | Why |
 |---|---|
-| Per-architecture tables in one place (syscall numbers, register schemas, trap encodings), generated or shared C to Zig | The fd tracer hard-coded x86-64 syscall numbers; each new architecture repeats this. |
+| Per-architecture tables in one place (syscall numbers, register schemas, trap encodings), generated or shared C to Zig | The fd event counter's x86-64 syscall numbers are `src/runtime/xrt_arch_syscalls.h`. Native fdflow still reads the host syscall header and checks it against that row on x86-64. Register rows and software-breakpoint bytes already live in `src/runtime/arch.c` for m68k, x86-64, aarch64, LoongArch, RISC-V and ppc64le. s390x has no row. `src/runtime/events.c` still spells the x86 `syscall` opcode and the restart numbers. No other architecture is guessed into the syscall table. |
 | Owned child processes in the job supervisor (sidecar JVMs, helpers, agents) | Leaked sidecar JVMs ran for 21 hours; every child needs an owner and an exit rule. |
 | Protocol versions and capability negotiation for every peer (agent, sidecar, remote xodb, MCP clients) | An older sidecar served stale data; a new flag would break an older remote xodb. |
 | Gate builds every helper it uses from the tree under test | A prebuilt native decompiler helper made a correct change fail. |

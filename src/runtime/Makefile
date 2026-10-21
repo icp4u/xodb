@@ -8,7 +8,13 @@ CPPFLAGS += -I$(CURDIR)
 CFLAGS ?= -O2 -g
 CFLAGS += -std=c11 -Wall -Wextra -Werror -Wswitch-enum
 LDLIBS += -latomic -pthread -ldl
-SOURCES := cancel gdb_packet gdb_link log gdb_description gdb_lldb gdbremote memory arch registers process target probes loongarch_step riscv_step watchpoints events family xstate perf perf_cpu perf_syscalls perf_allocations wire wire_target agent remote files file_view symbol_job loader elf_symbols mapped_file perf_wire agent_perf remote_perf fdscan allocation_broker sysstat sysstat_nvml fdevent fdevent_decode fdevent_count fdactivity source binary_object dwarf_cursor source_paths memstat memstat_system memstat_process memstat_pages memstat_cells memobserver
+# src/runtime/runtime_sources.list is the runtime. These observer files are host-only and are not in that list.
+RUNTIME_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+RUNTIME_PATHS := $(shell sed -e 's/[[:space:]]*\#.*//' -e '/^[[:space:]]*$$/d' $(RUNTIME_DIR)/runtime_sources.list)
+objname = $(if $(filter ../binary/object.c,$1),binary_object,$(if $(filter ../debug/dwarf_cursor.c,$1),dwarf_cursor,$(if $(filter ../debug/source_paths.c,$1),source_paths,$(if $(filter ../profile/allocation_broker.c,$1),allocation_broker,$(basename $(notdir $1))))))
+SHARED_SOURCES := $(foreach p,$(RUNTIME_PATHS),$(call objname,$(p)))
+AGENT_EXTRA := sysstat sysstat_nvml memstat memstat_system memstat_process memstat_pages memstat_cells memobserver
+SOURCES := $(SHARED_SOURCES) $(AGENT_EXTRA)
 OBJECTS := $(addprefix $(BUILD)/,$(addsuffix .o,$(SOURCES)))
 TESTS := cancel resolve gdb-packet gdb-link gdb-description gdb-lldb gdb-model memory registers process target perf wire snapshot symbols symbol-job fdscan sysstat services fdevent fdevent-count memstat-system memstat-process memstat-cells memobserver
 TEST_BINS := $(addprefix $(BUILD)/test-,$(TESTS))

@@ -176,7 +176,8 @@ class Server:
         self.target_identity = None
         self.log = (self.work / 'server.log').open('wb')
         args = [str(binary), '--headless', '--session-socket', str(self.path), '--agent-scope', scope]
-        agent = os.environ.get('XODB_RUNTIME_AGENT')
+        # The release-check agent lane reaches the shared server too.
+        agent = os.environ.get('XODB_RUNTIME_AGENT') or os.environ.get('XODB_TEST_RUNTIME_AGENT')
         if agent:
             args += ['--runtime-agent', str(Path(agent).resolve())]
         args += [*options, '--', str(fixture), *fixture_args]

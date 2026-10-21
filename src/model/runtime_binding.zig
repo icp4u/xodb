@@ -1,15 +1,15 @@
 //! Runtime layout identity is separate from evidence of interpreter execution.
 //! All discovery and native unwinding runs on the stopped target's owner.
 const std = @import("std");
-const model = @import("../model/session.zig");
-const Module = @import("../model/modules.zig").Module;
+const model = @import("session.zig");
+const Module = @import("modules.zig").Module;
 const A = std.mem.Allocator;
 const c = @import("../c.zig").api;
-pub const Budget = struct { reads: usize = 0, bytes: usize = 0 };
-pub const Witness = struct { seen: bool, python_stack: ?*const c.struct_xpy_stack = null };
-pub const Language = enum { python, perl };
-pub const Identity = enum { witnessed, unwitnessed };
-pub const Token = struct { module_id: u64, generation: u64, epoch: u64, maps: u64 };
+pub const Budget = @import("../language/binding_types.zig").Budget;
+pub const Witness = @import("../language/binding_types.zig").Witness;
+pub const Language = @import("../language/binding_types.zig").Language;
+pub const Identity = @import("../language/binding_types.zig").Identity;
+pub const Token = @import("../language/binding_types.zig").Token;
 pub const Binding = struct {
     python_stack: ?*const c.struct_xpy_stack = null,
     budget: Budget = .{},
@@ -132,12 +132,7 @@ fn unavailable(comptime language: Language) anyerror {
         .perl => error.PerlRuntimeUnavailable,
     };
 }
-pub fn noFrame(comptime language: Language) anyerror {
-    return switch (language) {
-        .python => error.PythonInterpreterFrameUnavailable,
-        .perl => error.PerlInterpreterFrameUnavailable,
-    };
-}
+pub const noFrame = @import("../language/binding_types.zig").noFrame;
 fn ambiguous(comptime language: Language) anyerror {
     return switch (language) {
         .python => error.PythonRuntimeAmbiguous,
@@ -152,8 +147,8 @@ pub fn owns(session: *model.Session, module: *Module, frame: model.Frame) bool {
 }
 fn witnessed(comptime language: Language, session: *model.Session, a: A, module: *Module, tid: i32, native: []const model.Frame, first: usize, budget: *Budget) !Witness {
     return switch (language) {
-        .python => @import("python.zig").runtimeWitness(session, a, module, tid, native, first, budget),
-        .perl => .{ .seen = try @import("perl.zig").runtimeWitness(session, module, native) },
+        .python => @import("../language/python.zig").runtimeWitness(&session.languageContext(), a, model.Session.languageModule(module), tid, native, first, budget),
+        .perl => .{ .seen = try @import("../language/perl.zig").runtimeWitness(&session.languageContext(), model.Session.languageModule(module), native) },
     };
 }
 fn bind(session: *model.Session, module: *Module, identity: Identity) Binding {

@@ -81,11 +81,13 @@ try:
         error('ControlLeaseRequired','select_language_frame',**fields)
     audit={}
     if a.strace:
-        observer=pid_host
-        if a.agent:
-            children=task_children(observer);assert len(children)==1;observer=int(children[0])
+        # With a runtime agent the agent, not the host, issues the target syscalls.
+        observer=c.collector_pid() if hasattr(c,'collector_pid') else pid_host
+        if a.shared and a.agent:
+            children=task_children(pid_host);assert len(children)==1;observer=int(children[0])
         def ticks():return {q.name:(q/'schedstat').read_text().split()[0] for q in Path(f'/proc/{pid}/task').iterdir()}
         before_ticks=ticks();trace=w/'readonly.strace'
+        cache_before=c.session().get('remote_read_cache')
         tracer=subprocess.Popen(['strace','-f','-qq','-o',str(trace),'-e','trace=ptrace,process_vm_readv,process_vm_writev,pread64,pwrite64,pwritev,pwritev2,kill,tgkill,tkill','-p',str(observer)],stderr=subprocess.PIPE)
         try:
             deadline=time.monotonic()+10
@@ -95,9 +97,12 @@ try:
         finally:
             if tracer.poll() is None:tracer.send_signal(signal.SIGINT)
             tracer.wait(timeout=10);(w/'strace.stderr').write_bytes(tracer.stderr.read())
-        text=trace.read_text();assert re.search(r'process_vm_readv|pread64|PTRACE_PEEKDATA',text)
+        text=trace.read_text();physical=bool(re.search(r'process_vm_readv|pread64|PTRACE_PEEKDATA',text))
+        cache_after=c.session().get('remote_read_cache')
+        cached=bool(cache_before and cache_after['hits']>cache_before['hits'])
+        assert physical or cached,(text,cache_before,cache_after)
         assert not re.search(r'process_vm_writev\(|pwrite64\(|pwritev2?\(|(?:kill|tgkill|tkill)\(|PTRACE_(?:POKE\w*|SET\w*|CONT|SINGLESTEP|SYSCALL)\b',text)
-        assert ticks()==before_ticks;audit=dict(target_reads_observed=True,target_mutations=0,target_runs=0)
+        assert ticks()==before_ticks;audit=dict(target_reads_observed=physical,cache_reads_observed=cached,target_mutations=0,target_runs=0)
     assert inspect('get_registers',tid=pid)==registers and c.session()['generation']==generation
     advance();deadline=time.monotonic()+15
     while c.session()['state']!='exited':assert time.monotonic()<deadline;time.sleep(.002)

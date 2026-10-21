@@ -74,7 +74,7 @@ def main():
                         def observe():
                             extra = client.inspect('add_language_watch', **args, expression='x')['added']
                             client.inspect('remove_language_watch', generation=generation, id=extra)
-                        result['readonly'] = audit(SimpleNamespace(p=SimpleNamespace(pid=client.collector_pid() if a.agent else client.p.pid), inspect=client.inspect, session=client.session), target.pid, w/'watches.strace', observe)
+                        result['readonly'] = audit(SimpleNamespace(p=SimpleNamespace(pid=client.collector_pid()), inspect=client.inspect, session=client.session), target.pid, w/'watches.strace', observe)
             deadline = time.monotonic() + 60
             while True:
                 current = client.inspect('get_language_watches')['watches']

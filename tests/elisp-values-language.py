@@ -53,6 +53,7 @@ try:
         assert c.inspect('evaluate_expression',tid=pid,frame=frame,expression='numargs')['value']['visualization'] is None
         if a.strace and index==0:
             observer=c.collector_pid();trace=w/'readonly.strace'
+            cache_before=c.session().get('remote_read_cache')
             state_before={p.name:(p/'schedstat').read_text().split()[0] for p in Path(f'/proc/{pid}/task').iterdir()}
             tracer=subprocess.Popen(['strace','-f','-qq','-o',str(trace),'-e','trace=ptrace,process_vm_readv,process_vm_writev,pread64,pwrite64,pwritev,pwritev2,kill,tgkill,tkill','-p',str(observer)],stderr=subprocess.PIPE)
             try:
@@ -63,10 +64,13 @@ try:
             finally:
                 if tracer.poll() is None:tracer.send_signal(signal.SIGINT)
                 tracer.wait(timeout=10);(w/'strace.stderr').write_bytes(tracer.stderr.read())
-            text=trace.read_text();assert re.search(r'process_vm_readv|pread64|PTRACE_PEEKDATA',text),text
+            text=trace.read_text();physical=bool(re.search(r'process_vm_readv|pread64|PTRACE_PEEKDATA',text))
+            cache_after=c.session().get('remote_read_cache')
+            cached=bool(cache_before and cache_after['hits']>cache_before['hits'])
+            assert physical or cached,(text,cache_before,cache_after)
             assert not re.search(r'process_vm_writev\(|pwrite64\(|pwritev2?\(|(?:kill|tgkill|tkill)\(|PTRACE_(?:POKE\w*|SET\w*|CONT|SINGLESTEP|SYSCALL)\b',text),text
             assert state_before=={p.name:(p/'schedstat').read_text().split()[0] for p in Path(f'/proc/{pid}/task').iterdir()}
-            audit={'target_reads_observed':True,'target_mutations':0,'target_runs':0}
+            audit={'target_reads_observed':physical,'cache_reads_observed':cached,'target_mutations':0,'target_runs':0}
         assert c.session()['generation']==generation and c.inspect('get_registers',tid=pid)==regs
         results.append(dict(name=name,value=value,cpu_rss_before=before,cpu_rss_after=after))
         if index+1<len(oracle):c.action('continue');stopped=c.stopped('breakpoint',seconds=180)

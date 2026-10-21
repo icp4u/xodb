@@ -7,7 +7,7 @@
 const std = @import("std");
 const c = @import("../c.zig").api;
 const gd = @import("gdscript.zig");
-const named = @import("../model/language_locals.zig");
+const named = @import("locals_types.zig");
 const A = std.mem.Allocator;
 const Memory = gd.Memory;
 const Layout = gd.Layout;
@@ -32,7 +32,7 @@ const top_chars = 96;
 const inner_chars = 40;
 const max_path_steps = 8;
 
-pub const Type = enum(u8) { variant, variant_type, obj_data, array, dictionary, pair, stack_debug, debug_list, debug_element, property, member_element, object, node, node_path, node_path_data, packed_ref, callable, signal, function, script, instance };
+pub const Type = @import("layouts.zig").GDScriptValueType;
 pub const type_names = [_][*:0]const u8{
     "Variant",
     "Variant::Type",
@@ -57,7 +57,7 @@ pub const type_names = [_][*:0]const u8{
     "GDScript",
     "GDScriptInstance",
 };
-pub const F = enum(u8) { variant_type, variant_data, obj_id, obj_ptr, array_ptr, dict_head, dict_count, pair_next, pair_key, pair_value, debug_line, debug_pos, debug_added, debug_identifier, list_first, element_value, element_next, property_name, member_next, member_key, member_index, object_id, object_script_instance, object_class_name, node_name, node_parent, path_data, path_names, path_subnames, path_absolute, packed_ptr, callable_method, signal_name, signal_object, function_argument_count, function_stack_size, function_stack_debug, function_arguments, script_members, instance_members, instance_script };
+pub const F = @import("layouts.zig").GDScriptValueField;
 const Spec = struct { Type, [*:0]const u8, c_uint, u8, bool };
 // In `F` order. A member path goes through members held by value only.
 const specs = [_]Spec{
@@ -106,18 +106,18 @@ const specs = [_]Spec{
 pub const field_count = specs.len;
 /// `Variant::Type`, in the engine's order: the enumerator the value is read
 /// from, and the name GDScript gives the type.
-pub const Kind = enum(u8) { nil, bool, int, float, string, vector2, vector2i, rect2, rect2i, vector3, vector3i, transform2d, vector4, vector4i, plane, quaternion, aabb, basis, transform3d, projection, color, string_name, node_path, rid, object, callable, signal, dictionary, array, packed_byte_array, packed_int32_array, packed_int64_array, packed_float32_array, packed_float64_array, packed_string_array, packed_vector2_array, packed_vector3_array, packed_color_array, packed_vector4_array };
+pub const Kind = @import("layouts.zig").GDScriptValueKind;
 const kind_names = [_]struct { [*:0]const u8, []const u8 }{
-    .{ "NIL", "Nil" },                                   .{ "BOOL", "bool" },                               .{ "INT", "int" },                             .{ "FLOAT", "float" },
-    .{ "STRING", "String" },                             .{ "VECTOR2", "Vector2" },                         .{ "VECTOR2I", "Vector2i" },                   .{ "RECT2", "Rect2" },
-    .{ "RECT2I", "Rect2i" },                             .{ "VECTOR3", "Vector3" },                         .{ "VECTOR3I", "Vector3i" },                   .{ "TRANSFORM2D", "Transform2D" },
-    .{ "VECTOR4", "Vector4" },                           .{ "VECTOR4I", "Vector4i" },                       .{ "PLANE", "Plane" },                         .{ "QUATERNION", "Quaternion" },
-    .{ "AABB", "AABB" },                                 .{ "BASIS", "Basis" },                             .{ "TRANSFORM3D", "Transform3D" },             .{ "PROJECTION", "Projection" },
-    .{ "COLOR", "Color" },                               .{ "STRING_NAME", "StringName" },                  .{ "NODE_PATH", "NodePath" },                  .{ "RID", "RID" },
-    .{ "OBJECT", "Object" },                             .{ "CALLABLE", "Callable" },                       .{ "SIGNAL", "Signal" },                       .{ "DICTIONARY", "Dictionary" },
-    .{ "ARRAY", "Array" },                               .{ "PACKED_BYTE_ARRAY", "PackedByteArray" },       .{ "PACKED_INT32_ARRAY", "PackedInt32Array" }, .{ "PACKED_INT64_ARRAY", "PackedInt64Array" },
-    .{ "PACKED_FLOAT32_ARRAY", "PackedFloat32Array" },   .{ "PACKED_FLOAT64_ARRAY", "PackedFloat64Array" }, .{ "PACKED_STRING_ARRAY", "PackedStringArray" }, .{ "PACKED_VECTOR2_ARRAY", "PackedVector2Array" },
-    .{ "PACKED_VECTOR3_ARRAY", "PackedVector3Array" },   .{ "PACKED_COLOR_ARRAY", "PackedColorArray" },     .{ "PACKED_VECTOR4_ARRAY", "PackedVector4Array" },
+    .{ "NIL", "Nil" },                                 .{ "BOOL", "bool" },                               .{ "INT", "int" },                                 .{ "FLOAT", "float" },
+    .{ "STRING", "String" },                           .{ "VECTOR2", "Vector2" },                         .{ "VECTOR2I", "Vector2i" },                       .{ "RECT2", "Rect2" },
+    .{ "RECT2I", "Rect2i" },                           .{ "VECTOR3", "Vector3" },                         .{ "VECTOR3I", "Vector3i" },                       .{ "TRANSFORM2D", "Transform2D" },
+    .{ "VECTOR4", "Vector4" },                         .{ "VECTOR4I", "Vector4i" },                       .{ "PLANE", "Plane" },                             .{ "QUATERNION", "Quaternion" },
+    .{ "AABB", "AABB" },                               .{ "BASIS", "Basis" },                             .{ "TRANSFORM3D", "Transform3D" },                 .{ "PROJECTION", "Projection" },
+    .{ "COLOR", "Color" },                             .{ "STRING_NAME", "StringName" },                  .{ "NODE_PATH", "NodePath" },                      .{ "RID", "RID" },
+    .{ "OBJECT", "Object" },                           .{ "CALLABLE", "Callable" },                       .{ "SIGNAL", "Signal" },                           .{ "DICTIONARY", "Dictionary" },
+    .{ "ARRAY", "Array" },                             .{ "PACKED_BYTE_ARRAY", "PackedByteArray" },       .{ "PACKED_INT32_ARRAY", "PackedInt32Array" },     .{ "PACKED_INT64_ARRAY", "PackedInt64Array" },
+    .{ "PACKED_FLOAT32_ARRAY", "PackedFloat32Array" }, .{ "PACKED_FLOAT64_ARRAY", "PackedFloat64Array" }, .{ "PACKED_STRING_ARRAY", "PackedStringArray" },   .{ "PACKED_VECTOR2_ARRAY", "PackedVector2Array" },
+    .{ "PACKED_VECTOR3_ARRAY", "PackedVector3Array" }, .{ "PACKED_COLOR_ARRAY", "PackedColorArray" },     .{ "PACKED_VECTOR4_ARRAY", "PackedVector4Array" },
 };
 pub const kind_count = kind_names.len;
 comptime {

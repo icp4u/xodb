@@ -46,6 +46,9 @@ struct symbol_partial {
     struct symbol_range ranges[4096];
     unsigned char request[];
 };
+#define READ_PAGE_SIZE 4096
+#define READ_PAGE_COUNT XRT_READ_CACHE_PAGES
+struct read_page { uint64_t address, used; uint8_t *bytes; bool valid; };
 struct xrt_connection {
     struct xrt_gdb *gdb;
     struct xrt_cancel *cancel;
@@ -69,7 +72,31 @@ struct xrt_connection {
     size_t not_elf_count, not_elf_next;
     /* Owner-thread symbol discovery only; workers use the ordinary file API. */
     struct symbol_partial *symbols;
+    /* One stopped target at a time, lazy allocation, at most XRT_READ_CACHE_PAGES pages (20 MiB). */
+    struct read_page pages[READ_PAGE_COUNT];
+    uint32_t read_target;
+    uint64_t read_generation, read_epoch;
+    uint64_t read_clock;
+    struct xrt_read_cache_stats read_stats;
 };
+static void discard_reads(struct xrt_connection *c)
+{
+    c->read_target = 0;
+    c->read_clock = 0;
+    for (unsigned i = 0; i < READ_PAGE_COUNT; ++i) c->pages[i].valid = false;
+}
+bool xrt_target_read_cache_stats(const struct xrt_target *t, struct xrt_read_cache_stats *out)
+{
+    if (!t || !t->connection || t->connection->gdb || !out) return false;
+    const struct xrt_read_cache_stats *s = &t->connection->read_stats;
+    *out = (struct xrt_read_cache_stats){
+        __atomic_load_n(&s->requests, __ATOMIC_RELAXED),
+        __atomic_load_n(&s->hits, __ATOMIC_RELAXED),
+        __atomic_load_n(&s->rpc_reads, __ATOMIC_RELAXED),
+        __atomic_load_n(&s->rpc_bytes, __ATOMIC_RELAXED),
+        __atomic_load_n(&s->allocated_bytes, __ATOMIC_RELAXED)};
+    return true;
+}
 enum xrt_status xrt_target_file_budget(const struct xrt_target *t, struct xrt_file_budget *budget)
 {
     if (t && t->connection) {
@@ -120,6 +147,7 @@ static enum xrt_status read_budget_status(const struct xrt_file_budget *budget)
 }
 static enum xrt_status broken(struct xrt_connection *c, enum xrt_status status)
 {
+    discard_reads(c);
     c->failed = status;
     if (c->gdb) xrt_gdb_abandon(c->gdb);
     if (c->fd >= 0) {
@@ -200,6 +228,7 @@ static void startup_failure(struct xrt_connection *c)
 }
 static void release_connection(struct xrt_connection *c)
 {
+    for (unsigned i = 0; i < READ_PAGE_COUNT; ++i) free(c->pages[i].bytes);
     if (c->gdb) {
         xrt_gdb_free(c->gdb);
         xrt_cancel_release(c->cancel);
@@ -282,11 +311,22 @@ const struct xrt_target *xrt_remote_root(const struct xrt_target *t)
             return t->connection->targets[i];
     return t;
 }
+static bool mutates(uint16_t op)
+{
+    const enum xrt_rpc_class rpc_class = xrt_rpc_classify(op);
+    return rpc_class == XRT_RPC_CLASS_MUTATION ||
+        (rpc_class == XRT_RPC_CLASS_PERF && op != XRT_RPC_PERF_INFO &&
+         op != XRT_RPC_PERF_THREAD && op != XRT_RPC_PERF_RING);
+}
 static enum xrt_status invoke(const struct xrt_target *target, const struct xrt_call *call)
 {
     if (!remote_io_allowed()) return XRT_REMOTE_IO_FORBIDDEN;
     struct xrt_target *t = (struct xrt_target *)target;
     struct xrt_connection *c = t->connection;
+    /* Invalidate even refused/uncertain mutations, including family operations.
+     * Do this at invoke, not just the public wrapper: recursive calls share it.
+     * Collector starts and teardown plant and lift uprobes in target text. */
+    if (mutates(call->op)) discard_reads(c);
     if (xrt_cancel_requested(c->cancel)) return broken(c, XRT_REMOTE_CANCELLED);
     if (c->gdb) {
         if (c->failed != XRT_OK) return c->failed;
@@ -340,9 +380,9 @@ static enum xrt_status invoke(const struct xrt_target *target, const struct xrt_
         return XRT_BUFFER_TOO_SMALL;
     /* A policy deadline stops the next request, never a reply in flight. */
     size_t written = 0;
-    const bool mutation = rpc_class == XRT_RPC_CLASS_MUTATION ||
-        (rpc_class == XRT_RPC_CLASS_PERF && call->op != XRT_RPC_PERF_INFO &&
-         call->op != XRT_RPC_PERF_THREAD && call->op != XRT_RPC_PERF_RING);
+    const bool mutation = mutates(call->op);
+    if (call->op == XRT_RPC_READ)
+        __atomic_add_fetch(&c->read_stats.rpc_reads, 1, __ATOMIC_RELAXED);
     enum xrt_wire_result sent = xrt_wire_write_cancel(c->fd, &frame, c->request_bytes, 10000, c->cancel, &written);
     if (sent != XRT_WIRE_OK) {
         enum xrt_status status = sent == XRT_WIRE_CANCELLED ? XRT_REMOTE_CANCELLED : XRT_TRANSPORT_FAILED;
@@ -364,7 +404,7 @@ static enum xrt_status invoke(const struct xrt_target *target, const struct xrt_
     struct xrt_codec in = xrt_codec(c->reply, reply.size, true);
     uint64_t value = 0;
     uint32_t size = 0, root = 0;
-    bool present = false, shared = false;
+    bool present = false, shared = false, unstable = true;
     xrt_codec_u64(&in, &value);
     xrt_codec_u32(&in, &size);
     if (!in.ok || size > call->capacity || size > in.size - in.at || (size && !call->out))
@@ -377,6 +417,8 @@ static enum xrt_status invoke(const struct xrt_target *target, const struct xrt_
         xrt_codec_u32(&in, &root);
         memset(c->decoded, 0, sizeof(*c->decoded));
         xrt_wire_target(&in, c->decoded);
+        if (c->capabilities & XRT_RPC_CAP_ADDRESS_SPACE)
+            xrt_codec_bool(&in, &unstable);
     }
     if (!in.ok || in.at != in.size || (no_snapshot && present) ||
         (reply.status == XRT_OK &&
@@ -429,9 +471,12 @@ static enum xrt_status invoke(const struct xrt_target *target, const struct xrt_
         memcpy(t->watchpoints, v->watchpoints, sizeof(v->watchpoints));
         t->remote_root = root;
         t->remote_shared = shared;
+        t->remote_unstable = unstable;
     }
     if (size)
         memcpy(call->out, c->reply + extra_at, size);
+    if (call->op == XRT_RPC_READ)
+        __atomic_add_fetch(&c->read_stats.rpc_bytes, size, __ATOMIC_RELAXED);
     if (call->length)
         *call->length = size;
     if (call->value && (reply.status == XRT_OK || call->op == XRT_RPC_REGISTER_WRITE ||
@@ -463,6 +508,83 @@ static void discard_symbols(struct xrt_connection *c)
     if (p->fd >= 0) close(p->fd);
     free(p);
 }
+static bool quiet(const struct xrt_target *t)
+{
+    if (t->state == XRT_RUNNING || t->want_run || t->stepping ||
+        t->remote_unstable) return false;
+    for (size_t i = 0; i < t->thread_count; ++i)
+        if (t->threads[i].state == XRT_RUNNING) return false;
+    return true;
+}
+/* A running family member on this connection may write MAP_SHARED pages. */
+static bool cacheable_stop(const struct xrt_target *t)
+{
+    if (t->state != XRT_STOPPED || !t->thread_count || t->remote_shared || t->birth_count ||
+        !quiet(t)) return false;
+    for (unsigned i = 0; i < XRT_RPC_TARGETS; ++i)
+        if (t->connection->targets[i] && !quiet(t->connection->targets[i])) return false;
+    return true;
+}
+/* Called under the connection lock. Cache only whole, successful pages of
+ * agent-normalized memory (including original software-breakpoint bytes).
+ * Cross-page/large reads retain their exact existing partial-read semantics. */
+static enum xrt_status read_cached(const struct xrt_target *t, const struct xrt_call *call)
+{
+    struct xrt_connection *c = t->connection;
+    __atomic_add_fetch(&c->read_stats.requests, 1, __ATOMIC_RELAXED);
+    const uint64_t address = call->args[0], size = call->args[1];
+    const size_t offset = address % READ_PAGE_SIZE;
+    if (!cacheable_stop(t)) discard_reads(c);
+    if (c->gdb || c->failed != XRT_OK || xrt_cancel_requested(c->cancel) ||
+        !cacheable_stop(t) || !size || size > READ_PAGE_SIZE - offset ||
+        size > call->capacity || !call->out || !call->length)
+        return invoke(t, call);
+    if (c->read_target != t->remote_id || c->read_generation != t->generation ||
+        c->read_epoch != t->image_epoch) {
+        discard_reads(c);
+        c->read_target = t->remote_id;
+        c->read_generation = t->generation;
+        c->read_epoch = t->image_epoch;
+    }
+    const uint64_t base = address - offset;
+    struct read_page *victim = &c->pages[0];
+    for (unsigned i = 0; i < READ_PAGE_COUNT; ++i) {
+        struct read_page *p = &c->pages[i];
+        if (p->valid && p->address == base) {
+            p->used = ++c->read_clock;
+            memcpy(call->out, p->bytes + offset, (size_t)size);
+            *call->length = (size_t)size;
+            __atomic_add_fetch(&c->read_stats.hits, 1, __ATOMIC_RELAXED);
+            return XRT_OK;
+        }
+        if (victim->valid && (!p->valid || p->used < victim->used)) victim = p;
+    }
+    /* Keep hot interpreter/stack pages when a newly inspected value brings
+     * in cold pages; FIFO otherwise churns on a walk just larger than the cap. */
+    struct read_page *p = victim;
+    p->valid = false;
+    if (!p->bytes) {
+        p->bytes = malloc(READ_PAGE_SIZE);
+        if (!p->bytes) return invoke(t, call); // Optimization must not create OOM failures.
+        __atomic_add_fetch(&c->read_stats.allocated_bytes, READ_PAGE_SIZE, __ATOMIC_RELAXED);
+    }
+    size_t count = 0;
+    const uint64_t generation = t->generation, epoch = t->image_epoch;
+    enum xrt_status status = invoke(t, &(struct xrt_call){.op = XRT_RPC_READ,
+        .args = {base, READ_PAGE_SIZE}, .out = p->bytes, .capacity = READ_PAGE_SIZE, .length = &count});
+    if (status == XRT_OK && count == READ_PAGE_SIZE && cacheable_stop(t) &&
+        generation == t->generation && epoch == t->image_epoch) {
+        p->address = base;
+        p->used = ++c->read_clock;
+        p->valid = true;
+        memcpy(call->out, p->bytes + offset, (size_t)size);
+        *call->length = (size_t)size;
+        return XRT_OK;
+    }
+    /* A readable word may sit in a page whose other bytes are unreadable.
+     * Never cache errors/partial pages or return a speculative page's error. */
+    return invoke(t, call);
+}
 enum xrt_status xrt_remote_call(const struct xrt_target *target, const struct xrt_call *call)
 {
     if (!remote_io_allowed()) return XRT_REMOTE_IO_FORBIDDEN;
@@ -475,7 +597,7 @@ enum xrt_status xrt_remote_call(const struct xrt_target *target, const struct xr
          call->op == XRT_RPC_DETACH_FAMILY || call->op == XRT_RPC_CLOSE || call->op == XRT_RPC_RESET) &&
         c->symbols && (c->symbols->target == target->remote_id || call->op == XRT_RPC_DETACH_FAMILY))
         discard_symbols(c);
-    enum xrt_status status = invoke(target, call);
+    enum xrt_status status = call->op == XRT_RPC_READ ? read_cached(target, call) : invoke(target, call);
     pthread_mutex_unlock(&c->mutex);
     return status;
 }
@@ -664,7 +786,7 @@ enum xrt_status xrt_target_remote_cancel(const char *const argv[], struct xrt_ta
         size_t meta_size = 0;
         const uint64_t before = xrt_now();
         status = xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_HELLO,
-                                                       .args = {XRT_RPC_HELLO_CAPABILITIES},
+                                                       .args = {XRT_RPC_HELLO_CAPABILITIES, XRT_RPC_CAP_ADDRESS_SPACE},
                                                        .value = &machine,
                                                        .out = meta,
                                                        .capacity = sizeof(meta),

@@ -1,18 +1,19 @@
 //! Retained-stop adapter for the C Lua reader. No target code is executed.
 const std = @import("std");
 const c = @import("../c.zig").api;
-const model = @import("../model/session.zig");
-const Module = @import("../model/modules.zig").Module;
-const eval = @import("../model/evaluate.zig");
-const view = @import("../model/value_view.zig");
+const context_api = @import("context.zig");
+const Context = context_api.Context;
+const Module = context_api.Module;
+const eval = @import("../debug/evaluate.zig");
+const view = @import("../debug/value_view.zig");
 const A = std.mem.Allocator;
 fn read(ctx: ?*anyopaque, at: u64, out: ?*anyopaque, n: usize) callconv(.c) c_int {
-    const session: *model.Session = @ptrCast(@alignCast(ctx.?));
+    const session: *const Context = @ptrCast(@alignCast(ctx.?));
     const bytes: [*]u8 = @ptrCast(out.?);
-    return if ((session.target.readMemory(at, bytes[0..n]) catch return -1) == n) 0 else -1;
+    return if ((session.readMemory(at, bytes[0..n]) catch return -1) == n) 0 else -1;
 }
-fn reader(session: *model.Session) c.struct_xl_reader {
-    return .{ .context = session, .read = read, .reads = 0, .bytes = 0, .@"error" = null };
+fn reader(session: *const Context) c.struct_xl_reader {
+    return .{ .context = @constCast(session), .read = read, .reads = 0, .bytes = 0, .@"error" = null };
 }
 fn hex(a: A, value: u64) ![]const u8 {
     return std.fmt.allocPrint(a, "0x{x}", .{value});
@@ -38,7 +39,7 @@ fn layoutError(message: [*c]const u8) anyerror {
     }
     return error.LuaLayoutUnsupported;
 }
-fn fileBytes(module: *Module, address: u64, out: []u8) !void {
+fn fileBytes(module: Module, address: u64, out: []u8) !void {
     for (0..module.image.header.segment_count) |i| {
         const seg = try module.image.segment(@intCast(i));
         if (seg.type != .load or address < seg.vaddr) continue;
@@ -50,14 +51,14 @@ fn fileBytes(module: *Module, address: u64, out: []u8) !void {
     }
     return error.LuaVersionUnavailable;
 }
-fn singleRuntime(module: *Module) !void {
+fn singleRuntime(module: Module) !void {
     // A static middleware copy may have local/hidden symbols. Do not let the
     // ordinary global-first lookup assign its state the other copy's version.
     // Symtab/dynsym and a debug companion can repeat the same definition.
     const elf = @import("../binary/elf.zig");
     var definitions: [2]?u64 = .{ null, null };
     var remaining: u32 = 1_000_000;
-    const images = [_]*const elf.Image{ &module.image, module.symbols() };
+    const images = [_]*const elf.Image{ module.image, module.symbols() };
     for (images, 0..) |image, index| {
         if (index == 1 and images[0] == image) continue;
         for ([_]elf.SymbolTable.Kind{ .symtab, .dynsym }) |kind| {
@@ -76,46 +77,44 @@ fn singleRuntime(module: *Module) !void {
         }
     }
 }
-fn runtimeModule(session: *model.Session) !*Module {
+fn runtimeModule(session: *const Context) !Module {
     try session.languages.require(.lua);
     // These profiles cover standalone interpreters and static embedded hosts.
     // Kernel PHDR evidence identifies their image without loading unrelated
     // modules or treating a filename as runtime identity.
-    const runtime = @import("../target/runtime.zig");
-    var loader = std.mem.zeroes(runtime.c.struct_xrt_loader);
-    _ = runtime.c.xrt_target_loader(session.target.handle, &loader, null);
-    if (loader.main_phdr == 0) return error.LuaModuleIdentityUnavailable;
-    const module = session.modules.at(loader.main_phdr) catch return error.LuaModuleIdentityUnavailable;
-    if (module.lua_layout == null) try singleRuntime(module);
+    const main_phdr = session.mainPhdr();
+    if (main_phdr == 0) return error.LuaModuleIdentityUnavailable;
+    const module = session.moduleAt(main_phdr) catch return error.LuaModuleIdentityUnavailable;
+    if (module.layouts.lua == null) try singleRuntime(module);
     if (module.symbols().findSymbol("lua_ident") == null) return error.LuaRuntimeUnavailable;
     if (module.symbols().findSymbol("luaV_execute") == null) return error.LuaImplementationUnsupported;
     return module;
 }
-fn profile(session: *model.Session, module: *Module) !*const c.struct_xl_layout {
-    if (session.target.snapshot().state != .stopped) return error.NotStopped;
-    if (session.target.arch() != .x86_64) return error.LuaArchitectureUnsupported;
+fn profile(session: *const Context, module: Module) !*const c.struct_xl_layout {
+    if (!session.snapshot().stopped) return error.NotStopped;
+    if (session.arch() != .x86_64) return error.LuaArchitectureUnsupported;
     const id = module.image.buildId() orelse return error.LuaBuildIdUnavailable;
     if (id.len == 0 or id.len > 64) return error.LuaBuildIdUnavailable;
     const note = module.image.sectionByName(".note.gnu.build-id") orelse return error.LuaBuildIdUnavailable;
     if (note.flags & 2 == 0 or note.size > 256) return error.LuaBuildIdUnavailable;
     const expected = try module.image.sectionData(note);
     var actual: [256]u8 = undefined;
-    if (try session.target.readMemory(try module.runtimeAddress(note.addr), actual[0..expected.len]) != expected.len or !std.mem.eql(u8, expected, actual[0..expected.len])) return error.LuaBuildIdMismatch;
+    if (try session.readMemory(try module.runtimeAddress(note.addr), actual[0..expected.len]) != expected.len or !std.mem.eql(u8, expected, actual[0..expected.len])) return error.LuaBuildIdMismatch;
     const symbol = module.symbols().findSymbol("lua_ident") orelse return error.LuaVersionUnavailable;
     if (!symbol.hasAddress() or symbol.size == 0 or symbol.size > 256) return error.LuaVersionUnavailable;
     var file: [256]u8 = undefined;
     const length: usize = @intCast(symbol.size);
     try fileBytes(module, symbol.value, file[0..length]);
-    if (try session.target.readMemory(try module.runtimeAddress(symbol.value), actual[0..length]) != length or !std.mem.eql(u8, file[0..length], actual[0..length])) return error.LuaVersionMismatch;
+    if (try session.readMemory(try module.runtimeAddress(symbol.value), actual[0..length]) != length or !std.mem.eql(u8, file[0..length], actual[0..length])) return error.LuaVersionMismatch;
     const version: [3]u8 = if (std.mem.startsWith(u8, file[0..length], "$LuaVersion: Lua 5.4.9 ")) .{ 5, 4, 9 } else if (std.mem.startsWith(u8, file[0..length], "$LuaVersion: Lua 5.2.4 ")) .{ 5, 2, 4 } else return error.LuaVersionUnsupported;
-    if (module.lua_layout == null) {
+    if (module.layouts.lua == null) {
         var layout: c.struct_xl_layout = undefined;
         const debug = module.debugInfo() catch return error.LuaDwarfMalformed;
         if (c.xl_layout_build(debug.dwarf, id.ptr, id.len, &version, &layout)) |why| return layoutError(why);
-        module.lua_layout = layout;
+        module.layouts.lua = layout;
     }
-    if (c.xl_layout_check(&module.lua_layout.?, id.ptr, id.len, &version) != null) return error.LuaBuildIdMismatch;
-    return &module.lua_layout.?;
+    if (c.xl_layout_check(&module.layouts.lua.?, id.ptr, id.len, &version) != null) return error.LuaBuildIdMismatch;
+    return &module.layouts.lua.?;
 }
 fn stateType(t: *const eval.Type) bool {
     return std.mem.eql(u8, t.name, "lua_State");
@@ -129,7 +128,7 @@ fn matchesField(t: *const eval.Type, path: []const u8, offset: u32, size: u32) b
     };
     return false;
 }
-pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview {
+pub fn preview(session: *const Context, a: A, value: eval.Value) !?view.Preview {
     if (!session.languages.on(.lua)) return null;
     if (value.availability != .available or value.type.kind != .pointer or value.bits == 0) return null;
     const child = value.type.child orelse return null;
@@ -171,11 +170,11 @@ pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview 
         .element_type = child.name,
         .truncated = raw.truncated != 0,
         .diagnostic = try reason(a, raw.reason),
-        .basis = if (module.debug_file != null) "Lua version and loaded build-id checked; build-id companion DWARF; bounded stopped memory; no target calls or metamethods; GC liveness and allocation extents unproved" else "Lua version and loaded build-id checked; same-image DWARF; bounded stopped memory; no target calls or metamethods; GC liveness and allocation extents unproved",
+        .basis = if (module.has_debug_companion) "Lua version and loaded build-id checked; build-id companion DWARF; bounded stopped memory; no target calls or metamethods; GC liveness and allocation extents unproved" else "Lua version and loaded build-id checked; same-image DWARF; bounded stopped memory; no target calls or metamethods; GC liveness and allocation extents unproved",
         .lua = .{
             .type = try a.dupe(u8, std.mem.sliceTo(&raw.type, 0)),
             .advisory = raw.advisory != 0,
-            .layout_source = if (module.debug_file != null) "build-id companion DWARF" else "same-image DWARF",
+            .layout_source = if (module.has_debug_companion) "build-id companion DWARF" else "same-image DWARF",
             .display = try a.dupe(u8, std.mem.sliceTo(&raw.display, 0)),
             .object = raw.object,
             .array_capacity = raw.array_capacity,
@@ -232,7 +231,7 @@ pub const Stack = struct {
 };
 pub const ArgumentDiagnostic = struct { frame: usize, reason: []const u8 };
 const Candidate = struct { address: u64, anchor: ?Anchor };
-fn fromFrame(session: *model.Session, a: A, frame: model.Frame, requested: ?u64, candidates: *std.ArrayList(Candidate)) !void {
+fn fromFrame(session: *const Context, a: A, frame: context_api.Frame, requested: ?u64, candidates: *std.ArrayList(Candidate)) !void {
     const locals = try session.frameLocals(a, frame);
     var typed_parameter = false;
     var recovered_parameter = false;
@@ -256,10 +255,10 @@ fn fromFrame(session: *model.Session, a: A, frame: model.Frame, requested: ?u64,
     }
     if (typed_parameter and !recovered_parameter) return unavailable;
 }
-pub fn stack(session: *model.Session, a: A, tid: i32, first: usize, requested: ?u64) !Stack {
+pub fn stack(session: *const Context, a: A, tid: i32, first: usize, requested: ?u64) !Stack {
     try session.languages.require(.lua);
-    if (session.target.snapshot().state != .stopped) return error.NotStopped;
-    const generation = session.target.snapshot().generation;
+    if (!session.snapshot().stopped) return error.NotStopped;
+    const generation = session.snapshot().generation;
     const native = try session.stack(a, tid, 64);
     if (first >= native.len) return error.InvalidFrame;
     const module = try runtimeModule(session);
@@ -306,42 +305,42 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize, requested: ?
         for (raw.frames[0..raw.count], frames) |f, *out| {
             var name = try a.dupe(u8, std.mem.sliceTo(&f.name, 0));
             if (f.native_function != 0) {
-                if (session.modules.symbolAt(f.native_function)) |symbol| {
+                if (session.symbolAt(f.native_function)) |symbol| {
                     if (symbol.offset == 0) name = try a.dupe(u8, symbol.name);
                 } else |_| {}
             }
             out.* = .{ .name = name, .file = if (f.file[0] != 0) try a.dupe(u8, std.mem.sliceTo(&f.file, 0)) else null, .line = if (f.line > 0) @intCast(f.line) else null, .defined_line = if (f.defined_line >= 0) @intCast(f.defined_line) else null, .kind = if (f.is_c != 0) "C" else "Lua", .call_info = try hex(a, f.ci), .function_slot = try hex(a, f.function), .prototype = if (f.proto != 0) try hex(a, f.proto) else null, .native_function = if (f.native_function != 0) try hex(a, f.native_function) else null, .tail_call = f.tail_call != 0, .identity_proved = f.identity_proved != 0, .reason = try reason(a, f.reason) };
         }
-        try segments.append(a, .{ .runtime = .{ .version = try versionText(a, layout), .build_id = try buildId(a, layout), .layout_source = if (module.debug_file != null) "build-id companion DWARF" else "same-image DWARF" }, .runtime_instance = .{ .address = try hex(a, candidate.address) }, .anchor = if (anchors.items.len > 0) anchors.items[0] else null, .additional_anchors = if (anchors.items.len > 1) try a.dupe(Anchor, anchors.items[1..]) else &.{}, .reason = (try reason(a, raw.reason)) orelse if (anchors.items.len > 0) "LuaNativeSegmentBoundaryUnproved" else "LuaNativeAnchorUnavailable", .frames = frames, .chain_complete = raw.chain_complete != 0, .memory_reads = r.reads - before_reads, .memory_bytes = r.bytes - before_bytes });
+        try segments.append(a, .{ .runtime = .{ .version = try versionText(a, layout), .build_id = try buildId(a, layout), .layout_source = if (module.has_debug_companion) "build-id companion DWARF" else "same-image DWARF" }, .runtime_instance = .{ .address = try hex(a, candidate.address) }, .anchor = if (anchors.items.len > 0) anchors.items[0] else null, .additional_anchors = if (anchors.items.len > 1) try a.dupe(Anchor, anchors.items[1..]) else &.{}, .reason = (try reason(a, raw.reason)) orelse if (anchors.items.len > 0) "LuaNativeSegmentBoundaryUnproved" else "LuaNativeAnchorUnavailable", .frames = frames, .chain_complete = raw.chain_complete != 0, .memory_reads = r.reads - before_reads, .memory_bytes = r.bytes - before_bytes });
         if (r.@"error") |why| {
             if (std.mem.eql(u8, std.mem.span(why), "LuaReadBudget")) break;
             r.@"error" = null;
         }
     }
-    try session.target.expectGeneration(generation);
+    try session.expectGeneration(generation);
     return .{ .session_id = session.id, .generation = generation, .tid = tid, .segments = try segments.toOwnedSlice(a), .native_stack_incomplete = native.len == 64 or (native.len > 0 and native[native.len - 1].diagnostic != null), .native_argument_diagnostics = try diagnostics.toOwnedSlice(a) };
 }
 
 /// Runtime identity and proof from the existing stopped-memory reader.
-pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.zig").Description {
+pub fn describe(session: *const Context, a: A) !@import("types.zig").Description {
     try session.languages.require(.lua);
     const module = try runtimeModule(session);
     const layout = try profile(session, module);
-    return .{ .version = try versionText(a, layout), .build_id = try buildId(a, layout), .basis = if (module.debug_file != null) "build-id companion DWARF" else "same-image DWARF" };
+    return .{ .version = try versionText(a, layout), .build_id = try buildId(a, layout), .basis = if (module.has_debug_companion) "build-id companion DWARF" else "same-image DWARF" };
 }
 
 /// Select through the canonical reader stack; raw target addresses are never
 /// accepted as a substitute for the requested retained logical frame.
-pub fn readLocals(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, start: usize, limit: usize) !@import("../model/language_locals.zig").Result {
+pub fn readLocals(session: *const Context, a: A, tid: i32, segment_index: usize, frame: usize, start: usize, limit: usize) !@import("locals_types.zig").Result {
     try session.languages.require(.lua);
     return readBindings(session, a, tid, segment_index, frame, start, limit, null);
 }
-pub fn evaluateLocal(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, text: []const u8) !@import("../model/language_locals.zig").Result {
+pub fn evaluateLocal(session: *const Context, a: A, tid: i32, segment_index: usize, frame: usize, text: []const u8) !@import("locals_types.zig").Result {
     try session.languages.require(.lua);
     return readBindings(session, a, tid, segment_index, frame, 0, 1, text);
 }
-fn readBindings(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, start: usize, limit: usize, expression: ?[]const u8) !@import("../model/language_locals.zig").Result {
-    const named = @import("../model/language_locals.zig");
+fn readBindings(session: *const Context, a: A, tid: i32, segment_index: usize, frame: usize, start: usize, limit: usize, expression: ?[]const u8) !@import("locals_types.zig").Result {
+    const named = @import("locals_types.zig");
     const observed = try stack(session, a, tid, 0, null);
     if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;
     const segment = observed.segments[segment_index];
@@ -387,7 +386,7 @@ fn readBindings(session: *model.Session, a: A, tid: i32, segment_index: usize, f
             },
         };
     }
-    try session.target.expectGeneration(observed.generation);
+    try session.expectGeneration(observed.generation);
     return .{
         .generation = observed.generation,
         .tid = tid,
@@ -410,7 +409,7 @@ fn readBindings(session: *model.Session, a: A, tid: i32, segment_index: usize, f
 /// A location watch re-resolves storage at every stop. CallInfo/prototype
 /// matching does not prove an activation survived unseen between stops.
 pub const WatchCapture = @import("watch.zig").Capture;
-fn watchValue(session: *model.Session, a: A, capture: *WatchCapture, frame: usize, page: ?usize) !void {
+fn watchValue(session: *const Context, a: A, capture: *WatchCapture, frame: usize, page: ?usize) !void {
     const module = try runtimeModule(session);
     if (module.id != capture.scope.runtime[0]) return error.LuaWatchRuntimeChanged;
     const layout = try profile(session, module);
@@ -461,29 +460,24 @@ pub fn watchExpression(a: A, expression: ?[]const u8, row: ?usize) ![:0]const u8
     if (expression != null and c.xl_expression_valid(checked_expression) == 0) return error.LuaExpressionUnsupported;
     return checked_expression;
 }
-pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: ?[]const u8, row: ?usize) !WatchCapture {
+pub fn createWatch(session: *const Context, a: A, observed: Stack, tid: i32, segment_index: usize, frame: usize, checked_expression: [:0]const u8, row: ?usize) !WatchCapture {
     try session.languages.require(.lua);
-    const checked_expression = try watchExpression(a, expression, row);
-    const observed = try @import("../model/language_selection.zig").cachedRead(.lua, session, tid);
     if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;
     const segment = observed.segments[segment_index];
     if (frame >= segment.frames.len) return error.InvalidLanguageFrame;
     const selected = segment.frames[frame];
     if (!selected.identity_proved or !std.mem.eql(u8, selected.kind, "Lua") or selected.prototype == null) return error.LuaWatchFrameUnproved;
-    const stable_thread = for (session.target.threadSlice()) |thread| {
-        if (thread.tid == tid) break thread.id;
-    } else return error.InvalidThread;
-    var capture = WatchCapture{ .scope = .{ .language = c.XLW_LUA, .session = session.id, .image = session.target.snapshot().image_epoch, .thread = stable_thread, .runtime = .{ (try runtimeModule(session)).id, try std.fmt.parseInt(u64, segment.runtime_instance.address, 0), 0, 0 }, .frame = .{ try std.fmt.parseInt(u64, selected.call_info, 0), try std.fmt.parseInt(u64, selected.prototype.?, 0), 0, 0 } }, .expression = checked_expression };
+    const stable_thread = try session.threadIdentity(tid);
+    var capture = WatchCapture{ .scope = .{ .language = c.XLW_LUA, .session = session.id, .image = session.snapshot().image_epoch, .thread = stable_thread, .runtime = .{ (try runtimeModule(session)).id, try std.fmt.parseInt(u64, segment.runtime_instance.address, 0), 0, 0 }, .frame = .{ try std.fmt.parseInt(u64, selected.call_info, 0), try std.fmt.parseInt(u64, selected.prototype.?, 0), 0, 0 } }, .expression = checked_expression };
     try watchValue(session, a, &capture, frame, row);
     // A row whose binding cannot be established must not become a name watch.
     if (row != null and capture.scope.frame[2] == 0) return error.LuaWatchBindingUnavailable;
-    try session.target.expectGeneration(observed.generation);
+    try session.expectGeneration(observed.generation);
     return capture;
 }
-pub fn observeWatch(session: *model.Session, a: A, tid: i32, scope: c.struct_xlw_scope, expression: []const u8) !WatchCapture {
+pub fn observeWatch(session: *const Context, a: A, observed: Stack, scope: c.struct_xlw_scope, expression: [:0]const u8) !WatchCapture {
     try session.languages.require(.lua);
-    var capture = WatchCapture{ .scope = scope, .expression = try a.dupeZ(u8, expression) };
-    const observed = try @import("../model/language_selection.zig").cachedRead(.lua, session, tid);
+    var capture = WatchCapture{ .scope = scope, .expression = expression };
     const module_id = (try runtimeModule(session)).id;
     if (module_id != scope.runtime[0]) {
         capture.scope.runtime[0] = module_id;
@@ -500,7 +494,7 @@ pub fn observeWatch(session: *model.Session, a: A, tid: i32, scope: c.struct_xlw
             }
             if (frame.prototype == null or try std.fmt.parseInt(u64, frame.prototype.?, 0) != scope.frame[1]) break;
             try watchValue(session, a, &capture, index, null);
-            try session.target.expectGeneration(observed.generation);
+            try session.expectGeneration(observed.generation);
             return capture;
         }
         // Only a complete canonical CallInfo walk establishes absence. Native
@@ -509,7 +503,7 @@ pub fn observeWatch(session: *model.Session, a: A, tid: i32, scope: c.struct_xlw
             capture.observation = c.XLW_FRAME_GONE;
             capture.diagnostic = try a.dupeZ(u8, "LuaWatchFrameGone");
         } else capture.diagnostic = try a.dupeZ(u8, segment.reason orelse "LuaWatchFrameUnproved");
-        try session.target.expectGeneration(observed.generation);
+        try session.expectGeneration(observed.generation);
         return capture;
     }
     capture.diagnostic = try a.dupeZ(u8, "LuaWatchCoroutineNotObserved");

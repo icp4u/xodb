@@ -9,8 +9,8 @@
 //! chain is bounded and checked before it is used.
 const std = @import("std");
 const c = @import("../c.zig").api;
-const model = @import("../model/session.zig");
-const Module = @import("../model/modules.zig").Module;
+const Context = @import("context.zig").Context;
+const Module = @import("context.zig").Module;
 const tls = @import("../binary/tls.zig");
 const A = std.mem.Allocator;
 
@@ -31,7 +31,7 @@ const max_reads = max_chain + 1 + max_frames * 16 + 16;
 const dwarf_work = 1 << 25;
 
 pub const values = @import("gdscript_values.zig");
-pub const Field = enum(u8) { level_stack, level_function, level_instance, level_ip, level_line, level_prev, function_name, function_source, function_script, script_path, instance_owner_id, language_track, language_max, name_string, string_name_data, string_data, engine_process_frames, engine_physics_frames, engine_in_physics };
+pub const Field = @import("layouts.zig").GDScriptField;
 const stack_type_names = [_][*:0]const u8{ "GDScriptLanguage::CallLevel", "GDScriptFunction", "GDScript", "GDScriptInstance", "GDScriptLanguage", "StringName::_Data", "StringName", "String", "Engine" };
 fn want(owner: u8, name: [*:0]const u8, kind: c_uint, width: u8, optional: bool) c.struct_xdt_field {
     return .{ .owner = owner, .name = name, .kind = @intCast(kind), .width = width, .optional = @intFromBool(optional) };
@@ -66,31 +66,7 @@ comptime {
 const type_names = stack_type_names ++ values.type_names;
 const wanted = stack_wanted ++ values.wanted(stack_type_names.len);
 
-/// Offsets proved from one image's DWARF and program headers.
-pub const Layout = struct {
-    build_id: [64]u8 = undefined,
-    build_id_len: u8 = 0,
-    level_size: u32,
-    offsets: [stack_wanted.len]?u32,
-    /// Members, sizes and `Variant::Type` values for the value reader; null
-    /// where this build's DWARF does not have them.
-    value_offsets: [values.field_count]?u32 = @splat(null),
-    value_sizes: [values.type_names.len]u32 = @splat(0),
-    kinds: [values.kind_count]?u32 = @splat(null),
-    /// Runtime address a GDScriptInstance's vtable pointer holds.
-    instance_vtable: ?u64 = null,
-    /// The executable's static TLS block and the two objects in it.
-    block: tls.Block,
-    call_stack: u64,
-    call_stack_size: u64,
-    /// Runtime address of `GDScriptLanguage::singleton`.
-    singleton: u64,
-    engine_singleton: ?u64 = null,
-    units: u64,
-    pub fn at(self: *const Layout, field: Field) u32 {
-        return self.offsets[@intFromEnum(field)].?;
-    }
-};
+pub const Layout = @import("layouts.zig").GDScript;
 
 /// Counted target reads. Tests supply their own memory.
 pub const Memory = struct {
@@ -287,8 +263,8 @@ fn decode(memory: *Memory, a: A, layout: *const Layout, level: *Level, thread_st
 }
 
 pub fn sessionRead(context: *anyopaque, address: u64, out: []u8) bool {
-    const session: *model.Session = @ptrCast(@alignCast(context));
-    return (session.target.readMemory(address, out) catch return false) == out.len;
+    const session: *const Context = @ptrCast(@alignCast(context));
+    return (session.readMemory(address, out) catch return false) == out.len;
 }
 fn hex(a: A, value: u64) ![]const u8 {
     return std.fmt.allocPrint(a, "0x{x}", .{value});
@@ -316,15 +292,13 @@ fn moduleError(err: anyerror) error{ GDScriptImageBudgetExceeded, SymbolDiscover
 /// its program headers: only the executable's thread-locals have a fixed
 /// place, and an engine's symbol tables are too large for a name scan. The
 /// image is read in full under the image budgets.
-pub fn runtimeModule(session: *model.Session) !*Module {
+pub fn runtimeModule(session: *const Context) !Module {
     try session.languages.require(.gdscript);
     try session.refreshMaps();
-    const runtime = @import("../target/runtime.zig");
-    var loader = std.mem.zeroes(runtime.c.struct_xrt_loader);
-    _ = runtime.c.xrt_target_loader(session.target.handle, &loader, null);
-    if (loader.main_phdr == 0) return error.GDScriptModuleIdentityUnavailable;
-    const module = session.modules.runtimeAt(loader.main_phdr) catch |err| return moduleError(err);
-    if (module.gdscript_layout != null) return module;
+    const main_phdr = session.mainPhdr();
+    if (main_phdr == 0) return error.GDScriptModuleIdentityUnavailable;
+    const module = session.runtimeModuleAt(main_phdr) catch |err| return moduleError(err);
+    if (module.layouts.gdscript != null) return module;
     const singleton = module.symbols().findSymbol(singleton_symbol) orelse return error.GDScriptRuntimeUnavailable;
     if (!singleton.hasAddress()) return error.GDScriptRuntimeUnavailable;
     return module;
@@ -337,7 +311,7 @@ fn layoutError(why: []const u8) anyerror {
     // this reader knows how to read.
     return error.GDScriptLayoutUnsupported;
 }
-fn tlsObject(module: *Module, block: tls.Block, name: []const u8, size: u64) !u64 {
+fn tlsObject(module: Module, block: tls.Block, name: []const u8, size: u64) !u64 {
     const symbol = module.symbols().findSymbol(name) orelse return error.GDScriptCallStackSymbolUnavailable;
     if (symbol.type != .tls) return error.GDScriptCallStackSymbolUnavailable;
     if (symbol.size != size) return error.GDScriptLayoutUnsupported;
@@ -345,9 +319,9 @@ fn tlsObject(module: *Module, block: tls.Block, name: []const u8, size: u64) !u6
     _ = tls.executableAddress(block, block.below, symbol.value, size) catch return error.GDScriptLayoutUnsupported;
     return symbol.value;
 }
-pub fn profile(session: *model.Session, module: *Module) !*const Layout {
-    if (session.target.snapshot().state != .stopped) return error.NotStopped;
-    if (session.target.arch() != .x86_64) return error.GDScriptArchitectureUnsupported;
+pub fn profile(session: *const Context, module: Module) !*const Layout {
+    if (!session.snapshot().stopped) return error.NotStopped;
+    if (session.arch() != .x86_64) return error.GDScriptArchitectureUnsupported;
     // The DWARF read from the file must describe the image that is running.
     const id = module.image.buildId() orelse return error.GDScriptBuildIdUnavailable;
     if (id.len == 0 or id.len > 64) return error.GDScriptBuildIdUnavailable;
@@ -355,15 +329,15 @@ pub fn profile(session: *model.Session, module: *Module) !*const Layout {
     if (note.flags & 2 == 0 or note.size > 256) return error.GDScriptBuildIdUnavailable;
     const expected = try module.image.sectionData(note);
     var actual: [256]u8 = undefined;
-    if (try session.target.readMemory(try module.runtimeAddress(note.addr), actual[0..expected.len]) != expected.len or !std.mem.eql(u8, expected, actual[0..expected.len])) return error.GDScriptBuildIdMismatch;
-    if (module.gdscript_layout) |*layout| {
+    if (try session.readMemory(try module.runtimeAddress(note.addr), actual[0..expected.len]) != expected.len or !std.mem.eql(u8, expected, actual[0..expected.len])) return error.GDScriptBuildIdMismatch;
+    if (module.layouts.gdscript) |*layout| {
         if (!std.mem.eql(u8, layout.build_id[0..layout.build_id_len], id)) return error.GDScriptBuildIdMismatch;
         return layout;
     }
-    if (module.gdscript_refusal) |why| return why;
+    if (module.layouts.gdscript_refusal) |why| return why;
     const singleton = module.symbols().findSymbol(singleton_symbol) orelse return error.GDScriptRuntimeUnavailable;
     if (!singleton.hasAddress() or singleton.size != 8) return error.GDScriptRuntimeUnavailable;
-    const block = tls.imageBlock(&module.image) catch return error.GDScriptCallStackSymbolUnavailable;
+    const block = tls.imageBlock(module.image) catch return error.GDScriptCallStackSymbolUnavailable;
     const call_stack = try tlsObject(module, block, call_stack_symbol, 8);
     const call_stack_size = try tlsObject(module, block, call_stack_size_symbol, 4);
     const debug = module.debugInfo() catch |err| return if (err == error.DebugMetadataPending) err else error.GDScriptDwarfUnavailable;
@@ -375,12 +349,12 @@ pub fn profile(session: *model.Session, module: *Module) !*const Layout {
     // A refusal is the answer for this image: the search is not repeated at
     // every stop and for every request.
     if (c.xdt_layout_build(debug.dwarf, &schema, dwarf_work, &slots, &sizes, &stats)) |why| {
-        module.gdscript_refusal = layoutError(std.mem.span(why));
-        return module.gdscript_refusal.?;
+        module.layouts.gdscript_refusal = layoutError(std.mem.span(why));
+        return module.layouts.gdscript_refusal.?;
     }
     // String and StringName are one pointer each; a level holds six.
     if (sizes[6] != 8 or sizes[7] != 8 or sizes[0] < 48 or sizes[0] > 256) {
-        module.gdscript_refusal = error.GDScriptLayoutUnsupported;
+        module.layouts.gdscript_refusal = error.GDScriptLayoutUnsupported;
         return error.GDScriptLayoutUnsupported;
     }
     var layout = Layout{ .level_size = sizes[0], .offsets = undefined, .block = block, .call_stack = call_stack, .call_stack_size = call_stack_size, .singleton = try module.runtimeAddress(singleton.value), .units = stats.units };
@@ -397,13 +371,13 @@ pub fn profile(session: *model.Session, module: *Module) !*const Layout {
     }
     @memcpy(layout.build_id[0..id.len], id);
     layout.build_id_len = @intCast(id.len);
-    module.gdscript_layout = layout;
-    return &module.gdscript_layout.?;
+    module.layouts.gdscript = layout;
+    return &module.layouts.gdscript.?;
 }
 pub const FrameCounters = struct { process: u64, physics: u64, in_physics: bool };
-pub fn frameCounters(session: *model.Session) !FrameCounters {
+pub fn frameCounters(session: *const Context) !FrameCounters {
     const layout = try profile(session, try runtimeModule(session));
-    var memory = Memory{ .context = session, .readFn = sessionRead };
+    var memory = Memory{ .context = @constCast(session), .readFn = sessionRead };
     const pointer = layout.engine_singleton orelse return error.RedotFrameCounterUnavailable;
     const engine = memory.word(pointer) orelse return error.RedotFrameCounterUnreadable;
     if (engine == 0) return error.RedotFrameCounterUnavailable;
@@ -540,23 +514,22 @@ fn join(levels: []const Level, level_size: u64, depth: usize, ranges: []const Ra
     return out;
 }
 
-pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
+pub fn stack(session: *const Context, a: A, tid: i32, first: usize) !Stack {
     return stackWithNative(session, a, tid, first, null);
 }
 /// Reuse an unwind from the same stopped generation for a joined sample.
-pub fn stackWithNative(session: *model.Session, a: A, tid: i32, first: usize, native_input: ?[]const model.Frame) !Stack {
+pub fn stackWithNative(session: *const Context, a: A, tid: i32, first: usize, native_input: ?[]const @import("context.zig").Frame) !Stack {
     try session.languages.require(.gdscript);
     if (first != 0) return error.InvalidFrame;
-    if (session.target.snapshot().state != .stopped) return error.NotStopped;
-    const generation = session.target.snapshot().generation;
+    if (!session.snapshot().stopped) return error.NotStopped;
+    const generation = session.snapshot().generation;
     const module = try runtimeModule(session);
     const layout = try profile(session, module);
-    var memory = Memory{ .context = session, .readFn = sessionRead };
+    var memory = Memory{ .context = @constCast(session), .readFn = sessionRead };
     const lang = try language(&memory, layout);
     const native = native_input orelse try session.stack(a, tid, 64);
     if (native.len == 0) return error.InvalidFrame;
-    const registers = try session.target.registers(tid);
-    const pointer = registers.named("fs_base") orelse return error.GDScriptThreadPointerUnavailable;
+    const pointer = (try session.registerValue(tid, "fs_base")) orelse return error.GDScriptThreadPointerUnavailable;
     const head_at = tls.executableAddress(layout.block, pointer, layout.call_stack, 8) catch return error.GDScriptThreadPointerUnavailable;
     const size_at = tls.executableAddress(layout.block, pointer, layout.call_stack_size, 4) catch return error.GDScriptThreadPointerUnavailable;
     const head = memory.word(head_at) orelse return error.GDScriptCallStackUnreadable;
@@ -564,15 +537,14 @@ pub fn stackWithNative(session: *model.Session, a: A, tid: i32, first: usize, na
     if (!memory.read(size_at, &size_bytes)) return error.GDScriptCallStackUnreadable;
     const size = std.mem.readInt(u32, &size_bytes, .little);
     // Live frames are at or above the stack pointer, inside its mapping.
-    const sp = native[0].registers[session.target.arch().sp()] orelse return error.GDScriptThreadStackUnavailable;
-    const bounds: Bounds = for (session.modules.regions.items) |region| {
-        if (sp >= region.start and sp < region.end) break .{ .low = sp, .high = region.end };
-    } else return error.GDScriptThreadStackUnavailable;
+    const sp = native[0].registers[session.arch().sp()] orelse return error.GDScriptThreadStackUnavailable;
+    const region = session.mappedRange(sp) orelse return error.GDScriptThreadStackUnavailable;
+    const bounds = Bounds{ .low = sp, .high = region.end };
     const found = try chain(&memory, a, layout, head, size, lang.limit, bounds);
 
     const ranges = try a.alloc(Range, native.len);
     for (native, ranges) |frame, *range| {
-        const low = frame.registers[session.target.arch().sp()];
+        const low = frame.registers[session.arch().sp()];
         range.* = if (low != null and frame.cfa != null and frame.cfa.? > low.?) .{ .low = low.?, .high = frame.cfa.?, .call = isCall(frame.symbol) } else .{ .low = 0, .high = 0, .call = isCall(frame.symbol) };
     }
     const native_incomplete = native.len == 64 or native[native.len - 1].diagnostic != null;
@@ -630,31 +602,29 @@ pub fn stackWithNative(session: *model.Session, a: A, tid: i32, first: usize, na
         .native_call_frames = joined.calls,
         .native_call_frame_without_level = if (joined.without_level) |index| native[index].index else null,
     };
-    try session.target.expectGeneration(generation);
+    try session.expectGeneration(generation);
     return .{ .session_id = session.id, .generation = generation, .tid = tid, .in_script = found.depth != 0, .segments = segments, .native_stack_incomplete = native_incomplete, .memory_reads = memory.reads, .memory_bytes = memory.bytes };
 }
 /// Runtime identity and proof for the language tab.
-pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.zig").Description {
+pub fn describe(session: *const Context, a: A) !@import("types.zig").Description {
     try session.languages.require(.gdscript);
     const layout = try profile(session, try runtimeModule(session));
-    var memory = Memory{ .context = session, .readFn = sessionRead };
+    var memory = Memory{ .context = @constCast(session), .readFn = sessionRead };
     _ = try language(&memory, layout);
     return .{ .version = version_text, .build_id = try buildId(a, layout), .basis = layout_text };
 }
 
-const named = @import("../model/language_locals.zig");
-pub fn readLocals(session: *model.Session, a: A, tid: i32, segment: usize, frame: usize, start: usize, limit: usize) !named.Result {
-    return readBindings(session, a, tid, segment, frame, start, limit, null);
+const named = @import("locals_types.zig");
+pub fn readLocals(session: *const Context, a: A, observed: Stack, tid: i32, segment: usize, frame: usize, start: usize, limit: usize) !named.Result {
+    return readBindings(session, a, observed, tid, segment, frame, start, limit, null, null);
 }
 /// A local, parameter or member name, or `self`, then `.member`, `[index]`
 /// and `["key"]` steps: storage only, nothing is evaluated.
-pub fn evaluateLocal(session: *model.Session, a: A, tid: i32, segment: usize, frame: usize, text: []const u8) !named.Result {
-    return readBindings(session, a, tid, segment, frame, 0, 1, text);
+pub fn evaluateLocal(session: *const Context, a: A, observed: Stack, tid: i32, segment: usize, frame: usize, text: []const u8, path: values.Path) !named.Result {
+    return readBindings(session, a, observed, tid, segment, frame, 0, 1, text, path);
 }
-fn readBindings(session: *model.Session, a: A, tid: i32, segment: usize, frame: usize, start: usize, limit: usize, expression: ?[]const u8) !named.Result {
+fn readBindings(session: *const Context, a: A, observed: Stack, tid: i32, segment: usize, frame: usize, start: usize, limit: usize, expression: ?[]const u8, path: ?values.Path) !named.Result {
     try session.languages.require(.gdscript);
-    const path = if (expression) |text| try values.parse(text) else null;
-    const observed = try @import("../model/language_selection.zig").cachedRead(.gdscript, session, tid);
     if (segment != 0 or observed.segments.len != 1) return error.InvalidLanguageSegment;
     if (frame >= observed.segments[0].frames.len) return error.InvalidLanguageFrame;
     const selected = observed.segments[0].frames[frame];
@@ -662,7 +632,7 @@ fn readBindings(session: *model.Session, a: A, tid: i32, segment: usize, frame: 
     if (frame == 0 and observed.segments[0].top_in_transition) return error.GDScriptCallLevelInTransition;
     const layout = try profile(session, try runtimeModule(session));
     if (values.usable(layout) != null) return error.GDScriptValueLayoutUnavailable;
-    var memory = Memory{ .context = session, .readFn = sessionRead, .limit = if (path == null) values.page_reads else values.path_reads };
+    var memory = Memory{ .context = @constCast(session), .readFn = sessionRead, .limit = if (path == null) values.page_reads else values.path_reads };
     var r = values.Reader{ .memory = &memory, .a = a, .layout = layout };
     const found = try values.frame(&r, .{ .call_level = try std.fmt.parseInt(u64, selected.call_level, 0), .function = try std.fmt.parseInt(u64, selected.function, 0), .line = selected.line });
     var rows: std.ArrayList(named.Row) = .empty;
@@ -678,7 +648,7 @@ fn readBindings(session: *model.Session, a: A, tid: i32, segment: usize, frame: 
         } else diagnostic = r.why;
     } else for (found.bindings[first..@min(total, first + limit)], first..) |*binding, ordinal|
         try rows.append(a, try row(&r, try values.bindingName(&r, binding), binding.scope, ordinal, binding.slot, values.row_children));
-    try session.target.expectGeneration(observed.generation);
+    try session.expectGeneration(observed.generation);
     return .{
         .generation = observed.generation,
         .tid = tid,

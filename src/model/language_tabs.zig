@@ -6,7 +6,7 @@ const Modules = @import("modules.zig").Modules;
 const rt = @import("../target/runtime.zig").c;
 const Text = @import("probes.zig").Text;
 const selection = @import("language_selection.zig");
-pub const Tab = enum { registers, native, python, perl, lua, javascript, ruby, go, elisp, gdscript };
+pub const Tab = @import("../language/types.zig").Tab;
 pub const order = [_]Tab{ .registers, .native, .python, .perl, .lua, .javascript, .ruby, .go, .elisp, .gdscript };
 pub fn title(tab: Tab) []const u8 {
     return switch (tab) {
@@ -22,10 +22,10 @@ pub fn title(tab: Tab) []const u8 {
         .gdscript => "GDScript",
     };
 }
-pub const Description = struct { version: []const u8, build_id: []const u8, basis: []const u8, identity: ?@import("../language/runtime_binding.zig").Identity = null, thread: ?i32 = null };
+pub const Description = @import("../language/types.zig").Description;
 const Entry = struct {
     thread: ?i32 = null,
-    identity: ?@import("../language/runtime_binding.zig").Identity = null,
+    identity: ?@import("../language/types.zig").Identity = null,
     present: bool = false,
     checked: bool = false,
     version: Text = .{},
@@ -143,7 +143,7 @@ pub const State = struct {
             }
             self.revision +%= 1;
         }
-        const binding_threads = @import("../language/runtime_binding.zig").threadStamp(session);
+        const binding_threads = @import("runtime_binding.zig").threadStamp(session);
         if (self.binding_maps != session.modules.maps_revision or self.binding_metadata != session.metadata.revision or self.binding_threads != binding_threads) {
             self.binding_maps = session.modules.maps_revision;
             self.binding_metadata = session.metadata.revision;
@@ -223,14 +223,14 @@ pub const State = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const description = switch (self.next) {
-            0 => @import("../language/python.zig").describe(session, a),
-            1 => @import("../language/perl.zig").describe(session, a),
-            2 => @import("../language/lua.zig").describe(session, a),
-            3 => @import("../language/javascript.zig").describe(session, a),
-            4 => @import("../language/ruby.zig").describe(session, a),
-            5 => @import("../language/go.zig").describe(session, a),
-            6 => @import("../language/elisp.zig").describe(session, a),
-            7 => @import("../language/gdscript.zig").describe(session, a),
+            0 => @import("../language/python.zig").describe(&session.languageContext(), a),
+            1 => @import("../language/perl.zig").describe(&session.languageContext(), a),
+            2 => @import("../language/lua.zig").describe(&session.languageContext(), a),
+            3 => @import("../language/javascript.zig").describe(&session.languageContext(), a),
+            4 => @import("../language/ruby.zig").describe(&session.languageContext(), a),
+            5 => @import("../language/go.zig").describe(&session.languageContext(), a),
+            6 => @import("../language/elisp.zig").describe(&session.languageContext(), a),
+            7 => @import("../language/gdscript.zig").describe(&session.languageContext(), a),
             else => unreachable,
         };
         const scoped: anyerror!Description = description catch |err| blk: {
@@ -298,7 +298,7 @@ pub const State = struct {
         self.revision +%= 1;
     }
     pub fn jsonStringify(self: State, writer: anytype) !void {
-        const Item = struct { thread: ?i32 = null, identity: ?@import("../language/runtime_binding.zig").Identity = null, tab: Tab, title: []const u8, visible: bool, status: []const u8, reason: ?[]const u8, version: ?[]const u8, build_id: ?[]const u8, basis: ?[]const u8, proof_generation: ?u64 };
+        const Item = struct { thread: ?i32 = null, identity: ?@import("../language/types.zig").Identity = null, tab: Tab, title: []const u8, visible: bool, status: []const u8, reason: ?[]const u8, version: ?[]const u8, build_id: ?[]const u8, basis: ?[]const u8, proof_generation: ?u64 };
         var items: [order.len]Item = undefined;
         for (order, 0..) |tab, i| {
             items[i] = .{ .tab = tab, .title = title(tab), .visible = self.visible(tab), .status = "ready", .reason = null, .version = null, .build_id = null, .basis = null, .proof_generation = null };
@@ -320,7 +320,7 @@ pub const State = struct {
 fn threadDescription(session: *Session, tid: i32, index: usize) !Description {
     inline for (.{ Tab.python, Tab.perl }, 0..) |language, i| if (index == i) {
         const stack = try selection.cachedRead(language, session, tid);
-        if (stack.segments.len == 0) return @import("../language/runtime_binding.zig").noFrame(if (language == .python) .python else .perl);
+        if (stack.segments.len == 0) return @import("../language/binding_types.zig").noFrame(if (language == .python) .python else .perl);
         const runtime = stack.segments[0].runtime;
         return .{ .version = runtime.version, .build_id = runtime.build_id, .basis = "selected-thread interpreter frames; several runtime images loaded", .identity = stack.identity, .thread = tid };
     };

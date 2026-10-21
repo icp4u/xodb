@@ -75,7 +75,9 @@ try:
         reader = SimpleNamespace(p=SimpleNamespace(pid=client.collector_pid()), inspect=client.inspect, session=client.session)
         result['readonly'] = audit(reader, tid, w/'selection.strace', observe)
         calls = result['readonly']['syscalls']
-        assert calls.get('process_vm_readv') == 2 and not calls.get('pread64') and not calls.get('ptrace:PTRACE_PEEKDATA'), calls
+        assert result['readonly']['read_requests'] == 2, result['readonly']
+        # The cache can only remove target reads, never add file or word reads.
+        assert calls.get('process_vm_readv', 0) <= 2 and not calls.get('pread64') and not calls.get('ptrace:PTRACE_PEEKDATA'), calls
     assert client.inspect('get_registers', tid=tid)==registers and client.session()['generation']==generation
     client.action('step_instruction', tid=tid)
     client.stopped()

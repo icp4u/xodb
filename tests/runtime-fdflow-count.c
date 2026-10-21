@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 #include "check.h"
+#include "xrt_arch_syscalls.h"
 #include "xrt_fdflow_count.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,15 +8,15 @@
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
-/* The x86-64 LP64 header asserts lock the same numbers. These keep this file
+/* The x86-64 row in xrt_arch_syscalls.h is the source. These keep this file
  * from drifting back to bare literals that abort on another architecture. */
 #if defined(__x86_64__) && !defined(__ILP32__)
-_Static_assert(SYS_read == 0 && SYS_write == 1 && SYS_writev == 20, "x86 read/write");
-_Static_assert(SYS_close == 3 && SYS_getpid == 39, "x86 close/getpid");
-_Static_assert(SYS_preadv == 295 && SYS_pwritev == 296, "x86 preadv/pwritev");
-_Static_assert(SYS_io_uring_setup == 425 && SYS_io_uring_enter == 426, "x86 io_uring");
-_Static_assert(SYS_fstat == 5 && SYS_lseek == 8 && SYS_munmap == 11, "x86 harmless");
-_Static_assert(SYS_uname == 63 && SYS_getuid == 102, "x86 harmless");
+_Static_assert(SYS_read == XRT_X86_64_NR_read && SYS_write == XRT_X86_64_NR_write && SYS_writev == XRT_X86_64_NR_writev, "x86 read/write");
+_Static_assert(SYS_close == XRT_X86_64_NR_close && SYS_getpid == XRT_X86_64_NR_getpid, "x86 close/getpid");
+_Static_assert(SYS_preadv == XRT_X86_64_NR_preadv && SYS_pwritev == XRT_X86_64_NR_pwritev, "x86 preadv/pwritev");
+_Static_assert(SYS_io_uring_setup == XRT_X86_64_NR_io_uring_setup && SYS_io_uring_enter == XRT_X86_64_NR_io_uring_enter, "x86 io_uring");
+_Static_assert(SYS_fstat == XRT_X86_64_NR_fstat && SYS_lseek == XRT_X86_64_NR_lseek && SYS_munmap == XRT_X86_64_NR_munmap, "x86 harmless");
+_Static_assert(SYS_uname == XRT_X86_64_NR_uname && SYS_getuid == XRT_X86_64_NR_getuid, "x86 harmless");
 #endif
 
 static int wrong_oracle;

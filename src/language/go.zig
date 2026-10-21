@@ -2,16 +2,16 @@
 //! runtime.allgs; layout from the image's own DWARF. No target calls.
 const std = @import("std");
 const c = @import("../c.zig").api;
-const model = @import("../model/session.zig");
-const Module = @import("../model/modules.zig").Module;
+const Context = @import("context.zig").Context;
+const Module = @import("context.zig").Module;
 const A = std.mem.Allocator;
 fn read(ctx: ?*anyopaque, at: u64, out: ?*anyopaque, n: usize) callconv(.c) c_int {
-    const session: *model.Session = @ptrCast(@alignCast(ctx.?));
+    const session: *const Context = @ptrCast(@alignCast(ctx.?));
     const bytes: [*]u8 = @ptrCast(out.?);
-    return if ((session.target.readMemory(at, bytes[0..n]) catch return -1) == n) 0 else -1;
+    return if ((session.readMemory(at, bytes[0..n]) catch return -1) == n) 0 else -1;
 }
-pub fn reader(session: *model.Session) c.struct_xgo_reader {
-    return .{ .context = session, .read = read, .reads = 0, .bytes = 0, .@"error" = null };
+pub fn reader(session: *const Context) c.struct_xgo_reader {
+    return .{ .context = @constCast(session), .read = read, .reads = 0, .bytes = 0, .@"error" = null };
 }
 fn hex(a: A, value: u64) ![]const u8 {
     return std.fmt.allocPrint(a, "0x{x}", .{value});
@@ -28,60 +28,58 @@ fn buildId(a: A, layout: *const c.struct_xgo_layout) ![]const u8 {
     }
     return out;
 }
-fn runtimeModule(session: *model.Session) !*Module {
+fn runtimeModule(session: *const Context) !Module {
     try session.languages.require(.go);
     // Initial profile: a statically linked Go executable (the default
     // `go build` output), identified by kernel PHDR evidence.
-    const runtime = @import("../target/runtime.zig");
-    var loader = std.mem.zeroes(runtime.c.struct_xrt_loader);
-    _ = runtime.c.xrt_target_loader(session.target.handle, &loader, null);
-    if (loader.main_phdr == 0) return error.GoModuleIdentityUnavailable;
-    const module = session.modules.at(loader.main_phdr) catch return error.GoModuleIdentityUnavailable;
+    const main_phdr = session.mainPhdr();
+    if (main_phdr == 0) return error.GoModuleIdentityUnavailable;
+    const module = session.moduleAt(main_phdr) catch return error.GoModuleIdentityUnavailable;
     if (module.symbols().findSymbol("runtime.buildVersion") == null or module.symbols().findSymbol("runtime.allgs") == null) return error.GoRuntimeUnavailable;
     return module;
 }
-pub fn globalAddress(module: *Module, name: []const u8) !u64 {
+pub fn globalAddress(module: Module, name: []const u8) !u64 {
     const sym = module.symbols().findSymbol(name) orelse return error.GoRuntimeSymbolsUnavailable;
     if (!sym.hasAddress()) return error.GoRuntimeSymbolsUnavailable;
     return module.runtimeAddress(sym.value);
 }
-fn word(session: *model.Session, at: u64) !u64 {
+fn word(session: *const Context, at: u64) !u64 {
     var bytes: [8]u8 = undefined;
-    if (try session.target.readMemory(at, &bytes) != bytes.len) return error.GoRuntimeUnreadable;
+    if (try session.readMemory(at, &bytes) != bytes.len) return error.GoRuntimeUnreadable;
     return std.mem.readInt(u64, &bytes, .little);
 }
 /// runtime.buildVersion as stored by the linker in the loaded image.
-fn loadedVersion(session: *model.Session, module: *Module, out: *[64]u8) ![]const u8 {
+fn loadedVersion(session: *const Context, module: Module, out: *[64]u8) ![]const u8 {
     const at = try globalAddress(module, "runtime.buildVersion");
     const ptr = try word(session, at);
     const len = try word(session, at + 8);
     if (len == 0 or len > out.len) return error.GoVersionUnavailable;
-    if (try session.target.readMemory(ptr, out[0..@intCast(len)]) != len) return error.GoVersionUnavailable;
+    if (try session.readMemory(ptr, out[0..@intCast(len)]) != len) return error.GoVersionUnavailable;
     return out[0..@intCast(len)];
 }
-fn verify(session: *model.Session, module: *Module) ![]const u8 {
-    if (session.target.snapshot().state != .stopped) return error.NotStopped;
-    if (session.target.arch() != .x86_64) return error.GoArchitectureUnsupported;
+fn verify(session: *const Context, module: Module) ![]const u8 {
+    if (!session.snapshot().stopped) return error.NotStopped;
+    if (session.arch() != .x86_64) return error.GoArchitectureUnsupported;
     const id = module.image.buildId() orelse return error.GoBuildIdUnavailable;
     if (id.len == 0 or id.len > 64) return error.GoBuildIdUnavailable;
     const note = module.image.sectionByName(".note.gnu.build-id") orelse return error.GoBuildIdUnavailable;
     if (note.flags & 2 == 0 or note.size > 256) return error.GoBuildIdUnavailable;
     const expected = try module.image.sectionData(note);
     var actual: [256]u8 = undefined;
-    if (try session.target.readMemory(try module.runtimeAddress(note.addr), actual[0..expected.len]) != expected.len or !std.mem.eql(u8, expected, actual[0..expected.len])) return error.GoBuildIdMismatch;
+    if (try session.readMemory(try module.runtimeAddress(note.addr), actual[0..expected.len]) != expected.len or !std.mem.eql(u8, expected, actual[0..expected.len])) return error.GoBuildIdMismatch;
     var version: [64]u8 = undefined;
     if (!std.mem.eql(u8, try loadedVersion(session, module, &version), c.XGO_VERSION)) return error.GoVersionUnsupported;
     return id;
 }
-pub fn verifiedModule(session: *model.Session) !*Module {
+pub fn verifiedModule(session: *const Context) !Module {
     try session.languages.require(.go);
     const module = try runtimeModule(session);
     _ = try verify(session, module);
     return module;
 }
-fn profile(session: *model.Session, module: *Module) !*const c.struct_xgo_layout {
+fn profile(session: *const Context, module: Module) !*const c.struct_xgo_layout {
     const id = try verify(session, module);
-    if (module.go_layout == null) {
+    if (module.layouts.go == null) {
         const debug = module.debugInfo() catch |err| return if (err == error.DebugMetadataPending) err else error.GoDwarfUnavailable;
         var layout: c.struct_xgo_layout = undefined;
         if (c.xgo_layout_build(debug.dwarf, id.ptr, id.len, &layout)) |why| {
@@ -90,11 +88,11 @@ fn profile(session: *model.Session, module: *Module) !*const c.struct_xgo_layout
             }
             return error.GoLayoutUnsupported;
         }
-        module.go_layout = layout;
+        module.layouts.go = layout;
     }
-    return &module.go_layout.?;
+    return &module.layouts.go.?;
 }
-fn globals(module: *Module) !c.struct_xgo_globals {
+fn globals(module: Module) !c.struct_xgo_globals {
     const wait = module.symbols().findSymbol("runtime.waitReasonStrings") orelse return error.GoRuntimeSymbolsUnavailable;
     const status = module.symbols().findSymbol("runtime.gStatusStrings") orelse return error.GoRuntimeSymbolsUnavailable;
     if (wait.size == 0 or wait.size % 16 != 0 or status.size == 0 or status.size % 16 != 0) return error.GoRuntimeSymbolsUnavailable;
@@ -108,7 +106,7 @@ fn globals(module: *Module) !c.struct_xgo_globals {
         .status_count = status.size / 16,
     };
 }
-pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.zig").Description {
+pub fn describe(session: *const Context, a: A) !@import("types.zig").Description {
     try session.languages.require(.go);
     const module = try runtimeModule(session);
     const layout = try profile(session, module);
@@ -125,7 +123,7 @@ pub const Stack = struct { session_id: u64, generation: u64, tid: i32, segments:
 
 const Raw = struct { pc: u64, lookup: u64, func: c.struct_xgo_func, reason: ?[]const u8 };
 /// Expand one physical frame into its DWARF inline chain, innermost first.
-fn expand(session: *model.Session, a: A, layout: *const c.struct_xgo_layout, out: *std.ArrayList(Frame), raw: Raw, callee: *?u8) !void {
+fn expand(session: *const Context, a: A, layout: *const c.struct_xgo_layout, out: *std.ArrayList(Frame), raw: Raw, callee: *?u8) !void {
     const fname = std.mem.sliceTo(&raw.func.name, 0);
     const pc = try hex(a, raw.pc);
     const entry: ?[]const u8 = if (raw.func.entry != 0) try hex(a, raw.func.entry) else null;
@@ -139,7 +137,7 @@ fn expand(session: *model.Session, a: A, layout: *const c.struct_xgo_layout, out
         break :blk null;
     };
     var inlined: []@import("../debug/info.zig").Inline = &.{};
-    if (session.modules.at(raw.lookup)) |module| {
+    if (session.moduleAt(raw.lookup)) |module| {
         if (module.debugInfo()) |debug| {
             inlined = debug.inlineAt(a, try module.linkAddress(raw.lookup)) catch &.{};
         } else |_| {}
@@ -150,7 +148,7 @@ fn expand(session: *model.Session, a: A, layout: *const c.struct_xgo_layout, out
         const visible = c.xgo_traceback_visible(layout, (try a.dupeZ(u8, item.name)).ptr, @intCast(layout.constants[c.XGO_C_FUNC_NORMAL]), @intFromBool(out.items.len == 0), @intFromBool(callee.* != null), callee.* orelse 0) != 0;
         try out.append(a, .{ .name = try a.dupe(u8, item.name), .file = file, .line = line, .kind = "go-inlined", .pc = pc, .function_entry = null, .go_traceback_visible = visible, .reason = null, .line_reason = line_reason });
         callee.* = @intCast(layout.constants[c.XGO_C_FUNC_NORMAL]);
-        file = if (item.call_path) |path| try session.sourceMaps().forward(a, path) else null;
+        file = if (item.call_path) |path| try session.mapSourcePath(a, path) else null;
         line = item.call_line;
         if (file == null or line == null) line_reason = "GoInlineCallSiteUnavailable";
     }
@@ -158,7 +156,7 @@ fn expand(session: *model.Session, a: A, layout: *const c.struct_xgo_layout, out
     try out.append(a, .{ .name = try a.dupe(u8, fname), .file = file, .line = line, .kind = "go", .pc = pc, .function_entry = entry, .go_traceback_visible = visible, .reason = raw.reason orelse try reason(a, raw.func.reason), .line_reason = line_reason });
     callee.* = raw.func.id;
 }
-fn created(session: *model.Session, a: A, layout: *const c.struct_xgo_layout, g: *const c.struct_xgo_goroutine) !?Created {
+fn created(session: *const Context, a: A, layout: *const c.struct_xgo_layout, g: *const c.struct_xgo_goroutine) !?Created {
     if (g.gopc == 0) return null;
     const name = std.mem.sliceTo(&g.creator.name, 0);
     if (name.len == 0) return .{ .function = "(unknown)", .file = null, .line = null, .pc = try hex(a, g.gopc), .parent_goid = g.parent, .reason = (try reason(a, g.creator.reason)) orelse "GoFunctionUnavailable" };
@@ -169,15 +167,14 @@ fn created(session: *model.Session, a: A, layout: *const c.struct_xgo_layout, g:
     const visible = g.goid != 1 and c.xgo_traceback_visible(layout, &g.creator.name, @intCast(layout.constants[c.XGO_C_FUNC_NORMAL]), 0, 1, @intCast(layout.constants[c.XGO_C_FUNC_NORMAL])) != 0;
     return .{ .function = try a.dupe(u8, name), .file = if (site) |s| s.path else null, .line = if (site) |s| s.line else null, .pc = try hex(a, g.gopc), .parent_goid = g.parent, .go_traceback_visible = visible, .reason = try reason(a, g.creator.reason) };
 }
-fn traced(session: *model.Session, tid: u64) ?i32 {
-    for (session.target.threadSlice()) |thread| if (thread.state != .exited and @as(u64, @intCast(thread.tid)) == tid) return thread.tid;
-    return null;
+fn traced(session: *const Context, tid: u64) ?i32 {
+    return session.liveThread(tid);
 }
-pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
+pub fn stack(session: *const Context, a: A, tid: i32, first: usize) !Stack {
     try session.languages.require(.go);
-    if (session.target.snapshot().state != .stopped) return error.NotStopped;
+    if (!session.snapshot().stopped) return error.NotStopped;
     if (first != 0) return error.InvalidFrame;
-    const generation = session.target.snapshot().generation;
+    const generation = session.snapshot().generation;
     const module = try runtimeModule(session);
     const layout = try profile(session, module);
     const roots = try globals(module);
@@ -201,7 +198,7 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
             if (why == null) {
                 // Running: CFI-unwind the thread, keep frames on this g's stack.
                 const native = try session.stack(a, thread.?, 64);
-                const sp_index = session.target.arch().sp();
+                const sp_index = session.arch().sp();
                 var started = false;
                 for (native) |f| {
                     const sp = f.registers[sp_index] orelse break;
@@ -257,6 +254,6 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
             return rank(x) < rank(y) or (rank(x) == rank(y) and x.goroutine.id < y.goroutine.id);
         }
     }.less);
-    try session.target.expectGeneration(generation);
+    try session.expectGeneration(generation);
     return .{ .session_id = session.id, .generation = generation, .tid = tid, .segments = try segments.toOwnedSlice(a), .total_goroutines = raw.total, .dead_goroutines = raw.dead, .truncated = raw.truncated != 0, .reason = try reason(a, raw.reason), .memory_reads = r.reads, .memory_bytes = r.bytes };
 }

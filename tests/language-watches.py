@@ -48,7 +48,7 @@ try:
                 def observed():
                     extra=client.inspect('add_language_watch',**args,expression='x')['added']
                     client.inspect('remove_language_watch',generation=generation,id=extra)
-                auditor=SimpleNamespace(p=SimpleNamespace(pid=client.collector_pid() if a.agent else client.p.pid),inspect=client.inspect,session=client.session)
+                auditor=SimpleNamespace(p=SimpleNamespace(pid=client.collector_pid()),inspect=client.inspect,session=client.session)
                 result['readonly']=audit(auditor,target.pid,w/'watches.strace',observed)
             for change,expected in [(dict(row=0,expression='x'),'InvalidArguments'),(dict(row=4096),'InvalidArguments'),(dict(expression='x',generation=generation+1),'StaleSnapshot')]:
                 response=client.tool('add_language_watch',**(args|change))

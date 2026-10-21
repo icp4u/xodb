@@ -35,18 +35,7 @@ pub const Module = struct {
     debug_sweep: bool = false,
     debug_refusal: ?snapshot.Refusal = null,
     debug_refusal_pending: bool = false,
-    perl_layout: ?c.struct_xpl_layout = null,
-    python_layout: ?c.struct_xpy_layout = null,
-    lua_layout: ?c.struct_xl_layout = null,
-    elisp_layout: ?c.struct_xel_layout = null,
-    gdscript_layout: ?@import("../language/gdscript.zig").Layout = null,
-    /// Why this image's DWARF gave no layouts, once that has been found out.
-    gdscript_refusal: ?anyerror = null,
-    ruby_layout: ?c.struct_xrb_layout = null,
-    go_layout: ?c.struct_xgo_layout = null,
-    go_value_layout: ?*c.struct_xgv_layout = null,
-    go_map_layout: ?*c.struct_xgm_layout = null,
-    javascript_dwarf: ?c.struct_xjs_dwarf_profile = null,
+    layouts: @import("../language/layouts.zig").Layouts = .{},
     debug_file: ?*const @import("../binary/debug_files.zig").File = null,
     debug_allocator: std.mem.Allocator = std.heap.page_allocator,
     file_offset: u64 = 0, // ELF entry offset in the backing file; zero for standalone ELF.
@@ -284,8 +273,8 @@ pub const Modules = struct {
         for (self.regions.items) |r| self.allocator.free(r.path);
         self.regions.deinit(self.allocator);
         for (self.loaded.items) |m| {
-            if (m.go_value_layout) |layout| m.debug_allocator.destroy(layout);
-            if (m.go_map_layout) |layout| m.debug_allocator.destroy(layout);
+            if (m.layouts.go_value) |layout| m.debug_allocator.destroy(layout);
+            if (m.layouts.go_map) |layout| m.debug_allocator.destroy(layout);
             if (m.debug) |*info| info.deinit();
             if (m.owns_mapping) snapshot.free(m.mapping);
             self.allocator.free(m.path);

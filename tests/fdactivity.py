@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 import types
+from client import runtime_agent_args
 
 root = Path(__file__).resolve().parents[1]
 os.chdir(root)
@@ -68,7 +69,7 @@ try:
     log = (work / 'server.log').open('wb')
     env = dict(os.environ)
     for key in ('DISPLAY', 'WAYLAND_DISPLAY', 'SWAYSOCK'): env.pop(key, None)
-    server = subprocess.Popen([str(root / 'zig-out/bin/xodb'), '--headless', '--session-socket', str(run / 's'), '--agent-scope', 'control'], stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, env=env)
+    server = subprocess.Popen([str(root / 'zig-out/bin/xodb'), '--headless', '--session-socket', str(run / 's'), '--agent-scope', 'control', *runtime_agent_args()], stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, env=env)
     until(lambda: (server.poll(), (run / 's').exists()), lambda r: r[0] is None and r[1], 'listener', 5)
     socket_owner = types.SimpleNamespace(path=run / 's', clients=[])
     first = shared.Client(socket_owner, 'fd-observer-one'); peers.append(first)

@@ -218,7 +218,7 @@ No LLM runtime is embedded in xodb by this proposal.
 | `src/mcp/server.zig` | Plugin discovery/invocation/job tools using the dispatcher; keep MCP framing separate |
 | `src/main.zig` and `src/preferences.zig` | Explicit loading, configuration, queue pumping and bounded shutdown |
 | `src/remote/client.zig` | Serialize plugin requests alongside human requests over the existing connection; capability adaptation |
-| `src/model/value_view.zig` and UI panes | Formatter registry, pending/stale results and host-rendered plugin panels |
+| `src/debug/value_view.zig` and UI panes | Formatter registry, pending/stale results and host-rendered plugin panels |
 | `src/ui/style.zig` and pane colors | Runtime theme object and declarative theme loading |
 | Existing profile view workers | Supply bounded stable inputs to Lua analysis; retain collection and unwinding in native code |
 | Build and reliability gate | Lua dependency, cancellation/memory/error tests, scope/staleness and GUI responsiveness tests |

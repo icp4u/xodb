@@ -6,10 +6,11 @@ from pathlib import Path
 import select
 import subprocess
 import time
+from client import runtime_agent_args
 
 root = Path(__file__).resolve().parents[1]
 os.chdir(root)
-process = subprocess.Popen(["./zig-out/bin/xodb", "--headless", "--mcp", "--", "./zig-out/bin/xodb-fixture"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+process = subprocess.Popen(["./zig-out/bin/xodb", "--headless", "--mcp", *runtime_agent_args(), "--", "./zig-out/bin/xodb-fixture"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 sequence = 0
 
 def receive():
@@ -91,7 +92,10 @@ try:
     observed = observation("get_process", {"pid": pid})["processes"]["rows"][0]
     stat = Path(f"/proc/{pid}/stat").read_text()
     assert observed["pid"] == pid and observed["start_ticks"] == int(stat[stat.rindex(")") + 2:].split()[19])
-    assert observed["state"] in "tT" and observed["ppid"] == process.pid
+    parent = observed["ppid"]
+    if runtime_agent_args():  # the C agent launched the fixture; xodb started the agent
+        parent = int(Path(f"/proc/{parent}/stat").read_text().rsplit(")", 1)[1].split()[1])
+    assert observed["state"] in "tT" and parent == process.pid
     listed = observation("list_processes", {"sort": "pid", "limit": 5, "redact": True})["processes"]
     assert listed["shown"] == 5 and all(row["cmdline"] == {"state": "unavailable", "why": "redacted"} for row in listed["rows"])
     overview = observation("get_overview", {"limit": 3})

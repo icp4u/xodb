@@ -2,20 +2,21 @@
 //! called. Native anchors and logical frames remain separate observations.
 const std = @import("std");
 const c = @import("../c.zig").api;
-const model = @import("../model/session.zig");
-const Module = @import("../model/modules.zig").Module;
-const eval = @import("../model/evaluate.zig");
-const view = @import("../model/value_view.zig");
+const context_api = @import("context.zig");
+const Context = context_api.Context;
+const Module = context_api.Module;
+const eval = @import("../debug/evaluate.zig");
+const view = @import("../debug/value_view.zig");
 const A = std.mem.Allocator;
-const binding = @import("runtime_binding.zig");
+const binding = @import("binding_types.zig");
 
 fn read(ctx: ?*anyopaque, address: u64, out: ?*anyopaque, n: usize) callconv(.c) c_int {
-    const session: *model.Session = @ptrCast(@alignCast(ctx.?));
+    const session: *const Context = @ptrCast(@alignCast(ctx.?));
     const bytes: [*]u8 = @ptrCast(out.?);
-    return if ((session.target.readMemory(address, bytes[0..n]) catch return -1) == n) 0 else -1;
+    return if ((session.readMemory(address, bytes[0..n]) catch return -1) == n) 0 else -1;
 }
-fn reader(session: *model.Session) c.struct_xpl_reader {
-    return .{ .context = session, .read = read, .reads = 0, .bytes = 0, .@"error" = null };
+fn reader(session: *const Context) c.struct_xpl_reader {
+    return .{ .context = @constCast(session), .read = read, .reads = 0, .bytes = 0, .@"error" = null };
 }
 fn hex(a: A, address: u64) ![]const u8 {
     return std.fmt.allocPrint(a, "0x{x}", .{address});
@@ -51,9 +52,9 @@ fn layoutError(message: [*c]const u8) anyerror {
     }
     return error.PerlLayoutUnsupported;
 }
-fn profile(session: *model.Session, module: *Module) !*const c.struct_xpl_layout {
-    if (session.target.snapshot().state != .stopped) return error.NotStopped;
-    if (session.target.arch() != .x86_64) return error.PerlArchitectureUnsupported;
+fn profile(session: *const Context, module: Module) !*const c.struct_xpl_layout {
+    if (!session.snapshot().stopped) return error.NotStopped;
+    if (session.arch() != .x86_64) return error.PerlArchitectureUnsupported;
     const id = module.image.buildId() orelse return error.PerlBuildIdUnavailable;
     if (id.len == 0 or id.len > 64) return error.PerlBuildIdUnavailable;
     const note = module.image.sectionByName(".note.gnu.build-id") orelse return error.PerlBuildIdUnavailable;
@@ -61,23 +62,23 @@ fn profile(session: *model.Session, module: *Module) !*const c.struct_xpl_layout
     const expected = try module.image.sectionData(note);
     var actual: [256]u8 = undefined;
     const address = try module.runtimeAddress(note.addr);
-    if (try session.target.readMemory(address, actual[0..expected.len]) != expected.len or !std.mem.eql(u8, expected, actual[0..expected.len]))
+    if (try session.readMemory(address, actual[0..expected.len]) != expected.len or !std.mem.eql(u8, expected, actual[0..expected.len]))
         return error.PerlBuildIdMismatch;
     var version: [3]u8 = undefined;
     for ([_][]const u8{ "PL_revision", "PL_version", "PL_subversion" }, &version) |name, *part| {
         const symbol = module.symbols().findSymbol(name) orelse return error.PerlVersionUnavailable;
         if (!symbol.hasAddress() or symbol.size != 1) return error.PerlVersionUnavailable;
-        if (try session.target.readMemory(try module.runtimeAddress(symbol.value), @as(*[1]u8, @ptrCast(part))) != 1) return error.PerlVersionUnavailable;
+        if (try session.readMemory(try module.runtimeAddress(symbol.value), @as(*[1]u8, @ptrCast(part))) != 1) return error.PerlVersionUnavailable;
     }
     if (!std.mem.eql(u8, &version, &.{ 5, 44, 0 })) return error.PerlVersionUnsupported;
-    if (module.perl_layout == null) {
+    if (module.layouts.perl == null) {
         var layout: c.struct_xpl_layout = undefined;
         const failure = c.xpl_layout_build((try module.debugInfo()).dwarf, id.ptr, id.len, &version, &layout);
         if (failure != null) return layoutError(failure);
-        module.perl_layout = layout;
+        module.layouts.perl = layout;
     }
-    if (c.xpl_layout_check(&module.perl_layout.?, id.ptr, id.len, &version) != null) return error.PerlBuildIdMismatch;
-    return &module.perl_layout.?;
+    if (c.xpl_layout_check(&module.layouts.perl.?, id.ptr, id.len, &version) != null) return error.PerlBuildIdMismatch;
+    return &module.layouts.perl.?;
 }
 pub const Anchor = struct { frame: usize, pc: []const u8, symbol: []const u8 };
 pub const Runtime = struct { language: []const u8 = "perl", implementation: []const u8 = "perl5", version: []const u8 = "5.44.0", build_id: []const u8 };
@@ -121,7 +122,7 @@ pub const Stack = struct {
     native_stack_incomplete: bool,
     basis: []const u8 = "Perl 5.44.0 threaded DWARF layout, verified loaded build-id, retained stopped memory; no inferior calls or inferred native/logical merge",
 };
-fn instance(session: *model.Session, a: A, frame: model.Frame) !u64 {
+fn instance(session: *const Context, a: A, frame: context_api.Frame) !u64 {
     const locals = try session.frameLocals(a, frame);
     for (locals) |local| if (std.mem.eql(u8, local.name, "my_perl")) {
         const v = try session.evaluateInFrame(a, frame, locals, "my_perl");
@@ -130,8 +131,8 @@ fn instance(session: *model.Session, a: A, frame: model.Frame) !u64 {
     };
     return error.PerlInterpreterUnavailable;
 }
-fn segment(session: *model.Session, a: A, frame: model.Frame, anchored: bool) !Segment {
-    const module = try session.modules.at(frame.lookup_pc);
+fn segment(session: *const Context, a: A, frame: context_api.Frame, anchored: bool) !Segment {
+    const module = try session.moduleAt(frame.lookup_pc);
     const layout = try profile(session, module);
     const build = try buildId(a, layout);
     const anchor: ?Anchor = if (anchored) .{ .frame = frame.index, .pc = try hex(a, frame.pc), .symbol = try a.dupe(u8, frame.symbol.?) } else null;
@@ -219,15 +220,15 @@ fn constrainSkipped(a: A, segment_: *Segment, skipped: []const SkippedAnchor) !v
     segment_.chain_complete = false;
 }
 
-pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
+pub fn stack(session: *const Context, a: A, tid: i32, first: usize) !Stack {
     try session.languages.require(.perl);
     if (first >= 64) return error.InvalidFrame;
-    if (session.target.snapshot().state != .stopped) return error.NotStopped;
-    const generation = session.target.snapshot().generation;
-    try binding.discover(.perl, session);
+    if (!session.snapshot().stopped) return error.NotStopped;
+    const generation = session.snapshot().generation;
+    try session.discoverRuntime(.perl);
     const native = try session.stack(a, tid, 64);
     if (first >= native.len) return error.InvalidFrame;
-    const bound = try binding.thread(.perl, session, a, tid, native, first);
+    const bound = try session.runtimeThread(.perl, a, tid, native, first);
     var segments: std.ArrayList(Segment) = .empty;
     var unresolved_inner = false;
     var recovered_anchor = false;
@@ -265,9 +266,9 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
     }
     // A readable current-frame argument can provide an unanchored observation;
     // it never establishes ordering relative to a different runtime segment.
-    if (!recovered_anchor and binding.owns(session, bound.module, native[first])) {
+    if (!recovered_anchor and session.runtimeOwns(bound.module, native[first])) {
         const frame = native[first];
-        const module = try session.modules.at(frame.lookup_pc);
+        const module = try session.moduleAt(frame.lookup_pc);
         if (module.symbols().findSymbol("Perl_runops_standard") != null) {
             var fallback = try segment(session, a, frame, false);
             if (fallback.runtime_instance != null) {
@@ -278,14 +279,14 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
         }
     }
     for (segments.items) |*item| item.binding_token = bound.token;
-    try session.target.expectGeneration(generation);
+    try session.expectGeneration(generation);
     return .{ .binding_token = bound.token, .session_id = session.id, .generation = generation, .tid = tid, .segments = try segments.toOwnedSlice(a), .native_stack_incomplete = native.len == 64 or (native.len > 0 and native[native.len - 1].diagnostic != null) };
 }
-fn valueBinding(session: *model.Session) !binding.Binding {
-    return binding.process(.perl, session);
+fn valueBinding(session: *const Context) !context_api.Binding {
+    return session.runtimeProcess(.perl);
 }
-fn runopsFrame(session: *model.Session, module: *Module, frame: model.Frame) ?model.Frame {
-    if (!binding.owns(session, module, frame)) return null;
+fn runopsFrame(session: *const Context, module: Module, frame: context_api.Frame) ?context_api.Frame {
+    if (!session.runtimeOwns(module, frame)) return null;
     const located = module.symbols().symbolAt(module.linkAddress(frame.lookup_pc) catch return null) orelse return null;
     const name = located.symbol.name;
     if (!std.mem.eql(u8, name, "Perl_runops_standard") and !std.mem.eql(u8, name, "Perl_runops_debug")) return null;
@@ -293,14 +294,14 @@ fn runopsFrame(session: *model.Session, module: *Module, frame: model.Frame) ?mo
     result.symbol = name;
     return result;
 }
-pub fn runtimeWitness(session: *model.Session, module: *Module, native: []const model.Frame) !bool {
+pub fn runtimeWitness(session: *const Context, module: Module, native: []const context_api.Frame) !bool {
     for (native) |frame| if (runopsFrame(session, module, frame) != null) {
         _ = try profile(session, module);
         return true;
     };
     return false;
 }
-pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview {
+pub fn preview(session: *const Context, a: A, value: eval.Value) !?view.Preview {
     if (!session.languages.on(.perl)) return null;
     if (value.availability != .available or value.type.kind != .pointer or value.bits == 0) return null;
     const child = value.type.child orelse return null;
@@ -312,7 +313,7 @@ pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview 
         break;
     };
     if (!matches) return null;
-    if (session.target.snapshot().state != .stopped) return error.NotStopped;
+    if (!session.snapshot().stopped) return error.NotStopped;
     // A type name alone is insufficient: require the native head's fields.
     const fields = [_]struct { name: []const u8, index: usize }{
         .{ .name = "sv_any", .index = c.XPL_ANY },     .{ .name = "sv_refcnt", .index = c.XPL_REFCNT },
@@ -380,28 +381,30 @@ test "Perl layout search bounds retain their diagnostics" {
 }
 
 /// Runtime identity and proof from the existing stopped-memory reader.
-pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.zig").Description {
+pub fn describe(session: *const Context, a: A) !@import("types.zig").Description {
     try session.languages.require(.perl);
     const bound = try valueBinding(session);
     const module = bound.module;
     const layout = try profile(session, module);
-    return .{ .version = "5.44.0", .build_id = try buildId(a, layout), .basis = if (module.debug_file != null) "build-id companion DWARF" else "same-image DWARF", .identity = bound.identity };
+    return .{ .version = "5.44.0", .build_id = try buildId(a, layout), .basis = if (module.has_debug_companion) "build-id companion DWARF" else "same-image DWARF", .identity = bound.identity };
 }
 
 /// Frame selection comes from the retained canonical stack, never raw client
 /// interpreter/CV/pad addresses. The C reader revalidates that context's pad.
-pub fn readLocals(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, start: usize, limit: usize) !@import("../model/language_locals.zig").Result {
+pub fn readLocals(session: *const Context, a: A, observed: Stack, tid: i32, segment_index: usize, frame: usize, start: usize, limit: usize) !@import("locals_types.zig").Result {
     try session.languages.require(.perl);
-    return readBindings(session, a, tid, segment_index, frame, start, limit, null);
+    return readBindings(session, a, observed, tid, segment_index, frame, start, limit, null);
 }
-pub fn evaluateLocal(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: []const u8) !@import("../model/language_locals.zig").Result {
-    try session.languages.require(.perl);
+/// Pure syntax preparation; the owner calls this before cached-stack access.
+pub fn checkExpression(a: A, expression: []const u8) !void {
     if (c.xpl_expression_check(try a.dupeZ(u8, expression)) != null) return error.UnsupportedPerlExpression;
-    return readBindings(session, a, tid, segment_index, frame, 0, 1, expression);
 }
-fn readBindings(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, start: usize, limit: usize, expression: ?[]const u8) !@import("../model/language_locals.zig").Result {
-    const named = @import("../model/language_locals.zig");
-    const observed = try @import("../model/language_selection.zig").cachedRead(.perl, session, tid);
+pub fn evaluateLocal(session: *const Context, a: A, observed: Stack, tid: i32, segment_index: usize, frame: usize, expression: []const u8) !@import("locals_types.zig").Result {
+    try session.languages.require(.perl);
+    return readBindings(session, a, observed, tid, segment_index, frame, 0, 1, expression);
+}
+fn readBindings(session: *const Context, a: A, observed: Stack, tid: i32, segment_index: usize, frame: usize, start: usize, limit: usize, expression: ?[]const u8) !@import("locals_types.zig").Result {
+    const named = @import("locals_types.zig");
     if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;
     const selected = observed.segments[segment_index];
     if (frame >= selected.frames.len) return error.InvalidLanguageFrame;
@@ -413,7 +416,7 @@ fn readBindings(session: *model.Session, a: A, tid: i32, segment_index: usize, f
     const version = try a.dupe(u8, selected.runtime.version);
     const id = try a.dupe(u8, selected.runtime.build_id);
     const stack_reason = if (selected.reason) |why| try a.dupe(u8, why) else null;
-    const module = try binding.retained(session, selected.binding_token orelse return error.StaleLanguageFrame);
+    const module = try session.retainedRuntime(selected.binding_token orelse return error.StaleLanguageFrame);
     const layout = try profile(session, module);
     if (!std.mem.eql(u8, id, try buildId(a, layout))) return error.PerlBuildIdMismatch;
     var r = reader(session);
@@ -453,7 +456,7 @@ fn readBindings(session: *model.Session, a: A, tid: i32, segment_index: usize, f
             },
         };
     }
-    try session.target.expectGeneration(generation);
+    try session.expectGeneration(generation);
     return .{
         .generation = generation,
         .tid = tid,
@@ -477,7 +480,7 @@ fn readBindings(session: *model.Session, a: A, tid: i32, segment_index: usize, f
 const WatchCapture = @import("watch.zig").Capture;
 // Runtime words: module/interpreter/stackinfo. Frame words: context index + 1
 // (zero for main)/CV/binding selector/pad declaration. Never retain cxstack.
-fn watchValue(session: *model.Session, a: A, module: *Module, capture: *WatchCapture, frame: usize, expected_context: u64, row: ?usize) !void {
+fn watchValue(session: *const Context, a: A, module: Module, capture: *WatchCapture, frame: usize, expected_context: u64, row: ?usize) !void {
     if (module.id != capture.scope.runtime[0]) return error.PerlWatchRuntimeChanged;
     const layout = try profile(session, module);
     var r = reader(session);
@@ -524,10 +527,8 @@ pub fn watchExpression(a: A, expression: ?[]const u8, row: ?usize) ![:0]const u8
     if (row) |index| if (index >= c.XPL_MAX_PAD_NAMES) return error.InvalidArguments;
     return try a.dupeZ(u8, expression orelse "binding");
 }
-pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: ?[]const u8, row: ?usize) !WatchCapture {
+pub fn createWatch(session: *const Context, a: A, observed: Stack, tid: i32, segment_index: usize, frame: usize, checked_expression: [:0]const u8, row: ?usize) !WatchCapture {
     try session.languages.require(.perl);
-    const checked_expression = try watchExpression(a, expression, row);
-    const observed = try @import("../model/language_selection.zig").cachedRead(.perl, session, tid);
     if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;
     const segment_ = observed.segments[segment_index];
     const instance_ = segment_.runtime_instance orelse return error.PerlWatchRuntimeUnproved;
@@ -535,29 +536,27 @@ pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize
     const selected = segment_.frames[frame];
     if (!selected.identity_proved) return error.PerlWatchFrameUnproved;
     if (!std.mem.eql(u8, selected.context_type, "sub") and !std.mem.eql(u8, selected.context_type, "main")) return error.PerlWatchFrameUnsupported;
-    const thread = for (session.target.threadSlice()) |entry| {
-        if (entry.tid == tid) break entry.id;
-    } else return error.InvalidThread;
-    const module = try binding.retained(session, segment_.binding_token orelse return error.StaleLanguageFrame);
+    const thread = try session.threadIdentity(tid);
+    const module = try session.retainedRuntime(segment_.binding_token orelse return error.StaleLanguageFrame);
     var capture = WatchCapture{ .runtime_identity = .witnessed, .scope = .{
         .language = c.XLW_PERL,
         .session = session.id,
-        .image = session.target.snapshot().image_epoch,
+        .image = session.snapshot().image_epoch,
         .thread = thread,
         .runtime = .{ module.id, try std.fmt.parseInt(u64, instance_.address, 0), selected.stackinfo, 0 },
         .frame = .{ if (selected.stackinfo == 0) 0 else selected.context_index + 1, try std.fmt.parseInt(u64, selected.cv, 0), 0, 0 },
     }, .expression = checked_expression };
     try watchValue(session, a, module, &capture, frame, try std.fmt.parseInt(u64, selected.context_address, 0), row);
     if (row != null and capture.scope.frame[2] == 0) return error.PerlWatchBindingUnavailable;
-    try session.target.expectGeneration(observed.generation);
+    try session.expectGeneration(observed.generation);
     return capture;
 }
-pub fn observeWatch(session: *model.Session, a: A, tid: i32, scope: c.struct_xlw_scope, expression: []const u8) !WatchCapture {
+pub fn observeWatch(session: *const Context, a: A, observed_result: anyerror!Stack, scope: c.struct_xlw_scope, expression: [:0]const u8) !WatchCapture {
     try session.languages.require(.perl);
-    var capture = WatchCapture{ .scope = scope, .expression = try a.dupeZ(u8, expression) };
-    const observed = @import("../model/language_selection.zig").cachedRead(.perl, session, tid) catch |err| {
+    var capture = WatchCapture{ .scope = scope, .expression = expression };
+    const observed = observed_result catch |err| {
         if (err != binding.noFrame(.perl)) return err;
-        const dormant = try binding.process(.perl, session);
+        const dormant = try session.runtimeProcess(.perl);
         capture.runtime_identity = dormant.identity;
         // Keep the last sample as history. Without a canonical thread frame,
         // do not dereference its remembered address or declare it retired.
@@ -565,7 +564,7 @@ pub fn observeWatch(session: *model.Session, a: A, tid: i32, scope: c.struct_xlw
         if (dormant.module.id != scope.runtime[0]) capture.scope.runtime[0] = dormant.module.id;
         return capture;
     };
-    const module_id = (try binding.retained(session, observed.binding_token orelse return error.StaleLanguageFrame)).id;
+    const module_id = (try session.retainedRuntime(observed.binding_token orelse return error.StaleLanguageFrame)).id;
     capture.runtime_identity = .witnessed;
     if (module_id != scope.runtime[0]) {
         capture.scope.runtime[0] = module_id;
@@ -586,8 +585,8 @@ pub fn observeWatch(session: *model.Session, a: A, tid: i32, scope: c.struct_xlw
                 return capture;
             }
             if (try std.fmt.parseInt(u64, frame.cv, 0) != scope.frame[1]) continue;
-            try watchValue(session, a, try binding.retained(session, segment_.binding_token orelse return error.StaleLanguageFrame), &capture, index, try std.fmt.parseInt(u64, frame.context_address, 0), null);
-            try session.target.expectGeneration(observed.generation);
+            try watchValue(session, a, try session.retainedRuntime(segment_.binding_token orelse return error.StaleLanguageFrame), &capture, index, try std.fmt.parseInt(u64, frame.context_address, 0), null);
+            try session.expectGeneration(observed.generation);
             return capture;
         }
     }
@@ -595,6 +594,6 @@ pub fn observeWatch(session: *model.Session, a: A, tid: i32, scope: c.struct_xlw
         capture.observation = c.XLW_FRAME_GONE;
         capture.diagnostic = try a.dupeZ(u8, "PerlWatchFrameGone");
     } else capture.diagnostic = try a.dupeZ(u8, "PerlWatchFrameNotObserved");
-    try session.target.expectGeneration(observed.generation);
+    try session.expectGeneration(observed.generation);
     return capture;
 }

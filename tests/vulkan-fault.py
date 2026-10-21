@@ -171,7 +171,11 @@ def run_case(d, shim, name, rules, frames, seconds, expect):
     if expect == 'render' and r['reason'] != 'frame_limit': problems.append('did not reach frame limit')
     if expect == 'recover':
         if r['reason'] != 'frame_limit': problems.append('did not recover to frame limit')
-        if not (r['init_failures'] + r['frame_failures']): problems.append('no renderer failure occurred before recovery')
+        # A loader filtered to the display's driver that gives no instance
+        # loads every driver in the same attempt (init and prepare alike):
+        # the failed call followed by a successful one is that recovery.
+        filter_fallback = rules.endswith('fail=vkCreateInstance@1:oodm') and summary and summary['calls'].get('vkCreateInstance', [0, 0])[0] > 1
+        if not (r['init_failures'] + r['frame_failures'] or filter_fallback): problems.append('no renderer failure occurred before recovery')
     if expect == 'retry':
         if rendered: problems.append('rendered despite unusable startup')
         if not r['init_failures']: problems.append('no init failure reported')

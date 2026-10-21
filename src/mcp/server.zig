@@ -557,7 +557,11 @@ pub const Server = struct {
             session.record(.agent, action);
             return asValue(a, .{ .id = created_id, .session = session.snapshot() });
         }
-        if (std.mem.eql(u8, name, "get_session")) return asValue(a, session.snapshot());
+        if (std.mem.eql(u8, name, "get_session")) {
+            var result = try asValue(a, session.snapshot());
+            try result.object.put(a, "remote_read_cache", try asValue(a, session.target.readCacheStats()));
+            return result;
+        }
         if (std.mem.eql(u8, name, "list_threads")) {
             if (session.target.gdbRemoteInfo()) |info| if (info.threads == .unsupported) return error.UnsupportedControl;
             return asValue(a, .{ .generation = session.target.snapshot().generation, .threads = session.target.threadSlice(), .thread_labels = session.compatibility.labels.items });
@@ -570,21 +574,27 @@ pub const Server = struct {
             if (tid == 0 or tid > std.math.maxInt(i32) or frame >= 64) return error.InvalidArguments;
             if (std.mem.eql(u8, language, "lua")) {
                 const state: ?u64 = if (member(args, "state")) |v| std.fmt.parseInt(u64, string(v) orelse return error.InvalidArguments, 0) catch return error.InvalidArguments else null;
-                return asValue(a, try @import("../language/lua.zig").stack(session, a, @intCast(tid), @intCast(frame), state));
+                return asValue(a, try @import("../language/lua.zig").stack(&session.languageContext(), a, @intCast(tid), @intCast(frame), state));
             }
             if (member(args, "state") != null) return error.InvalidArguments;
-            if (std.mem.eql(u8, language, "gdscript")) return asValue(a, @import("../language/gdscript.zig").stack(session, a, @intCast(tid), @intCast(frame)) catch |err| {
+            if (std.mem.eql(u8, language, "gdscript")) return asValue(a, @import("../language/gdscript.zig").stack(&session.languageContext(), a, @intCast(tid), @intCast(frame)) catch |err| {
                 // Which image, how large, and what to rerun with.
                 if (err == error.GDScriptImageBudgetExceeded) self.error_detail = if (session.modules.budgetDetail(null)) |detail| try a.dupe(u8, detail) else null;
                 return err;
             });
-            if (std.mem.eql(u8, language, "elisp")) return asValue(a, try @import("../language/elisp.zig").stack(session, a, @intCast(tid), @intCast(frame)));
-            if (std.mem.eql(u8, language, "ruby")) return asValue(a, try @import("../language/ruby.zig").stack(session, a, @intCast(tid), @intCast(frame)));
-            if (std.mem.eql(u8, language, "go")) return asValue(a, try @import("../language/go.zig").stack(session, a, @intCast(tid), @intCast(frame)));
-            if (std.mem.eql(u8, language, "javascript")) return asValue(a, try @import("../language/javascript.zig").stack(session, a, @intCast(tid), @intCast(frame)));
-            if (std.mem.eql(u8, language, "python")) return asValue(a, try @import("../language/python.zig").stack(session, a, @intCast(tid), @intCast(frame)));
+            if (std.mem.eql(u8, language, "elisp")) {
+                try session.languages.require(.elisp);
+                // The zero-frame query is identical to the retained selection
+                // stack used by locals. Nonzero starts keep their anchor scope.
+                if (frame == 0) return asValue(a, try @import("../model/language_selection.zig").cachedRead(.elisp, session, @intCast(tid)));
+                return asValue(a, try @import("../language/elisp.zig").stack(&session.languageContext(), a, @intCast(tid), @intCast(frame)));
+            }
+            if (std.mem.eql(u8, language, "ruby")) return asValue(a, try @import("../language/ruby.zig").stack(&session.languageContext(), a, @intCast(tid), @intCast(frame)));
+            if (std.mem.eql(u8, language, "go")) return asValue(a, try @import("../language/go.zig").stack(&session.languageContext(), a, @intCast(tid), @intCast(frame)));
+            if (std.mem.eql(u8, language, "javascript")) return asValue(a, try @import("../language/javascript.zig").stack(&session.languageContext(), a, @intCast(tid), @intCast(frame)));
+            if (std.mem.eql(u8, language, "python")) return asValue(a, try @import("../language/python.zig").stack(&session.languageContext(), a, @intCast(tid), @intCast(frame)));
             if (!std.mem.eql(u8, language, "perl")) return error.InvalidArguments;
-            return asValue(a, try @import("../language/perl.zig").stack(session, a, @intCast(tid), @intCast(frame)));
+            return asValue(a, try @import("../language/perl.zig").stack(&session.languageContext(), a, @intCast(tid), @intCast(frame)));
         }
         if (std.mem.eql(u8, name, "get_stack")) {
             const tid = number(member(args, "tid")) orelse return error.InvalidArguments;

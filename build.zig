@@ -1,5 +1,21 @@
 const std = @import("std");
-const runtime_sources = [_][]const u8{ "cancel.c", "gdb_packet.c", "gdb_link.c", "log.c", "gdb_description.c", "gdb_lldb.c", "gdbremote.c", "target_state.c", "file_identity.c", "memory.c", "arch.c", "registers.c", "process.c", "target.c", "probes.c", "loongarch_step.c", "riscv_step.c", "watchpoints.c", "events.c", "family.c", "xstate.c", "perf.c", "perf_cpu.c", "perf_syscalls.c", "perf_allocations.c", "wire.c", "wire_target.c", "agent.c", "remote.c", "files.c", "file_view.c", "symbol_job.c", "loader.c", "elf_symbols.c", "mapped_file.c", "perf_wire.c", "agent_perf.c", "remote_perf.c", "fdscan.c", "fdinherit.c", "fdgraph.c", "fdgraph_layout.c", "fdtreemap.c", "unix_peer.c", "fdevent.c", "fdevent_decode.c", "fdevent_count.c", "fdactivity.c", "fdflow.c", "fdflow_decode.c", "fdflow_count.c", "fdflow_owner.c", "fdflow_graph.c", "../profile/allocation_broker.c", "source.c", "../binary/object.c", "../debug/dwarf_cursor.c", "../debug/source_paths.c" };
+
+fn loadRuntimeSources(b: *std.Build) []const []const u8 {
+    const a = b.allocator;
+    const io = b.graph.io;
+    const text = b.build_root.handle.readFileAlloc(io, "src/runtime/runtime_sources.list", a, .limited(64 * 1024)) catch
+        @panic("src/runtime/runtime_sources.list");
+    var list: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or std.mem.startsWith(u8, line, "#")) continue;
+        list.append(a, line) catch @panic("runtime source list");
+    }
+    if (list.items.len == 0) @panic("runtime source list is empty");
+    return list.items;
+}
+
 // The subset of runtime_sources (plus the agent's main) that has no Linux-only
 // dependency; the macos-seam step and `test` compile it for aarch64-macos.
 const macos_seam_sources = [_][]const u8{ "cancel.c", "gdb_packet.c", "gdb_link.c", "log.c", "gdb_description.c", "gdb_lldb.c", "gdbremote.c", "target_state.c", "file_identity.c", "arch.c", "loongarch_step.c", "riscv_step.c", "wire.c", "wire_target.c", "agent.c", "agent_main.c", "remote.c", "file_view.c", "perf_wire.c", "agent_perf.c", "remote_perf.c", "fdinherit.c", "fdgraph.c", "fdgraph_layout.c", "fdtreemap.c", "fdevent_decode.c", "fdevent_count.c", "fdflow_decode.c", "fdflow_count.c", "fdflow_graph.c" };
@@ -8,6 +24,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     if (target.result.os.tag == .macos) return @import("build_macos.zig").build(b, target, optimize);
+    const runtime_sources = loadRuntimeSources(b);
     // Helpers are copied to other machines: never inherit the build host ISA.
     var portable_query = target.query;
     portable_query.cpu_model = .baseline;
@@ -705,6 +722,7 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&replies_run.step);
         const remote_tests = b.addExecutable(.{ .name = "xodb-runtime-remote-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
         remote_tests.pie = false;
+        b.installArtifact(remote_tests);
         remote_tests.root_module.addIncludePath(b.path("src/runtime"));
         for (runtime_sources) |source| remote_tests.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
         remote_tests.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-remote.c"), .flags = &.{ "-std=c11", "-UNDEBUG", "-fno-pie", "-Wall", "-Wextra", "-Werror" } });

@@ -512,6 +512,9 @@ pub fn analyseWindowed(a: std.mem.Allocator, samples: []const ath9k.Stamped, dwe
     var start = from_ns;
     while (start < to_ns) : (start += location_window_ns) {
         const stop = @min(to_ns, start +| location_window_ns);
+        // A very short phase tail cannot resolve 20 mains periods and should
+        // not dilute the location-window denominator.
+        if (stop - start < 1_000_000_000) break;
         while (si < samples.len and samples[si].mono_ns < start) si += 1;
         var end = si;
         while (end < samples.len and samples[end].mono_ns < stop) end += 1;
@@ -980,7 +983,9 @@ test "phase location is the five-second union of a swept carrier" {
             for (seg) |s| try xs.append(a, .{ .s = s, .mono_ns = window_start + dwell * 750_000_000 + s.tsf_us * 1000 });
         }
     }
-    const to = from + offsets.len * location_window_ns;
+    // The final 500 ms models a phase ending between scheduled lines. It is
+    // too short to resolve mains pulsing and must not count as a fourth view.
+    const to = from + offsets.len * location_window_ns + 500_000_000;
     const r = try analyseWindowed(a, xs.items, &.{}, from, to, to, null);
     try std.testing.expectEqual(@as(u16, 3), r.location_windows_total);
     try std.testing.expectEqual(@as(u16, 3), r.location_windows_pulsing);

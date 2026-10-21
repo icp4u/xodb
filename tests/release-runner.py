@@ -603,6 +603,185 @@ class RunnerTests(unittest.TestCase):
         self.assertGreater(len(real.get('src/model/session.zig', ())), 50)
         self.assertIn('src/model/session.zig', gate.hubs())
 
+    def test_agent_lane_uses_one_switch_and_keeps_the_property(self):
+        import client
+        keys = ('XODB_TEST_RUNTIME_AGENT', 'XODB_RUNTIME_AGENT')
+        saved = {key: os.environ.pop(key, None) for key in keys}
+        try:
+            # No switch: a launch and an attach stay in-process.
+            self.assertEqual(client.with_runtime_agent(['--break', 'ready'], './fixture'), ['--break', 'ready'])
+            self.assertEqual(client.with_runtime_agent([], None), [])
+            os.environ['XODB_TEST_RUNTIME_AGENT'] = './zig-out/bin/xodb-agent'
+            # The lane switch applies to a launch and to an attach.
+            self.assertEqual(client.with_runtime_agent([], None), ['--runtime-agent', './zig-out/bin/xodb-agent'])
+            self.assertEqual(client.with_runtime_agent(['--break', 'ready'], './fixture')[:2], ['--runtime-agent', './zig-out/bin/xodb-agent'])
+            # A core, a capture and a protocol the caller named are not redirected.
+            for held in (['--core', 'dump'], ['--open-capture', 'cap'], ['--gdb-remote', 'host:9'], ['--runtime-agent', 'other']):
+                self.assertEqual(client.with_runtime_agent(held, './fixture'), held)
+            # An argv that already names the agent is not doubled.
+            self.assertEqual(client.with_runtime_agent(['--runtime-agent', './zig-out/bin/xodb-agent', '--break', 'ready'], None).count('--runtime-agent'), 1)
+            # A launch that sets its own agent keeps that agent. An attach still follows the lane.
+            os.environ['XODB_RUNTIME_AGENT'] = 'proxy-agent'
+            self.assertEqual(client.with_runtime_agent(['--break', 'ready'], './fixture')[:2], ['--runtime-agent', 'proxy-agent'])
+            self.assertEqual(client.with_runtime_agent([], None)[:2], ['--runtime-agent', './zig-out/bin/xodb-agent'])
+            # Overview and a saved packet capture reject the agent. Planted injection would add it.
+            self.assertEqual(client.with_runtime_agent(['--overview'], None), ['--overview'])
+            self.assertEqual(client.with_runtime_agent(['--open-pcap', 'cap'], './fixture'), ['--open-pcap', 'cap'])
+            self.assertEqual(client.with_runtime_agent(['--open-mitmproxy', 'flows'], None), ['--open-mitmproxy', 'flows'])
+            self.assertEqual(client.with_runtime_agent(['--redot-debugger'], './engine'), ['--redot-debugger'])
+            # The engine image cap is a product failure, not an omission.
+            self.assertNotIn('gdscript-stack', gate.AGENT_INELIGIBLE)
+            self.assertNotIn('gdscript-values', gate.AGENT_INELIGIBLE)
+            os.environ.pop('XODB_RUNTIME_AGENT')
+            # Planted bug: forgetting the switch leaves the attach in-process, and this property fails.
+            planted = []
+            self.assertNotEqual(client.with_runtime_agent([], None), planted)
+            os.environ.pop('XODB_TEST_RUNTIME_AGENT')
+            os.environ['XODB_RUNTIME_AGENT'] = './zig-out/bin/xodb-agent'
+            # The older switch is launch-only. An attach does not gain an agent.
+            self.assertEqual(client.with_runtime_agent([], None), [])
+            self.assertEqual(client.with_runtime_agent([], './fixture'), ['--runtime-agent', './zig-out/bin/xodb-agent'])
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        replaced, notes = gate.apply_agent_lane(gate.plan('host'))
+        names = [step.name for step in replaced]
+        self.assertIn('run-control-agent-lane', names)
+        self.assertNotIn('run-control', names)
+        # Quoting the debugger path, or using it as a fixture filename, is not a launch.
+        self.assertIn('release-runner', names)
+        self.assertIn('demo-binary', names)
+        self.assertNotIn('core-debugging', names)
+        self.assertNotIn('system-capture', names)
+        self.assertIn('system overview rejects', dict(notes)['system-capture'])
+        self.assertIn('opens a packet capture', dict(notes)['private-network-evidence'])
+        self.assertIn('core-debugging', [name for name, _ in notes])
+        redot_lane, redot_notes = gate.apply_agent_lane(gate.plan('host', redot='fixture-engine'))
+        redot_names = [step.name for step in redot_lane]
+        redot_why = dict(redot_notes)
+        self.assertIn('gdscript-stack-agent-lane', redot_names)
+        self.assertIn('gdscript-values-agent-lane', redot_names)
+        self.assertNotIn('redot-protocol', redot_names)
+        self.assertIn('Redot debugger', redot_why['redot-protocol'])
+        self.assertIn('no target', redot_why['gdscript-demo'])
+        self.assertIn(gate.AGENT_INELIGIBLE['core-debugging'], dict(notes)['core-debugging'])
+        self.assertNotIn('memory-search-speed', names)
+        self.assertIn('memory-search-speed-agent', names)
+        self.assertNotIn('memory-search-speed-agent-lane', names)
+        variant = next(step for step in replaced if step.name == 'run-control-agent-lane')
+        self.assertEqual(variant.argv[:2], ['env', 'XODB_TEST_RUNTIME_AGENT=./zig-out/bin/xodb-agent'])
+        # `all` stays one copy. The periodic tier carries the host variants.
+        self.assertFalse(any(step.name.endswith(gate.AGENT_LANE_SUFFIX) for step in gate.plan('all')))
+        periodic = gate.plan('periodic')
+        periodic_names = [step.name for step in periodic]
+        self.assertEqual(len(periodic_names), len(set(periodic_names)))
+        self.assertIn('run-control-agent-lane', periodic_names)
+        self.assertNotIn('core-debugging-agent-lane', periodic_names)
+        self.assertNotIn('memory-search-speed-agent-lane', periodic_names)
+        self.assertNotIn('run-control-agent-lane', {step.name for step in gate.plan('periodic', headless=True)})
+        present = set(periodic_names)
+        for step in periodic:
+            if step.name.endswith(gate.AGENT_LANE_SUFFIX):
+                for need in step.needs:
+                    self.assertIn(need, present, step.name)
+        # The GUI owner matrix already names the agent, so the lane keeps it.
+        owners = [step for step in gate.plan('periodic-gui') if step.name.startswith('gui-owner-')]
+        self.assertTrue(owners)
+        kept, owner_notes = gate.apply_agent_lane(owners)
+        self.assertEqual([step.name for step in kept], [step.name for step in owners])
+        self.assertEqual(owner_notes, [])
+
+    def test_agent_lane_step_fails_when_the_agent_never_starts(self):
+        # The switch points at a wrapper that records a start, then executes the
+        # agent. A lane step that exits 0 without that record is not coverage.
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            logs = cwd / 'logs'
+            logs.mkdir()
+            agent = cwd / 'zig-out' / 'bin' / 'xodb-agent'
+            agent.parent.mkdir(parents=True)
+            # The real agent records its arguments: the wrapper must execute it.
+            agent.write_text('#!/bin/sh\nprintf %s "$*" > "$0.ran"\n')
+            agent.chmod(0o755)
+            switch = ['env', 'XODB_TEST_RUNTIME_AGENT=./zig-out/bin/xodb-agent']
+            started = gate.run_step('probe-agent-lane', switch + ['sh', '-c', 'exec "$XODB_TEST_RUNTIME_AGENT" one two'],
+                                    30, cwd, os.environ.copy(), logs)
+            self.assertEqual(started['status'], 'passed')
+            self.assertIs(started['agent_started'], True)
+            self.assertEqual((agent.parent / 'xodb-agent.ran').read_text(), 'one two')
+            skipped = gate.run_step('skip-agent-lane', switch + ['sh', '-c', 'exit 0'],
+                                    30, cwd, os.environ.copy(), logs)
+            self.assertEqual(skipped['status'], 'agent_not_started')
+            self.assertIs(skipped['agent_started'], False)
+            plain = gate.run_step('plain', ['sh', '-c', 'exit 0'], 30, cwd, os.environ.copy(), logs)
+            self.assertEqual(plain['status'], 'passed')
+            self.assertNotIn('agent_started', plain)
+
+    def test_direct_launchers_have_a_reason_class_and_the_routable_ones_join_the_lane(self):
+        saved = {key: os.environ.pop(key, None) for key in ('XODB_TEST_RUNTIME_AGENT', 'XODB_RUNTIME_AGENT')}
+        try:
+            import client
+            self.assertEqual(client.runtime_agent_args(), [])
+            os.environ['XODB_TEST_RUNTIME_AGENT'] = './zig-out/bin/xodb-agent'
+            self.assertEqual(client.runtime_agent_args()[0], '--runtime-agent')
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        steps = gate.plan('host', perl='perl', padwalker='pad', python='python', ruby='ruby',
+                          node='node', go='go', emacs='emacs', redot='engine',
+                          lua=[('lua', 'src', 'lib')])
+        replaced, notes = gate.apply_agent_lane(steps)
+        names = {step.name for step in replaced}
+        why = dict(notes)
+        for name in ('mcp', 'stale-interrupt', 'local-large-symbols', 'fdactivity'):
+            self.assertIn(name + '-agent-lane', names)
+            self.assertNotIn(name, why)
+        classes = ('is the subject', 'agent twin', 'no target')
+        omitted = (
+            'agent-startup', 'remote-startup', 'remote-broken-exit', 'remote-unknown',
+            'shared-sessions', 'shared-processes', 'shared-cleanup', 'log-levels',
+            'metadata-session', 'language-tabs', 'javascript-cache', 'python-named-shared-0',
+            'perl-named-shared-0', 'lua-named-shared-0', 'remote-queued-drop', 'remote-stops',
+            'sysstat-headless', 'system-capture-flow', 'ghidra-static-images', 'apk-symbols',
+            'gdscript-demo', 'gdscript-demo-values', 'memdefrag-tui', 'observation-experiments',
+        )
+        for name in omitted:
+            self.assertTrue(any(phrase in why[name] for phrase in classes), (name, why.get(name)))
+            self.assertNotIn(name + '-agent-lane', names)
+        self.assertIn('is the subject', why['agent-startup'])
+        self.assertIn('agent twin', why['shared-sessions'])
+        self.assertIn('no target', why['memdefrag-tui'])
+        self.assertIn('no target', why['observation-experiments'])
+
+    def test_a_plain_step_whose_script_names_a_launch_flag_fails_classification(self):
+        # A file that names the flags but does not start the debugger must not
+        # stay plain. tests/release-runner.py quotes the gate flag and stays plain.
+        plant = root / 'tests' / '_plain_flag_plant.py'
+        gate._CLIENT_CACHE = None
+        try:
+            step = gate.Step('planted-plain', ['python3', '-B', 'tests/_plain_flag_plant.py'], 30)
+            # Each flag alone is enough.
+            for flag in ('--headless', '--listen'):
+                plant.write_text('value = "%s"\n' % flag)
+                gate._CLIENT_CACHE = None
+                fate, reason = gate.agent_fate(step)
+                self.assertEqual(fate, 'invalid', flag)
+                self.assertEqual(reason, 'a plain step whose script contains --headless or --listen')
+                with self.assertRaises(ValueError):
+                    gate.apply_agent_lane([step])
+            runner = next(item for item in gate.plan('host') if item.name == 'release-runner')
+            self.assertEqual(gate.agent_fate(runner), ('plain', ''))
+        finally:
+            plant.unlink(missing_ok=True)
+            gate._CLIENT_CACHE = None
+
     def test_native_mac_paths_have_focused_coverage(self):
         steps = gate.plan('all', macos='fixture-mac')
         for path in ('build_macos.zig', 'src/macos_main.zig', 'scripts/macos-bundle.py', 'tests/cocoa-native.m'):
@@ -908,7 +1087,9 @@ time.sleep(60)
             'tests/vulkan-fault.py', 'zig-out/bin/xodb', '.work/vulkan-faults.json'])
         self.assertEqual(set(regular['vulkan-faults'][5:]), {
             'baseline', 'partial-vkCreateFramebuffer', 'poison-vkCreateSwapchainKHR',
-            'frame-vkQueuePresentKHR-lost', 'repeat-init-fails-late', 'resize-real-output'})
+            'frame-vkQueuePresentKHR-lost', 'repeat-init-fails-late', 'resize-real-output',
+            # The early Vulkan setup path (SR03-F2): its failures must reach recovery.
+            'partial-vkCreateInstance', 'partial-vkCreateImage', 'start-memory-no-device-local'})
         for delay in (25, 50, 100):
             name = f'symbol-discovery-latency-{delay}'
             self.assertNotIn(name, regular)

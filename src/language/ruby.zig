@@ -1,19 +1,20 @@
 //! Retained-stop adapter for the C CRuby reader. No target evaluation.
 const std = @import("std");
 const c = @import("../c.zig").api;
-const model = @import("../model/session.zig");
-const Module = @import("../model/modules.zig").Module;
-const eval = @import("../model/evaluate.zig");
-const view = @import("../model/value_view.zig");
-const named = @import("../model/language_locals.zig");
+const context_api = @import("context.zig");
+const Context = context_api.Context;
+const Module = context_api.Module;
+const eval = @import("../debug/evaluate.zig");
+const view = @import("../debug/value_view.zig");
+const named = @import("locals_types.zig");
 const A = std.mem.Allocator;
 fn read(ctx: ?*anyopaque, at: u64, out: ?*anyopaque, n: usize) callconv(.c) c_int {
-    const session: *model.Session = @ptrCast(@alignCast(ctx.?));
+    const session: *const Context = @ptrCast(@alignCast(ctx.?));
     const bytes: [*]u8 = @ptrCast(out.?);
-    return if ((session.target.readMemory(at, bytes[0..n]) catch return -1) == n) 0 else -1;
+    return if ((session.readMemory(at, bytes[0..n]) catch return -1) == n) 0 else -1;
 }
-fn reader(session: *model.Session) c.struct_xrb_reader {
-    return .{ .context = session, .read = read, .reads = 0, .bytes = 0, .@"error" = null };
+fn reader(session: *const Context) c.struct_xrb_reader {
+    return .{ .context = @constCast(session), .read = read, .reads = 0, .bytes = 0, .@"error" = null };
 }
 fn hex(a: A, value: u64) ![]const u8 {
     return std.fmt.allocPrint(a, "0x{x}", .{value});
@@ -30,24 +31,22 @@ fn buildId(a: A, layout: *const c.struct_xrb_layout) ![]const u8 {
     }
     return out;
 }
-fn runtimeModule(session: *model.Session) !*Module {
+fn runtimeModule(session: *const Context) !Module {
     try session.languages.require(.ruby);
     // Initial profile: a standalone/static CRuby executable, identified by
     // kernel PHDR evidence. A shared-library runtime stays unavailable.
-    const runtime = @import("../target/runtime.zig");
-    var loader = std.mem.zeroes(runtime.c.struct_xrt_loader);
-    _ = runtime.c.xrt_target_loader(session.target.handle, &loader, null);
-    if (loader.main_phdr == 0) return error.RubyModuleIdentityUnavailable;
-    const module = session.modules.at(loader.main_phdr) catch return error.RubyModuleIdentityUnavailable;
+    const main_phdr = session.mainPhdr();
+    if (main_phdr == 0) return error.RubyModuleIdentityUnavailable;
+    const module = session.moduleAt(main_phdr) catch return error.RubyModuleIdentityUnavailable;
     if (module.symbols().findSymbol("ruby_version") == null or module.symbols().findSymbol("rb_vm_exec") == null) return error.RubyStaticRuntimeUnavailable;
     return module;
 }
-fn constant(session: *model.Session, module: *Module, name: []const u8, expected: []const u8) !void {
+fn constant(session: *const Context, module: Module, name: []const u8, expected: []const u8) !void {
     const sym = module.symbols().findSymbol(name) orelse return error.RubyVersionUnavailable;
     if (!sym.hasAddress() or sym.size != expected.len + 1 or sym.size > 128) return error.RubyVersionUnsupported;
     var loaded: [128]u8 = undefined;
     const size: usize = @intCast(sym.size);
-    if (try session.target.readMemory(try module.runtimeAddress(sym.value), loaded[0..size]) != size) return error.RubyVersionUnavailable;
+    if (try session.readMemory(try module.runtimeAddress(sym.value), loaded[0..size]) != size) return error.RubyVersionUnavailable;
     if (loaded[size - 1] != 0 or !std.mem.eql(u8, loaded[0 .. size - 1], expected)) return error.RubyVersionUnsupported;
     for (0..module.image.header.segment_count) |i| {
         const seg = try module.image.segment(@intCast(i));
@@ -60,19 +59,19 @@ fn constant(session: *model.Session, module: *Module, name: []const u8, expected
     }
     return error.RubyVersionUnavailable;
 }
-fn profile(session: *model.Session, module: *Module) !*const c.struct_xrb_layout {
-    if (session.target.snapshot().state != .stopped) return error.NotStopped;
-    if (session.target.arch() != .x86_64) return error.RubyArchitectureUnsupported;
+fn profile(session: *const Context, module: Module) !*const c.struct_xrb_layout {
+    if (!session.snapshot().stopped) return error.NotStopped;
+    if (session.arch() != .x86_64) return error.RubyArchitectureUnsupported;
     const id = module.image.buildId() orelse return error.RubyBuildIdUnavailable;
     if (id.len == 0 or id.len > 64) return error.RubyBuildIdUnavailable;
     const note = module.image.sectionByName(".note.gnu.build-id") orelse return error.RubyBuildIdUnavailable;
     if (note.flags & 2 == 0 or note.size > 256) return error.RubyBuildIdUnavailable;
     const expected = try module.image.sectionData(note);
     var actual: [256]u8 = undefined;
-    if (try session.target.readMemory(try module.runtimeAddress(note.addr), actual[0..expected.len]) != expected.len or !std.mem.eql(u8, expected, actual[0..expected.len])) return error.RubyBuildIdMismatch;
+    if (try session.readMemory(try module.runtimeAddress(note.addr), actual[0..expected.len]) != expected.len or !std.mem.eql(u8, expected, actual[0..expected.len])) return error.RubyBuildIdMismatch;
     try constant(session, module, "ruby_version", c.XRB_VERSION);
     try constant(session, module, "ruby_revision", c.XRB_REVISION);
-    if (module.ruby_layout == null) {
+    if (module.layouts.ruby == null) {
         const debug = module.debugInfo() catch |err| return if (err == error.DebugMetadataPending) err else error.RubyDwarfUnavailable;
         var layout: c.struct_xrb_layout = undefined;
         if (c.xrb_layout_build(debug.dwarf, id.ptr, id.len, c.XRB_VERSION, c.XRB_REVISION, &layout)) |why| {
@@ -81,21 +80,21 @@ fn profile(session: *model.Session, module: *Module) !*const c.struct_xrb_layout
             }
             return error.RubyLayoutUnsupported;
         }
-        module.ruby_layout = layout;
+        module.layouts.ruby = layout;
     }
-    return &module.ruby_layout.?;
+    return &module.layouts.ruby.?;
 }
-fn globalAddress(module: *Module, name: []const u8) !u64 {
+fn globalAddress(module: Module, name: []const u8) !u64 {
     const sym = module.symbols().findSymbol(name) orelse return error.RubyRuntimeSymbolsUnavailable;
     if (!sym.hasAddress()) return error.RubyRuntimeSymbolsUnavailable;
     return module.runtimeAddress(sym.value);
 }
-fn zjitEntry(session: *model.Session, module: *Module) !u64 {
+fn zjitEntry(session: *const Context, module: Module) !u64 {
     var bytes: [8]u8 = undefined;
-    if (try session.target.readMemory(try globalAddress(module, "rb_zjit_entry"), &bytes) != bytes.len) return error.RubyJitStateUnavailable;
+    if (try session.readMemory(try globalAddress(module, "rb_zjit_entry"), &bytes) != bytes.len) return error.RubyJitStateUnavailable;
     return std.mem.readInt(u64, &bytes, .little);
 }
-pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.zig").Description {
+pub fn describe(session: *const Context, a: A) !@import("types.zig").Description {
     try session.languages.require(.ruby);
     const module = try runtimeModule(session);
     const layout = try profile(session, module);
@@ -113,7 +112,7 @@ fn converted(a: A, v: *const c.struct_xrb_value) !named.Value {
     };
     return .{ .type = try a.dupe(u8, std.mem.sliceTo(&v.type, 0)), .display = try a.dupe(u8, std.mem.sliceTo(&v.display, 0)), .count = if (std.mem.eql(u8, std.mem.sliceTo(&v.type, 0), "String") or std.mem.eql(u8, std.mem.sliceTo(&v.type, 0), "Array") or std.mem.eql(u8, std.mem.sliceTo(&v.type, 0), "Symbol") or std.mem.eql(u8, std.mem.sliceTo(&v.type, 0), "Hash")) v.count else null, .diagnostic = try reason(a, v.reason), .truncated = v.truncated != 0, .children = children };
 }
-pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview {
+pub fn preview(session: *const Context, a: A, value: eval.Value) !?view.Preview {
     if (!session.languages.on(.ruby)) return null;
     if (value.availability != .available or !value.type.ruby_value or value.type.kind != .unsigned or value.type.size != 8) return null;
     const module = try runtimeModule(session);
@@ -132,10 +131,10 @@ pub const Frame = struct { name: []const u8, qualified_name: ?[]const u8 = null,
 pub const Segment = struct { runtime: Runtime, runtime_instance: Instance, anchor: ?Anchor, additional_anchors: []Anchor = &.{}, frames: []Frame, chain_complete: bool = false, state: []const u8 = "partial", reason: ?[]const u8, memory_reads: usize, memory_bytes: usize };
 pub const ArgumentDiagnostic = struct { frame: usize, reason: []const u8 };
 pub const Stack = struct { session_id: u64, generation: u64, tid: i32, segments: []Segment, native_stack_incomplete: bool, native_argument_diagnostics: []ArgumentDiagnostic, basis: []const u8 = "CRuby control frames from native rb_vm_exec ec; segment anchor only, logical/native pairing unproved; no target calls" };
-pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
+pub fn stack(session: *const Context, a: A, tid: i32, first: usize) !Stack {
     try session.languages.require(.ruby);
-    if (session.target.snapshot().state != .stopped) return error.NotStopped;
-    const generation = session.target.snapshot().generation;
+    if (!session.snapshot().stopped) return error.NotStopped;
+    const generation = session.snapshot().generation;
     const module = try runtimeModule(session);
     const layout = try profile(session, module);
     const zjit = try zjitEntry(session, module);
@@ -145,7 +144,7 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
     var diagnostics: std.ArrayList(ArgumentDiagnostic) = .empty;
     for (native[first..]) |f| {
         if (!std.mem.eql(u8, f.symbol orelse "", "rb_vm_exec")) continue;
-        if ((session.modules.at(f.pc) catch continue) != module) continue;
+        if ((session.moduleAt(f.pc) catch continue).identity != module.identity) continue;
         const ec = recoveredEc(session, a, f) catch |err| {
             if (err == error.OutOfMemory) return err;
             try diagnostics.append(a, .{ .frame = f.index, .reason = @errorName(err) });
@@ -184,10 +183,10 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
         try segments.append(a, .{ .runtime = .{ .build_id = try buildId(a, layout) }, .runtime_instance = .{ .address = address }, .anchor = .{ .frame = f.index, .pc = try hex(a, f.pc) }, .frames = frames, .chain_complete = raw.reason == null, .reason = (try reason(a, raw.reason)) orelse "RubyNativePairingUnproved", .memory_reads = r.reads, .memory_bytes = r.bytes });
     }
     if (segments.items.len == 0 and diagnostics.items.len == 0) return error.RubyExecutionContextUnavailable;
-    try session.target.expectGeneration(generation);
+    try session.expectGeneration(generation);
     return .{ .session_id = session.id, .generation = generation, .tid = tid, .segments = try segments.toOwnedSlice(a), .native_argument_diagnostics = try diagnostics.toOwnedSlice(a), .native_stack_incomplete = native.len == 64 or native[native.len - 1].diagnostic != null };
 }
-fn recoveredEc(session: *model.Session, a: A, frame: model.Frame) !u64 {
+fn recoveredEc(session: *const Context, a: A, frame: context_api.Frame) !u64 {
     const locals = try session.frameLocals(a, frame);
     for (locals) |local| {
         if (!local.parameter or !std.mem.eql(u8, local.name, "ec") or local.value.type.kind != .pointer) continue;
@@ -199,17 +198,17 @@ fn recoveredEc(session: *model.Session, a: A, frame: model.Frame) !u64 {
     }
     return error.RubyExecutionContextArgumentUnavailable;
 }
-pub fn readLocals(session: *model.Session, a: A, tid: i32, segment: usize, frame: usize, start: usize, limit: usize) !named.Result {
+pub fn readLocals(session: *const Context, a: A, observed: Stack, tid: i32, segment: usize, frame: usize, start: usize, limit: usize) !named.Result {
     try session.languages.require(.ruby);
-    return bindings(session, a, tid, segment, frame, start, limit, null);
+    return bindings(session, a, observed, tid, segment, frame, start, limit, null);
 }
-fn checkedExpression(a: A, text: []const u8) ![:0]const u8 {
+pub fn checkedExpression(a: A, text: []const u8) ![:0]const u8 {
     if (text.len == 0 or text.len > c.XLW_EXPRESSION or std.mem.indexOfScalar(u8, text, 0) != null) return error.UnsupportedRubyExpression;
     const query = try a.dupeZ(u8, text);
     if (c.xrb_expression_check(query) != null) return error.UnsupportedRubyExpression;
     return query;
 }
-fn readContext(module: *Module, expression: []const u8) !c.struct_xrb_context {
+fn readContext(module: Module, expression: []const u8) !c.struct_xrb_context {
     var context = std.mem.zeroes(c.struct_xrb_context);
     context.symbols = try globalAddress(module, "ruby_global_symbols");
     context.hash_class = try globalAddress(module, "rb_cHash");
@@ -232,13 +231,12 @@ fn readContext(module: *Module, expression: []const u8) !c.struct_xrb_context {
     }) |entry| @field(context, entry[0]) = try globalAddress(module, entry[1]);
     return context;
 }
-pub fn evaluateLocal(session: *model.Session, a: A, tid: i32, segment: usize, frame: usize, expression: []const u8) !named.Result {
+pub fn evaluateLocal(session: *const Context, a: A, observed: Stack, tid: i32, segment: usize, frame: usize, expression: []const u8) !named.Result {
+    // The owner calls checkedExpression before acquiring the retained stack.
     try session.languages.require(.ruby);
-    _ = try checkedExpression(a, expression);
-    return bindings(session, a, tid, segment, frame, 0, 1, expression);
+    return bindings(session, a, observed, tid, segment, frame, 0, 1, expression);
 }
-fn bindings(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, start: usize, limit: usize, expression: ?[]const u8) !named.Result {
-    const observed = try @import("../model/language_selection.zig").cachedRead(.ruby, session, tid);
+fn bindings(session: *const Context, a: A, observed: Stack, tid: i32, segment_index: usize, frame: usize, start: usize, limit: usize, expression: ?[]const u8) !named.Result {
     if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;
     const segment = observed.segments[segment_index];
     if (frame >= segment.frames.len) return error.InvalidLanguageFrame;
@@ -264,7 +262,7 @@ fn bindings(session: *model.Session, a: A, tid: i32, segment_index: usize, frame
         .storage_lifetime = if (item.escaped != 0) "escaped Ruby environment; resolve again after resume/GC" else "Ruby VM stack slot; resolve again after resume/fiber switch",
         .value = try converted(a, &item.value),
     };
-    try session.target.expectGeneration(observed.generation);
+    try session.expectGeneration(observed.generation);
     return .{ .generation = observed.generation, .tid = tid, .language = .ruby, .segment = segment_index, .frame = frame, .start = raw.start, .total = raw.total, .truncated = raw.truncated != 0, .rows = rows, .diagnostic = try reason(a, raw.reason), .runtime_version = segment.runtime.version, .runtime_build_id = segment.runtime.build_id, .basis = "same-image DWARF; CRuby local table and validated stack/escaped environment; nearest lexical environment first; no target calls", .memory_reads = r.reads, .memory_bytes = r.bytes };
 }
 
@@ -272,7 +270,7 @@ const WatchCapture = @import("watch.zig").Capture;
 // Runtime words: module/execution context. Frame words: control frame/iseq/
 // binding selector/lexical ordinal. Environment and VALUE addresses are never
 // retained: Binding creation, fiber switches and compacting GC can move them.
-fn watchValue(session: *model.Session, a: A, capture: *WatchCapture, frame: usize, row: ?usize) !void {
+fn watchValue(session: *const Context, a: A, capture: *WatchCapture, frame: usize, row: ?usize) !void {
     const module = try runtimeModule(session);
     if (module.id != capture.scope.runtime[0]) return error.RubyWatchRuntimeChanged;
     const layout = try profile(session, module);
@@ -323,35 +321,30 @@ pub fn watchExpression(a: A, expression: ?[]const u8, row: ?usize) ![:0]const u8
     if (row) |index| if (index >= 4096) return error.InvalidArguments;
     return if (expression) |query| try checkedExpression(a, query) else try a.dupeZ(u8, "binding");
 }
-pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: ?[]const u8, row: ?usize) !WatchCapture {
+pub fn createWatch(session: *const Context, a: A, observed: Stack, tid: i32, segment_index: usize, frame: usize, checked_expression: [:0]const u8, row: ?usize) !WatchCapture {
     try session.languages.require(.ruby);
-    const checked_expression = try watchExpression(a, expression, row);
-    const observed = try @import("../model/language_selection.zig").cachedRead(.ruby, session, tid);
     if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;
     const segment = observed.segments[segment_index];
     if (frame >= segment.frames.len) return error.InvalidLanguageFrame;
     const selected = segment.frames[frame];
     if (selected.reason != null) return error.RubyWatchFrameUnproved;
-    const thread = for (session.target.threadSlice()) |entry| {
-        if (entry.tid == tid) break entry.id;
-    } else return error.InvalidThread;
+    const thread = try session.threadIdentity(tid);
     var capture = WatchCapture{ .scope = .{
         .language = c.XLW_RUBY,
         .session = session.id,
-        .image = session.target.snapshot().image_epoch,
+        .image = session.snapshot().image_epoch,
         .thread = thread,
         .runtime = .{ (try runtimeModule(session)).id, try std.fmt.parseInt(u64, segment.runtime_instance.address, 0), 0, 0 },
         .frame = .{ try std.fmt.parseInt(u64, selected.control_frame, 0), try std.fmt.parseInt(u64, selected.instruction_sequence, 0), 0, 0 },
     }, .expression = checked_expression };
     try watchValue(session, a, &capture, frame, row);
     if (row != null and capture.scope.frame[2] == 0) return error.RubyWatchBindingUnavailable;
-    try session.target.expectGeneration(observed.generation);
+    try session.expectGeneration(observed.generation);
     return capture;
 }
-pub fn observeWatch(session: *model.Session, a: A, tid: i32, scope: c.struct_xlw_scope, expression: []const u8) !WatchCapture {
+pub fn observeWatch(session: *const Context, a: A, observed: Stack, scope: c.struct_xlw_scope, expression: [:0]const u8) !WatchCapture {
     try session.languages.require(.ruby);
-    var capture = WatchCapture{ .scope = scope, .expression = try a.dupeZ(u8, expression) };
-    const observed = try @import("../model/language_selection.zig").cachedRead(.ruby, session, tid);
+    var capture = WatchCapture{ .scope = scope, .expression = expression };
     const module_id = (try runtimeModule(session)).id;
     if (module_id != scope.runtime[0]) {
         capture.scope.runtime[0] = module_id;
@@ -371,7 +364,7 @@ pub fn observeWatch(session: *model.Session, a: A, tid: i32, scope: c.struct_xlw
                 return capture;
             }
             try watchValue(session, a, &capture, index, null);
-            try session.target.expectGeneration(observed.generation);
+            try session.expectGeneration(observed.generation);
             return capture;
         }
     }
@@ -379,6 +372,6 @@ pub fn observeWatch(session: *model.Session, a: A, tid: i32, scope: c.struct_xlw
         capture.observation = c.XLW_FRAME_GONE;
         capture.diagnostic = try a.dupeZ(u8, "RubyWatchFrameGone");
     } else capture.diagnostic = try a.dupeZ(u8, "RubyWatchFrameNotObserved");
-    try session.target.expectGeneration(observed.generation);
+    try session.expectGeneration(observed.generation);
     return capture;
 }

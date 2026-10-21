@@ -2,13 +2,14 @@
 """Step over a Go call that grows the stack.
 
 On aarch64, g lives in x28; on x86-64, r14; on riscv64, s11 (Go's X27);
-on loong64, r22 (Go's R22). The row comes from the target's architecture.
+on loong64, r22 (Go's R22); on ppc64le, r30 (Go's R30) and the stack
+pointer column is r1. The row comes from the target's architecture.
 A return probe that only remembers the stack pointer runs away when the
 copy moves that pointer. This stops on the next line of the caller, with
 the same g and a readable local.
 
 release-check only runs on x86-64, so there this guards the r14 path. Run it
-on aarch64 for x28. For riscv64 or loong64, pass --runtime-ssh,
+on aarch64 for x28. For riscv64, loong64 or ppc64le, pass --runtime-ssh,
 --runtime-agent and --exe so the target is that architecture. Other local
 machines print a skip line and exit 0. --exe runs a binary already built
 from SOURCE, for a machine with no Go toolchain.
@@ -52,7 +53,7 @@ p.add_argument('--runtime-ssh')
 p.add_argument('--ssh-config', dest='ssh_file')
 p.add_argument('--runtime-agent')
 a = p.parse_args()
-REGS = {'aarch64': ('aarch64', 'x28', 'sp'), 'arm64': ('aarch64', 'x28', 'sp'), 'x86_64': ('x86_64', 'r14', 'rsp'), 'riscv64': ('riscv64', 's11', 'sp'), 'loongarch64': ('loongarch64', 'r22', 'r3'), 'loong64': ('loongarch64', 'r22', 'r3')}
+REGS = {'aarch64': ('aarch64', 'x28', 'sp'), 'arm64': ('aarch64', 'x28', 'sp'), 'x86_64': ('x86_64', 'r14', 'rsp'), 'riscv64': ('riscv64', 's11', 'sp'), 'loongarch64': ('loongarch64', 'r22', 'r3'), 'loong64': ('loongarch64', 'r22', 'r3'), 'ppc64le': ('ppc64le', 'r30', 'r1')}
 remote = bool(a.runtime_ssh or a.runtime_agent)
 if not remote and os.uname().machine not in REGS:
     print('go-step-g: skip, no Go g register on this host')

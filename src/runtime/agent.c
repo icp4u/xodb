@@ -27,6 +27,7 @@ struct agent_file {
     struct xrt_file_identity identity;
 };
 struct agent {
+    uint64_t negotiated;
     struct xrt_agent_perf *collectors;
     struct entry entries[XRT_RPC_TARGETS];
     uint32_t next_id, next_file;
@@ -88,7 +89,10 @@ static enum xrt_status dispatch(struct agent *a, struct xrt_wire_frame *frame, u
         xrt_codec_u32(&extra, &hz);
         xrt_codec_u32(&extra, &page);
         if (args[0] == XRT_RPC_HELLO_CAPABILITIES) {
-            uint64_t caps = XRT_RPC_CAP_SOURCE;
+            /* Advertise the snapshot suffix only to a host that asked for it,
+             * so the reply bit and the agreed reply shape cannot disagree. */
+            a->negotiated = args[1] & XRT_RPC_CAP_ADDRESS_SPACE;
+            uint64_t caps = XRT_RPC_CAP_SOURCE | a->negotiated;
             xrt_codec_u64(&extra, &caps);
         }
         *extra_size = extra.at;
@@ -517,6 +521,10 @@ int xrt_agent_serve(int input, int output, const volatile sig_atomic_t *stop)
             xrt_codec_bool(&out, &shared);
             xrt_codec_u32(&out, &root);
             xrt_wire_target(&out, snapshot);
+            if (a->negotiated & XRT_RPC_CAP_ADDRESS_SPACE) {
+                bool unstable = xrt_target_address_space_unstable(snapshot);
+                xrt_codec_bool(&out, &unstable);
+            }
         }
         if (!out.ok) {
             result = 1;

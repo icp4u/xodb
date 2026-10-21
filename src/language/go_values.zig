@@ -3,10 +3,11 @@
 const std = @import("std");
 const c = @import("../c.zig").api;
 const go = @import("go.zig");
-const model = @import("../model/session.zig");
-const Module = @import("../model/modules.zig").Module;
-const eval = @import("../model/evaluate.zig");
-const view = @import("../model/value_view.zig");
+const InspectionContext = @import("context.zig").Context;
+const results = @import("value_types.zig");
+const Module = @import("context.zig").Module;
+const eval = @import("../debug/evaluate.zig");
+const view = @import("../debug/value_view.zig");
 const A = std.mem.Allocator;
 pub fn supported(t: *const eval.Type) bool {
     return t.language == .go and (t.go_kind == view.go_kind.map or t.go_kind == view.go_kind.chan or t.go_kind == view.go_kind.interface);
@@ -17,36 +18,36 @@ fn layoutError(why: [*c]const u8) anyerror {
     }
     return error.GoValueLayoutUnsupported;
 }
-fn valueProfile(module: *Module) !*const c.struct_xgv_layout {
-    if (module.go_map_layout) |p| return &p.values;
-    if (module.go_value_layout) |p| return p;
+fn valueProfile(module: Module) !*const c.struct_xgv_layout {
+    if (module.layouts.go_map) |p| return &p.values;
+    if (module.layouts.go_value) |p| return p;
     const debug = try module.debugInfo();
     const id = module.image.buildId() orelse return error.GoBuildIdUnavailable;
     const p = try module.debug_allocator.create(c.struct_xgv_layout);
     errdefer module.debug_allocator.destroy(p);
     if (c.xgv_layout_build(debug.dwarf, id.ptr, id.len, p)) |why| return layoutError(why);
-    module.go_value_layout = p;
+    module.layouts.go_value = p;
     return p;
 }
-fn mapProfile(module: *Module) !*const c.struct_xgm_layout {
-    if (module.go_map_layout) |p| return p;
+fn mapProfile(module: Module) !*const c.struct_xgm_layout {
+    if (module.layouts.go_map) |p| return p;
     const debug = try module.debugInfo();
     const id = module.image.buildId() orelse return error.GoBuildIdUnavailable;
     const p = try module.debug_allocator.create(c.struct_xgm_layout);
     errdefer module.debug_allocator.destroy(p);
     if (c.xgm_layout_build(debug.dwarf, id.ptr, id.len, p)) |why| return layoutError(why);
-    module.go_map_layout = p;
+    module.layouts.go_map = p;
     return p;
 }
 const Context = struct {
-    session: *model.Session,
-    module: *Module,
+    session: *const InspectionContext,
+    module: Module,
     generation: u64,
     moduledata: u64,
     types: u64,
     etypes: u64,
-    fn init(session: *model.Session, t: *const eval.Type) !Context {
-        const generation = session.target.snapshot().generation;
+    fn init(session: *const InspectionContext, t: *const eval.Type) !Context {
+        const generation = session.snapshot().generation;
         const module = try go.verifiedModule(session);
         const debug = try module.debugInfo();
         const dwarf = debug.dwarf orelse return error.GoDwarfUnavailable;
@@ -57,7 +58,7 @@ const Context = struct {
         return .{ .session = session, .module = module, .generation = generation, .moduledata = try go.globalAddress(module, "runtime.firstmoduledata"), .types = types, .etypes = etypes };
     }
     fn finish(self: Context) !void {
-        try self.session.target.expectGeneration(self.generation);
+        try self.session.expectGeneration(self.generation);
     }
     fn typeAddress(self: Context, t: *const eval.Type) !u64 {
         if (t.go_dwarf != @as(*const anyopaque, @ptrCast((try self.module.debugInfo()).dwarf.?))) return error.GoRuntimeTypeImageMismatch;
@@ -105,12 +106,12 @@ fn dynamicValue(a: A, t: *const eval.Type, raw: *const c.struct_xgv_interface) !
     std.mem.writeInt(u64, bytes[0..8], raw.data, .little);
     return .{ .type = t, .data = bytes };
 }
-fn partial(a: A, out: *model.ValueSummary, why: []const u8) !void {
+fn partial(a: A, out: *results.ValueSummary, why: []const u8) !void {
     out.partial = true;
     out.diagnostic = try a.dupe(u8, why);
     out.display = try std.fmt.allocPrint(a, "partial: {s}", .{why});
 }
-fn preview(ctx: Context, a: A, v: eval.Value, out: *model.ValueSummary) anyerror!void {
+fn preview(ctx: Context, a: A, v: eval.Value, out: *results.ValueSummary) anyerror!void {
     switch (v.type.go_kind) {
         view.go_kind.map => {
             var raw: c.struct_xgm_page = undefined;
@@ -152,7 +153,7 @@ fn preview(ctx: Context, a: A, v: eval.Value, out: *model.ValueSummary) anyerror
         else => unreachable,
     }
 }
-pub fn summarize(session: *model.Session, a: A, v: eval.Value, out: *model.ValueSummary) !bool {
+pub fn summarize(session: *const InspectionContext, a: A, v: eval.Value, out: *results.ValueSummary) !bool {
     // With the Go view off these are plain native values.
     if (!supported(v.type) or !session.languages.on(.go)) return false;
     const ctx = Context.init(session, v.type) catch |err| {
@@ -163,17 +164,17 @@ pub fn summarize(session: *model.Session, a: A, v: eval.Value, out: *model.Value
     try ctx.finish();
     return true;
 }
-pub fn children(session: *model.Session, a: A, v: eval.Value, start: u64, limit: usize) anyerror!model.Session.ValuePage {
+pub fn children(session: *const InspectionContext, a: A, v: eval.Value, start: u64, limit: usize) anyerror!results.ValuePage {
     if (!session.languages.on(.go)) return session.valueChildren(a, v, start, limit, true);
     if (limit == 0 or limit > view.max_children or v.availability != .available) return error.InvalidValuePage;
     const ctx = try Context.init(session, v.type);
-    var items: std.ArrayList(model.Session.ValueChild) = .empty;
+    var items: std.ArrayList(results.ValueChild) = .empty;
     var total: u64 = 0;
     var next: ?u64 = null;
     if (v.type.go_kind == view.go_kind.map) {
         var raw: c.struct_xgm_page = undefined;
         // Native callers may pass an unmaterialized address/composite pointer.
-        const materialized = try eval.materialize(.{ .allocator = a, .user = session, .read = read, .lookup = lookup }, v);
+        const materialized = try eval.materialize(.{ .allocator = a, .user = @constCast(session), .read = read, .lookup = lookup }, v);
         try ctx.map(materialized, start, limit, &raw);
         if (raw.reason != null) return error.GoMapPageUnavailable;
         total = raw.total;
@@ -210,8 +211,8 @@ pub fn children(session: *model.Session, a: A, v: eval.Value, start: u64, limit:
     return .{ .value = try session.summarize(a, v), .presentation = .fields, .total = total, .start = start, .next = next, .children = try items.toOwnedSlice(a), .basis = "same-image Go DWARF; C runtime storage; retained stopped generation; no target calls" };
 }
 fn read(ptr: *anyopaque, at: u64, out: []u8) !usize {
-    const session: *model.Session = @ptrCast(@alignCast(ptr));
-    return session.target.readMemory(at, out);
+    const session: *const InspectionContext = @ptrCast(@alignCast(ptr));
+    return session.readMemory(at, out);
 }
 fn lookup(_: *anyopaque, _: []const u8) !eval.Value {
     return error.UnknownVariable;

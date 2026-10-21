@@ -68,6 +68,7 @@ struct xrt_target {
     uint32_t remote_collectors;
     uint32_t remote_files;
     bool remote_shared;
+    bool remote_unstable;
     const struct xrt_arch *arch;
     uint8_t identity_admitted;
     struct xrt_reg_io *reg_io;

@@ -4,6 +4,12 @@
 #include <stdio.h>
 #include <sys/syscall.h>
 
+bool xrt_target_address_space_unstable(const struct xrt_target *t)
+{
+    if (!t) return false;
+    if (t->connection) return t->remote_unstable;
+    return xrt_target_shared_vm(t) || t->vfork_hold || t->vfork_release;
+}
 bool xrt_target_shared_vm(const struct xrt_target *t)
 {
     if (t && t->connection)

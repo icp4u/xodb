@@ -53,6 +53,8 @@ COVERS = (
     (('src/debug/macho*', 'tests/macos-debug*', 'tests/macos-dwarf*', 'tests/macos-object*', 'tests/macos-unwind*', 'src/model/image_label.zig'), ('macos-debug*', 'macos-dwarf*', 'macos-unwind*', 'macos-names*', 'gui-macos-debug', 'proton-metadata*', 'pe-*', 'pdb-*')),
     (('src/model/remote_worker.zig', 'tests/helpers/agent_proxy.py', 'src/runtime/remote_perf.c'), ('remote-exit-export*', 'remote-broken-exit', 'remote-startup*')),
     (('src/target/runtime.zig', 'src/runtime/remote.c', 'tests/helpers/agent_proxy.py'), ('remote-unknown', 'remote-broken-exit', 'remote-startup*')),
+    (('src/runtime/remote.c', 'src/runtime/xrt_remote.h', 'tests/runtime-remote.c'), ('remote-read-cache',)),
+    (('src/runtime/remote.c', 'src/runtime/agent.c', 'src/runtime/family.c', 'src/runtime/rpc.h', 'src/runtime/target_internal.h', 'src/runtime/xrt_target.h', 'tests/runtime-remote.c'), ('remote-unstable-cache',)),
     (("src/language/runtime_binding.zig", "tests/runtime-binding.py", "tests/fixtures/pe/runtime-binding.c"), ("runtime-binding*", "gui-runtime-binding*", "python-*", "perl-*", *LANGUAGE_PANES)),
     (('tests/gibson-gui.py', 'tests/scene3d-gui.py', 'tests/memdefrag-modern-gui.py', 'tests/gibson-camera.py',
       'tests/deepmap-gui.py', 'tests/memdefrag-win95-gui.py'), ('complete-log-lines',)),
@@ -84,13 +86,13 @@ COVERS = (
     (('src/language/elisp*', 'tests/fixtures/elisp/*', 'examples/emacs-demo.el', 'scripts/demo-emacs'), ('elisp-*', 'emacs-demo*')),
     (('src/language/jai*',), ('jai-*', 'gui-jai-*')),
     (('src/preferences.zig', 'config/preferences.example.json'), ('language-off*', 'm2-preferences*')),
-    (('src/language/watch.*', 'src/model/language_*', 'src/mcp/language_*', 'src/mcp/locals_list.zig', 'src/ui/language_*'),
+    (('src/language/watch.*', 'src/language/context.zig', 'src/language/types.zig', 'src/language/binding_types.zig', 'src/language/locals_types.zig', 'src/debug/frame.zig', 'src/model/runtime_binding.zig', 'src/model/language_*', 'src/mcp/language_*', 'src/mcp/locals_list.zig', 'src/ui/language_*'),
      ('lua-*', 'python-*', 'perl-*', 'ruby-*', 'javascript-*', 'go-language*', 'go-gui', 'elisp-*', 'gdscript-*', *LANGUAGE_PANES)),
     (('src/model/session.zig', 'tests/run-control.py', 'tests/run-control-gui.py'),
      ('go-language*', 'go-gui', 'go-native*', 'go-step-g', 'lua-*', 'python-*', 'perl-*', 'ruby-*', 'javascript-*', 'elisp-*', 'gdscript-*', 'run-control', 'gui-run-control', *LANGUAGE_PANES)),
     (('src/model/remote_*', 'src/model/workspace_view.zig', 'src/ui/remote_workspace.zig'), ('remote-owner-*', 'remote-queued-drop', 'gui-remote-retry', 'gui-remote-owner', 'gui-remote-close', 'gui-remote-publication', 'gui-owner-*')),
     (('src/model/remote_worker.zig', 'src/model/remote_dispatch.zig', 'tests/fixtures/hold-ptrace.c'), ('gui-local-owner*',)),
-    (('src/model/runtime_*', 'src/model/value_view.zig', 'src/mcp/runtime_type*', 'src/ui/runtime_types.zig'),
+    (('src/model/runtime_*', 'src/debug/value_view.zig', 'src/mcp/runtime_type*', 'src/ui/runtime_types.zig'),
      ('jai-*', 'gui-jai-*', 'go-*', 'elisp-*', 'emacs-demo*')),
     (('src/mcp/memory.zig', 'src/mcp/registers.zig', 'src/model/memory.zig', 'src/runtime/memory.c',
       'src/runtime/registers.c', 'src/runtime/xrt_memory.h'), ('memory-registers', 'memory-search-*')),
@@ -270,6 +272,290 @@ class Steps(list):
         for step in more:
             self.append(step)
         return self
+
+
+# The local C agent. One switch, XODB_TEST_RUNTIME_AGENT, makes tests/client.py
+# and the GUI input helper pass --runtime-agent. Steps that cannot use that
+# path say why in AGENT_INELIGIBLE.
+AGENT_BIN = './zig-out/bin/xodb-agent'
+AGENT_LANE_SUFFIX = '-agent-lane'
+AGENT_INELIGIBLE = {
+    'core-debugging': 'reads an ELF core in-process; the C agent is not a core reader',
+    'gdb-debugserver': 'GDB remote protocol, not the C agent',
+    'gdb-debugserver-deadline': 'GDB remote protocol, not the C agent',
+    'gdb-lldb-fuzz': 'GDB remote packet fuzz, not a live C agent target',
+    'macos-native': 'macOS debugserver over ssh, not the Linux C agent',
+    'macos-bootstrap': 'macOS debugserver over ssh, not the Linux C agent',
+    'macos-local': 'macOS debugserver over ssh, not the Linux C agent',
+    'macos-native-stress': 'macOS debugserver over ssh, not the Linux C agent',
+    'system-capture': 'system overview rejects --runtime-agent; it has no target transport',
+    'private-network-evidence': 'opens a packet capture or a mitmproxy flow; those modes reject --runtime-agent',
+    'usb-evidence': 'opens a packet capture; that mode rejects --runtime-agent',
+    'dbus-evidence': 'opens a packet capture; that mode rejects --runtime-agent',
+    'redot-protocol': 'the Redot debugger requires a local owned launch and rejects --runtime-agent',
+    'redot-time': 'the Redot debugger requires a local owned launch and rejects --runtime-agent',
+    'remote': 'starts an xodb --listen server itself, without tests/client.py',
+    # Each of these exits 0 without starting the agent, so the start check fails them.
+    'frame-host': 'opens saved frame streams; that mode has no target for the C agent',
+    'macos-views': 'a GDB remote replay stub, not the C agent',
+    'macos-names': 'a GDB remote replay stub, not the C agent',
+    'macos-debug': 'a GDB remote replay stub, not the C agent',
+    'macos-debug-objects': 'a GDB remote replay stub, not the C agent',
+    'macos-debug-hostile': 'a GDB remote replay stub, not the C agent',
+    'remote-exit-export': 'the C agent is the subject of this step, behind its own proxy',
+    'remote-exit-export-stdio': 'the C agent is the subject of this step, behind its own proxy',
+}
+# These scripts already run each case locally and then through the C agent.
+# A lane variant would only run the agent half twice.
+AGENT_BOTH_PATHS = {'repeated-break', 'mcp-precision', 'mcp-modules', 'macho-mcp', 'mcp-list-pages'}
+# Direct launchers the lane can enter. Each one reads the lane switch and
+# passes --runtime-agent, or starts xodb through tests/shared-sessions.py,
+# which does. The memory view and an observation archive cannot: the view
+# exits before an agent exists, and opening an archive rejects the agent.
+AGENT_ROUTABLE = {
+    'tests/mcp.py',
+    'tests/stale-interrupt.py',
+    'tests/local-large-symbols.py',
+    'tests/fdactivity.py',
+}
+# The other direct launchers, by the script they run. The reason names one
+# class: the C agent is the subject, an existing twin already runs it, or
+# the step has no target for the C agent.
+AGENT_DIRECT = {
+    'tests/agent-startup.py': 'the C agent is the subject of this step',
+    'tests/remote-startup.py': 'the C agent is the subject of this step',
+    'tests/remote-broken-exit.py': 'the C agent is the subject of this step',
+    'tests/remote-unknown.py': 'the C agent is the subject of this step',
+    'tests/shared-sessions.py': 'an existing agent twin runs this command',
+    'tests/shared-processes.py': 'an existing agent twin runs this command',
+    'tests/shared-cleanup.py': 'an existing agent twin runs this command',
+    'tests/log-levels.py': 'an existing agent twin runs this command',
+    'tests/metadata-session.py': 'an existing agent twin runs this command',
+    'tests/language-tabs.py': 'an existing agent twin runs this command',
+    'tests/javascript-cache.py': 'an existing agent twin runs this command',
+    'tests/python-locals-shared.py': 'an existing agent twin runs this command',
+    'tests/perl-locals-shared.py': 'an existing agent twin runs this command',
+    'tests/lua-locals-shared.py': 'an existing agent twin runs this command',
+    'tests/remote-queued-drop.py': 'an existing agent twin runs this command',
+    'tests/remote-stops.py': 'an existing agent twin runs this command',
+    'tests/overview-headless.py': 'this step has no target for the C agent',
+    'tests/system-capture-flow.py': 'this step has no target for the C agent',
+    'tests/ghidra-static-images.py': 'this step has no target for the C agent',
+    'tests/apk/check.py': 'this step has no target for the C agent',
+    'tests/gdscript-demo.py': 'this step has no target for the C agent',
+    'tests/memdefrag-tui.py': 'this step has no target for the C agent',
+    'tests/observation-experiments.py': 'this step has no target for the C agent',
+}
+_CLIENT_CACHE = None
+
+
+def _test_script(step):
+    for arg in step.argv:
+        if isinstance(arg, str) and arg.startswith('tests/') and arg.endswith('.py'):
+            return arg
+    return None
+
+
+def _launches_debugger(body):
+    """The file starts the debugger binary. Naming that path is not enough:
+    a self-test can quote a step argv, and a fixture can use the path as a filename."""
+    import re
+    token = r'zig-out/bin/xodb(?![\w.-])'
+    if not re.search(token, body):
+        return False
+    nested = r'(?:[^]()\n]|\([^)]*\)){0,240}'
+    if re.search(r'\b(?:Popen|run|check_call|check_output)\s*\(\s*\[' + nested + token, body):
+        return True
+    if re.search(r'\b(?:binary|xodb|server)\b[^\n]{0,120}' + token, body):
+        return True
+    if re.search(r'''root\s*/\s*['\"]''' + token, body):
+        return True
+    if re.search(r'''XODB_BIN['\"]\s*,\s*['\"][^'\"]*''' + token, body):
+        return True
+    return False
+
+
+def _client_and_direct():
+    """Test scripts that construct tests/client.py Client, and scripts that
+    start the debugger without that client. Helpers count when imported."""
+    global _CLIENT_CACHE
+    if _CLIENT_CACHE is not None:
+        return _CLIENT_CACHE
+    import re
+    root = ROOT / 'tests'
+    files = [path for path in root.rglob('*.py')]
+    text = {path: path.read_text(errors='replace') for path in files}
+
+    def uses(path, seen):
+        if path in seen or path not in text:
+            return False
+        seen.add(path)
+        body = text[path]
+        if 'Client(' in body and re.search(r'(from client import|import client\b|client\.Client\b)', body):
+            return True
+        for mod in re.findall(r'^\s*(?:from|import)\s+([\w.]+)', body, re.M):
+            mod = mod.split()[0].split('.')
+            if mod[0] == 'helpers' and len(mod) > 1:
+                helper = root / 'helpers' / (mod[1] + '.py')
+            elif mod[0] == 'client':
+                return 'Client(' in body
+            else:
+                helper = root / (mod[0] + '.py')
+            if uses(helper, seen):
+                return True
+        return False
+
+    users, direct = set(), set()
+    for path in files:
+        rel = str(path.relative_to(ROOT))
+        if uses(path, set()):
+            users.add(rel)
+        elif _launches_debugger(text[path]):
+            direct.add(rel)
+    _CLIENT_CACHE = (users, direct)
+    return _CLIENT_CACHE
+
+
+def _argv_has_agent(argv):
+    for arg in argv:
+        if not isinstance(arg, str):
+            continue
+        if arg in ('--agent', '--runtime-agent') or arg.startswith('XODB_RUNTIME_AGENT=') or arg.startswith('XODB_TEST_RUNTIME_AGENT='):
+            return True
+    return False
+
+
+def _normalized_argv(argv):
+    """Command identity ignoring the agent switch and the work directory."""
+    out, skip = [], False
+    for arg in argv:
+        if skip:
+            skip = False
+            continue
+        if not isinstance(arg, str) or arg == 'env' or arg.startswith('XODB_RUNTIME_AGENT=') or arg.startswith('XODB_TEST_RUNTIME_AGENT='):
+            continue
+        if arg in ('--agent', '--runtime-agent', '--work'):
+            skip = True
+            continue
+        if arg.startswith('.work/'):
+            continue
+        out.append(arg)
+    return tuple(out)
+
+
+# tests/release-runner.py quotes the gate flag --headless. It does not start xodb.
+PLAIN_LAUNCH_FLAG_EXEMPT = 'tests/release-runner.py'
+
+
+def _script_names_launch_flag(script):
+    """True when the script text contains --headless or --listen.
+
+    A step that stays plain while its script names either flag is a
+    classifier miss. The check is the script body, not a launch.
+    """
+    try:
+        body = (ROOT / script).read_text(errors='replace')
+    except OSError:
+        return False
+    return '--headless' in body or '--listen' in body
+
+
+def agent_fate(step):
+    """'twin', 'eligible', 'ineligible', 'invalid' or 'plain'.
+
+    Ineligible returns a reason. Invalid is a plain script that names
+    --headless or --listen; apply_agent_lane refuses it.
+    """
+    # An argv that already names the agent is a twin, including the GUI owner
+    # matrix. Classifying every gui step first would drop that matrix.
+    if _argv_has_agent(step.argv) or step.name in AGENT_BOTH_PATHS:
+        return 'twin', ''
+    if step.kind == 'gui' or step.name.startswith('gui-'):
+        return 'ineligible', 'GUI compositor path; the headless step covers the target transport'
+    if step.name in AGENT_INELIGIBLE:
+        return 'ineligible', AGENT_INELIGIBLE[step.name]
+    script = _test_script(step)
+    if script is None or step.kind == 'build':
+        return 'plain', ''
+    users, direct = _client_and_direct()
+    if script in users:
+        return 'eligible', ''
+    if script in direct:
+        if script in AGENT_ROUTABLE:
+            return 'eligible', ''
+        return 'ineligible', AGENT_DIRECT.get(script, 'starts xodb without tests/client.py, so the lane switch cannot reach it')
+    if script != PLAIN_LAUNCH_FLAG_EXEMPT and _script_names_launch_flag(script):
+        return 'invalid', 'a plain step whose script contains --headless or --listen'
+    return 'plain', ''
+
+
+def _agent_variant(step):
+    argv = ['env', 'XODB_TEST_RUNTIME_AGENT=' + AGENT_BIN]
+    skip = False
+    work = []
+    for arg in step.argv:
+        if skip:
+            skip = False
+            if isinstance(arg, str) and arg.startswith('.work/'):
+                arg = arg + AGENT_LANE_SUFFIX
+                work.append(arg[len('.work/'):])
+            argv.append(arg)
+            continue
+        argv.append(arg)
+        if arg == '--work':
+            skip = True
+    for entry in step.work:
+        suffixed = entry if str(entry).endswith(AGENT_LANE_SUFFIX) else entry + AGENT_LANE_SUFFIX
+        if suffixed not in work:
+            work.append(suffixed)
+    return Step(step.name + AGENT_LANE_SUFFIX, argv, step.timeout, kind=step.kind, needs=step.needs,
+                paths=step.paths, serial=step.serial, work=tuple(work))
+
+
+def _twins_cover(steps):
+    return {_normalized_argv(step.argv) for step in steps if agent_fate(step)[0] == 'twin'}
+
+
+def agent_variants(steps):
+    """Agent form of each eligible step that no hand-written twin already covers."""
+    covered = _twins_cover(steps)
+    return [_agent_variant(step) for step in steps
+            if agent_fate(step)[0] == 'eligible' and _normalized_argv(step.argv) not in covered]
+
+
+def apply_agent_lane(steps):
+    """Run eligible steps through the C agent. Keep twins and steps with no
+    target. Omit ineligible steps and return (name, reason) for each.
+    A variant that is already scheduled is not emitted twice. An invalid
+    plain step, one whose script names --headless or --listen, raises."""
+    covered = _twins_cover(steps)
+    scheduled = {step.name for step in steps}
+    out, notes = [], []
+    for step in steps:
+        fate, reason = agent_fate(step)
+        if fate == 'eligible':
+            variant = _agent_variant(step)
+            if _normalized_argv(step.argv) in covered:
+                notes.append((step.name, 'an existing agent twin runs this command'))
+                continue
+            if variant.name in scheduled:
+                notes.append((step.name, 'the agent lane already schedules this step'))
+                continue
+            out.append(variant)
+        elif fate == 'ineligible':
+            notes.append((step.name, reason))
+        elif fate == 'invalid':
+            raise ValueError(step.name + ': ' + reason)
+        else:
+            out.append(step)
+    return out, notes
+
+
+def agent_source(path):
+    """A change here selects the agent variant of every step it already maps to."""
+    return path.startswith(('src/runtime/', 'src/remote/', 'src/model/remote_')) or path in (
+        'src/mcp/remote.zig', 'src/target/runtime.zig', 'src/target/linux.zig', 'tests/client.py',
+        'tests/shared-sessions.py')
 
 
 def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=(), python=None, padwalker=None, ruby=None, node_refusal=None, go=None, wine=None, emacs=None, moved=False, redot=None, macos_ssh=None, arm64_sidecar=None, macos=None, riscv64_guest=None):
@@ -459,10 +745,25 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps += plan('gui', *runtimes, moved=True, redot=redot, macos_ssh=macos_ssh)
         elif not headless:
             steps += plan('host', *runtimes, moved=True, redot=redot, macos_ssh=macos_ssh)
+        # Agent variants of the host lane live here, not in `all`. `host
+        # --agent-lane` runs that copy alone. A headless periodic run stays
+        # free of live targets. moved=True is the same plan, so variants are
+        # added once.
+        if tier == 'periodic' and not moved and not headless:
+            present = {step.name for step in steps}
+            host_steps = [*plan('host', *runtimes, redot=redot),
+                          *plan('host', *runtimes, moved=True, redot=redot)]
+            for variant in agent_variants(host_steps):
+                if variant.name in present:
+                    continue
+                steps.append(variant)
+                present.add(variant.name)
         return steps
     if live:
         steps.append(('remote-queued-drop', [sys.executable, '-B', 'tests/remote-queued-drop.py', '--work', '.work/remote-queued-drop'], 60))
         steps.append(('remote-lifecycle', ['zig-out/bin/xodb-remote-lifecycle-test'], 30))
+        steps.append(('remote-read-cache', ['zig-out/bin/xodb-runtime-remote-test', 'zig-out/bin/xodb-agent', '--cache'], 30))
+        steps.append(('remote-unstable-cache', ['zig-out/bin/xodb-runtime-remote-test', 'zig-out/bin/xodb-agent', '--unstable'], 30))
         steps.append(('remote-resolve', ['zig-out/bin/xodb-remote-resolve-test'], 35))
         steps.append(('remote-cancel', ['zig-out/bin/xodb-remote-cancel-test'], 35))
         steps.kind = 'live'
@@ -661,7 +962,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps.append(('go-maps', [sys.executable, '-B', 'tests/go-maps.py', '--go', go, '--strace', '--work', '.work/go-maps'], 180))
             steps.append(('go-values', [sys.executable, '-B', 'tests/go-values.py', '--go', go, '--strace', '--work', '.work/go-values'], 180))
             steps.append(('go-language', [sys.executable, '-B', 'tests/go-language.py', '--go', go, '--strace', '--work', '.work/go'], 120))
-            steps.append(('go-language-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', sys.executable, '-B', 'tests/go-language.py', '--go', go, '--work', '.work/go-agent'], 180))
+            steps.append(('go-language-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', sys.executable, '-B', 'tests/go-language.py', '--go', go, '--strace', '--work', '.work/go-agent'], 180))
             steps.append(('go-step-g', [sys.executable, '-B', 'tests/go-step-g.py', '--go', go, '--work', '.work/go-step-g'], 180))
         if redot:
             steps.append(('redot-protocol', [sys.executable, '-B', 'tests/redot-protocol.py', '--redot', redot, '--work', '.work/rdp'], 60))
@@ -682,7 +983,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             sdk = ['--source', source, '--library', library]
             for remote in (False, True):
                 prefix = ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent'] if remote else []
-                steps.append((f'language-selection-{index}-{int(remote)}', [*prefix, sys.executable, '-B', 'tests/language-selection.py', '--include', source, '--library', library, *([] if remote else ['--strace']), '--work', f'.work/language-selection-{index}-{int(remote)}'], 120))
+                steps.append((f'language-selection-{index}-{int(remote)}', [*prefix, sys.executable, '-B', 'tests/language-selection.py', '--include', source, '--library', library, '--strace', '--work', f'.work/language-selection-{index}-{int(remote)}'], 120))
             steps.append((f'lua-component-{index}', [sys.executable, '-B', 'tests/lua-component.py', *sdk, '--work', f'.work/lua-component-{index}'], 120))
             for remote in (False, True):
                 agent = ['--agent', 'zig-out/bin/xodb-agent'] if remote else []
@@ -708,7 +1009,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.kind = 'gui'
         steps.append(('vulkan-faults', [sys.executable, '-B', 'tests/vulkan-fault.py',
                       'zig-out/bin/xodb', '.work/vulkan-faults.json',
-                      'baseline', 'partial-vkCreateFramebuffer', 'poison-vkCreateSwapchainKHR',
+                      'baseline', 'partial-vkCreateInstance', 'partial-vkCreateImage',
+                      'start-memory-no-device-local', 'partial-vkCreateFramebuffer', 'poison-vkCreateSwapchainKHR',
                       'frame-vkQueuePresentKHR-lost', 'repeat-init-fails-late', 'resize-real-output'], 600))
         for name, args in (
             ('vulkan-enumeration', ['tests/vulkan-enumeration.py']),
@@ -973,6 +1275,34 @@ def stop_adopted(baseline, session=None):
     return sorted(adopted_since(baseline, session))
 
 
+def _shell_quote(text):
+    return "'" + str(text).replace("'", "'\\''") + "'"
+
+
+def arm_agent_start_check(name, argv, cwd, logs):
+    """Point a lane step's switch at a wrapper that records one agent start.
+
+    The wrapper writes a marker and then executes the real agent. A lane step
+    that exits 0 without that marker did not start the agent.
+    """
+    argv = list(argv)
+    if not str(name).endswith(AGENT_LANE_SUFFIX):
+        return argv, None
+    prefix = 'XODB_TEST_RUNTIME_AGENT='
+    marker = Path(logs) / (str(name) + '.agent-started')
+    index = next((i for i, arg in enumerate(argv) if isinstance(arg, str) and arg.startswith(prefix)), None)
+    if index is None:
+        return argv, marker
+    real = argv[index][len(prefix):]
+    if not os.path.isabs(real):
+        real = str(Path(cwd) / real)
+    wrapper = Path(logs) / (str(name) + '.agent-wrapper')
+    wrapper.write_text('#!/bin/sh\nset -eu\n: > %s\nexec %s "$@"\n' % (_shell_quote(marker), _shell_quote(real)))
+    wrapper.chmod(0o755)
+    argv[index] = prefix + str(wrapper)
+    return argv, marker
+
+
 def child_environment(inherited):
     # A gate has no interactive terminal. Individual tests opt into the colour,
     # geometry or locale they exercise, after this per-step baseline is applied.
@@ -990,11 +1320,13 @@ def run_step(name, argv, timeout, cwd, env, logs, halt=None):
     # halt is set for a step that runs beside others: an Event that interrupts it.
     log = logs / (name + '.log')
     started = time.monotonic()
-    outcome = dict(name=name, argv=argv, timeout_seconds=timeout, log=str(log), status='failed')
+    outcome = dict(name=name, argv=list(argv), timeout_seconds=timeout, log=str(log), status='failed')
     child = None
+    marker = None
     baseline = children()
     with log.open('x') as stream:
         try:
+            argv, marker = arm_agent_start_check(name, argv, cwd, logs)
             child = subprocess.Popen(argv, cwd=cwd, env=child_environment(env), stdout=stream,
                                      stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
             try:
@@ -1038,6 +1370,11 @@ def run_step(name, argv, timeout, cwd, env, logs, halt=None):
             outcome['status'] = 'leaked_processes'
         if remaining:
             outcome['status'] = 'cleanup_failed'
+    if marker is not None:
+        started_agent = marker.is_file()
+        outcome['agent_started'] = started_agent
+        if not started_agent and outcome['status'] == 'passed':
+            outcome['status'] = 'agent_not_started'
     outcome['seconds'] = round(time.monotonic() - started, 3)
     print(f"{outcome['status']:16} {name} ({outcome['seconds']:.1f}s)", flush=True)
     return outcome
@@ -1387,6 +1724,7 @@ def main(argv=None):
     parser.add_argument('--lua', action='append', nargs=3, default=[], metavar=('EXECUTABLE', 'SOURCE', 'LIBRARY'), help='Include Lua live/component checks; repeat for each debug runtime and matching internal headers/static library')
     parser.add_argument('--node-include', default='/usr/include/node', help='Matching Node development header directory')
     parser.add_argument('--capstone', choices=['system', 'vendored'], default='system', help='Link system Capstone, or the private prefix from scripts/build-capstone')
+    parser.add_argument('--agent-lane', action='store_true', help='Run every eligible target step through the local C agent (zig-out/bin/xodb-agent). Steps that cannot use it are omitted and listed with a reason. The periodic tier adds these variants beside its own steps.')
     parser.add_argument('--keep-going', action='store_true', help='Run every step after a failure (not after a failed build or probe), then summarise all failures')
     parser.add_argument('--compare-binary', metavar='XODB', help='Opt-in: compare the same MCP command transcript against this reference binary (host/all/affected/periodic)')
     parser.add_argument('--compare-agent', metavar='AGENT', help='Also compare local-agent mode using this reference agent and the built candidate agent; requires --compare-binary')
@@ -1445,6 +1783,8 @@ def main(argv=None):
         parser.error('--node-refusal requires the gui or all tier, or a periodic tier')
     if args.lua and args.tier in ('portable', 'perf'):
         parser.error('--lua is not for the portable or perf tier')
+    if args.agent_lane and args.tier == 'affected':
+        parser.error('--agent-lane selects a tier; affected adds the variants when a runtime or agent file changes')
     runtimes = (args.headless, args.optimize, args.uprobes, args.perl, args.node, args.node_include, args.lua, args.python, args.padwalker, args.ruby, args.node_refusal, args.go, args.wine, args.emacs)
     steps = plan(args.tier, *runtimes, redot=args.redot, macos_ssh=args.macos_ssh, arm64_sidecar=args.arm64_sidecar, macos=args.macos, riscv64_guest=args.riscv64_guest)
     decisions, missing = [], []
@@ -1475,8 +1815,22 @@ def main(argv=None):
             if lost:
                 missing.append('--' + flag)
                 decisions.append(f'affected: WARNING: without --{flag}, {len(lost)} steps that cover this change cannot run: ' + ' '.join(lost))
-        decisions.append(f'affected: {len(changed)} changed files against {base} select {len(steps)} of {len(everything)} steps')
+        extra = []
+        if any(agent_source(path) for path in changed):
+            pool = everything  # host, gui and the steps periodic moved, already planned
+            selected = {step.name for step in steps}
+            have = {step.name for step in steps}
+            extra = [variant for variant in agent_variants(pool)
+                     if variant.name[:-len(AGENT_LANE_SUFFIX)] in selected and variant.name not in have]
+            steps = list(steps) + extra
+            decisions.append(f'affected: agent lane adds {len(extra)} variants of steps a runtime or agent file maps to')
+        decisions.append(f'affected: {len(changed)} changed files against {base} select {len(steps) - len(extra)} of {len(everything)} steps'
+                         + (f', plus {len(extra)} agent variants' if extra else ''))
         print('\n'.join(decisions), file=sys.stderr if args.list else sys.stdout, flush=True)
+    if args.agent_lane:
+        steps, agent_notes = apply_agent_lane(steps)
+        for name, reason in agent_notes:
+            print(f'agent-lane: omit {name}: {reason}', file=sys.stderr)
     if args.compare_binary:
         for lane in ('native', 'agent', 'gui') if args.compare_agent else ('native', 'gui'):
             argv = [sys.executable, '-B', 'tests/command-compare.py', '--reference', str(Path(args.compare_binary).resolve()),

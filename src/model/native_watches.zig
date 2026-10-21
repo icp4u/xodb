@@ -514,7 +514,7 @@ pub const Source = struct {
         const frame = self.frames[i][index];
         const value = self.session.evaluateInFrame(self.scratch.allocator(), frame, self.frameLocals(tid, index, frame), text) catch |err| return .{ .failed = err };
         const summary = self.session.summarize(a, value) catch |err| return .{ .failed = err };
-        const expandable = value.type.kind == .structure or value.type.kind == .array or (value.type.language == .go and value.type.go_kind == @import("value_view.zig").go_kind.map);
+        const expandable = value.type.kind == .structure or value.type.kind == .array or (value.type.language == .go and value.type.go_kind == @import("../debug/value_view.zig").go_kind.map);
         const extent_advisory = if (summary.visualization) |v| v.extent_advisory else false;
         var result = Result{ .value = .{ .display = summary.display, .type_name = summary.type, .available = summary.availability == .available, .extent_advisory = extent_advisory, .expandable = expandable } };
         if (page) |start| if (expandable) {
