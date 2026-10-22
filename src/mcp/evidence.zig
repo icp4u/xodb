@@ -987,7 +987,7 @@ fn describe(a: Allocator, s: *evidence.Stream) !Value {
             .declared_by = "pcap/pcapng file format: seconds since the Unix epoch (CLOCK_REALTIME of the capturing host)",
             .mapping = .{ .state = @tagName(m.state), .to = "CLOCK_MONOTONIC of the opened capture archive", .offset_ns = if (m.state == .aligned) std.math.cast(i64, m.offset_ns) else null, .uncertainty_ns = if (m.state == .aligned) @as(?u64, m.uncertainty_ns) else null, .pairs = m.pairs, .spread_ns = m.spread_ns, .reason = m.reason },
         },
-        .context = .{ .present = s.context != null, .redacted = if (s.context) |ctx| ctx.redacted else false, .capture_pid = if (s.context) |ctx| @as(?i32, ctx.pid) else null, .capture_started_ns = if (s.context) |ctx| @as(?u64, ctx.capture_started_ns) else null },
+        .context = .{ .present = s.context != null, .collection = if (s.context) |ctx| (if (ctx.collection == .collected) "collected" else "not_collected") else null, .reason = if (s.context) |ctx| ctx.collection.reason() else null, .redacted = if (s.context) |ctx| ctx.redacted else false, .capture_pid = if (s.context) |ctx| @as(?i32, ctx.pid) else null, .capture_started_ns = if (s.context) |ctx| @as(?u64, ctx.capture_started_ns) else null },
     });
     try out.object.put(a, "interfaces", .{ .array = interfaces });
     try out.object.getPtr("context").?.object.put(a, "tables", .{ .array = tables });

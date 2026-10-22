@@ -1,6 +1,7 @@
 # Allowed layer imports. One rule per line:
 #   deny NAME FROM... -> TO...   FROM must not reach TO
 #   only NAME FROM... -> TO...   FROM may reach only TO (and itself)
+# Prefix with strict to forbid baseline exemptions, including transitive ones.
 # FROM and TO are layer names (tools/deps/layers) or path globs. Every rule is
 # checked directly and transitively: FROM reaching a forbidden file through files
 # outside FROM is a violation of the edge where the chain leaves FROM.
@@ -18,7 +19,7 @@ only render-leaf            render -> platform common c_ui config
 only platform-leaf          platform -> common c_ui
 
 # Language providers get a narrow context, never the session; no exceptions.
-deny language-no-session    language -> src/model/session.zig
+strict deny language-no-session language -> src/model/session.zig
 deny providers-no-session   semq debug binary -> src/model/session.zig
 
 # The C runtime builds alone (src/runtime/Makefile, xodb-agent): it includes only

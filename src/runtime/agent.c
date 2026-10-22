@@ -92,7 +92,7 @@ static enum xrt_status dispatch(struct agent *a, struct xrt_wire_frame *frame, u
             /* Advertise the snapshot suffix only to a host that asked for it,
              * so the reply bit and the agreed reply shape cannot disagree. */
             a->negotiated = args[1] & XRT_RPC_CAP_ADDRESS_SPACE;
-            uint64_t caps = XRT_RPC_CAP_SOURCE | a->negotiated;
+            uint64_t caps = XRT_RPC_CAP_SOURCE | XRT_RPC_CAP_LARGE_IMAGES | a->negotiated;
             xrt_codec_u64(&extra, &caps);
         }
         *extra_size = extra.at;
@@ -389,7 +389,7 @@ static enum xrt_status dispatch(struct agent *a, struct xrt_wire_frame *frame, u
              * body-size policy only for explicitly requested symbol ranges. */
             if (status == XRT_OK && opened.identity.size <= 0)
                 status = XRT_FILE_UNAVAILABLE;
-            if (status == XRT_OK && !args[0] && opened.identity.size > 256 * 1024 * 1024)
+            if (status == XRT_OK && !args[0] && (uint64_t)opened.identity.size > XRT_REMOTE_IMAGE_LIMIT)
                 status = XRT_FILE_LIMIT;
             if (status != XRT_OK) {
                 close(fd);

@@ -15,6 +15,7 @@ today are listed in a baseline that may only shrink. Plan:
 | `scripts/deps layers` | Edge counts between layers, and files per layer (`--all` includes edges inside a layer). |
 | `scripts/deps cycles` | Every import cycle (strongly connected component) and its files. |
 | `scripts/deps graph --json` | Files with layer and fan-in/fan-out, edges with kind, build modules, unresolved includes. |
+| `scripts/deps diff A B` | Compare exported graph JSON files or source directories; report removed, re-layered and added file-pair edges. `--from-layer language --to-layer model` restricts the boundary; `--json` retains details. Inputs are paths, not Git revisions. |
 | `scripts/deps baseline --write` | Rewrite `tools/deps/baseline` from today's tree. |
 | `scripts/release-check portable --only deps,deps-selftest` | The gate steps. `deps` runs in every tier. |
 
@@ -56,6 +57,21 @@ required for other arithmetic on decoded integers.
 Every rule is checked directly and transitively. FROM reaching a forbidden file
 through other files counts, so a re-export module cannot launder an edge. The
 violation is reported once, on the direct edge where the chain leaves FROM.
+
+Prefix a rule with `strict`, for example
+`strict deny language-no-session language -> src/model/session.zig`, to forbid
+baseline exemptions mechanically. `check` rejects any baseline line tagged with
+that rule (direct or transitive). `baseline --write` refuses to change the file
+while strict violations exist. Other rules retain their baseline behavior.
+
+Graph diffs compare distinct file pairs, as `layers` does. A preserved edge whose
+endpoint layer changes is **re-layered**, not removed. File moves are inferred
+only for unique matching basenames among disappeared/appeared paths, and printed
+as inferences; review the source diff to confirm them. Ambiguous basenames are
+reported and not matched. Same-layer path moves preserve edges. Filters include
+re-layered edges entering or leaving that boundary, with old/new layers in the
+JSON; the before/after counts count only the selected boundary. Export graphs at
+each milestone to avoid counting a file move as a cut dependency.
 
 ## Reading a failure
 

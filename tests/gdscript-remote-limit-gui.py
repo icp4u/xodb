@@ -12,7 +12,7 @@ a.work.mkdir(parents=True,exist_ok=True);work=Path(tempfile.mkdtemp(prefix='gdli
 spec=importlib.util.spec_from_file_location('limit_input',root/'tests/helpers/input.py');h=importlib.util.module_from_spec(spec);spec.loader.exec_module(h);h.WORK=str(work)
 h.Display.reply_seconds=30*h.load_scale()
 for name in ['tmp','cache']:(work/name).mkdir(mode=0o755)
-engine=Path(a.redot).resolve();limit=256*1024*1024
+engine=Path(a.redot).resolve();limit=2*1024*1024*1024
 # Small engines get inert trailing bytes in an owned copy, so this oracle
 # always proves a size refusal. ELF load segments and DWARF stay unchanged.
 if engine.stat().st_size<=limit:
@@ -41,7 +41,7 @@ try:
     report['observed_refusal']=why
     expected='GDScriptDwarfUnavailable' if a.wrong_result else 'GDScriptImageBudgetExceeded'
     assert reply.get('isError') and why==expected,reply
-    assert any('remote image transfer is capped at 256 MiB' in c.get('text','') for c in reply['content']),reply
+    assert any('remote image transfer is capped at 2048 MiB' in c.get('text','') for c in reply['content']),reply
     while True:
         view=d.tool('get_language_tabs')['view'];tab=next(t for t in view['tabs'] if t['tab']=='gdscript')
         if tab['status']!='pending':break

@@ -130,8 +130,11 @@ file, at most 64 MiB per call (the reader's own caps are 128 MiB read and
 the image budgets and has no row in the table above. See [MACHO.md](MACHO.md#bounds).
 What a name lookup reads of images that have no symbols-only view
 keeps fixed bounds too (256 MiB each, 512 MiB for one process; see "Name
-lookups and the full image"). With a runtime agent, whole-file transfers keep
-the agent's fixed 256 MiB cap, whatever the local budget is; the refusal says so. Opening a
+lookups and the full image"). With a runtime agent, synchronous whole-file
+transfers keep a fixed 256 MiB cap, whatever the local budget is; the refusal
+says so. Only the background main-image job below reads up to 2 GiB.
+An older agent without the large-image capability retains its 256 MiB limit and
+reports "agent refused: older agent cap" with advice to update the agent. Opening a
 profile archive reads only verified local assets under the same two budgets,
 so an archive cannot make xodb read more than they allow.
 
@@ -169,6 +172,13 @@ name lookup may read an image in full:
    what makes `find_symbol` work on a 1 GB game engine with 105 MB of symbol
    tables. It is identified by device, inode and path, and once a file has
    been chosen for a process image no other file ever is.
+   This full-image name fallback is local-only: runtime-agent sessions do not
+   use the host's `/proc/PID/exe` to prove a remote executable's identity.
+   If its symbol tables exceed the bounded symbols-only reader, even an
+   explicit name in the remote main executable returns `ImageBudgetExceeded`.
+   Raising `--image-limit` alone does not enable that fallback. An image
+   already loaded by explicit source/locals or language inspection can still
+   be searched under rule 1, subject to its ordinary transfer and image limits.
 3. **An image with no symbols-only view** is read in full by any lookup, but
    only within fixed bounds: 256 MiB each and 512 MiB for one process,
    whatever the image budgets are. These are libraries stored inside a
@@ -334,13 +344,38 @@ a stack frame has loaded it.
 
 Through a runtime agent the main executable is not told apart in a search
 either: it counts as any other image there, within the same 1 GiB and the
-same share of the total (and the agent's 256 MiB transfer cap). Separate file transfers can have distinct snapshot
+same share of the total (and the 256 MiB synchronous transfer cap). Separate file transfers can have distinct snapshot
 identities, so two agent readers can require separate copies of one target
 file. Release the earlier capture, or restart to release a line reader,
 before testing a fresh capture at a full sweep share. Caller frames use
 metadata-only unwinding until their image is explicitly selected; selecting
-an address uses the frame budget. The agent's fixed 256 MiB whole-file transfer
-cap is unchanged by host budget options.
+an address uses the frame budget. The fixed 256 MiB synchronous transfer cap
+and the 2 GiB background-job cap are unchanged by host budget options.
+
+The main runtime image selected by the kernel's program headers (GDScript) and
+remote main-image sidecar warmup use a cancellable metadata worker. It merges
+the ELF headers/tables, file-backed sections and segment ranges, rounding out to
+64 KiB cache boundaries before merging and fetching through the bounded file-view
+API. DWARF, symbols, native joins and later
+source/code views retain their original section contents and addresses; unused
+gaps are zero-filled in a sealed derived ELF, not an exact copy of the original
+file. A debug-heavy engine can still need most of the file on its first use.
+The existing two-slot managed range cache keys data by full file identity and
+build ID. Reopening verifies the build ID and identity; cached bulk data need not
+cross again, but verification metadata still does. A busy/unavailable cache
+falls back to bounded uncached reads, not a refusal.
+
+`get_debug_metadata` reports image progress (`image_bytes`, `image_total`,
+`source_bytes`, `cached_bytes`); `cancel_debug_metadata` and retry use the existing
+job IDs. The GUI footer shows progress and Esc cancels a pending image transfer.
+Closing joins the cancelled worker before releasing its target. Runtime reads
+retain the image/total budgets; sidecar warmup also retains the sweep budget.
+Preparation checks the available image budget first, but its sealed staging file
+is separate from the admitted in-memory copy: at most two image jobs per session,
+each at most 2 GiB, retained until cancellation is joined or the job is released.
+The existing disk-cache pool is separately bounded (two slots, 8 GiB each).
+Local loading is unchanged. Other explicit full-file paths still use their
+existing synchronous owner-side transfer.
 
 The periodic `image-budget-lifecycle`, `image-budget-regressions` and
 `image-budget-torch` checks exercise these bounds. The Torch check uses
@@ -610,6 +645,11 @@ automatic stack decoration. Selecting a caller for explicit locals inspection
 can still load its full debug image; later stack walks reuse that image. The top
 frame and explicit source/locals operations retain their existing synchronous
 small-image path.
+
+If an explicit image request was refused by a budget, `get_stack.image_budget`
+also reports that recorded refusal for an unloaded caller. An image that has not
+been requested is not itself a budget failure. `get_source_location` preserves
+the error name and adds the same image/budget advice as a second error text.
 
 Native cache checks: the default and debug-frame cases are fast; eviction and
 budget variants are periodic.

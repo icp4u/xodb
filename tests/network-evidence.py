@@ -20,6 +20,7 @@ parser.add_argument('--gui', action='store_true')
 options = parser.parse_args()
 work = Path(options.work)
 work.mkdir(parents=True, exist_ok=True)
+AGENT = bool(os.environ.get('XODB_TEST_RUNTIME_AGENT'))
 
 # ------------------------------------------------------------ pcapng writer
 
@@ -183,10 +184,17 @@ try:
     assert [i['link'] for i in s['interfaces']] == ['ethernet', 'linux_sll', 'unknown'], s['interfaces']
     assert s['loss']['isb_ifdrop'] == 2 and s['loss']['isb_osdrop'] == 3, s['loss']
     m = s['clock']['mapping']
-    assert s['clock']['domain'] == 'realtime' and m['state'] == 'aligned' and m['pairs'] == 2, s['clock']
+    assert s['clock']['domain'] == 'realtime', s['clock']
     assert s['context']['present'] and s['context']['capture_pid'] == peer['pid'], s['context']
-    assert [tb['when'] for tb in s['context']['tables']] == ['start', 'stop'], s['context']
-    assert s['context']['tables'][1]['sockets'] >= 2, s['context']
+    if AGENT:
+        assert m['state'] == 'unaligned' and m['pairs'] == 0, s['clock']
+        assert s['context']['collection'] == 'not_collected' and s['context']['reason'] == 'not collected: remote', s['context']
+        assert s['context']['tables'] == [], s['context']
+    else:
+        assert m['state'] == 'aligned' and m['pairs'] == 2, s['clock']
+        assert s['context']['collection'] == 'collected' and s['context']['reason'] is None, s['context']
+        assert [tb['when'] for tb in s['context']['tables']] == ['start', 'stop'], s['context']
+        assert s['context']['tables'][1]['sockets'] >= 2, s['context']
     tcp_rows = o.inspect('query_stream', protocol='tcp', port=H, flows=True, limit=2)
     assert len(tcp_rows['records']) == 2 and tcp_rows['next'] is not None, tcp_rows
     rows = tcp_rows['records']
@@ -197,29 +205,40 @@ try:
     assert rows[3]['decoded']['src_port'] == P and rows[3]['decoded']['payload_length'] == 4, rows[3]
     first = rows[0]['time']
     assert first['clock'] == 'realtime' and first['stream_ns'] == t['ping2'] - 3000, first
-    assert first['capture_ns'] is not None and first['uncertainty_ns'] is not None and first['uncertainty_ns'] < 10**7, first
-    assert rows[5]['time']['capture_ns'] is None, rows[5]
+    if AGENT:
+        assert all(row['time']['capture_ns'] is None and row['time']['uncertainty_ns'] is None for row in rows), rows
+    else:
+        assert first['capture_ns'] is not None and first['uncertainty_ns'] is not None and first['uncertainty_ns'] < 10**7, first
+        assert rows[5]['time']['capture_ns'] is None, rows[5]
     joins = {}
     for index in range(len(packets)):
         j = o.inspect('correlate', record=index)
         joins[index] = j
         summary[index] = dict(basis=j['basis'], direction=j['direction'], pid=(j['process'] or {}).get('pid'))
-    for index in (0, 2, 3):
-        assert joins[index]['basis'] == 'exact' and joins[index]['direction'] == 'outbound', joins[index]
-        assert joins[index]['process']['pid'] == peer['pid'] and joins[index]['socket']['local_port'] == P, joins[index]
-    for index in (1, 4):
-        assert joins[index]['basis'] == 'exact' and joins[index]['direction'] == 'inbound', joins[index]
-    assert joins[5]['basis'] == 'exact' and joins[5]['socket']['protocol'] == 'udp' and joins[5]['socket']['local_port'] == peer['udp'], joins[5]
-    assert joins[6]['basis'] == 'none' and joins[6]['record']['undecoded'] == 'unknown_link_type', joins[6]
-    assert joins[7]['basis'] == 'none', joins[7]
-    for index in (8, 9, 10, 11, 12):
-        assert joins[index]['basis'] == 'sampled' and joins[index]['process']['pid'] == peer['pid'], joins[index]
+    if AGENT:
+        for index in (*range(0, 6), *range(7, len(packets))):
+            assert joins[index]['basis'] == 'none' and joins[index]['reason'] == 'not collected: remote', joins[index]
+            assert joins[index]['direction'] is None and joins[index]['process'] is None and joins[index]['socket'] is None, joins[index]
+        assert joins[6]['basis'] == 'none' and joins[6]['record']['undecoded'] == 'unknown_link_type', joins[6]
+        assert 'no 5-tuple' in joins[6]['reason'], joins[6]
+    else:
+        for index in (0, 2, 3):
+            assert joins[index]['basis'] == 'exact' and joins[index]['direction'] == 'outbound', joins[index]
+            assert joins[index]['process']['pid'] == peer['pid'] and joins[index]['socket']['local_port'] == P, joins[index]
+        for index in (1, 4):
+            assert joins[index]['basis'] == 'exact' and joins[index]['direction'] == 'inbound', joins[index]
+        assert joins[5]['basis'] == 'exact' and joins[5]['socket']['protocol'] == 'udp' and joins[5]['socket']['local_port'] == peer['udp'], joins[5]
+        assert joins[6]['basis'] == 'none' and joins[6]['record']['undecoded'] == 'unknown_link_type', joins[6]
+        assert joins[7]['basis'] == 'none', joins[7]
+        for index in (8, 9, 10, 11, 12):
+            assert joins[index]['basis'] == 'sampled' and joins[index]['process']['pid'] == peer['pid'], joins[index]
     assert joins[0]['thread'] is None and joins[0]['thread_reason'], joins[0]
-    assert joins[0]['process']['comm'].startswith('python'), joins[0]
+    if not AGENT: assert joins[0]['process']['comm'].startswith('python'), joins[0]
     undecoded = o.inspect('query_stream', undecoded=True, include_raw=True)['records']
     assert [r['index'] for r in undecoded] == [6] and undecoded[0]['raw_hex'] == b'opaque-user-link-record'.hex(), undecoded
-    window = o.inspect('query_stream', clock='capture', from_ns=rows[1]['time']['capture_ns'], to_ns=rows[3]['time']['capture_ns'])
-    assert [r['index'] for r in window['records']] == [1, 2], window
+    if not AGENT:
+        window = o.inspect('query_stream', clock='capture', from_ns=rows[1]['time']['capture_ns'], to_ns=rows[3]['time']['capture_ns'])
+        assert [r['index'] for r in window['records']] == [1, 2], window
     bad = o.tool('correlate', record=99)
     assert bad['result']['isError'] and bad['result']['content'][0]['text'] == 'UnknownRecord', bad
     (work / 'offline-rpc.json').write_text(json.dumps(o.transcript, indent=2) + '\n')
@@ -229,8 +248,14 @@ finally:
 o = opened(pcap, archive)
 try:
     s = o.inspect('list_streams')['streams'][0]
-    assert s['format'] == 'pcap' and s['records'] == 10 and s['clock']['mapping']['state'] == 'aligned', s
-    assert o.inspect('correlate', record=0)['basis'] == 'exact'
+    assert s['format'] == 'pcap' and s['records'] == 10, s
+    if AGENT:
+        assert s['clock']['mapping']['state'] == 'unaligned', s
+        j = o.inspect('correlate', record=0)
+        assert j['basis'] == 'none' and j['reason'] == 'not collected: remote', j
+    else:
+        assert s['clock']['mapping']['state'] == 'aligned', s
+        assert o.inspect('correlate', record=0)['basis'] == 'exact'
 finally:
     o.close()
 

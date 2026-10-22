@@ -234,6 +234,27 @@ def lookup(w, a, result):
     libs = [oversized_symbols(plain, w/f'lk{i}.so') for i in range(count)]
     program = oversized_symbols(w/'host', w/'lk_host')  # exe_marker stays in .dynsym
     try:
+        if os.environ.get('XODB_TEST_RUNTIME_AGENT'):
+            # Remote name scans do not use the local /proc/exe full-image
+            # fallback, even when this is the target's main executable.
+            for options in (OPTIN, (*OPTIN, '--break', 'xodb_no_such_symbol')):
+                r = Run(w, program, libs, options=options)
+                try:
+                    r.holds(0, 0)
+                    for name in ('exe_marker', 'exe_marker', 'xodb_no_such_symbol', 'xodb_no_such_symbol_2'):
+                        reply, _ = r.symbol(name)
+                        texts = errors(reply)
+                        assert texts[0] == ('SymbolNotFound' if a.wrong_result else 'ImageBudgetExceeded'), reply
+                        assert len(texts) == 2 and str(program) in texts[1], reply
+                        assert 'symbol tables too large to search by name' in texts[1], reply
+                    held = r.holds(0, 0)
+                    assert r.client.session()['generation'] == r.session['generation']
+                    result['lookup'] = {'policy': 'remote name fallback unavailable', 'images': count + 1,
+                                        'image_bytes': BIG, 'held_bytes': held, 'peak_rss_bytes': r.peak_rss()}
+                    r.close()
+                finally:
+                    r.kill()
+            return
         r = Run(w, program, libs, options=OPTIN)
         try:
             # Attaching, and the automatic language probes with it, read no image in full.

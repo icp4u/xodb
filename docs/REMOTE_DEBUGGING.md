@@ -1,5 +1,14 @@
 # Remote debugging over SSH or TCP
 
+Runtime-agent image-name limit: `--runtime-agent` and `--runtime-ssh` use a
+bounded symbols-only reader. When an image's symbol tables exceed that reader's
+limit, a name lookup returns `ImageBudgetExceeded` and names the image. Unlike
+local sessions, it does not fall back to reading the main executable in full
+just for a name; raising the image budget does not enable that exception.
+Explicit source/locals or language inspection may load the image under the
+ordinary transfer and image budgets, after which its names are searchable.
+See [name lookups and image budgets](LARGE_IMAGES.md#name-lookups-and-the-full-image).
+
 Adopted by the user on 2026-10-01. The workstation GUI now controls a headless
 xodb on another host. Verified: x86-64 GUI to native ARM64, over both
 SSH and direct LAN TCP. [Evidence and screenshots](research/remote-gui/README.md).

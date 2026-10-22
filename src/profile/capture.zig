@@ -197,8 +197,10 @@ pub const Capture = struct {
                     self.cpu_before[i] = activity.readTarget(@ptrCast(target), pid, config.tids[i]);
                     _ = std.fmt.bufPrintZ(&self.thread_names[i], "Thread {d}", .{config.tids[i]}) catch unreachable;
                 }
-                // A remote target's /proc is on another host.
-                if (self.producer == null) self.net = @import("net_context.zig").Recorder.begin(a, pid, started_ns);
+                // A remote target's /proc is on another host. Its empty
+                // recorder still gives the archive a well-formed ECTX.
+                const net_context = @import("net_context.zig").Recorder;
+                self.net = if (self.producer == null) net_context.begin(a, pid, started_ns) else net_context.beginRemote(a, pid, started_ns);
                 return .{ .capture = self };
             },
         }

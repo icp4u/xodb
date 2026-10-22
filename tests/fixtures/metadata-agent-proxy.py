@@ -31,6 +31,13 @@ try:
         assert magic == b'XRT1' and size <= 1024 * 1024
         body = agent.stdout.read(size)
         assert len(body) == size
+        # Compatibility replay: the previous agent has no 2 GiB image
+        # capability. Its unchanged bounded range API still works.
+        if os.environ.get('XODB_METADATA_LEGACY_IMAGES') and op == 1 and status == 0:
+            extra = struct.unpack_from('>I', body, 8)[0]
+            if extra == 24:
+                caps = struct.unpack_from('>Q', body, 28)[0]
+                body = body[:28] + struct.pack('>Q', caps & ~4) + body[36:]
         if op == 37 and status == 0:  # VIEW, never LAUNCH
             view = body
         if fault == 'snapshot' and op == 39 and view is not None:

@@ -1206,6 +1206,26 @@ pub const State = struct {
         if (self.job) |job| if (job.running()) return;
         var selected_images: [max_warm_images]WarmCandidate = undefined;
         var count: usize = 0;
+        // The first remote snapshot is often the dynamic loader at exec-stop,
+        // not the main executable. Use the target's program-header mapping,
+        // not load order or a path on this host, and queue that image first.
+        if (session.target.isRemote()) {
+            const context = session.languageContext();
+            const phdr = context.mainPhdr();
+            if (phdr == 0) return;
+            const main = session.modules.cachedAt(phdr) catch
+                session.metadata.mainImage(session, phdr, .sweep) catch return;
+            if (self.warm_main == null or self.warm_main.? != main.id) {
+                const path = page.dupe(u8, main.path) catch return;
+                if (self.warm_main_path) |old| page.free(old);
+                self.warm_main_path = path;
+                self.warm_main = main.id;
+            }
+            if (!self.sawWarmImage(main.id) and !self.warmBackedOff(main.path)) {
+                selected_images[0] = .{ .id = main.id, .path = main.path, .mapping = main.mapping, .size = main.mapping.len, .file_offset = main.file_offset };
+                count = 1;
+            }
+        }
         // Mapped executable files are available before xodb needs their symbol
         // images. Hashing them in this worker lets the main executable start
         // importing immediately after the first map refresh.

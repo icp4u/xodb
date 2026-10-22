@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """scripts/deps on a small fake tree: each kind of failure, and the clean case."""
 from pathlib import Path
+import json
 import subprocess
 import sys
 import tempfile
@@ -200,6 +201,102 @@ class DepsSelfTest(unittest.TestCase):
         self.assertIn(('src/runtime/a.c', 'src/runtime/a.h', 'include'), edges)
         self.assertIn(('src/main.zig', 'module:build_options', 'module'), edges)
         self.assertNotIn(('src/ui/view.zig', 'src/model/hub.zig', 'import'), edges)  # inside a string
+
+    def strict_rule(self, name='model-no-ui'):
+        self.write('tools/deps/rules', RULES.replace('deny ' + name, 'strict deny ' + name))
+
+    def test_strict_clean_and_baselined_direct_violation(self):
+        self.strict_rule()
+        self.passes()
+        self.write('src/model/hub.zig', 'const v = @import("../ui/view.zig");\n')
+        self.write('tools/deps/rules', RULES)
+        self.assertEqual(self.deps('baseline', '--write').returncode, 0)
+        self.passes()  # Negative control: the same exemption works without strict.
+        self.strict_rule()
+        self.fails('strict rule forbids baseline exemption', '[model-no-ui]')
+        before = self.read('tools/deps/baseline')
+        run = self.deps('baseline', '--write')
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertIn('baseline unchanged', run.stdout)
+        self.assertEqual(self.read('tools/deps/baseline'), before)
+
+    def test_strict_transitive_exemption_and_stale_exemption(self):
+        self.write('src/common/util.zig', 'const h = @import("../model/hub.zig");\n')
+        self.assertEqual(self.deps('baseline', '--write').returncode, 0)
+        self.passes()
+        self.strict_rule('no-hub')
+        self.fails('strict rule forbids baseline exemption', '[no-hub transitive]')
+        self.write('src/common/util.zig', FILES['src/common/util.zig'])
+        self.fails('strict rule forbids baseline exemption', 'no longer occur')
+        self.assertEqual(self.deps('baseline', '--write').returncode, 0)
+        self.passes()
+
+    def test_strict_only_rule_and_new_violation(self):
+        self.write('tools/deps/rules', RULES.replace('only runtime-alone', 'strict only runtime-alone'))
+        self.passes()
+        self.write('src/runtime/a.c', '#include "../common/x.h"\n')
+        self.write('src/common/x.h', '#pragma once\n')
+        self.fails('[runtime-alone]')
+        before = self.read('tools/deps/baseline')
+        self.assertEqual(self.deps('baseline', '--write').returncode, 1)
+        self.assertEqual(self.read('tools/deps/baseline'), before)
+
+    def graph_file(self, name, layers, edges):
+        self.write(name, json.dumps(dict(schema=1, files=[dict(path=p, layer=l) for p, l in layers.items()],
+                                        edges=[dict(source=a, target=b, kind='import') for a, b in edges])))
+        return str(self.root/name)
+
+    def test_diff_removed_relayered_added(self):
+        a = self.graph_file('a.json', {'src/language/p.zig': 'language', 'src/model/value.zig': 'model',
+                                      'src/model/hub.zig': 'model'},
+                            [('src/language/p.zig', 'src/model/value.zig'), ('src/language/p.zig', 'src/model/hub.zig')])
+        b = self.graph_file('b.json', {'src/language/p.zig': 'language', 'src/debug/value.zig': 'debug',
+                                      'src/model/new.zig': 'model'},
+                            [('src/language/p.zig', 'src/debug/value.zig'), ('src/language/p.zig', 'src/model/new.zig')])
+        run = self.deps('diff', a, b, '--from-layer', 'language', '--to-layer', 'model', '--json')
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertEqual((result['before'], result['after']), (2, 1))
+        self.assertEqual(result['removed'], [['src/language/p.zig', 'src/model/hub.zig']])
+        self.assertEqual(result['added'], [['src/language/p.zig', 'src/model/new.zig']])
+        self.assertEqual(len(result['relayered']), 1)
+        self.assertEqual(result['inferred_moves'], {'src/model/value.zig': 'src/debug/value.zig'})
+        self.assertEqual(result['relayered'][0]['layers_after'], ['language', 'debug'])
+        self.assertIn('removed=1 re-layered=1 added=1', self.deps('diff', a, b).stdout)
+        reverse = json.loads(self.deps('diff', b, a, '--to-layer', 'model', '--json').stdout)
+        self.assertEqual((len(reverse['removed']), len(reverse['relayered']), len(reverse['added'])), (1, 1, 1))
+        # Planted wrong layer: a move within model must not count as re-layering.
+        value = json.loads(self.read('b.json'))
+        value['files'][1]['layer'] = 'model'
+        self.write('b.json', json.dumps(value))
+        wrong = json.loads(self.deps('diff', a, b, '--json').stdout)
+        self.assertEqual(wrong['relayered'], [])
+        self.assertEqual(wrong['unchanged'], 1)
+
+    def test_diff_same_path_layer_change_and_ambiguous_moves(self):
+        a = self.graph_file('a.json', {'src/p.zig': 'language', 'src/a/v.zig': 'model', 'src/b/v.zig': 'model'},
+                            [('src/p.zig', 'src/a/v.zig'), ('src/p.zig', 'src/b/v.zig')])
+        b = self.graph_file('b.json', {'src/p.zig': 'language', 'src/c/v.zig': 'debug'}, [('src/p.zig', 'src/c/v.zig')])
+        result = json.loads(self.deps('diff', a, b, '--json').stdout)
+        self.assertEqual(result['inferred_moves'], {})
+        self.assertEqual(len(result['ambiguous_moves']), 1)
+        self.assertEqual((len(result['removed']), len(result['added'])), (2, 1))
+        value = json.loads(self.read('a.json'))
+        value['files'][1]['layer'] = 'debug'
+        self.write('b.json', json.dumps(value))
+        result = json.loads(self.deps('diff', a, b, '--json').stdout)
+        self.assertEqual((len(result['relayered']), result['unchanged']), (1, 1))
+
+    def test_diff_directory_json_and_bad_input(self):
+        self.write('graph.json', self.deps('graph', '--json').stdout)
+        run = self.deps('diff', str(self.root), str(self.root/'graph.json'), '--json')
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertEqual((result['before'], result['after'], result['unchanged']), (6, 6, 6))
+        self.assertEqual(result['removed'] + result['relayered'] + result['added'], [])
+        self.assertEqual(self.deps('diff', str(self.root), str(self.root), '--to-layer', 'typo').returncode, 2)
+        self.write('bad.json', '{bad')
+        self.assertEqual(self.deps('diff', str(self.root/'bad.json'), str(self.root)).returncode, 2)
 
 
 if __name__ == '__main__':

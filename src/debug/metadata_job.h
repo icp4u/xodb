@@ -9,7 +9,7 @@
 /* Session-owned metadata work. Open the pinned view on the target owner
  * thread. A successful start transfers it to the job; destroy joins before
  * closing it. The target must outlive the job. Poll/cancel do no target I/O. */
-enum xmd_state { XMD_PREPARING, XMD_SYMBOLS, XMD_CHECKING, XMD_READY, XMD_CANCELLED, XMD_FAILED, XMD_UNWIND, XMD_INDEXING, XMD_LOOKUP };
+enum xmd_state { XMD_PREPARING, XMD_SYMBOLS, XMD_CHECKING, XMD_READY, XMD_CANCELLED, XMD_FAILED, XMD_UNWIND, XMD_INDEXING, XMD_LOOKUP, XMD_IMAGE };
 struct xmd_snapshot {
     enum xmd_state state;
     enum xbo_status status;
@@ -26,10 +26,17 @@ struct xmd_snapshot {
     /* Successful provider reads; failed/in-flight transport bytes are unknown. */
     uint64_t slices, source_bytes, source_reads, cache_bytes, cache_reads;
     uint64_t candidate_units, accelerator_hits;
+    uint64_t image_bytes, image_total;
     unsigned machine, address_size, little_endian;
     const char *reason; /* static diagnostic, never borrowed parser storage */
 };
 struct xmd_job;
+/* Remote main-runtime image: merge file-backed ELF section/segment ranges,
+ * retain a sealed derived ELF with zero-filled unreferenced gaps, and reuse
+ * the bounded managed range cache. Not an exact original-file byte copy.
+ * Successful start owns the pinned view; result fd is borrowed until destroy. */
+enum xbo_status xmd_start_image(struct xrt_file_view *, struct xmd_job **);
+enum xbo_status xmd_image_result(struct xmd_job *, int *fd);
 /* Optional range_cache_fd is borrowed and duplicated, or -1 for uncached.
  * The caller selects a private regular cache and grants a finite file quota.
  * Directory selection and aggregate cache reservation belong to the caller. */

@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 #include "target_internal.h"
+#include "xrt_process.h"
 #include "xrt_remote.h"
 #include <assert.h>
 #include <errno.h>
@@ -823,6 +824,56 @@ static bool unstable_reads(const char *agent, bool exec_child, bool wrong)
     close(go[1]); close(ready[0]);
     return fresh;
 }
+/* The debugger ignores SIGPIPE. That disposition survives exec into the
+ * agent. Continue must still kill a target whose saved disposition is the
+ * default: stop on SIGPIPE, resume, and the process dies of SIGPIPE. A
+ * caller's own ignore, or the target's, must still keep it alive. */
+static void sigpipe_case(const char *agent, const char *self, bool caller_ignores, const char *fixture,
+                         int64_t detail)
+{
+    struct sigaction original, caller, ignore;
+    CHECK(sigaction(SIGPIPE, NULL, &original) == 0);
+    memset(&caller, 0, sizeof(caller));
+    sigemptyset(&caller.sa_mask);
+    caller.sa_handler = caller_ignores ? SIG_IGN : SIG_DFL;
+    CHECK(sigaction(SIGPIPE, &caller, NULL) == 0);
+    enum xrt_status saved = xrt_process_save_launch_signals();
+    if (saved != XRT_OK)
+        CHECK(sigaction(SIGPIPE, &original, NULL) == 0);
+    CHECK(saved == XRT_OK);
+    memset(&ignore, 0, sizeof(ignore));
+    sigemptyset(&ignore.sa_mask);
+    ignore.sa_handler = SIG_IGN;
+    CHECK(sigaction(SIGPIPE, &ignore, NULL) == 0);
+    const char *transport[] = {agent, "--stdio", NULL};
+    const char *argv[] = {self, fixture, NULL};
+    struct xrt_target *t = NULL;
+    enum xrt_status opened = xrt_target_remote(transport, &t);
+    /* The agent has already recorded the saved disposition. Put this process
+     * back, including the snapshot a later local launch would restore. */
+    CHECK(sigaction(SIGPIPE, &original, NULL) == 0);
+    CHECK(xrt_process_save_launch_signals() == XRT_OK);
+    CHECK(opened == XRT_OK);
+    OK(xrt_target_launch(t, argv));
+    CHECK(view(t).state == XRT_STOPPED);
+    OK(xrt_target_continue(t));
+    OK(xrt_target_wait_stopped(t));
+    CHECK(view(t).state == XRT_STOPPED);
+    CHECK(view(t).threads[0].signal == SIGPIPE);
+    CHECK(view(t).threads[0].reason == XRT_STOP_SIGNAL);
+    OK(xrt_target_continue(t));
+    wait_exit(t);
+    CHECK(t->event_count > 0);
+    CHECK(t->events[t->event_count - 1].kind == XRT_EVENT_EXIT);
+    CHECK(t->events[t->event_count - 1].detail == detail);
+    OK(xrt_target_destroy(t));
+}
+static void sigpipe_delivery(const char *agent, const char *self)
+{
+    sigpipe_case(agent, self, false, "--sigpipe-fixture", -SIGPIPE);
+    sigpipe_case(agent, self, true, "--sigpipe-fixture", 42);
+    sigpipe_case(agent, self, false, "--sigpipe-ignores", 42);
+}
 static void legacy_reads(const char *agent, const char *self)
 {
     const char *transport[] = {self, "--legacy-cache-proxy", agent, NULL};
@@ -874,6 +925,15 @@ int main(int argc, char **argv)
         fn();
         _exit(23);
     }
+    if (argc == 2 && !strcmp(argv[1], "--sigpipe-fixture")) {
+        raise(SIGPIPE);
+        _exit(42);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--sigpipe-ignores")) {
+        signal(SIGPIPE, SIG_IGN);
+        raise(SIGPIPE);
+        _exit(42);
+    }
     if (argc == 2 && !strcmp(argv[1], "--fork-fixture")) {
         pid_t child = fork();
         if (child < 0)
@@ -924,6 +984,7 @@ int main(int argc, char **argv)
         collectors(argv[1], self);
     if (xrt_arch_native()->machine == XRT_X86_64)
         family(argv[1], self);
+    sigpipe_delivery(argv[1], self);
     struct xrt_target *bad = NULL;
     const char *missing[] = {"/xodb-no-agent", NULL};
     assert(xrt_target_remote(missing, &bad) == XRT_TRANSPORT_FAILED && !bad);

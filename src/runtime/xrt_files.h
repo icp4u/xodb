@@ -5,6 +5,14 @@
 #include <stddef.h>
 #include <signal.h>
 struct xrt_target;
+/* Whole-image extent, not an up-front allocation. Older agents advertised no
+ * large-image capability and enforced the legacy limit independently. */
+#define XRT_REMOTE_IMAGE_LIMIT (UINT64_C(2) * 1024 * 1024 * 1024)
+#define XRT_LEGACY_REMOTE_IMAGE_LIMIT (UINT64_C(256) * 1024 * 1024)
+/* Synchronous whole-file transfers run on the target owner thread, uncached and
+ * uncancellable. Larger main images use the background ranged image job. */
+#define XRT_REMOTE_SYNC_IMAGE_LIMIT XRT_LEGACY_REMOTE_IMAGE_LIMIT
+uint64_t xrt_target_remote_image_limit(const struct xrt_target *);
 struct xrt_file_identity {
     uint64_t device, inode;
     int64_t size, mtime_sec, mtime_ns, ctime_sec, ctime_ns;

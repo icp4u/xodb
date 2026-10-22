@@ -6,8 +6,13 @@
 #include <stdint.h>
 
 /* Call once before installing the debugger's signal handlers, on the ptrace
- * owner thread. Subsequent launches/restarts restore these dispositions. */
+ * owner thread. Subsequent launches/restarts restore these dispositions.
+ * A fork that execs the runtime agent must apply them too: SIG_IGN survives
+ * exec, and the agent records whatever it inherits. */
 enum xrt_status xrt_process_save_launch_signals(void);
+/* Apply the saved dispositions. No saved set is a no-op. A fork child calls
+ * this before exec and must not exec when the result is not XRT_OK. */
+enum xrt_status xrt_process_restore_launch_signals(void);
 
 /* argv is a NULL-terminated native vector. On success, ownership of the seized
  * child transfers to the caller, which must wait for exec/exit and eventually

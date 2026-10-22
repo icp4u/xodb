@@ -304,6 +304,8 @@ AGENT_INELIGIBLE = {
     'macos-debug-hostile': 'a GDB remote replay stub, not the C agent',
     'remote-exit-export': 'the C agent is the subject of this step, behind its own proxy',
     'remote-exit-export-stdio': 'the C agent is the subject of this step, behind its own proxy',
+    'runtime-host': 'names its own --runtime-agent binary, so the lane switch cannot reach it',
+    'perl-path-component': 'the --component run is an in-process Perl path oracle and returns before the debugger starts',
 }
 # These scripts already run each case locally and then through the C agent.
 # A lane variant would only run the agent half twice.
@@ -331,6 +333,7 @@ AGENT_DIRECT = {
     'tests/shared-cleanup.py': 'an existing agent twin runs this command',
     'tests/log-levels.py': 'an existing agent twin runs this command',
     'tests/metadata-session.py': 'an existing agent twin runs this command',
+    'tests/image-transfer.py': 'the C agent is the subject of this step',
     'tests/language-tabs.py': 'an existing agent twin runs this command',
     'tests/javascript-cache.py': 'an existing agent twin runs this command',
     'tests/python-locals-shared.py': 'an existing agent twin runs this command',
@@ -854,6 +857,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 steps.append((name, args, 180))
                 steps.append((name + '-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', *args], 180))
         steps.append(('metadata-session', [sys.executable, '-B', 'tests/metadata-session.py', '--work', '.work/ms'], 180))
+        steps.append(('image-transfer', [sys.executable, '-B', 'tests/image-transfer.py', '--work', '.work/imtr', '--agent', 'zig-out/bin/xodb-agent'], 60))
         steps.append(('metadata-session-agent', [sys.executable, '-B', 'tests/metadata-session.py', '--work', '.work/ma', '--agent', 'zig-out/bin/xodb-agent'], 240))
         steps.append(('language-tabs', [sys.executable, '-B', 'tests/language-tabs.py', '--work', '.work/lt', *language_args], 900 if node else 240))
         steps.append(('language-tabs-agent', [sys.executable, '-B', 'tests/language-tabs.py', '--work', '.work/la', '--agent', 'zig-out/bin/xodb-agent', *language_args], 900 if node else 300))
@@ -1061,6 +1065,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ('gui-run-control', ['tests/run-control-gui.py']),
             ('gui-inline', ['tests/optimized-gui.py', 'zig-out']),
             ('gui-image-budget', ['tests/image-budget-gui.py', 'zig-out']),
+            ('gui-image-transfer', ['tests/image-transfer-gui.py', '--work', '.work/input-imtr']),
             ('gui-profile', ['scripts/gui-smoke.py', '--profile']),
             ('gui-flame-status', ['tests/flame-status-gui.py']),
             ('gui-capture-setup', ['tests/m2-capture-setup.py']),

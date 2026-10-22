@@ -1501,6 +1501,17 @@ pub const Workspace = struct {
                 }
             };
         }
+        // Snapshot every metadata job only for Esc, not on each input pass.
+        const pending_image = if (code != 1) null else if (remote) context.header.metadata else @import("../model/workspace_view.zig").capture(session).metadata;
+        if (pending_image) |job| if (job.kind == .image) {
+            if (remote) context.send(self, .{ .workspace = .{ .cancel_metadata = job.id } }) else session.metadata.cancel(job.id) catch |err| {
+                self.status = @errorName(err);
+                return;
+            };
+            self.status = "Image transfer cancelled";
+            w.dirty = true;
+            return;
+        };
         if (code == 16) {
             w.closing = true;
             w.close_reason = .quit_key;
@@ -2149,7 +2160,10 @@ pub const Workspace = struct {
         } else if (header.frame_failure) |err| {
             try fit(r, font, 16, height - look.workspace.footer_text, if (width >= 900) width - 432 else width - 32, theme.warm, "Archive frames {s}: {s} / L details", .{ header.frame_state, err });
         } else if (pending_metadata) |job| {
-            try fit(r, font, 16, height - look.workspace.footer_text, if (width >= 900) width - 432 else width - 32, theme.text, "Debug data: {s}, {d} units, {d} MiB read", .{ job.state, job.units, job.source_bytes / (1024 * 1024) });
+            if (job.kind == .image)
+                try fit(r, font, 16, height - look.workspace.footer_text, if (width >= 900) width - 432 else width - 32, theme.text, "Image: {d}/{d} MiB, {d} MiB transferred / Esc cancels", .{ job.image_bytes / (1024 * 1024), job.image_total / (1024 * 1024), job.source_bytes / (1024 * 1024) })
+            else
+                try fit(r, font, 16, height - look.workspace.footer_text, if (width >= 900) width - 432 else width - 32, theme.text, "Debug data: {s}, {d} units, {d} MiB read", .{ job.state, job.units, job.source_bytes / (1024 * 1024) });
         } else if (self.shared_clients) |count| {
             if (self.shared_controller) |owner| {
                 try fit(r, font, 16, height - look.workspace.footer_text, if (width >= 900) width - 432 else width - 32, theme.text, "{s} / agent {s} / controller #{d} / {d} clients", .{ self.status, @tagName(header.scope), owner, count });

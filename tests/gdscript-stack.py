@@ -22,6 +22,22 @@ w = a.work.resolve(); w.mkdir(parents=True, exist_ok=True); w.chmod(0o755)
 began = time.monotonic()
 engine = Path(a.redot).resolve()
 result = {'status': 'running', 'engine_bytes': engine.stat().st_size}
+if os.environ.get('XODB_TEST_RUNTIME_AGENT'):
+    cache = w/'image-cache'; cache.mkdir(mode=0o700)
+    os.environ['XDG_CACHE_HOME'] = str(cache)
+    result['image_load'] = []
+    result['load'] = os.getloadavg(); result['cpus'] = os.cpu_count()
+
+def usage(client):
+    fields = Path(f'/proc/{client.p.pid}/stat').read_text().rsplit(')', 1)[1].split()
+    return {'cpu_seconds': (int(fields[11]) + int(fields[12])) / os.sysconf('SC_CLK_TCK'),
+            'rss_bytes': int(Path(f'/proc/{client.p.pid}/statm').read_text().split()[1]) * os.sysconf('SC_PAGESIZE')}
+
+def image_load(client, label, started, before):
+    jobs = [j for j in client.inspect('get_debug_metadata')['jobs'] if j['kind'] == 'image' and j['image'] == str(engine)]
+    check(len(jobs) == 1 and jobs[0]['state'] == 'ready', jobs)
+    result['image_load'].append({'name': label, 'job': jobs[0], 'seconds': time.monotonic() - started,
+                                 'before': before, 'after': usage(client)})
 
 def check(condition, message):
     if not condition: raise SystemExit('FAIL: ' + str(message)[:4000])
@@ -82,6 +98,7 @@ try:
     #    script). Both must be seen; other threads hit the first one too.
     client = Client('control', None, options=['--attach', str(pid), '--break', DELAY, '--break', FRAME, *limits(engine)], reply_seconds=120)
     session = client.stopped(seconds=120)
+    image_started, image_before = time.monotonic(), usage(client)
     scripted = idle = None
     deadline = time.monotonic() + 120
     while scripted is None or idle is None:
@@ -89,6 +106,8 @@ try:
         generation = session['generation']
         stack, why = language_stack(client, tid=pid, generation=generation)
         check(stack, why)
+        if client.runtime_agent and not result['image_load']:
+            image_load(client, 'cold', image_started, image_before)
         segment = stack['segments'][0]
         check(len(stack['segments']) == 1 and segment['reason'] is None and segment['state'] == 'complete', segment)
         at_break = any(t['tid'] == pid and t['reason'] == 'breakpoint' for t in session['threads'])
@@ -147,6 +166,18 @@ try:
         client.tool('continue', generation=generation)
         session = client.stopped('breakpoint', seconds=60)
     client.tool('detach', generation=client.session()['generation']); client.close(); client = None
+
+    if 'image_load' in result:
+        client = Client('control', None, options=['--attach', str(pid), *limits(engine)], reply_seconds=120)
+        generation = client.stopped(seconds=120)['generation']
+        image_started, image_before = time.monotonic(), usage(client)
+        stack, why = language_stack(client, tid=pid, generation=generation)
+        check(stack, why)
+        image_load(client, 'warm', image_started, image_before)
+        cold, warm = [r['job'] for r in result['image_load']]
+        check(cold['source_bytes'] > warm['source_bytes'] and warm['source_bytes'] < 65536, (cold, warm))
+        check(warm['cached_bytes'] > engine.stat().st_size // 2, warm)
+        client.tool('detach', generation=generation); client.close(); client = None
 
     # 2. A budget the engine image does not fit: the refusal says so.
     if engine.stat().st_size > 256 << 20:

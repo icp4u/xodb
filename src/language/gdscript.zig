@@ -281,8 +281,10 @@ pub fn buildId(a: A, layout: *const Layout) ![]const u8 {
 fn overBudget(err: anyerror) bool {
     return err == error.BinarySnapshotLimit or err == error.SymbolSnapshotLimit;
 }
-fn moduleError(err: anyerror) error{ GDScriptImageBudgetExceeded, SymbolDiscoveryPending, SymbolDiscoveryCancelled, SymbolDiscoveryBudgetExceeded, GDScriptModuleIdentityUnavailable } {
+fn moduleError(err: anyerror) error{ GDScriptImageBudgetExceeded, DebugMetadataPending, DebugMetadataCancelled, SymbolDiscoveryPending, SymbolDiscoveryCancelled, SymbolDiscoveryBudgetExceeded, GDScriptModuleIdentityUnavailable } {
     if (overBudget(err)) return error.GDScriptImageBudgetExceeded;
+    if (err == error.DebugMetadataPending) return error.DebugMetadataPending;
+    if (err == error.DebugMetadataCancelled) return error.DebugMetadataCancelled;
     if (err == error.SymbolDiscoveryPending) return error.SymbolDiscoveryPending;
     if (err == error.SymbolDiscoveryCancelled) return error.SymbolDiscoveryCancelled;
     if (err == error.SymbolDiscoveryBudgetExceeded) return error.SymbolDiscoveryBudgetExceeded;

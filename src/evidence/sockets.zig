@@ -54,12 +54,27 @@ pub const max_processes = 1024;
 pub const max_tables = 8;
 pub const max_pairs = 8;
 
+pub const Collection = enum(u8) {
+    collected,
+    not_collected_remote,
+
+    pub fn reason(self: Collection) ?[]const u8 {
+        return switch (self) {
+            .collected => null,
+            .not_collected_remote => "not collected: remote",
+        };
+    }
+};
+
 /// Collector evidence stored beside a capture (archive section ECTX).
 pub const Context = struct {
     capture_started_ns: u64,
     pid: i32,
     pairs: []const clock.Pair,
     tables: []const Table,
+    /// An empty pair/table sequence is the wire sentinel for a remote target,
+    /// whose /proc data is not available to the host collector.
+    collection: Collection = .collected,
     /// Written under --redact (schema 2): private addresses are tags, names masked.
     redacted: bool = false,
 
@@ -302,6 +317,8 @@ pub const max_bytes = 16 * 1024 * 1024;
 
 pub fn encode(a: std.mem.Allocator, ctx: Context) ![]u8 {
     if (ctx.pairs.len > max_pairs or ctx.tables.len > max_tables) return error.EvidenceContextLimit;
+    const empty = ctx.pairs.len == 0 and ctx.tables.len == 0;
+    if (empty != (ctx.collection == .not_collected_remote)) return error.EvidenceContextValue;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
     const W = struct {
@@ -442,7 +459,7 @@ pub fn decodeContext(a: std.mem.Allocator, bytes: []const u8) !Context {
         t.* = .{ .when = when, .sampled_ns = sampled, .unreadable = unreadable, .truncated = truncated, .processes = processes, .sockets = sockets, .usb_fds = usb_fds };
     }
     if (r.left() != 0) return error.EvidenceContextTrailingBytes;
-    return .{ .capture_started_ns = started, .pid = pid, .pairs = pairs, .tables = tables, .redacted = is_redacted };
+    return .{ .capture_started_ns = started, .pid = pid, .pairs = pairs, .tables = tables, .collection = if (pairs.len == 0 and tables.len == 0) .not_collected_remote else .collected, .redacted = is_redacted };
 }
 
 /// Decodes ECTX and, when present, attaches its optional EUSB rows.
@@ -604,6 +621,12 @@ test "ECTX round trip and validation" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
+    try std.testing.expectError(error.EvidenceContextValue, encode(a, .{ .capture_started_ns = 1_000, .pid = 7, .pairs = &.{}, .tables = &.{} }));
+    const remote = try encode(a, .{ .capture_started_ns = 1_000, .pid = 7, .pairs = &.{}, .tables = &.{}, .collection = .not_collected_remote });
+    defer a.free(remote);
+    const remote_context = try decodeContext(arena.allocator(), remote);
+    try std.testing.expectEqual(Collection.not_collected_remote, remote_context.collection);
+    try std.testing.expectEqualStrings("not collected: remote", remote_context.collection.reason().?);
     const lo = decode.v4(127, 0, 0, 1);
     const sockets = [_]Socket{.{ .pid = 7, .fd = 3, .inode = 11, .protocol = .tcp, .family = .ipv4, .local = lo, .local_port = 1, .remote = lo, .remote_port = 2, .state = 1 }};
     const ctx = testContext(&sockets, &.{.{ .pid = 7 }}, &.{.{ .monotonic_before_ns = 1, .realtime_ns = 2, .monotonic_after_ns = 3 }});

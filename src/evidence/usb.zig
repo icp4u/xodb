@@ -216,6 +216,7 @@ pub const Stream = struct {
     pub fn correlate(self: *const Stream, index: usize) sockets.UsbJoin {
         const record = self.records[index];
         const ctx = self.parent.context orelse return .{ .reason = "no capture context: open with --open-capture an archive containing USB fd tables" };
+        if (ctx.collection.reason()) |reason| return .{ .reason = reason };
         return sockets.correlateUsb(&ctx, record.bus, record.device, self.parent.timeOf(record.source_record).monotonic_ns);
     }
 };
@@ -449,6 +450,12 @@ test "generated usbmon pcapng pairs URBs and decodes standard and class descript
     try std.testing.expectEqual(@as(u16, 0x1234), stream.records[1].descriptors[0].vendor_id.?);
     try std.testing.expectEqual(@as(u16, 0x5678), stream.devices[0].product_id.?);
     try std.testing.expectEqual(@as(u64, 0), stream.loss().orphan_completions);
+
+    // A remote archive's empty ECTX is "not collected", not "no descriptor matched".
+    const remote = try sockets.encode(a, .{ .capture_started_ns = 1_000, .pid = 9, .pairs = &.{}, .tables = &.{}, .collection = .not_collected_remote });
+    defer a.free(remote);
+    try parent.attachContext(remote, null);
+    try std.testing.expectEqualStrings("not collected: remote", stream.correlate(1).reason);
 }
 
 test "USB class labels cover HID, CDC and mass storage basics" {

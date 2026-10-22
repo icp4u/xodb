@@ -2878,7 +2878,14 @@ const LanguageAccess = struct {
         return owner(user).refreshMaps();
     }
     fn runtimeModuleAt(user: *anyopaque, address: u64) !language_view.Module {
-        return moduleView(try owner(user).modules.runtimeAt(address));
+        const session = owner(user);
+        if (session.target.isRemote()) {
+            if (address == 0 or address != mainPhdr(user)) return error.BinaryIdentityUnavailable;
+            try session.refreshMaps();
+            if (session.modules.cachedAt(address)) |module| return moduleView(module) else |_| {}
+            return moduleView(try session.metadata.mainImage(session, address, .frame));
+        }
+        return moduleView(try session.modules.runtimeAt(address));
     }
     fn registerValue(user: *anyopaque, tid: i32, name: []const u8) !?u64 {
         const registers = try owner(user).target.registers(tid);

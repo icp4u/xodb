@@ -189,7 +189,7 @@ capture start and stop.
 | Mapping | When | Uncertainty |
 |---|---|---|
 | `aligned` | the archive has at least one pair | half the narrowest bracket, plus the largest disagreement between the pairs (a realtime step or slew during the capture widens it) |
-| `unaligned` | no `--open-capture`, or an archive without ECTX | records keep only their stream time; they are never placed on the capture's axis and are counted as `off_axis` in the lane |
+| `unaligned` | no `--open-capture`, an archive without ECTX, or a remote archive whose ECTX says `not collected: remote` | records keep only their stream time; they are never placed on the capture's axis and are counted as `off_axis` in the lane |
 
 The pcap writer's realtime must be the same host's clock as the capture's. A
 file from another host, or one whose clock stepped between the pairs and the
@@ -202,8 +202,11 @@ The collector step (`src/profile/net_context.zig`) runs for local targets at
 capture start and stop. It reads `/proc/PID/fd` for `socket:[inode]` links and
 the target's network namespace tables `/proc/PID/net/{tcp,tcp6,udp,udp6}`, and
 keeps the rows whose inode the target holds: pid, fd, inode, protocol, local and
-remote address and port, state, plus the process `comm`. Remote targets
-(`--runtime-agent`/`--runtime-ssh`) record nothing: their `/proc` is elsewhere.
+remote address and port, state, plus the process `comm`. For remote targets
+(`--runtime-agent`/`--runtime-ssh`), the host cannot read the target's `/proc`.
+Their archives carry a valid empty ECTX sentinel and report `not collected:
+remote`; they contain no clock pair or socket row and make no correlation
+claim.
 
 `correlate(record)` joins the record's 5-tuple to those rows:
 
@@ -212,7 +215,7 @@ remote address and port, state, plus the process `comm`. Remote targets
 | `exact` | protocol and both endpoints equal a connected socket the process held, and the packet's aligned time is bracketed by the nearest tables before and after it that both show that same socket (same inode and tuple), or lies within the clock uncertainty of a table that does |
 | `sampled` | the same 5-tuple match, but no tables holding that socket bracket the packet: it was seen only at start or only at stop (opened or closed during the capture), the packet is outside the tables, or the stream is unaligned. Another socket or process may have held the tuple then |
 | `inferred` | only the local endpoint matched a listening or unconnected socket (wildcard addresses match any local address); the remote end is not part of its identity |
-| `none` | no row matches, the record has no TCP/UDP 5-tuple, or there is no capture context; `reason` says which |
+| `none` | no row matches, the record has no TCP/UDP 5-tuple, there is no capture context, or collection was unavailable for a remote target; `reason` says which |
 
 The reply names the process (pid, comm), the socket (fd, inode, endpoints,
 state), which table matched (`start` or `stop`, with its monotonic time), and
@@ -241,9 +244,10 @@ DNS names, mitmproxy headers and URL fields.
 
 ## Archive storage (format 2.10)
 
-Local captures write an optional, ignorable `ECTX` section after the others and
-set minor version 9; captures without it keep their previous minor. Older
-readers skip the section and stay correct. See
+Profile captures write an optional, ignorable `ECTX` section after the others
+and set minor version 9. A remote capture uses the empty-count sentinel
+described above. Readers that predate the sentinel decode it as an empty,
+unaligned context and report no matching socket rather than `not collected`. See
 [M2_ARCHIVE_FORMAT.md](M2_ARCHIVE_FORMAT.md#evidence-context-ectx-29). The pcap
 file itself is not copied into the archive in X1: keep it beside the `.xoc`.
 USB fd rows use a separate optional `EUSB` section at minor 10. Keeping ECTX

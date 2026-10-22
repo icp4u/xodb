@@ -523,8 +523,22 @@ pub const Modules = struct {
     }
     pub fn load(self: *Modules, region: Region, why: Reason) !*Module {
         if (region.path.len == 0 or region.path[0] != '/') return error.NoBinaryImage;
-        return self.loadRange(region, false, why) catch |err| {
+        return self.loadRange(region, false, why, null) catch |err| {
             if (why == .sweep) self.noteSkipped(region, err);
+            self.noteFailure(region, err);
+            return err;
+        };
+    }
+    /// Budget refusal discovered before an asynchronous image transfer starts.
+    pub fn refuseImage(self: *Modules, region: Region, reason: snapshot.Refusal) void {
+        self.refusal = reason;
+        self.noteFailure(region, error.BinarySnapshotLimit);
+    }
+    /// A pinned, sealed main-runtime ELF view prepared by the owner metadata
+    /// job. The caller proves the kernel PHDR mapping; this is not a name scan.
+    pub fn loadMainImage(self: *Modules, region: Region, fd: c_int, why: enum { frame, sweep }) !*Module {
+        defer self.reportBudget();
+        return self.loadRange(region, false, if (why == .frame) .frame else .sweep, fd) catch |err| {
             self.noteFailure(region, err);
             return err;
         };
@@ -686,7 +700,7 @@ pub const Modules = struct {
     /// collection of VMAs. Do not combine it with the opening/live map snapshot.
     pub fn loadObserved(self: *Modules, region: Region) !*Module {
         if (region.path.len == 0 or region.path[0] != '/') return error.NoBinaryImage;
-        return self.loadRange(region, true, .sweep) catch |err| {
+        return self.loadRange(region, true, .sweep, null) catch |err| {
             self.noteSkipped(region, err);
             return err;
         };
@@ -853,7 +867,7 @@ pub const Modules = struct {
         }
         return null;
     }
-    fn loadRange(self: *Modules, region: Region, observed: bool, why: Reason) !*Module {
+    fn loadRange(self: *Modules, region: Region, observed: bool, why: Reason, prepared: ?c_int) !*Module {
         self.refusal = null;
         if (self.cachedRange(region, observed)) |module| {
             if (why == .frame) module.debug_sweep = false;
@@ -865,10 +879,13 @@ pub const Modules = struct {
         errdefer self.allocator.free(path);
         // Only read the inode actually mapped by the target. map_files can need
         // privileges unavailable to run-as, so exe/path retain inode checks.
-        var source: mapped_file.Source = if (self.core_source != null) .core_path else .unopened;
-        const fd = if (self.core_source != null) c.open(path, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK) else mapped_file.openResolved(self.target, self.pid, region, null, &source) catch |err| {
+        var source: mapped_file.Source = if (prepared != null) .remote_snapshot else if (self.core_source != null) .core_path else .unopened;
+        const fd = if (prepared) |ready| c.fcntl(ready, c.F_DUPFD_CLOEXEC, @as(c_int, 3)) else if (self.core_source != null) c.open(path, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK) else mapped_file.openResolved(self.target, self.pid, region, null, &source) catch |err| {
             // A runtime agent refuses whole files above its own fixed cap.
-            if (err == error.BinarySnapshotLimit) self.refusal = .{ .size = 0, .limit = snapshot.remote_image_limit, .which = .remote };
+            if (err == error.BinarySnapshotLimit) {
+                const agent = rt.xrt_target_remote_image_limit(self.target);
+                self.refusal = .{ .size = 0, .limit = @min(agent, rt.XRT_REMOTE_SYNC_IMAGE_LIMIT), .which = .remote, .older_agent = agent < snapshot.remote_image_limit };
+            }
             return err;
         };
         if (fd < 0) return error.BinaryIdentityUnavailable;
@@ -882,7 +899,10 @@ pub const Modules = struct {
         const entry: apk.Entry = if (std.mem.eql(u8, &signature, "\x7fELF")) .{ .offset = 0, .size = file_size } else try apk.find(self.allocator, fd, file_size, region.offset);
         if (entry.offset % try self.pageSize() != 0) return error.ApkEntryNotPageAligned;
         // Some readers keep fixed bounds whatever the image budgets are.
-        const bound = self.allowance(why, region);
+        const bound: ?Bound = if (prepared != null and why == .sweep)
+            .{ .each = snapshot.per_image_limit, .pool = .sweeps, .which = .sweep }
+        else
+            self.allowance(why, region);
         if (bound) |b| if (b.pool == .lookups) {
             const left = lookup_total_limit -| self.lookup_bytes;
             if (entry.size > b.each or entry.size > left) {

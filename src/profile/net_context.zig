@@ -15,6 +15,9 @@ pub const Recorder = struct {
     arena: std.heap.ArenaAllocator,
     pid: i32,
     started_ns: u64,
+    /// A remote target's /proc belongs to the agent host and is unavailable
+    /// here. Keep an empty recorder so its archive still carries valid ECTX.
+    remote: bool = false,
     pairs: [2]clock.Pair = undefined,
     pair_count: u8 = 0,
     tables: [2]sockets.Table = undefined,
@@ -25,10 +28,14 @@ pub const Recorder = struct {
         self.sample(.start);
         return self;
     }
+    pub fn beginRemote(a: std.mem.Allocator, pid: i32, started_ns: u64) Recorder {
+        return .{ .arena = std.heap.ArenaAllocator.init(a), .pid = pid, .started_ns = started_ns, .remote = true };
+    }
     pub fn deinit(self: *Recorder) void {
         self.arena.deinit();
     }
     pub fn sample(self: *Recorder, when: sockets.When) void {
+        if (self.remote) return;
         if (self.pair_count < self.pairs.len) {
             self.pairs[self.pair_count] = pair();
             self.pair_count += 1;
@@ -41,14 +48,14 @@ pub const Recorder = struct {
     /// The ECTX payload, allocated with `a`; redacted under `policy` (the
     /// archive's own key).
     pub fn encode(self: *const Recorder, a: std.mem.Allocator, policy: ?*const redact.Policy) ![]u8 {
-        const ctx = sockets.Context{ .capture_started_ns = self.started_ns, .pid = self.pid, .pairs = self.pairs[0..self.pair_count], .tables = self.tables[0..self.table_count] };
+        const ctx = sockets.Context{ .capture_started_ns = self.started_ns, .pid = self.pid, .pairs = self.pairs[0..self.pair_count], .tables = self.tables[0..self.table_count], .collection = if (self.remote) .not_collected_remote else .collected };
         const p = policy orelse return sockets.encode(a, ctx);
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         return sockets.encode(a, try redacted(arena.allocator(), ctx, p));
     }
     pub fn encodeUsb(self: *const Recorder, a: std.mem.Allocator, policy: ?*const redact.Policy) ![]u8 {
-        const ctx = sockets.Context{ .capture_started_ns = self.started_ns, .pid = self.pid, .pairs = self.pairs[0..self.pair_count], .tables = self.tables[0..self.table_count] };
+        const ctx = sockets.Context{ .capture_started_ns = self.started_ns, .pid = self.pid, .pairs = self.pairs[0..self.pair_count], .tables = self.tables[0..self.table_count], .collection = if (self.remote) .not_collected_remote else .collected };
         const p = policy orelse return sockets.encodeUsb(a, ctx);
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
@@ -59,6 +66,35 @@ pub const Recorder = struct {
         return false;
     }
 };
+
+test "remote recorder emits a valid empty ECTX in both archive modes" {
+    const a = std.testing.allocator;
+    var recorder = Recorder.beginRemote(a, 17, 1_000);
+    defer recorder.deinit();
+    recorder.sample(.stop);
+    try std.testing.expectEqual(@as(u8, 0), recorder.pair_count);
+    try std.testing.expectEqual(@as(u8, 0), recorder.table_count);
+
+    const plain = try recorder.encode(a, null);
+    defer a.free(plain);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const plain_context = try sockets.decodeContext(arena.allocator(), plain);
+    try std.testing.expectEqual(sockets.schema, plain[0]);
+    try std.testing.expectEqual(@as(usize, 0), plain_context.pairs.len);
+    try std.testing.expectEqual(@as(usize, 0), plain_context.tables.len);
+    try std.testing.expectEqual(sockets.Collection.not_collected_remote, plain_context.collection);
+
+    const policy = redact.Policy.init(@splat(3));
+    const masked = try recorder.encode(a, &policy);
+    defer a.free(masked);
+    const masked_context = try sockets.decodeContext(arena.allocator(), masked);
+    try std.testing.expectEqual(sockets.schema_redacted, masked[0]);
+    try std.testing.expect(masked_context.redacted);
+    try std.testing.expectEqual(@as(usize, 0), masked_context.pairs.len);
+    try std.testing.expectEqual(@as(usize, 0), masked_context.tables.len);
+    try std.testing.expectEqualStrings("not collected: remote", masked_context.collection.reason().?);
+}
 
 /// A copy of `ctx` for a shared archive: addresses outside loopback and the
 /// documentation ranges become tags under `policy`'s key (one per archive,

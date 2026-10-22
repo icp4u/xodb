@@ -18,7 +18,12 @@ import time
 from client import Client
 
 MIB = 1 << 20
-SIZE = 257 * MIB  # just above the 256 MiB budget the refusals below ask for
+REMOTE = bool(os.environ.get('XODB_TEST_RUNTIME_AGENT'))
+# Exercise the same budget matrix below the independent remote transport cap.
+LOW_MIB = 128 if REMOTE else 256
+SIZE = (LOW_MIB + 1) * MIB
+ADVICE_MIB = 200 if REMOTE else 300
+TOTAL_MIB = 100 if REMOTE else 200
 DEFAULTS = {'image_limit': 1024 * MIB, 'total_limit': 4096 * MIB}
 LIBRARY = '''
 #include <unistd.h>
@@ -57,8 +62,23 @@ def modules(client):
 
 def stack(client, session, tid):
     deadline = time.monotonic() + 30
+    requested = set()
     while True:
         found = client.inspect('get_stack', generation=session['generation'], tid=tid)
+        # Automatic remote unwinds intentionally do not fetch caller DWARF.
+        # Select each unloaded caller explicitly before asserting full-image policy.
+        if client.runtime_agent:
+            missing = [f['lookup_pc'] for f in found['frames']
+                       if f['inline_diagnostic'] == 'DebugMetadataNotLoaded' and f['lookup_pc'] not in requested]
+            for pc in missing:
+                requested.add(pc)
+                reply = client.tool('get_source_location', address=hex(pc))['result']
+                if reply.get('isError'):
+                    texts = [c['text'] for c in reply['content']]
+                    assert texts[0] in ('BinarySnapshotLimit', 'CompressedDebugBudget', 'NoDebugInfoAtAddress', 'NoSourceAtAddress'), reply
+                    if texts[0] == 'BinarySnapshotLimit':
+                        assert len(texts) == 2 and 'budget' in texts[1], reply
+            if missing: continue
         if not any(f['diagnostic'] == 'DebugMetadataPending' for f in found['frames']): return found
         assert time.monotonic() < deadline, found
         time.sleep(.005)
@@ -82,12 +102,21 @@ def refused(client, tid, library, budget, knobs):
     assert notice and notice.startswith(f'{library} is {SIZE // MIB} MiB; '), found
     assert budget in notice and all(knob in notice for knob in knobs), notice
     assert not any(f['symbol'] == 'big_wait' for f in found['frames']), found  # the probe saw the image unread
-    assert any(f['inline_diagnostic'] == 'BinarySnapshotLimit' for f in found['frames']), found
+    assert any(f['inline_diagnostic'] == ('DebugMetadataNotLoaded' if client.runtime_agent else 'BinarySnapshotLimit') for f in found['frames']), found
     regions, page = modules(client)
     assert page['image_budget'] == notice, page
     failure = [f for f in page['load_failures'] if f['path'] == str(library)]
     assert len(failure) == 1 and failure[0]['diagnostic'] == 'BinarySnapshotLimit' and failure[0]['detail'] == notice, page['load_failures']
     assert any(r['path'] == str(library) and r['full_image_deferred'] for r in regions), regions
+    refused_frame = next(f for f in found['frames'] if any(
+        r['path'] == str(library) and r['start'] <= f['lookup_pc'] < r['end'] for r in regions))
+    reply = client.tool('get_source_location', address=hex(refused_frame['lookup_pc']))['result']
+    # Walking other frames can have consumed part of the total since the first
+    # refusal. A new request must describe the remaining budget now.
+    notice = modules(client)[1]['image_budget']
+    assert notice.startswith(f'{library} is {SIZE // MIB} MiB; ') and budget in notice, notice
+    assert all(knob in notice for knob in knobs), notice
+    assert reply.get('isError') and [c['text'] for c in reply['content']] == ['BinarySnapshotLimit', notice], reply
     # A name that is nowhere may be in the unread image: say so instead of "not found".
     reply = symbol(client, 'xodb_no_such_symbol')
     assert reply['isError'] and [c['text'] for c in reply['content']] == ['ImageBudgetExceeded', notice], reply
@@ -137,18 +166,21 @@ def main():
         client = Client('control', None, options=attach)
         figures = client.inspect('list_modules', limit=1)['image_bytes']
         assert {k: figures[k] for k in DEFAULTS} == DEFAULTS, figures
+        if client.runtime_agent:
+            unloaded = client.inspect('get_stack', generation=client.stopped()['generation'], tid=tid)
+            assert unloaded['image_budget'] is None, unloaded  # not requested is not a budget refusal
         found = stack(client, client.stopped(), tid)
         assert found['image_budget'] is None and any(f['symbol'] == 'big_wait' for f in found['frames']), found
         assert b'module budget' not in close(client); client = None
 
         # A smaller budget on the command line: the refusal says what to
         # rerun with for this image.
-        client = Client('control', None, options=[*attach, '--image-limit', '256M'])
-        notice = refused(client, tid, library, 'image budget 256 MiB', ('--image-limit', 'symbols.image_bytes'))
+        client = Client('control', None, options=[*attach, '--image-limit', f'{LOW_MIB}M'])
+        notice = refused(client, tid, library, f'image budget {LOW_MIB} MiB', ('--image-limit', 'symbols.image_bytes'))
         err = close(client); client = None
         assert err.count(b'module budget:') == 1 and notice.encode() in err, err
         advice = re.search(r'; rerun with ((?:--image-(?:total-)?limit \d+[MG] ?)+) or set symbols\.image_bytes', notice)
-        assert advice and advice.group(1) == '--image-limit 300M', notice
+        assert advice and advice.group(1) == f'--image-limit {ADVICE_MIB}M', notice
         result['option'] = notice
 
         # Rerun with the sentence's own words: read in full, named, with source.
@@ -169,11 +201,11 @@ def main():
         assert b'module budget' not in close(client); client = None
 
         # Set in the config file: the same words. Raised there: it loads.
-        (w/'low.json').write_text(json.dumps({'symbols': {'image_bytes': 256 * MIB}}))
+        (w/'low.json').write_text(json.dumps({'symbols': {'image_bytes': LOW_MIB * MIB}}))
         client = Client('control', None, options=[*attach, '--config', str(w/'low.json')])
-        assert refused(client, tid, library, 'image budget 256 MiB', ('--image-limit', 'symbols.image_bytes')) == notice
+        assert refused(client, tid, library, f'image budget {LOW_MIB} MiB', ('--image-limit', 'symbols.image_bytes')) == notice
         close(client); client = None
-        (w/'high.json').write_text(json.dumps({'symbols': {'image_bytes': 300 * MIB}}))
+        (w/'high.json').write_text(json.dumps({'symbols': {'image_bytes': ADVICE_MIB * MIB}}))
         client = Client('control', None, options=[*attach, '--config', str(w/'high.json')])
         found = stack(client, client.stopped(), tid)
         assert found['image_budget'] is None and any(f['symbol'] == 'big_wait' for f in found['frames']), found
@@ -186,8 +218,8 @@ def main():
         close(client); client = None
 
         # The total is a budget too, and says what is left of it.
-        client = Client('control', None, options=[*attach, '--image-limit', '1G', '--image-total-limit', '200M'])
-        total = refused(client, tid, library, 'MiB left of the 200 MiB total image budget; rerun with --image-total-limit 2G', ('--image-total-limit', 'symbols.image_total_bytes'))
+        client = Client('control', None, options=[*attach, '--image-limit', '1G', '--image-total-limit', f'{TOTAL_MIB}M'])
+        total = refused(client, tid, library, f'MiB left of the {TOTAL_MIB} MiB total image budget; rerun with --image-total-limit 2G', ('--image-total-limit', 'symbols.image_total_bytes'))
         close(client); client = None
         result['total'] = total
 
@@ -208,7 +240,7 @@ def main():
         library.unlink(missing_ok=True)
         result['elapsed_seconds'] = round(time.monotonic() - started, 3)
         (w/'results.json').write_text(json.dumps(result, indent=2) + '\n')
-    print(f"image budget: defaults are 1 GiB an image and 4 GiB in all and load a {SIZE // MIB} MiB image; with --image-limit 256M it is refused with: {result['option'].replace(str(w), '.')}; "
+    print(f"image budget: defaults are 1 GiB an image and 4 GiB in all and load a {SIZE // MIB} MiB image; with --image-limit {LOW_MIB}M it is refused with: {result['option'].replace(str(w), '.')}; "
           f"rerun with {result['advised']['options']} it loads and symbolises ({result['advised']['rss_bytes'] >> 20} MiB resident)")
 
 

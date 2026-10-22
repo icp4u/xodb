@@ -121,6 +121,7 @@ pub const Stream = struct {
     pub fn correlate(self: *const Stream, i: usize) sockets.Join {
         const ctx = self.context orelse return .{ .reason = "no capture context: open with --open-capture an archive recorded with socket tables" };
         const flow = self.summaries[i].flow() orelse return .{ .reason = "record has no 5-tuple (undecoded, or not TCP/UDP)" };
+        if (ctx.collection.reason()) |reason| return .{ .reason = reason };
         return sockets.correlate(&ctx, flow, self.timeOf(i).monotonic_ns);
     }
 
@@ -214,6 +215,14 @@ test "stream decodes, groups flows and correlates" {
     try std.testing.expect(!join.outbound);
     try std.testing.expect(s.correlate(0).outbound);
     try std.testing.expect(s.matches(1, .{ .clock = .capture, .from_ns = 15, .to_ns = 21 }));
+
+    const remote_payload = try sockets.encode(a, .{ .capture_started_ns = 1_000, .pid = 9, .pairs = &.{}, .tables = &.{}, .collection = .not_collected_remote });
+    defer a.free(remote_payload);
+    try s.attachContext(remote_payload, null);
+    try std.testing.expectEqual(clock.State.unaligned, s.mapping.state);
+    try std.testing.expectEqualStrings("not collected: remote", s.correlate(0).reason);
+    // An undecoded record keeps the more specific absence-of-a-tuple reason.
+    try std.testing.expect(std.mem.indexOf(u8, s.correlate(2).reason, "no 5-tuple") != null);
 }
 
 test "loss totals saturate across hostile interface counters" {

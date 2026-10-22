@@ -99,6 +99,7 @@ already runs it, or the step has no target for the C agent. `mcp.py`,
 `stale-interrupt.py`, `local-large-symbols.py`, and `fdactivity.py` read the
 switch and are lane steps. The memory view exits before an agent exists, and
 opening an observation archive rejects the agent, so those two stay omitted.
+`runtime-host` always names its own agent binary, and `perl-path-component` is an in-process oracle that returns before the debugger starts, so both stay omitted.
 A plain step whose script contains `--headless` or `--listen` fails classification.
 `tests/release-runner.py` quotes that gate flag and does not start the debugger, so it stays plain. The
 `periodic` tier schedules those host variants beside its own steps, so `all`

@@ -158,11 +158,12 @@ pub const Source = struct {
         var ticks: std.ArrayList(timeline.Tick) = .empty;
         var off_axis: u64 = 0;
         const same_capture = if (stream.context) |ctx| capture_started_ns != null and ctx.capture_started_ns == capture_started_ns.? else false;
+        const aligned = same_capture and stream.mapping.state == .aligned;
         for (0..stream.parsed.records.len) |i| {
             const t = stream.timeOf(i);
             const at: ?u64 = if (capture_started_ns == null)
                 (if (t.known) t.stream_ns - (stream.first_time_ns orelse t.stream_ns) else null)
-            else if (same_capture) t.capture_ns else null;
+            else if (aligned) t.capture_ns else null;
             if (at == null or at.? >= extent) {
                 off_axis += 1;
                 continue;
@@ -175,7 +176,18 @@ pub const Source = struct {
             }
         }.less);
         var note_buffer: [160]u8 = undefined;
-        const note = if (capture_started_ns == null) "" else if (!same_capture) (if (stream.context == null) "unaligned: the capture archive has no clock pairs (ECTX); records are not placed on its clock" else "unaligned: clock pairs belong to a different capture") else try std.fmt.bufPrint(&note_buffer, "aligned to the capture clock from paired samples, +/-{d} ns", .{stream.mapping.uncertainty_ns});
+        const note = if (capture_started_ns == null)
+            ""
+        else if (stream.context == null)
+            "unaligned: the capture archive has no clock pairs (ECTX); records are not placed on its clock"
+        else if (stream.context.?.collection.reason()) |reason|
+            try std.fmt.bufPrint(&note_buffer, "unaligned: {s}; records are not placed on the capture clock", .{reason})
+        else if (!same_capture)
+            "unaligned: clock pairs belong to a different capture"
+        else if (!aligned)
+            "unaligned: ECTX has no usable clock pairs"
+        else
+            try std.fmt.bufPrint(&note_buffer, "aligned to the capture clock from paired samples, +/-{d} ns", .{stream.mapping.uncertainty_ns});
         return .{ .label = stream.label, .ticks = ticks.items, .off_axis = off_axis, .undecoded = stream.undecoded, .note = try a.dupe(u8, note) };
     }
     fn valid(capture: *const profile.Capture, sample: anytype) bool {

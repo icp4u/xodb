@@ -68,6 +68,7 @@ def machine():
 # OCR text).
 NAMES, SHORT, ADDRESSES, MACS = machine()
 V4 = next((a for a in ADDRESSES if a.version == 4), None)
+AGENT = bool(os.environ.get('XODB_TEST_RUNTIME_AGENT'))
 
 def token(text, name):
     """name in text as src/redact.zig matches it (3+ characters)."""
@@ -333,7 +334,9 @@ for redact in (False, True):
     peer, middle, archive = peer_capture(redact, name)
     ectx = section(archive.read_bytes(), 0x58544345)
     assert ectx is not None and ectx[0] == (2 if redact else 1), 'ECTX schema'
-    if V4:
+    if AGENT:
+        assert len(ectx) == 15 and ectx[13:] == b'\0\0', f'{name}: remote ECTX is not empty'
+    elif V4:
         raw_address = V4.packed
         assert (raw_address in ectx) != redact, f'{name}: raw address bytes in socket tables: {raw_address in ectx}'
     summary[name] = dict(ectx_bytes=len(ectx), schema=ectx[0])
@@ -368,7 +371,10 @@ check('--open-pcap --redact replies', text, False)
 assert '172.16.31.7' not in text and own not in text and '203.0.113.9' in text and '127.0.0.1' in text, 'pcap address rule'
 srcs = [r['decoded']['src'] for r in rows['records']]
 assert srcs[1].startswith('ip-') and srcs[1] == srcs[2], 'one peer, one tag'
-assert joins[0]['basis'] in ('exact', 'sampled') and joins[0]['process']['pid'] == peer['pid'], joins[0]['basis']
+if AGENT:
+    assert joins[0]['basis'] == 'none' and joins[0]['process'] is None, joins[0]
+else:
+    assert joins[0]['basis'] in ('exact', 'sampled') and joins[0]['process']['pid'] == peer['pid'], joins[0]['basis']
 error(raw, 'RawPayloadRedacted')
 (work / 'pcap-redact.json').write_text(text)
 summary['pcap'] = dict(records=len(rows['records']), loopback_basis=joins[0]['basis'], include_raw='RawPayloadRedacted')

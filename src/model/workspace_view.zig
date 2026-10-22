@@ -27,6 +27,8 @@ pub fn signature(value: Header) u64 {
         std.hash.autoHash(&hash, job.id);
         std.hash.autoHash(&hash, job.units);
         std.hash.autoHash(&hash, job.source_bytes);
+        std.hash.autoHash(&hash, job.image_bytes);
+        std.hash.autoHash(&hash, job.image_total);
         hash.update(job.state);
     }
     return hash.final();
@@ -34,6 +36,8 @@ pub fn signature(value: Header) u64 {
 pub fn capture(session: *Session) Header {
     const metadata = session.metadata.snapshot();
     const pending: ?@import("debug_metadata.zig").JobStatus = for (metadata.items[0..metadata.count]) |job| {
+        if (job.kind == .image and !std.mem.eql(u8, job.state, "ready") and !std.mem.eql(u8, job.state, "failed") and !std.mem.eql(u8, job.state, "cancelled")) break job;
+    } else for (metadata.items[0..metadata.count]) |job| {
         if (!std.mem.eql(u8, job.state, "ready") and !std.mem.eql(u8, job.state, "failed") and !std.mem.eql(u8, job.state, "cancelled")) break job;
     } else null;
     return .{
@@ -51,12 +55,14 @@ pub fn capture(session: *Session) Header {
 
 pub const Action = union(enum) {
     cancel_continue,
+    cancel_metadata: u64,
     run_to_source: struct { tid: i32, path: []const u8, line: u32 },
     toggle_source: struct { path: []const u8, line: u32 },
     watch_local: struct { tid: i32, frame: usize, metadata: u64, name: []const u8, address: u64 },
 };
 pub fn apply(a: std.mem.Allocator, session: *Session, action: Action) !void {
     switch (action) {
+        .cancel_metadata => |id| try session.metadata.cancel(id),
         .cancel_continue, .run_to_source, .toggle_source => {
             const operation: @import("command.zig").Operation = switch (action) {
                 .cancel_continue => .{ .control = .cancel_continue },

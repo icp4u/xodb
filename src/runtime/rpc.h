@@ -11,13 +11,14 @@
 #define XRT_RPC_TARGETS 128
 #define XRT_RPC_REQUEST_PREFIX 32
 /* FILE_OPEN arg[0]: allow a verified large mapped file for bounded symbol
- * ranges. Zero preserves the ordinary 256 MiB snapshot policy, including
+ * ranges. Zero uses XRT_REMOTE_IMAGE_LIMIT for ordinary snapshots, including
  * requests from older hosts. Older agents may still refuse large images. */
 #define XRT_RPC_FILE_SYMBOLS UINT64_C(1)
 /* HELLO arg[0] requests an optional u64 capability suffix. Old hosts keep the
  * original 16-byte response; old agents ignore the request and return 16. */
 #define XRT_RPC_HELLO_CAPABILITIES UINT64_C(1)
 #define XRT_RPC_CAP_SOURCE UINT64_C(1)
+#define XRT_RPC_CAP_LARGE_IMAGES UINT64_C(4)
 /* HELLO arg[1] opts into this capability. When negotiated, each present
  * snapshot is followed by an address_space_unstable bool. Old hosts keep
  * their original reply shape; hosts without this evidence bypass read caches. */

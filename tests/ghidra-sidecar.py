@@ -217,6 +217,34 @@ atexit.register(shutil.rmtree, work, True)
 fixture_dir = work / "qx"
 subprocess.run(["sh", "tests/fixtures/semq/build_fixtures.sh", str(fixture_dir)], check=True, timeout=60)
 fixture = fixture_dir / "qx-gcc-O2"
+fixture_sha256 = hashlib.sha256(fixture.read_bytes()).hexdigest()
+if '--wrong-image-identity' in sys.argv:
+    fixture_sha256 = '0' * 64
+
+
+def fixture_request(request):
+    """Remote imports name a host snapshot, not the target's filesystem path.
+
+    Check both the claimed identity and the actual bytes admitted by the sidecar.
+    The fake server independently validates open_image's digest as well.
+    """
+    if request.get('sha256') != fixture_sha256:
+        return False
+    try:
+        return hashlib.sha256(Path(request['path']).read_bytes()).hexdigest() == fixture_sha256
+    except (OSError, KeyError):
+        return False
+
+
+# The same bytes at another path match; a same-size wrong image does not, even
+# when it claims the fixture's digest. --wrong-image-identity plants a bad oracle.
+copy = work / 'image-copy'
+copy.write_bytes(fixture.read_bytes())
+assert fixture_request(dict(path=str(copy), sha256=fixture_sha256)), 'renamed image identity'
+wrong = bytearray(copy.read_bytes()); wrong[0] ^= 1
+copy.write_bytes(wrong)
+assert not fixture_request(dict(path=str(copy), sha256=fixture_sha256)), 'wrong image admitted'
+copy.unlink()
 payload = ROOT / "src/semq/adapter_fixture.json"
 results = []
 managed_processes = []
@@ -330,7 +358,7 @@ record("configured sidecar starts before the first decompile request", (case / "
 record("throwaway priming is replaced by real-function warm-ahead",
        not any(request.get("verb") == "prime" for request in requests), requests)
 record("the mapped executable is imported before pseudo-C is requested", any(request.get("verb") == "open_image" and
-       Path(request.get("path", "")) == fixture for request in requests), requests)
+       fixture_request(request) for request in requests), requests)
 record("eager imports are marked as background work", any(request.get("id") == "xodb-warm-open" and
        request.get("background") is True for request in requests), requests)
 try:
@@ -364,14 +392,14 @@ while time.monotonic() < deadline:
     if any(request.get("verb") == "decompile" and request.get("background") is True for request in requests): break
     tool(value, "get_session")
     time.sleep(.02)
-opened = [Path(request.get("path", "")) for request in requests
+opened = [request for request in requests
           if request.get("verb") == "open_image" and request.get("background") is True]
 record("eager library byte bound keeps the main image eligible and skips libraries",
-       opened and all(path == fixture for path in opened), opened)
-warm_paths = [Path(request.get("path", "")) for request in requests
+       opened and all(fixture_request(request) for request in opened), opened)
+warm_images = [request for request in requests
               if request.get("background") is True and request.get("verb") in ("open_image", "decompile")]
 record("outer stack frames cannot bypass the eager library bound",
-       warm_paths and all(path == fixture for path in warm_paths), warm_paths)
+       warm_images and all(fixture_request(request) for request in warm_images), warm_images)
 close(value)
 stop_server()
 
@@ -453,7 +481,7 @@ try:
         time.sleep(.03)
     logged = [json.loads(line) for line in (case / "requests").read_text().splitlines()]
     eager_opens = [request for request in logged if request.get("id") == "xodb-warm-open" and
-                   Path(request.get("path", "")) == fixture]
+                   fixture_request(request)]
     record("interactive pseudo-C cancels queued background import", result.get("status") == "completed" and
            (case / "cancelled").exists() and (case / "cancelled").read_text() == "warm:hang", result)
     record("a cancelled import backs off instead of restarting after each foreground poll",
@@ -470,14 +498,20 @@ value.continue_initial_stop()
 value.stopped("breakpoint")
 deadline = time.monotonic() + 10
 warm_requests = []
+warm_pending = False
 while time.monotonic() < deadline:
     if (case / "requests").exists():
         logged = [json.loads(line) for line in (case / "requests").read_text().splitlines()]
         warm_requests = [request for request in logged if request.get("verb") == "decompile" and request.get("background") is True]
-        if warm_requests: break
+        # Receipt of decompile is earlier than the client's adoption of the
+        # pending job ID. Witness its first status poll before testing cancel.
+        warm_pending = any(request.get("verb") == "status" and
+                           str(request.get("job", "")).startswith("warm-decompile:")
+                           for request in logged)
+        if warm_requests and warm_pending: break
     time.sleep(.02)
 record("warm-ahead queues stack functions at low priority within the hard bound",
-       0 < len(warm_requests) <= 16, warm_requests)
+       0 < len(warm_requests) <= 16 and warm_pending, warm_requests)
 value.action("continue")
 deadline = time.monotonic() + 5
 while time.monotonic() < deadline and not (case / "cancelled").exists(): time.sleep(.02)

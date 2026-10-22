@@ -28,6 +28,16 @@ enum xrt_status xrt_process_save_launch_signals(void)
     return XRT_OK;
 }
 
+enum xrt_status xrt_process_restore_launch_signals(void)
+{
+    if (!have_launch_signals)
+        return XRT_OK;
+    for (size_t i = 0; i < 4; ++i)
+        if (sigaction(launch_signal_numbers[i], &launch_signals[i], NULL) < 0)
+            return XRT_SIGNAL_FAILED;
+    return XRT_OK;
+}
+
 uintptr_t xrt_process_options(bool owned, bool follow)
 {
     /* Even with following disabled, hold children before they execute
@@ -86,10 +96,8 @@ enum xrt_status xrt_process_launch(const char *const argv[], bool follow, int32_
         if (count != 1 || token != 1)
             _exit(126);
         close(gate[0]);
-        if (have_launch_signals)
-            for (size_t i = 0; i < 4; ++i)
-                if (sigaction(launch_signal_numbers[i], &launch_signals[i], NULL) < 0)
-                    _exit(126);
+        if (xrt_process_restore_launch_signals() != XRT_OK)
+            _exit(126);
         if (dup2(STDERR_FILENO, STDOUT_FILENO) < 0)
             _exit(126);
         const int input = open("/dev/null", O_RDONLY);

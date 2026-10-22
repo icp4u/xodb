@@ -186,9 +186,8 @@ Their event times use the same host monotonic domain.
 
 ## Evidence context (ECTX, 2.9)
 
-Local captures append the optional, ignorable ECTX section (tag `0x58544345`)
-after every other section and write minor version 9; captures without it keep
-their previous minor. Older readers skip it as an unknown optional section and
+Profile captures append the optional, ignorable ECTX section (tag `0x58544345`)
+after every other section and write minor version 9. Older readers skip it as an unknown optional section and
 keep the original bytes. Readers of 2.9 reject ECTX that is not marked
 ignorable, appears twice or precedes a required section. Like FRAM, it stays
 optional under an older minor number (a tool that rewrites the minor keeps it
@@ -205,8 +204,14 @@ The payload (little endian; encoder and validation in `src/evidence/sockets.zig`
 | table count (at most 8), then tables | u8; each: u8 when (0 start, 1 stop), u64 monotonic sample time, u32 unreadable rows/files, u8 truncated, u32 process count (at most 1,024) of i32 pid + 16-byte comm, u32 socket count (at most 65,536) of i32 pid, i32 fd, u64 inode, u8 protocol (6 TCP, 17 UDP), u8 family (1 IPv4, 2 IPv6), 16-byte local address, u16 local port, 16-byte remote address, u16 remote port, u8 kernel state |
 
 Counts are checked against the remaining bytes before allocation; unknown
-enum values and trailing bytes fail. The collector reads `/proc` of the target
-only, unprivileged, at capture start and stop; remote captures write no ECTX.
+enum values and trailing bytes fail. The collector reads `/proc` of a local
+target only, unprivileged, at capture start and stop. A remote capture writes a
+valid ECTX with both counts zero. That otherwise-unused empty sequence is the
+`not collected: remote` sentinel: it supplies neither a clock mapping nor
+socket rows, and does not claim that the host observed the remote target.
+Readers that predate the sentinel decode it as an unaligned context with no
+tables, so their joins say no socket matched; only a reader that knows the
+sentinel can tell `not collected` from `collected, nothing found`.
 See [network evidence](NETWORK_EVIDENCE.md) for the join and its limits.
 
 ## USB evidence context (EUSB, 2.10)

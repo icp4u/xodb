@@ -566,7 +566,15 @@ pub const Server = struct {
             if (session.target.gdbRemoteInfo()) |info| if (info.threads == .unsupported) return error.UnsupportedControl;
             return asValue(a, .{ .generation = session.target.snapshot().generation, .threads = session.target.threadSlice(), .thread_labels = session.compatibility.labels.items });
         }
-        if (std.mem.eql(u8, name, "get_source_location")) return asValue(a, .{ .generation = session.target.snapshot().generation, .source = try session.sourceAt(a, try address(args)) });
+        if (std.mem.eql(u8, name, "get_source_location")) {
+            const pc = try address(args);
+            const site = session.sourceAt(a, pc) catch |err| {
+                if (err == error.BinarySnapshotLimit or err == error.CompressedDebugBudget)
+                    self.error_detail = if (session.modules.budgetDetail(pc)) |detail| try a.dupe(u8, detail) else null;
+                return err;
+            };
+            return asValue(a, .{ .generation = session.target.snapshot().generation, .source = site });
+        }
         if (std.mem.eql(u8, name, "get_language_stack")) {
             const tid = number(member(args, "tid")) orelse return error.InvalidArguments;
             const frame = if (member(args, "frame")) |v| number(v) orelse return error.InvalidArguments else 0;
@@ -603,7 +611,9 @@ pub const Server = struct {
             // Name the first image this stack could not read in full.
             // A core has no metadata unwinder: its walk ends at that frame.
             const image_budget: ?[]const u8 = found: for (frames) |frame| {
-                for ([_]?[]const u8{ frame.inline_diagnostic, frame.diagnostic }) |reason| if (reason) |why| if (std.mem.eql(u8, why, "BinarySnapshotLimit") or std.mem.eql(u8, why, "CompressedDebugBudget")) if (session.modules.budgetDetail(frame.lookup_pc)) |detail| break :found try a.dupe(u8, detail);
+                // Remote callers use only cached images. An explicit source or
+                // locals request may already have recorded why one did not load.
+                for ([_]?[]const u8{ frame.inline_diagnostic, frame.diagnostic }) |reason| if (reason) |why| if (std.mem.eql(u8, why, "BinarySnapshotLimit") or std.mem.eql(u8, why, "CompressedDebugBudget") or std.mem.eql(u8, why, "DebugMetadataNotLoaded")) if (session.modules.budgetDetail(frame.lookup_pc)) |detail| break :found try a.dupe(u8, detail);
             } else null;
             var result = try asValue(a, .{ .generation = session.target.snapshot().generation, .image_budget = image_budget, .frames = frames });
             for (result.object.getPtr("frames").?.array.items) |*frame| {

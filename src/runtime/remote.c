@@ -8,6 +8,7 @@
 #include "elf_symbols.h"
 #include "xrt_source.h"
 #include "xrt_log.h"
+#include "xrt_process.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -764,6 +765,11 @@ enum xrt_status xrt_target_remote_cancel(const char *const argv[], struct xrt_ta
         if (dup2(sockets[1], STDIN_FILENO) < 0 || dup2(sockets[1], STDOUT_FILENO) < 0)
             _exit(126);
         close(sockets[1]);
+        /* The host ignores SIGPIPE after saving the caller's dispositions.
+         * SIG_IGN survives exec, so the agent would record that policy and
+         * hand it to every target. Restore the saved set before exec. */
+        if (xrt_process_restore_launch_signals() != XRT_OK)
+            _exit(126);
         execvp(argv[0], (char *const *)argv);
         _exit(127);
     }
@@ -838,6 +844,11 @@ enum xrt_status xrt_target_remote_cancel(const char *const argv[], struct xrt_ta
 bool xrt_target_source_capable(const struct xrt_target *t)
 {
     return t && t->connection && (t->connection->capabilities & XRT_RPC_CAP_SOURCE) != 0;
+}
+uint64_t xrt_target_remote_image_limit(const struct xrt_target *t)
+{
+    return t && t->connection && !(t->connection->capabilities & XRT_RPC_CAP_LARGE_IMAGES) ?
+        XRT_LEGACY_REMOTE_IMAGE_LIMIT : XRT_REMOTE_IMAGE_LIMIT;
 }
 enum xrt_status xrt_remote_destroy(struct xrt_target *t)
 {
@@ -1215,7 +1226,7 @@ enum xrt_status xrt_remote_file(const struct xrt_target *t, const struct xrt_fil
     }
     /* A valid large file is a policy refusal, not a broken transport. The
      * symbol projection API can consume bounded sections from this file. */
-    if (regular && identity.size > 256 * 1024 * 1024) {
+    if (regular && (uint64_t)identity.size > XRT_REMOTE_SYNC_IMAGE_LIMIT) {
         status = XRT_FILE_LIMIT;
         goto done;
     }

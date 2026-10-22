@@ -7,9 +7,9 @@ const Region = @import("modules.zig").Region;
 const info = @import("../debug/info.zig");
 const loc = @import("../debug/location.zig");
 const A = std.heap.page_allocator;
-const Kind = enum { javascript, unwind };
+const Kind = enum { javascript, unwind, image };
 const max_unwind_jobs = 64;
-const max_jobs = max_unwind_jobs + 2;
+const max_jobs = max_unwind_jobs + 4;
 const unwind_budget: u64 = 128 * 1024 * 1024;
 const Entry = struct {
     id: u64,
@@ -53,6 +53,8 @@ pub const JobStatus = struct {
     index_file_bytes: u64,
     candidate_units: u64,
     accelerator_hits: u64,
+    image_bytes: u64 = 0,
+    image_total: u64 = 0,
 };
 pub const Snapshot = struct {
     items: [max_jobs]JobStatus = undefined,
@@ -61,8 +63,13 @@ pub const Snapshot = struct {
         try writer.write(self.items[0..self.count]);
     }
 };
+/// A main-image job refused before it started. Remembered for the image epoch
+/// so an owner poll does not reopen the remote file to learn the same answer.
+const ImageRefusal = struct { epoch: u64, region: Region, size: u64, reason: @import("../binary/snapshot.zig").Refusal };
 pub const State = struct {
     entries: [max_jobs]?Entry = @splat(null),
+    image_refusals: [2]?ImageRefusal = @splat(null),
+    image_refusal_next: usize = 0,
     epoch: u64 = 0,
     kernel: ?runtime.c.struct_xrt_auxv = null,
     revision: u64 = 0,
@@ -122,12 +129,22 @@ pub const State = struct {
                 return entry;
             }
         };
+        if (kind == .image) for (self.image_refusals) |slot| if (slot) |old| {
+            const r = old.region;
+            if (old.epoch != self.epoch or r.start != region.start or r.end != region.end or r.offset != region.offset or
+                r.inode != region.inode or r.device_major != region.device_major or r.device_minor != region.device_minor) continue;
+            // Cap refusals hold for the epoch; the total may have freed up since.
+            const image_budget = @import("../binary/snapshot.zig");
+            const reason = if (old.reason.which == .remote or old.reason.which == .image) old.reason else if (old.size > image_budget.remaining()) image_budget.refusal(old.size) else break;
+            session.modules.refuseImage(region, reason);
+            return error.BinarySnapshotLimit;
+        };
         if (kind == .unwind) {
             try self.reserveUnwind(runtime.c.xrt_target_is_remote(session.target.handle));
         } else {
             var count: usize = 0;
             for (self.entries) |slot| if (slot) |entry| {
-                if (entry.kind == .javascript) count += 1;
+                if (entry.kind == kind) count += 1;
             };
             if (count >= 2) return error.DebugMetadataJobLimit;
         }
@@ -142,9 +159,27 @@ pub const State = struct {
         errdefer _ = c.xrt_file_view_close(view);
         const local = c.xrt_file_view_remote(view) == 0;
         const identity = c.xrt_file_view_identity(view).*;
+        if (kind == .image) {
+            const image_budget = @import("../binary/snapshot.zig");
+            const limit = runtime.c.xrt_target_remote_image_limit(session.target.handle);
+            if (identity.size <= 0) return error.BinaryIdentityUnavailable;
+            const size: u64 = @intCast(identity.size);
+            const refused: ?image_budget.Refusal = if (size > limit)
+                .{ .size = size, .limit = limit, .which = .remote, .older_agent = limit < image_budget.remote_image_limit }
+            else if (size > image_budget.remaining()) image_budget.refusal(size) else null;
+            if (refused) |reason| {
+                // Region.path is borrowed from the map snapshot; matching uses identity fields only.
+                self.image_refusals[self.image_refusal_next] = .{ .epoch = self.epoch, .region = region, .size = size, .reason = reason };
+                self.image_refusal_next = (self.image_refusal_next + 1) % self.image_refusals.len;
+                session.modules.refuseImage(region, reason);
+                return error.BinarySnapshotLimit;
+            }
+        }
         if (local) try session.modules.rememberMetadataIdentity(region, @bitCast(identity));
         var job: ?*c.struct_xmd_job = null;
-        const status = if (kind == .javascript)
+        const status = if (kind == .image)
+            c.xmd_start_image(view, &job)
+        else if (kind == .javascript)
             c.xmd_start_javascript_cached(view, &job)
         else if (local and identity.size > 0 and identity.size <= c.XMD_LOCAL_CFI_LIMIT)
             c.xmd_start_cfi_local(view, &job)
@@ -156,6 +191,18 @@ pub const State = struct {
         self.next_id +|= 1;
         self.revision +%= 1;
         return &slot.*.?;
+    }
+    /// Only the kernel-proved main image takes the runtime's full-image budget.
+    /// The context adapter checks PHDR before entering this asynchronous path.
+    pub fn mainImage(self: *State, session: *Session, address: u64, why: enum { frame, sweep }) !*@import("modules.zig").Module {
+        const region = try mapped(session, address);
+        const entry = try self.get(session, .image, region);
+        var progress: c.struct_xmd_snapshot = undefined;
+        c.xmd_poll(entry.job, &progress);
+        if (progress.state == c.XMD_CANCELLED) return error.DebugMetadataCancelled;
+        var fd: c_int = -1;
+        try check(c.xmd_image_result(entry.job, &fd), if (progress.reason) |reason| std.mem.span(reason) else null);
+        return session.modules.loadMainImage(region, fd, if (why == .frame) .frame else .sweep);
     }
     fn reserveUnwind(self: *State, remote: bool) !void {
         while (true) {
@@ -347,6 +394,7 @@ pub const State = struct {
                 c.XMD_UNWIND => "unwind",
                 c.XMD_INDEXING => "indexing",
                 c.XMD_LOOKUP => "lookup",
+                c.XMD_IMAGE => "image",
                 c.XMD_READY => "ready",
                 c.XMD_CANCELLED => "cancelled",
                 else => "failed",
@@ -355,7 +403,7 @@ pub const State = struct {
             // Full mapping paths remain available through paged list_modules.
             var path_end = @min(entry.path.len, 512);
             while (path_end < entry.path.len and path_end > 0 and entry.path[path_end] & 0xc0 == 0x80) path_end -= 1;
-            out.items[out.count] = .{ .id = entry.id, .kind = entry.kind, .image = entry.path[0..path_end], .image_truncated = path_end != entry.path.len, .state = state, .reason = entry.verify_error orelse if (progress.reason) |why| std.mem.span(why) else null, .source_bytes = progress.source_bytes, .source_reads = progress.source_reads, .source_size = progress.object.source_size, .units = if (progress.state == c.XMD_INDEXING) progress.index.units else progress.scan.dwarf.units, .dies = if (progress.state == c.XMD_INDEXING) progress.index.dies else progress.scan.dwarf.dies, .retained_unwind_bytes = progress.unwind.retained_bytes, .cached_bytes = progress.cache_bytes, .index_file_bytes = progress.index.file_bytes, .candidate_units = progress.candidate_units, .accelerator_hits = progress.accelerator_hits };
+            out.items[out.count] = .{ .id = entry.id, .kind = entry.kind, .image = entry.path[0..path_end], .image_truncated = path_end != entry.path.len, .state = state, .reason = entry.verify_error orelse if (progress.reason) |why| std.mem.span(why) else null, .source_bytes = progress.source_bytes, .source_reads = progress.source_reads, .source_size = progress.object.source_size, .units = if (progress.state == c.XMD_INDEXING) progress.index.units else progress.scan.dwarf.units, .dies = if (progress.state == c.XMD_INDEXING) progress.index.dies else progress.scan.dwarf.dies, .retained_unwind_bytes = progress.unwind.retained_bytes, .cached_bytes = progress.cache_bytes, .index_file_bytes = progress.index.file_bytes, .candidate_units = progress.candidate_units, .accelerator_hits = progress.accelerator_hits, .image_bytes = progress.image_bytes, .image_total = progress.image_total };
             out.count += 1;
         };
         return out;

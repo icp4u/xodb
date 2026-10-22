@@ -10,6 +10,7 @@ tools/deps/budgets. See docs/DEPENDENCIES_LINT.md.
                                   a new cycle edge, an exceeded budget, an unmapped file,
                                   or unsafe narrow integer arithmetic
   scripts/deps graph --json       files, edges and the layer of each file
+  scripts/deps diff A B           removed / re-layered / added edges between graphs
   scripts/deps layers             layer-to-layer edge counts
   scripts/deps why A B            shortest import chain from file/layer A to file/layer B
   scripts/deps rdeps FILE         every file that imports FILE, directly or not
@@ -312,9 +313,12 @@ class Layers:
 
 class Rule:
     def __init__(self, number, words, layers, graph, layer_of):
-        # KIND NAME FROM... -> TO...
+        # [strict] KIND NAME FROM... -> TO...
+        self.strict = words[0] == 'strict'
+        if self.strict:
+            words = words[1:]
         if len(words) < 5 or words[0] not in ('deny', 'only') or '->' not in words[3:]:
-            fail(f'tools/deps/rules:{number}: expected "deny|only NAME FROM... -> TO..."')
+            fail(f'tools/deps/rules:{number}: expected "[strict] deny|only NAME FROM... -> TO..."')
         self.kind, self.name = words[0], words[1]
         arrow = words.index('->')
         self.sources, self.targets = words[2:arrow], words[arrow + 1:]
@@ -516,6 +520,12 @@ def check(linter, verbose):
     failed = False
     print(f'deps: {len(graph.files)} files, {len(graph.edges)} edges, {len(linter.layers.names)} layers, '
           f'{len(linter.rules)} rules, {len(baseline)} baseline lines, {len(linter.sccs)} cycles')
+    strict_names = {rule.name for rule in linter.rules if rule.strict}
+    for line in baseline:
+        tag = re.search(r'\[([^\] ]+)(?: transitive)?\]$', line)
+        if tag and tag[1] in strict_names:
+            failed = True
+            print('deps: FAIL strict rule forbids baseline exemption: ' + line)
     narrow = narrow_bool_sums(linter.root, graph.files)
     if narrow:
         failed = True
@@ -592,7 +602,14 @@ def check(linter, verbose):
 
 
 def write_baseline(linter):
-    lines = sorted(linter.violations())
+    current = linter.violations()
+    strict = [line for line, (rule, *_) in current.items() if rule is not None and rule.strict]
+    if strict:
+        print('deps: FAIL strict violations cannot be baselined; baseline unchanged:')
+        for line in sorted(strict):
+            print('  + ' + line)
+        return 1
+    lines = sorted(current)
     (linter.config / 'baseline').write_text(BASELINE_HEADER + ''.join(line + '\n' for line in lines)
                                             + size_line(linter.sccs) + '\n')
     counts = {}
@@ -638,6 +655,65 @@ def layer_table(linter, include_self):
     return 0
 
 
+def diff_graphs(before, after, source_layer=None, target_layer=None):
+    """Classify file pairs, distinguishing a removed dependency from a layer move.
+
+    Same-basename moves are inferred only when unique among deleted/added paths.
+    They are evidence candidates, not proof of semantic source identity.
+    """
+    def unpack(value):
+        layers = {f['path']: f['layer'] for f in value['files'] + value.get('modules', [])}
+        edges = {(e['source'], e['target']) for e in value['edges']}
+        return layers, edges
+    old_layers, old = unpack(before)
+    new_layers, new = unpack(after)
+    for layer in (source_layer, target_layer):
+        if layer is not None and layer not in set(old_layers.values()) | set(new_layers.values()):
+            raise ValueError(f'unknown layer: {layer}')
+    gone, born = old_layers.keys() - new_layers.keys(), new_layers.keys() - old_layers.keys()
+    moves, ambiguous = {}, []
+    for name in sorted({Path(p).name for p in gone} & {Path(p).name for p in born}):
+        a = sorted(p for p in gone if Path(p).name == name)
+        b = sorted(p for p in born if Path(p).name == name)
+        if len(a) == len(b) == 1:
+            moves[a[0]] = b[0]
+        else:
+            ambiguous.append(dict(name=name, before=a, after=b))
+    def selected(edge, layers):
+        return ((source_layer is None or layers.get(edge[0]) == source_layer) and
+                (target_layer is None or layers.get(edge[1]) == target_layer))
+    def pair(edge, layers):
+        return [layers.get(p) for p in edge]
+    mapped = {tuple(moves.get(p, p) for p in e) for e in old}
+    removed, relayered, added, unchanged = [], [], [], 0
+    for edge in sorted(old):
+        moved = tuple(moves.get(p, p) for p in edge)
+        if moved not in new:
+            if selected(edge, old_layers):
+                removed.append(list(edge))
+        elif selected(edge, old_layers) or selected(moved, new_layers):
+            if pair(edge, old_layers) != pair(moved, new_layers):
+                relayered.append(dict(before=list(edge), after=list(moved),
+                                      layers_before=pair(edge, old_layers), layers_after=pair(moved, new_layers)))
+            else:
+                unchanged += 1
+    added = [list(e) for e in sorted(new - mapped) if selected(e, new_layers)]
+    return dict(schema=1, before=sum(selected(e, old_layers) for e in old),
+                after=sum(selected(e, new_layers) for e in new), unchanged=unchanged,
+                removed=removed, relayered=relayered, added=added,
+                inferred_moves=moves, ambiguous_moves=ambiguous)
+
+
+def graph_input(path):
+    if path.is_dir():
+        return graph_json(Linter(path.resolve()))
+    with path.open() as stream:
+        value = json.load(stream)
+    if value.get('schema') != 1:
+        raise ValueError('expected a schema 1 deps graph')
+    return value
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--root', type=Path, default=ROOT, help='tree to check (default: this checkout)')
@@ -646,6 +722,12 @@ def main(argv=None):
     p.add_argument('-v', '--verbose', action='store_true', help='also list unresolved includes')
     p = sub.add_parser('graph', help='print the file graph')
     p.add_argument('--json', action='store_true', required=True)
+    p = sub.add_parser('diff', help='compare graph JSON files or source directories (not git revisions)')
+    p.add_argument('before', type=Path)
+    p.add_argument('after', type=Path)
+    p.add_argument('--from-layer')
+    p.add_argument('--to-layer')
+    p.add_argument('--json', action='store_true')
     p = sub.add_parser('layers', help='layer-to-layer edge counts')
     p.add_argument('--all', action='store_true', help='include edges inside a layer')
     p = sub.add_parser('why', help='shortest import chain from A to B (each a file, a layer or a glob)')
@@ -658,6 +740,25 @@ def main(argv=None):
     p.add_argument('--write', action='store_true', required=True)
     sub.add_parser('cycles', help='list import cycles (strongly connected components)')
     args = parser.parse_args(argv)
+    if args.command == 'diff':
+        try:
+            result = diff_graphs(graph_input(args.before), graph_input(args.after), args.from_layer, args.to_layer)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            parser.error(f'cannot compare graphs: {error}')
+        if args.json:
+            json.dump(result, sys.stdout, indent=2)
+            print()
+        else:
+            print(f'{result["before"]} -> {result["after"]} edges: removed={len(result["removed"])} '
+                  f're-layered={len(result["relayered"])} added={len(result["added"])} unchanged={result["unchanged"]}')
+            for a, b in result['inferred_moves'].items():
+                print(f'inferred move (unique basename): {a} -> {b}')
+            for item in result['ambiguous_moves']:
+                print(f'ambiguous move (not inferred): {item["name"]}')
+            for kind in ('removed', 'relayered', 'added'):
+                for item in result[kind]:
+                    print(kind + ': ' + json.dumps(item, sort_keys=True))
+        return 0
     linter = Linter(args.root.resolve())
     if args.command == 'check':
         return check(linter, args.verbose)

@@ -655,6 +655,9 @@ class RunnerTests(unittest.TestCase):
         self.assertIn('release-runner', names)
         self.assertIn('demo-binary', names)
         self.assertNotIn('core-debugging', names)
+        self.assertNotIn('runtime-host', names)
+        self.assertNotIn('runtime-host-agent-lane', names)
+        self.assertIn('lane switch cannot reach it', dict(notes)['runtime-host'])
         self.assertNotIn('system-capture', names)
         self.assertIn('system overview rejects', dict(notes)['system-capture'])
         self.assertIn('opens a packet capture', dict(notes)['private-network-evidence'])
@@ -680,6 +683,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(periodic_names), len(set(periodic_names)))
         self.assertIn('run-control-agent-lane', periodic_names)
         self.assertNotIn('core-debugging-agent-lane', periodic_names)
+        self.assertNotIn('runtime-host-agent-lane', periodic_names)
         self.assertNotIn('memory-search-speed-agent-lane', periodic_names)
         self.assertNotIn('run-control-agent-lane', {step.name for step in gate.plan('periodic', headless=True)})
         present = set(periodic_names)
@@ -759,6 +763,9 @@ class RunnerTests(unittest.TestCase):
         self.assertIn('agent twin', why['shared-sessions'])
         self.assertIn('no target', why['memdefrag-tui'])
         self.assertIn('no target', why['observation-experiments'])
+        self.assertNotIn('perl-path-component-agent-lane', names)
+        self.assertIn('in-process', why['perl-path-component'])
+        self.assertIn('perl-path-watches-0-agent-lane', names)
 
     def test_a_plain_step_whose_script_names_a_launch_flag_fails_classification(self):
         # A file that names the flags but does not start the debugger must not

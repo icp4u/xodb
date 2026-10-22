@@ -11,7 +11,7 @@ pub const max_limit: u64 = if (@sizeOf(usize) >= 8) 1 << 40 else 1 << 31;
 pub var per_image_limit: usize = 1024 * mib;
 pub var total_limit: usize = if (@sizeOf(usize) >= 8) 4096 * mib else 2048 * mib;
 /// Whole-file transfers from a runtime agent keep the agent's fixed cap.
-pub const remote_image_limit: usize = 256 * mib;
+pub const remote_image_limit: usize = c.XRT_REMOTE_IMAGE_LIMIT;
 /// Null keeps the default. Values are bytes.
 pub fn configure(per_image: ?u64, total: ?u64) error{InvalidImageBudget}!void {
     for ([_]?u64{ per_image, total }) |value| if (value) |n| {
@@ -41,6 +41,7 @@ pub const Refusal = struct {
     limit: u64,
     which: enum { image, total, remote, lookup, runtime, sweep },
     derived: bool = false,
+    older_agent: bool = false,
     sweep_each: u64 = sweep_image_limit,
     /// What the total had left when the image was refused.
     left: u64 = 0,
@@ -84,7 +85,12 @@ pub const Refusal = struct {
             else
                 std.fmt.bufPrint(buffer, "{s} is {d} MiB; image budget {d} MiB; rerun with --image-limit {d}M or set symbols.image_bytes", .{ shown, need, self.limit / mib, imageOption(self.size) }),
             .total => std.fmt.bufPrint(buffer, "{s} is {d} MiB; {d} MiB left of the {d} MiB total image budget; rerun with --image-total-limit {d}G or set symbols.image_total_bytes", .{ shown, need, self.limit / mib, total_limit / mib, self.totalOption() }),
-            .remote => std.fmt.bufPrint(buffer, "{s}: remote image transfer is capped at {d} MiB", .{ shown, self.limit / mib }),
+            .remote => if (self.older_agent)
+                std.fmt.bufPrint(buffer, "{s}: agent refused: older agent cap ({d} MiB); update xodb-agent for the 2 GiB image limit", .{ shown, self.limit / mib })
+            else if (self.limit < remote_image_limit)
+                std.fmt.bufPrint(buffer, "{s}: remote image transfer is capped at {d} MiB outside the background main-image job", .{ shown, self.limit / mib })
+            else
+                std.fmt.bufPrint(buffer, "{s}: remote image transfer is capped at {d} MiB", .{ shown, self.limit / mib }),
             .lookup => std.fmt.bufPrint(buffer, "{s} is {d} MiB and has no symbols-only view; a name lookup may read {d} MiB of it (such images: 256 MiB each, 512 MiB per process)", .{ shown, need, self.limit / mib }),
             .runtime => std.fmt.bufPrint(buffer, "{s} is {d} MiB; a language view may read {d} MiB of the image it finds its runtime in, unless that is the main executable (256 MiB each, 512 MiB per process); {s}", .{ shown, need, self.limit / mib, if (self.stack_loads) |loads| (if (loads) "a stack frame in it loads it" else "it has no debug info, so a stack does not load it either") else "it is used once something else loads it" }),
             .sweep => if (self.size > self.sweep_each)
