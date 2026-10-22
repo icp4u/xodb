@@ -6,9 +6,10 @@ struct xsq_cancel;
 /* One supervised decompile for the debugger host.
  *
  * Starts tools/ghx/ghx_supervise (which starts ghx_worker in its own process
- * group with PR_SET_PDEATHSIG), writes one DECOMPILE line and reads the
- * supervisor's RESULT. The worker never runs inside the target or the target
- * agent. The call is bounded: the supervisor enforces deadline_ms on the
+ * group with PR_SET_PDEATHSIG), validates its protocol, producer, schema and
+ * capabilities before writing one DECOMPILE line, then reads RESULT. The
+ * worker never runs inside the target or the target agent. The call is
+ * bounded: the supervisor enforces deadline_ms on the
  * worker, and the host gives the supervisor deadline_ms + grace_ms + 3 s before
  * SIGTERM, then grace_ms + 1 s more before SIGKILL; the supervisor is always
  * reaped before return. A set cancel flag stops the supervisor the same way
@@ -21,6 +22,7 @@ enum xghx_status {
     XGHX_HOST_DEADLINE, /* supervisor exceeded the host bound; stopped and reaped */
     XGHX_SPAWN_FAILED,  /* pipes, output files or posix_spawn failed (errno in outcome) */
     XGHX_PROTOCOL,      /* supervisor exited without a RESULT line */
+    XGHX_INCOMPATIBLE,  /* supervisor HELLO did not match; no request was sent */
 };
 
 struct xghx_request {

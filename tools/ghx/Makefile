@@ -29,13 +29,13 @@ $(OUT)/elfid.o: elfid.c elfid.h sha256.h
 	$(CC) $(CFLAGS) -c -o $@ elfid.c
 $(OUT)/ghx_elfcheck: tests/ghx_elfcheck.c $(OUT)/elfid.o $(OUT)/sha256.o
 	$(CC) $(CFLAGS) -I. -o $@ tests/ghx_elfcheck.c $(OUT)/elfid.o $(OUT)/sha256.o
-$(OUT)/ghx_worker.o: ghx_worker.cc sha256.h elfid.h
+$(OUT)/ghx_worker.o: ghx_worker.cc ../../src/semq/ghx_protocol.h sha256.h elfid.h
 	@test -n "$(GHIDRA_CPP)" || { echo "set GHIDRA_CPP to a built copy of Ghidra's decompiler cpp directory (build_ghidra.sh)" >&2; exit 1; }
 	@mkdir -p $(OUT)
 	$(CXX) $(CXXFLAGS) -c -o $@ ghx_worker.cc
 $(OUT)/ghx_worker: $(OUT)/ghx_worker.o $(OUT)/sha256.o $(OUT)/elfid.o $(GHIDRA_CPP)/libdecomp.a
 	$(CXX) -o $@ $(OUT)/ghx_worker.o $(OUT)/sha256.o $(OUT)/elfid.o $(GHIDRA_CPP)/libdecomp.a -lz
-$(OUT)/ghx_supervise: ghx_supervise.c
+$(OUT)/ghx_supervise: ghx_supervise.c ../../src/semq/ghx_protocol.h
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) -D_GNU_SOURCE -o $@ ghx_supervise.c
 

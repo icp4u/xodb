@@ -9,10 +9,12 @@
  *             [\t bounds=advisory|strict] [\t function_map=/PATH]
  *   CANCEL \t id=ID          cancel an in-flight or queued request
  * stdout (one event per line):
+ *   HELLO  \t protocol=.. \t producer=.. \t schema=.. \t capabilities=..
  *   WORKER \t pid=N \t event=start|exit|killed \t detail=.. [\t reap=done|pending \t reap_ms=T]
  *   RESULT \t id=ID \t status=S \t bytes=N \t ms=T \t overshoot_ms=T \t cleanup_ms=T
  *          [\t worker_status=S \t detail=..] \t file=PATH
  *     S: ok error timeout cancelled worker_died output_limit bad_request publish_failed
+ *        incompatible_worker
  *
  * Contract (docs/SEMANTIC_QUERIES.md, "C01 worker export contract", supervisor):
  *  - every artifact is published with RENAME_NOREPLACE into OUTDIR (opened
@@ -46,6 +48,8 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "../../src/semq/ghx_protocol.h"
 
 #define MAXLINE 8192
 #define MAXQ 1024
@@ -645,6 +649,18 @@ static int read_header(char *hdr, size_t hl, double deadline, const char *curid)
 	}
 }
 
+/* Gate analysis state on an exact protocol, producer, schema and capability
+ * reply.  A stale worker either rejects HELLO or returns a different line;
+ * both cases fail closed before the DECOMPILE request is written. */
+static int worker_handshake(double deadline, const char *curid)
+{
+	char hdr[512];
+	int r = write_all("HELLO\n", 6, deadline, curid);
+	if (r == 0) r = read_header(hdr, sizeof hdr, deadline, curid);
+	if (r == 0 && strcmp(hdr, GHX_WORKER_HELLO_LINE) != 0) return -4;
+	return r;
+}
+
 static void run_request(const char *line)
 {
 	char id[80], hdr[512], st[32], bytes_s[32], rid[80];
@@ -664,7 +680,18 @@ static void run_request(const char *line)
 		return;
 	}
 	if (nseen < MAXIDS) seen[nseen++] = strdup(id);
-	if (wpid <= 0 && worker_start() != 0) { result_local(id, "worker_died", "cannot start worker", t0, 0); return; }
+	if (wpid <= 0) {
+		if (worker_start() != 0) { result_local(id, "worker_died", "cannot start worker", t0, 0); return; }
+		r = worker_handshake(deadline, id);
+		if (r != 0) {
+			worker_stop("killed", 1, &cleanup, NULL);
+			if (r == -2) result_local(id, "timeout", "worker handshake exceeded timeout", t0, cleanup);
+			else if (r == -3) result_local(id, "cancelled", got_term ? "supervisor terminating" : "cancelled during worker handshake", t0, cleanup);
+			else if (r == -4) result_local(id, "incompatible_worker", "worker protocol, producer, schema or capabilities mismatch", t0, cleanup);
+			else result_local(id, "worker_died", "worker closed its pipes, exited or crashed during handshake", t0, cleanup);
+			return;
+		}
+	}
 	req = malloc(strlen(line) + 64);
 	if (!req) { result_local(id, "worker_died", "out of memory", t0, 0); return; }
 	sprintf(req, "%s\tmax_out=%lld\n", line, max_out);
@@ -772,6 +799,8 @@ int main(int argc, char **argv)
 	sigaction(SIGTERM, &sa, NULL);
 	sigaction(SIGINT, &sa, NULL);
 	signal(SIGPIPE, SIG_IGN);
+	/* The host waits for this exact contract before writing DECOMPILE. */
+	out("%s\n", GHX_SUPERVISOR_HELLO_LINE);
 
 	while (!got_term) {
 		if (npending) reap_pending(0);

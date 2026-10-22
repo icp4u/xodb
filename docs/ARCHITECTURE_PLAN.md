@@ -163,7 +163,8 @@ session. On every connection the parent checks an explicit protocol version,
 producer version and required capabilities before sending state. A mismatch is
 a typed refusal or one bounded replacement attempt, never an assumption that a
 new option is understood. New agent and remote-xodb transports follow this
-rule as their launch paths move behind the owner.
+rule as their launch paths move behind the owner. The audited runtime matrix and
+open gaps are kept in [CHILD_PROCESSES.md](CHILD_PROCESSES.md).
 
 ## 4. View layer for agents (concept)
 

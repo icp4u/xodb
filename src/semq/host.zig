@@ -259,6 +259,10 @@ pub const Job = struct {
                 self.fail("supervisor_failed", "could not start ghx_supervise (errno {d})", .{outcome.@"error"});
                 return null;
             },
+            c.XGHX_INCOMPATIBLE => {
+                self.failure = .{ .code = "supervisor_protocol_mismatch", .detail = "ghx_supervise sent no matching HELLO (protocol, producer, schema or capabilities) within its startup bound; no analysis state was sent", .worker_pid = pid };
+                return null;
+            },
             else => {
                 self.failure = .{ .code = "supervisor_failed", .detail = try std.fmt.allocPrint(a, "ghx_supervise ended without a result (wait status {d})", .{outcome.supervisor_status}), .worker_pid = pid };
                 return null;

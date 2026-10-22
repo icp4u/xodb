@@ -18,9 +18,11 @@
  *             [\t bounds=strict|advisory] [\t function_map=/abs] [\t max_out=N]
  *             test hooks (only with --test-hooks): test_sleep_ms, test_crash,
  *             test_alloc_mb, test_barrier=/abs, test_read_barrier=/abs
- *   PING | QUIT
+ *   HELLO | PING | QUIT
  * Response: "RESULT\tid=..\tstatus=ok|error\tbytes=N\n" followed by N bytes of
- * JSON (schema xodb.ghidra.function_graph 0.4.1), or "PONG\n".
+ * JSON (schema xodb.ghidra.function_graph 0.4.1), the versioned HELLO reply
+ * from ghx_protocol.h, or "PONG\n".  DECOMPILE is refused until HELLO has
+ * completed, so analysis state never crosses an unchecked connection.
  */
 #include "libdecomp.hh"
 #include "funcdata.hh"
@@ -28,6 +30,7 @@
 #include "comment.hh"
 #include "prettyprint.hh"
 #include "jumptable.hh"
+#include "../../src/semq/ghx_protocol.h"
 
 extern "C" {
 #include "sha256.h"
@@ -53,7 +56,7 @@ extern "C" {
 using namespace ghidra;
 using std::string;
 
-static const char *WORKER_VERSION = "0.4.2";
+static const char *WORKER_VERSION = GHX_WORKER_VERSION;
 static const char *SCHEMA = "xodb.ghidra.function_graph";
 static const char *SCHEMA_VERSION = "0.4.1";
 #ifndef GHIDRA_COMMIT
@@ -1974,10 +1977,17 @@ int main(int argc, char **argv)
 	signal(SIGPIPE, SIG_DFL);
 	if (spec_error.empty()) startDecompilerLibrary(snapdir.c_str());
 	string line;
+	bool hello_complete = false;
 	while (std::getline(std::cin, line)) {
 		if (line.size() > 8192) { std::cout << "RESULT\tid=-\tstatus=error\tbytes=0\n" << std::flush; continue; }
 		if (line == "QUIT") break;
+		if (line == "HELLO") {
+			hello_complete = true;
+			std::cout << GHX_WORKER_HELLO_LINE "\n" << std::flush;
+			continue;
+		}
 		if (line == "PING") { std::cout << "PONG\n" << std::flush; continue; }
+		if (!hello_complete) { std::cout << "REFUSED\tcode=handshake_required\n" << std::flush; continue; }
 		if (line.compare(0, 10, "DECOMPILE\t") != 0) { std::cout << "RESULT\tid=-\tstatus=error\tbytes=0\n" << std::flush; continue; }
 		string rid;
 		bool ok;

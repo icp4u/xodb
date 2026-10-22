@@ -594,6 +594,8 @@ def native_toolchain():
                       "import sys\nfrom pathlib import Path\n" +
                       f"payload=Path({str(payload)!r}).read_bytes()\n" +
                       "for line in sys.stdin.buffer:\n"
+                      " if line == b'HELLO\\n':\n"
+                      "  sys.stdout.write('HELLO\\tprotocol=1\\tproducer=ghx_worker/0.4.2\\tschema=xodb.ghidra.function_graph/0.4.1\\tcapabilities=decompile,function_map,immutable_snapshot,strict_bounds\\n'); sys.stdout.flush(); continue\n"
                       " ident=next((field[3:] for field in line.decode().strip().split('\\t') if field.startswith('id=')),'f')\n"
                       " sys.stdout.buffer.write(f'RESULT\\tid={ident}\\tstatus=ok\\tbytes={len(payload)}\\n'.encode()+payload)\n"
                       " sys.stdout.buffer.flush()\n")

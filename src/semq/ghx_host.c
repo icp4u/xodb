@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #include "ghx_host.h"
 #include "xsq.h"
+#include "ghx_protocol.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -106,6 +107,45 @@ static void free_environment(char **env)
     free(env);
 }
 
+/* A current supervisor writes HELLO before reading stdin.  A pre-HELLO
+ * supervisor writes nothing until it receives DECOMPILE, so silence past
+ * this bound is the same typed mismatch as a wrong HELLO line. */
+#define GHX_HELLO_MS 5000.0
+
+/* Read the supervisor's exact startup contract without sending analysis
+ * state.  Bytes after the first line stay in buffer for the normal event
+ * loop.  Returns 0 ok, -1 I/O/EOF, -2 deadline, -3 cancel, -4 mismatch. */
+static int supervisor_hello(int fd, const struct xsq_cancel *cancel, double deadline,
+                            char *buffer, size_t capacity, size_t *used)
+{
+    for (;;) {
+        char *end = *used ? memchr(buffer, '\n', *used) : NULL;
+        if (end) {
+            const size_t length = (size_t)(end - buffer);
+            const size_t expected = strlen(GHX_SUPERVISOR_HELLO_LINE);
+            const int match = length == expected && !memcmp(buffer, GHX_SUPERVISOR_HELLO_LINE, expected);
+            const size_t consumed = length + 1;
+            *used -= consumed;
+            memmove(buffer, end + 1, *used);
+            return match ? 0 : -4;
+        }
+        if (xsq_cancel_requested(cancel)) return -3;
+        if (now_ms() >= deadline) return -2;
+        if (*used == capacity - 1) return -4;
+        struct pollfd p = {fd, POLLIN, 0};
+        int ready = poll(&p, 1, 50);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready < 0) return -1;
+        if (!ready) continue;
+        if (!(p.revents & POLLIN)) return -1;
+        ssize_t got = read(fd, buffer + *used, capacity - 1 - *used);
+        if (got < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        if (got <= 0) return -1;
+        *used += (size_t)got;
+        buffer[*used] = 0;
+    }
+}
+
 enum xghx_status xghx_run(const struct xghx_request *r, const struct xsq_cancel *cancel, struct xghx_outcome *o)
 {
     memset(o, 0, sizeof *o);
@@ -174,6 +214,24 @@ enum xghx_status xghx_run(const struct xghx_request *r, const struct xsq_cancel 
     close(out[1]);
     close(log);
     in[0] = out[1] = log = -1;
+    char buffer[16384];
+    size_t used = 0;
+    int have_result = 0, eof = 0;
+    enum xghx_status status = XGHX_RESULT;
+    double host_deadline = start + r->deadline_ms + r->grace_ms + 3000;
+    const double hello_deadline = start + GHX_HELLO_MS < host_deadline ? start + GHX_HELLO_MS : host_deadline;
+    const int greeting = supervisor_hello(out[0], cancel, hello_deadline, buffer, sizeof buffer, &used);
+    if (greeting != 0) {
+        status = greeting == -3 ? XGHX_CANCELLED : greeting == -2 && hello_deadline == host_deadline ? XGHX_HOST_DEADLINE :
+                 greeting == -2 || greeting == -4 ? XGHX_INCOMPATIBLE : XGHX_PROTOCOL;
+        close(in[1]);
+        in[1] = -1;
+        o->supervisor_status = stop(pid, r->grace_ms);
+        close(out[0]);
+        free_environment(env);
+        o->ms = now_ms() - start;
+        return status;
+    }
     /* The request is far below PIPE_BUF; a failed write shows up as no RESULT. */
     {
         size_t length = strlen(r->line);
@@ -188,11 +246,6 @@ enum xghx_status xghx_run(const struct xghx_request *r, const struct xsq_cancel 
         close(in[1]);
         in[1] = -1;
     }
-    char buffer[16384];
-    size_t used = 0;
-    int have_result = 0, eof = 0;
-    enum xghx_status status = XGHX_RESULT;
-    double host_deadline = start + r->deadline_ms + r->grace_ms + 3000;
     while (!eof) {
         if (xsq_cancel_requested(cancel)) {
             status = XGHX_CANCELLED;
@@ -292,6 +345,7 @@ const char *xghx_status_name(enum xghx_status status)
     case XGHX_HOST_DEADLINE: return "host_deadline";
     case XGHX_SPAWN_FAILED: return "spawn_failed";
     case XGHX_PROTOCOL: return "protocol";
+    case XGHX_INCOMPATIBLE: return "incompatible";
     }
     return "unknown";
 }

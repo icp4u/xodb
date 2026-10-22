@@ -105,6 +105,15 @@ connections so a failed exchange cannot desynchronise later work. The held
 connection carries no requests; it records that a live xodb session owns use
 of the shared JVM and prevents idle exit.
 
+The native fallback has two private pipe connections. Before sending an ELF
+path or DECOMPILE request, xodb validates the supervisor's protocol, producer,
+function-graph schema and required capabilities; the supervisor repeats that
+check for its worker. Both exact contracts live in `src/semq/ghx_protocol.h`.
+A stale supervisor, including one that sends no HELLO within five seconds, is
+`supervisor_protocol_mismatch`; a stale worker is
+`incompatible_worker`. Neither receives analysis state before its HELLO is
+accepted.
+
 ## Verbs
 
 `hello` has no verb-specific fields. A usable reply is `ready` and contains

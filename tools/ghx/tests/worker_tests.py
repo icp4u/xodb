@@ -31,6 +31,9 @@ ENV = dict(os.environ, TMPDIR=TMP)
 BUILDS = ["fx-gcc-O0", "fx-gcc-O2", "fx-clang-O0", "fx-clang-O2"]
 FUNCS = ["fx_arith", "fx_loop", "fx_struct", "fx_calls", "fx_switch", "fx_add", "main"]
 VOLATILE_TOP = ("timing",)
+HELLO = ("HELLO\tprotocol=1\tproducer=ghx_worker/0.4.2"
+         "\tschema=xodb.ghidra.function_graph/0.4.1"
+         "\tcapabilities=decompile,function_map,immutable_snapshot,strict_bounds")
 results = []
 
 
@@ -55,6 +58,10 @@ class Worker:
     def __init__(self, sleighhome=SLEIGH, extra=()):
         self.p = subprocess.Popen([WORKER, "--sleighhome", sleighhome, "--test-hooks"] + list(extra),
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ENV)
+        self.send("HELLO\n")
+        reply = self.p.stdout.readline().decode().rstrip("\n")
+        if reply != HELLO:
+            raise AssertionError("bad worker HELLO %r (stderr %s)" % (reply, self.p.stderr.read(2000)))
 
     def send(self, line):
         self.p.stdin.write(line.encode())

@@ -160,6 +160,20 @@ def fake_toolchain(name, script):
     (d / 'ghx_worker').write_text('#!/bin/sh\n' + script + '\n'); (d / 'ghx_worker').chmod(0o755)
     return d
 
+def mismatched_supervisor_toolchain(silent=False):
+    # silent: a pre-HELLO supervisor prints nothing until it reads DECOMPILE.
+    d = fake_toolchain('silent-supervisor' if silent else 'old-supervisor', 'exit 99')
+    marker = d / 'state-received'
+    (d / 'ghx_supervise').write_text(
+        '#!/usr/bin/env python3\n'
+        'import select, sys, time\nfrom pathlib import Path\n' +
+        (f"line = sys.stdin.readline()\nif line: Path({str(marker)!r}).write_text(line)\n" if silent else
+         f"if select.select([sys.stdin], [], [], .2)[0]: Path({str(marker)!r}).write_text(sys.stdin.readline())\n"
+         "print('HELLO\\tprotocol=0\\tproducer=ghx_supervise/old\\tschema=old\\tcapabilities=none', flush=True)\n") +
+        'time.sleep(30)\n')
+    (d / 'ghx_supervise').chmod(0o755)
+    return d, marker
+
 def bounded(case, c, xodb_pid, target_pid, r, code, limit_ms):
     job = r.get('job', {})
     failure = job.get('failure') or {}
@@ -173,6 +187,22 @@ def bounded(case, c, xodb_pid, target_pid, r, code, limit_ms):
     check(f'{case}: no leaked child of xodb', not extra, sorted(extra))
 
 def lifecycle():
+    for silent in (False, True):
+        kind = 'silent pre-HELLO' if silent else 'stale'
+        old, marker = mismatched_supervisor_toolchain(silent)
+        c, target = client(O2, '--static-analysis', str(old))
+        try:
+            tool(c, 'analyze_function', symbol='qx_alloc')
+            r = poll(c, 'analyze_function', symbol='qx_alloc', seconds=10)
+            failure = r.get('job', {}).get('failure', {})
+            check(f'protocol: {kind} supervisor is a typed refusal', r.get('status') == 'failed' and
+                  failure.get('code') == 'supervisor_protocol_mismatch', r)
+            check(f'protocol: {kind} supervisor received no analysis state', not marker.exists(),
+                  marker.read_text() if marker.exists() else '')
+            extra = children(c.p.pid) - {c.backend_pid if c.backend_pid is not None else target}
+            check(f'protocol: {kind} supervisor reaped', not extra, sorted(extra))
+        finally:
+            close(c)
     hang = fake_toolchain('hang', 'exec sleep 600')
     c, target = client(O2, '--static-analysis', str(hang))
     try:

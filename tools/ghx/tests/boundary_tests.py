@@ -37,6 +37,9 @@ ENV = dict(os.environ, TMPDIR=TMP)
 BASE = 0x401000
 R, W, X = 4, 2, 1
 results = []
+HELLO = ("HELLO\tprotocol=1\tproducer=ghx_worker/0.4.2"
+         "\tschema=xodb.ghidra.function_graph/0.4.1"
+         "\tcapabilities=decompile,function_map,immutable_snapshot,strict_bounds")
 
 
 def elf(name, segments):
@@ -58,9 +61,11 @@ def elf(name, segments):
 
 
 def ask(lines):
-    p = subprocess.run([WORKER, "--sleighhome", SLEIGH], input=("".join(lines) + "QUIT\n").encode(),
+    p = subprocess.run([WORKER, "--sleighhome", SLEIGH], input=("HELLO\n" + "".join(lines) + "QUIT\n").encode(),
                        capture_output=True, env=ENV, timeout=60)
     out, docs = p.stdout, []
+    hello, sep, out = out.partition(b"\n")
+    assert sep and hello.decode() == HELLO, "bad worker HELLO %r" % hello
     while out:
         hdr, _, out = out.partition(b"\n")
         n = int(dict(kv.split("=", 1) for kv in hdr.decode().split("\t")[1:])["bytes"])

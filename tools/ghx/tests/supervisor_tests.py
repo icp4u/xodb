@@ -14,6 +14,7 @@ grandchild it caused is left alive.  Writes per-test JSON with timings.
 import json
 import os
 import signal
+import select
 import subprocess
 import sys
 import time
@@ -32,7 +33,19 @@ ELF = os.path.join(SCRATCH, "dummy.elf")
 with open(ELF, "wb") as f:
     f.write(b"\x7fELF" + bytes(124))
 
-HEAD = "#!%s\nimport os, sys, time, signal\n" % PY
+HELLO = ("HELLO\tprotocol=1\tproducer=ghx_worker/0.4.2"
+         "\tschema=xodb.ghidra.function_graph/0.4.1"
+         "\tcapabilities=decompile,function_map,immutable_snapshot,strict_bounds")
+HEAD = """#!%s
+import os, sys, time, signal, select
+hello = sys.stdin.readline()
+if hello != 'HELLO\\n': sys.exit(96)
+probe = os.environ.get('GHX_TEST_PREHELLO_PROBE')
+if probe and select.select([sys.stdin], [], [], .2)[0]:
+    open(probe, 'w').write(sys.stdin.readline())
+sys.stdout.write(os.environ.get('GHX_TEST_HELLO', %r) + '\\n')
+sys.stdout.flush()
+""" % (PY, HELLO)
 WORKERS = {
     # valid reply for every request (the review's worker-ok.py)
     "ok": """
@@ -412,6 +425,19 @@ def _(outdir):
 def _(outdir):
     r = run(paths["garbage"], outdir, [req("g1")], t=2000)
     assert r["results"][0]["status"] == "worker_died", r["results"]
+    no_leftovers(r)
+
+
+@test("worker_handshake_rejects_mismatch_before_state")
+def _(outdir):
+    probe = os.path.join(SCRATCH, "prehello-state")
+    env = dict(os.environ, GHX_TEST_HELLO=HELLO.replace("0.4.2", "0.4.1"),
+               GHX_TEST_PREHELLO_PROBE=probe)
+    r = run(paths["ok"], outdir, [req("old1")], t=2000, env=env)
+    assert r["results"][0]["status"] == "incompatible_worker", r["results"]
+    assert not os.path.exists(probe), "DECOMPILE reached the worker before HELLO was accepted"
+    refusal = json.load(open(os.path.join(outdir, "old1.json")))
+    assert refusal["error"]["code"] == "incompatible_worker", refusal
     no_leftovers(r)
 
 
