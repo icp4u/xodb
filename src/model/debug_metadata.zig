@@ -9,6 +9,9 @@ const loc = @import("../debug/location.zig");
 const A = std.heap.page_allocator;
 const Kind = enum { javascript, unwind, image };
 const max_unwind_jobs = 64;
+// Every unwind job keeps its file view open. The C agent holds 32 open files
+// for all features (symbols, sources, file requests); keep half for them.
+const max_remote_unwind_jobs = 16;
 const max_jobs = max_unwind_jobs + 4;
 const unwind_budget: u64 = 128 * 1024 * 1024;
 const Entry = struct {
@@ -19,7 +22,6 @@ const Entry = struct {
     path: [:0]u8,
     job: *c.struct_xmd_job,
     retired: bool = false,
-    local: bool = false,
     touched_query: u64 = 0,
     last_state: c_uint = c.XMD_PREPARING,
     cfi: ?info.Cfi = null,
@@ -186,7 +188,7 @@ pub const State = struct {
         else
             c.xmd_start_cfi(view, &job);
         try check(status, null);
-        slot.* = .{ .id = self.next_id, .kind = kind, .epoch = self.epoch, .region = region, .path = path, .job = job.?, .local = local, .touched_query = self.query };
+        slot.* = .{ .id = self.next_id, .kind = kind, .epoch = self.epoch, .region = region, .path = path, .job = job.?, .touched_query = self.query };
         slot.*.?.region.path = path;
         self.next_id +|= 1;
         self.revision +%= 1;
@@ -205,10 +207,10 @@ pub const State = struct {
         return session.modules.loadMainImage(region, fd, if (why == .frame) .frame else .sweep);
     }
     fn reserveUnwind(self: *State, remote: bool) !void {
+        const limit: usize = if (remote) max_remote_unwind_jobs else max_unwind_jobs;
         while (true) {
             var used: u64 = 0;
             var count: usize = 0;
-            var active: usize = 0;
             var free = false;
             var waiting = false;
             for (self.entries) |slot| {
@@ -218,7 +220,6 @@ pub const State = struct {
                 };
                 if (entry.kind != .unwind) continue;
                 count += 1;
-                if (!entry.retired) active += 1;
                 if (c.xmd_join(entry.job) == c.XBO_OK) {
                     var progress: c.struct_xmd_snapshot = undefined;
                     c.xmd_poll(entry.job, &progress);
@@ -229,14 +230,15 @@ pub const State = struct {
                     waiting = true;
                 }
             }
-            if (remote and active >= 4) return error.DebugMetadataJobLimit;
-            if (free and count < max_unwind_jobs and used <= unwind_budget - c.XCF_MAX_BYTES) return;
+            if (free and count < limit and used <= unwind_budget - c.XCF_MAX_BYTES) return;
             var oldest: ?usize = null;
             for (self.entries, 0..) |slot, i| if (slot) |entry| {
-                if (entry.kind != .unwind or !entry.local or entry.touched_query == self.query or c.xmd_join(entry.job) != c.XBO_OK) continue;
+                // Finished jobs from earlier queries are eligible whether the
+                // file view is local or remote. This query's jobs stay.
+                if (entry.kind != .unwind or entry.touched_query == self.query or c.xmd_join(entry.job) != c.XBO_OK) continue;
                 if (oldest == null or entry.touched_query < self.entries[oldest.?].?.touched_query) oldest = i;
             };
-            const victim = oldest orelse return if (waiting) error.DebugMetadataPending else error.DebugMetadataBudgetLimit;
+            const victim = oldest orelse return if (waiting) error.DebugMetadataPending else if (count >= limit) error.DebugMetadataJobLimit else error.DebugMetadataBudgetLimit;
             // Unwind results contain owned register values, never decoder
             // pointers. Destroy libdw before the backing job bytes.
             self.entries[victim].?.deinit();

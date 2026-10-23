@@ -2248,17 +2248,26 @@ pub const Session = struct {
             const lookup_pc = if (frames.items.len > 0 and !sigcontext_pc) self.target.arch().callerLookup(pc) orelse break else pc;
             sigcontext_pc = false;
             var frame = Frame{ .architecture = self.target.arch(), .tid = tid, .index = frames.items.len, .pc = pc, .lookup_pc = lookup_pc, .registers = registers };
-            const remote_caller = frames.items.len != 0 and @import("../target/runtime.zig").c.xrt_target_is_remote(self.target.handle);
-            const metadata_only = self.modules.prefersUnwindMetadata(frame.lookup_pc) catch false;
-            if (if (remote_caller or metadata_only) self.modules.cachedSymbolAt(frame.lookup_pc) else self.modules.symbolAt(frame.lookup_pc)) |symbol| {
+            const remote = @import("../target/runtime.zig").c.xrt_target_is_remote(self.target.handle);
+            const remote_caller = frames.items.len != 0 and remote;
+            // Remote callers load a whole image only for .debug_frame without
+            // usable .eh_frame. A failed classification keeps that caller bounded.
+            // The first frame of a remote target still loads, as before.
+            const metadata_only = if (remote_caller)
+                self.modules.prefersUnwindMetadata(frame.lookup_pc) catch true
+            else if (remote)
+                false
+            else
+                self.modules.prefersUnwindMetadata(frame.lookup_pc) catch false;
+            if (if (metadata_only) self.modules.cachedSymbolAt(frame.lookup_pc) else self.modules.symbolAt(frame.lookup_pc)) |symbol| {
                 frame.symbol = symbol.name;
                 frame.module_id = symbol.module_id;
             } else |_| {}
             const step: info.Unwind = step: {
-                // Decorating an unloaded remote caller must not download its
-                // whole library on the event loop. CFI uses the C range worker;
-                // explicit locals/source inspection can still load full DWARF.
-                const module = (if (remote_caller or metadata_only) self.modules.cachedAt(frame.lookup_pc) else self.modules.at(frame.lookup_pc)) catch |err| {
+                // A remote caller downloads its library only when classification
+                // says it has .debug_frame and no usable .eh_frame. Other remote
+                // callers stay on the bounded CFI worker.
+                const module = (if (metadata_only) self.modules.cachedAt(frame.lookup_pc) else self.modules.at(frame.lookup_pc)) catch |err| {
                     if (err == error.PeDebugInfoUnavailable and arch_ == .x86_64) {
                         frame.inline_diagnostic = "PeDebugInfoUnavailable";
                         const image = self.modules.peAt(pc) catch |pe_error| {

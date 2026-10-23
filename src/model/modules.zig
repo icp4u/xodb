@@ -1032,8 +1032,11 @@ pub const Modules = struct {
     }
     /// Keep ordinary stripped-library stack frames on the bounded CFI path.
     /// Full DWARF (including verified companions) retains source/inline views.
+    /// A remote caller is loaded whole only when it has .debug_frame and no
+    /// .eh_frame. Every other remote caller stays on the bounded CFI worker.
     pub fn prefersUnwindMetadata(self: *Modules, address: u64) !bool {
-        if (self.immutable or self.target == null or rt.xrt_target_is_remote(self.target)) return false;
+        if (self.immutable or self.target == null) return false;
+        const remote = rt.xrt_target_is_remote(self.target);
         for (self.regions.items) |region| {
             if (address < region.start or address >= region.end) continue;
             if (self.cachedRange(region, false) != null) return false;
@@ -1041,6 +1044,18 @@ pub const Modules = struct {
             const index = try self.fileIdentity(region);
             self.syncCompanionPolicy(index);
             if (self.identities.items[index].metadata_only) |decision| return decision;
+            if (remote) {
+                const debug_frame = image.sectionByName(".debug_frame") != null or image.sectionByName(".zdebug_frame") != null;
+                // -fno-unwind-tables still leaves a 4-byte terminator. That is
+                // not unwind information; the bounded worker only reads .eh_frame.
+                const eh_frame = if (image.sectionByName(".eh_frame")) |section| section.size > 4 else false;
+                const full = debug_frame and !eh_frame;
+                // Report a rejected automatic companion from this classification.
+                // The result does not decide whether the caller is loaded.
+                _ = self.companionFor(region, image, region.path) catch null;
+                self.identities.items[index].metadata_only = !full;
+                return !full;
+            }
             const has_dwarf = image.sectionByName(".debug_info") != null or image.sectionByName(".zdebug_info") != null or
                 image.sectionByName(".debug_frame") != null or image.sectionByName(".zdebug_frame") != null;
             const full = has_dwarf or (self.companionFor(region, image, region.path) catch null) != null;
