@@ -100,7 +100,7 @@ static void files(struct xrt_target *t, const char *self, bool latency)
         uint64_t resident = 0;
         binary = -1;
         if (latency) budget.deadline_ns = xrt_now() + UINT64_C(25000000);
-        assert(xrt_remote_symbol_file(t, &request, &binary, &resident) ==
+        assert(xrt_remote_symbol_file(t, &request, &binary, &resident, NULL) ==
                (latency ? XRT_DISCOVERY_PENDING : XRT_DISCOVERY_BUDGET));
         assert(binary == -1 && budget.bytes == 16 && budget.files == 1 && budget.reads == 1);
         budget = (struct xrt_file_budget){.limit_bytes = 1024 * 1024,
@@ -111,13 +111,13 @@ static void files(struct xrt_target *t, const char *self, bool latency)
             do {
                 budget = (struct xrt_file_budget){.limit_bytes = 1024 * 1024,
                     .deadline_ns = xrt_now() + UINT64_C(25000000)};
-                status = xrt_remote_symbol_file(t, &request, &binary, &resident);
+                status = xrt_remote_symbol_file(t, &request, &binary, &resident, NULL);
                 assert(status == XRT_OK || status == XRT_DISCOVERY_PENDING);
                 assert(budget.reads == 1 && budget.files == 0);
                 assert(++slices < 128);
             } while (status != XRT_OK);
         } else {
-            OK(xrt_remote_symbol_file(t, &request, &binary, &resident));
+            OK(xrt_remote_symbol_file(t, &request, &binary, &resident, NULL));
             assert(budget.files == 0); // Retained handle, not just retained bytes.
         }
         assert((latency || budget.resumed_bytes == 16) && resident > 16 && resident < 1024 * 1024);
@@ -127,7 +127,7 @@ static void files(struct xrt_target *t, const char *self, bool latency)
         volatile sig_atomic_t cancel = 1;
         budget.cancel = &cancel;
         binary = -1;
-        assert(xrt_remote_symbol_file(t, &request, &binary, &resident) == XRT_DISCOVERY_CANCELLED);
+        assert(xrt_remote_symbol_file(t, &request, &binary, &resident, NULL) == XRT_DISCOVERY_CANCELLED);
         assert(binary == -1);
         xrt_target_file_budget(t, NULL);
         /* Exhausting current-agent slots is a resource refusal, never an
@@ -145,7 +145,7 @@ static void files(struct xrt_target *t, const char *self, bool latency)
         }
         open.value = &unused;
         assert(xrt_remote_call(t, &open) == XRT_FILE_UNAVAILABLE);
-        assert(xrt_remote_symbol_file(t, &request, &binary, &resident) == XRT_FILE_UNAVAILABLE);
+        assert(xrt_remote_symbol_file(t, &request, &binary, &resident, NULL) == XRT_FILE_UNAVAILABLE);
         for (unsigned i = 0; i < 32; ++i)
             OK(xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_FILE_CLOSE, .args = {handles[i]}}));
         ++request.mapping.inode;

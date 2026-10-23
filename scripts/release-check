@@ -761,6 +761,15 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                     continue
                 steps.append(variant)
                 present.add(variant.name)
+            # This step is registered on the periodic plan, so the host loop
+            # above does not see it. Its agent form belongs with the others.
+            for step in list(steps):
+                if step.name != 'module-unwind-eviction':
+                    continue
+                variant = _agent_variant(step)
+                if variant.name not in present:
+                    steps.append(variant)
+                    present.add(variant.name)
         return steps
     if live:
         steps.append(('remote-queued-drop', [sys.executable, '-B', 'tests/remote-queued-drop.py', '--work', '.work/remote-queued-drop'], 60))

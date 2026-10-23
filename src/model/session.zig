@@ -2284,7 +2284,11 @@ pub const Session = struct {
                         };
                     }
                     if ((err == error.BinarySnapshotLimit or err == error.DebugMetadataNotLoaded) and self.target.core == null) {
-                        frame.inline_diagnostic = if (metadata_only) "NoDebugInfo" else @errorName(err);
+                        // Lazy callers can still have an explicit source/locals
+                        // refusal. Do not hide that known budget behind NoDebugInfo.
+                        frame.inline_diagnostic = if (self.modules.budgetFailure(frame.lookup_pc)) |failure|
+                            failure.diagnostic
+                        else if (metadata_only) "NoDebugInfo" else @errorName(err);
                         break :step self.metadata.unwind(self, a, frame.lookup_pc, registers) catch |metadata_error| {
                             frame.diagnostic = @errorName(metadata_error);
                             try frames.append(a, frame);

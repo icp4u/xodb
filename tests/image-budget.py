@@ -69,13 +69,13 @@ def stack(client, session, tid):
         # Select each unloaded caller explicitly before asserting full-image policy.
         if client.runtime_agent:
             missing = [f['lookup_pc'] for f in found['frames']
-                       if f['inline_diagnostic'] == 'DebugMetadataNotLoaded' and f['lookup_pc'] not in requested]
+                       if f['inline_diagnostic'] in ('DebugMetadataNotLoaded', 'NoDebugInfo') and f['lookup_pc'] not in requested]
             for pc in missing:
                 requested.add(pc)
                 reply = client.tool('get_source_location', address=hex(pc))['result']
                 if reply.get('isError'):
                     texts = [c['text'] for c in reply['content']]
-                    assert texts[0] in ('BinarySnapshotLimit', 'CompressedDebugBudget', 'NoDebugInfoAtAddress', 'NoSourceAtAddress'), reply
+                    assert texts[0] in ('BinarySnapshotLimit', 'CompressedDebugBudget', 'NoDebugInfo', 'NoDebugInfoAtAddress', 'NoSourceAtAddress'), reply
                     if texts[0] == 'BinarySnapshotLimit':
                         assert len(texts) == 2 and 'budget' in texts[1], reply
             if missing: continue
@@ -101,8 +101,10 @@ def refused(client, tid, library, budget, knobs):
     notice = found['image_budget']
     assert notice and notice.startswith(f'{library} is {SIZE // MIB} MiB; '), found
     assert budget in notice and all(knob in notice for knob in knobs), notice
-    assert not any(f['symbol'] == 'big_wait' for f in found['frames']), found  # the probe saw the image unread
-    assert any(f['inline_diagnostic'] == ('DebugMetadataNotLoaded' if client.runtime_agent else 'BinarySnapshotLimit') for f in found['frames']), found
+    # Remote symbol projections can name an unread caller; source still cannot
+    # appear, and the recorded refusal must survive metadata-only unwinding.
+    assert not any(f['symbol'] == 'big_wait' and (not client.runtime_agent or f['source']) for f in found['frames']), found
+    assert any(f['inline_diagnostic'] == 'BinarySnapshotLimit' for f in found['frames']), found
     regions, page = modules(client)
     assert page['image_budget'] == notice, page
     failure = [f for f in page['load_failures'] if f['path'] == str(library)]

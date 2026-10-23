@@ -1079,7 +1079,8 @@ static enum xrt_status symbol_read(void *context, uint64_t at, void *out, size_t
  * incomplete file and its verified agent descriptor survive between slices.
  * FILE_READ and the final FILE_CLOSE revalidate the same original identity. */
 enum xrt_status xrt_remote_symbol_file(const struct xrt_target *t,
-        const struct xrt_file_request *request, int *out, uint64_t *resident)
+        const struct xrt_file_request *request, int *out, uint64_t *resident,
+        struct xrt_file_identity *original)
 {
     if (!remote_io_allowed()) return XRT_REMOTE_IO_FORBIDDEN;
     if (!t || !t->connection || !request || request->kind != XRT_FILE_MAPPED || !out || !resident)
@@ -1170,6 +1171,7 @@ enum xrt_status xrt_remote_symbol_file(const struct xrt_target *t,
     if (status == XRT_OK) {
         *out = p->fd;
         *resident = p->bytes;
+        if (original) *original = p->identity;
     } else if (p->fd >= 0) close(p->fd);
     free(p);
     c->symbols = NULL;

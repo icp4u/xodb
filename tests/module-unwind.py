@@ -153,6 +153,14 @@ try:
             if index == 0 and not a.budget and not a.debug_frame and not a.full_dwarf:
                 assert any(j['image'].endswith('lib00.so') and j['state']=='ready' for j in metadata), metadata
                 original_id = next(j['id'] for j in metadata if j['image'].endswith('lib00.so'))
+            if a.eviction and index == 2:
+                # A full module load after the unwind view must compare the
+                # target's identity, not a host copy's: unchanged files load.
+                # lib02 is never changed; a loaded module keeps its own snapshot.
+                for f in frames[:4]:
+                    pc = f['pc'] if isinstance(f['pc'], int) else int(f['pc'], 16)
+                    found = c.tool('get_source_location', address=hex(pc))['result']
+                    assert 'BinaryChangedDuringRead' not in json.dumps(found), (hex(pc), found)
             if a.eviction and index == count-1:
                 assert not any(j['id']==original_id for j in metadata), metadata
             if a.eviction and index == count:

@@ -880,7 +880,8 @@ pub const Modules = struct {
         // Only read the inode actually mapped by the target. map_files can need
         // privileges unavailable to run-as, so exe/path retain inode checks.
         var source: mapped_file.Source = if (prepared != null) .remote_snapshot else if (self.core_source != null) .core_path else .unopened;
-        const fd = if (prepared) |ready| c.fcntl(ready, c.F_DUPFD_CLOEXEC, @as(c_int, 3)) else if (self.core_source != null) c.open(path, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK) else mapped_file.openResolved(self.target, self.pid, region, null, &source) catch |err| {
+        var opened = std.mem.zeroes(rt.struct_xrt_file_identity);
+        const fd = if (prepared) |ready| c.fcntl(ready, c.F_DUPFD_CLOEXEC, @as(c_int, 3)) else if (self.core_source != null) c.open(path, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK) else mapped_file.openResolved(self.target, self.pid, region, &opened, &source) catch |err| {
             // A runtime agent refuses whole files above its own fixed cap.
             if (err == error.BinarySnapshotLimit) {
                 const agent = rt.xrt_target_remote_image_limit(self.target);
@@ -890,6 +891,8 @@ pub const Modules = struct {
         };
         if (fd < 0) return error.BinaryIdentityUnavailable;
         defer _ = c.close(fd);
+        // A prepared remote image was checked when its file view opened.
+        if (prepared == null and self.core_source == null and rt.xrt_target_is_remote(self.target)) try self.rememberMetadataIdentity(region, opened);
         try self.verifySymbolIdentity(region, fd);
         var stat: c.struct_stat = undefined;
         if (c.fstat(fd, &stat) != 0 or stat.st_size <= 0 or stat.st_mode & c.S_IFMT != c.S_IFREG) return error.BinaryUnavailable;
@@ -1107,13 +1110,15 @@ pub const Modules = struct {
         return found;
     }
     /// File versions and mapped-instance IDs outlive both symbol and CFI data.
+    /// A remote symbol projection records the agent's identity of the file it
+    /// read; later file views must match it, and the projection stays pinned.
     pub fn rememberMetadataIdentity(self: *Modules, region: Region, identity: rt.struct_xrt_file_identity) !void {
         if (self.symbol_pending) |pending| if (sameFile(pending.region, region) and !std.meta.eql(pending.identity, identity)) return error.BinaryChangedDuringRead;
         const index = try self.fileIdentity(region);
         const file = &self.identities.items[index];
         if (file.identity) |original| {
             if (!std.meta.eql(original, identity)) return error.BinaryChangedDuringRead;
-        } else if (file.remote_snapshot) return error.BinaryIdentityUnavailable;
+        }
         file.identity = identity;
     }
     pub fn findSymbol(self: *Modules, name: []const u8) !Symbol {
@@ -1225,8 +1230,9 @@ pub const Modules = struct {
         var resident: u64 = 0;
         var source: mapped_file.Source = .remote_snapshot;
         var identity: ?rt.struct_xrt_file_identity = null;
+        var projected = std.mem.zeroes(rt.struct_xrt_file_identity);
         if (rt.xrt_target_is_remote(self.target)) {
-            try runtime_api.check(rt.xrt_remote_symbol_file(self.target, &request, &fd, &resident));
+            try runtime_api.check(rt.xrt_remote_symbol_file(self.target, &request, &fd, &resident, &projected));
         } else {
             var pinned: rt.struct_xrt_file_identity = undefined;
             self.localSymbolFile(region, &request, &fd, &resident, &source, &pinned, self.identities.items[file_index].identity) catch |err| {
@@ -1259,7 +1265,10 @@ pub const Modules = struct {
         const image = try elf.Image.parse(bytes);
         if (@intFromEnum(image.header.machine) != rt.xrt_target_arch(self.target).*.machine) return error.UnsupportedTargetArchitecture;
         try self.trimSymbols(retained);
-        if (identity) |id| try self.rememberMetadataIdentity(region, id) else self.identities.items[file_index].remote_snapshot = true;
+        // A remote projection carries the agent's stat of the file it read,
+        // so a later file view is compared with the version symbols came from.
+        try self.rememberMetadataIdentity(region, identity orelse projected);
+        if (identity == null) self.identities.items[file_index].remote_snapshot = true;
         var saved = region;
         saved.path = try self.allocator.dupe(u8, region.path);
         errdefer self.allocator.free(saved.path);
@@ -1281,9 +1290,9 @@ pub const Modules = struct {
         if (needed > self.symbol_limit) return error.SymbolSnapshotLimit;
         while (self.symbol_bytes > self.symbol_limit - needed) {
             var oldest: ?usize = null;
-            // Remote symbol projections lack an original-file identity and
-            // stay pinned; reopening could mix two versions under one ID.
-            for (self.symbol_images.items, 0..) |item, i| if (self.identities.items[item.file].identity != null) {
+            // A remote symbol projection stays pinned. Reopening it could mix
+            // two versions under one ID.
+            for (self.symbol_images.items, 0..) |item, i| if (self.identities.items[item.file].identity != null and !self.identities.items[item.file].remote_snapshot) {
                 if (oldest == null or item.last_used < self.symbol_images.items[oldest.?].last_used) oldest = i;
             };
             const index = oldest orelse return error.SymbolSnapshotLimit;
@@ -1305,6 +1314,9 @@ pub const Modules = struct {
         }
     }
     fn verifySymbolIdentity(self: *const Modules, region: Region, fd: c_int) !void {
+        // A remote file is a sealed host copy. Its host stat is not the
+        // target's identity; the agent's identity is compared instead.
+        if (self.core_source == null and rt.xrt_target_is_remote(self.target)) return;
         const index = self.identityIndex(region) orelse return;
         const expected = self.identities.items[index].identity orelse return;
         var current: rt.struct_xrt_file_identity = undefined;
@@ -2062,6 +2074,40 @@ test "metadata-only identity survives without resident symbol bytes" {
     try std.testing.expectEqual(@as(usize, 0), modules.cachedSymbolCount());
     original.size += 1;
     try std.testing.expectError(error.BinaryChangedDuringRead, modules.rememberMetadataIdentity(region, original));
+}
+
+test "remote symbol projection records the first file view and stays pinned" {
+    var modules = Modules.init(std.testing.allocator);
+    defer modules.deinit();
+    modules.symbol_limit = 4096;
+    const ptr = c.mmap(null, 4096, c.PROT_READ | c.PROT_WRITE, c.MAP_PRIVATE | c.MAP_ANONYMOUS, -1, 0);
+    if (ptr == c.MAP_FAILED) return error.OutOfMemory;
+    const bytes: snapshot.Bytes = @as([*]align(std.heap.page_size_min) u8, @ptrCast(@alignCast(ptr)))[0..4096];
+    @memcpy(bytes[0..7], "\x7fELF\x02\x01\x01");
+    std.mem.writeInt(u16, bytes[16..18], 3, .little);
+    std.mem.writeInt(u16, bytes[18..20], 62, .little);
+    std.mem.writeInt(u32, bytes[20..24], 1, .little);
+    std.mem.writeInt(u16, bytes[52..54], 64, .little);
+    const path = try modules.allocator.dupe(u8, "/owned-remote.so");
+    const region = Region{ .start = 4096, .end = 8192, .offset = 0, .inode = 9, .device_major = 1, .device_minor = 1, .permissions = "r-xp".*, .path = path };
+    const file = try modules.fileIdentity(region);
+    modules.identities.items[file].remote_snapshot = true;
+    try modules.symbol_images.append(modules.allocator, .{ .region = region, .file = file, .bytes = bytes, .image = try elf.Image.parse(bytes), .retained = 4096 });
+    modules.symbol_bytes += 4096;
+    var original = std.mem.zeroes(rt.struct_xrt_file_identity);
+    original.size = 4096;
+    try modules.rememberMetadataIdentity(region, original);
+    try std.testing.expect(modules.identities.items[file].remote_snapshot);
+    try std.testing.expect(std.meta.eql(modules.identities.items[file].identity.?, original));
+    try modules.rememberMetadataIdentity(region, original);
+    var changed = original;
+    changed.size += 1;
+    try std.testing.expectError(error.BinaryChangedDuringRead, modules.rememberMetadataIdentity(region, changed));
+    try std.testing.expect(modules.identities.items[file].remote_snapshot);
+    try std.testing.expect(std.meta.eql(modules.identities.items[file].identity.?, original));
+    try std.testing.expectError(error.SymbolSnapshotLimit, modules.trimSymbols(1));
+    try std.testing.expectEqual(@as(usize, 1), modules.symbol_images.items.len);
+    try std.testing.expectEqual(@as(u64, 0), modules.symbol_evictions);
 }
 
 test "module relabel preserves exact provenance at process-scale mapping counts" {

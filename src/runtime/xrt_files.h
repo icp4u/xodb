@@ -94,9 +94,10 @@ struct xrt_file_budget {
 enum xrt_status xrt_target_file_budget(const struct xrt_target *, struct xrt_file_budget *);
 /* Owner thread only. Remote ELF symbol-only sparse projection; do not use for
  * debug information or code bytes. Partial transfers resume on the next pass.
- * The output fd is sealed; resident counts retained source bytes, not holes. */
+ * The output fd is sealed; resident counts retained source bytes, not holes.
+ * identity, when not NULL, receives the agent's stat of the projected file. */
 enum xrt_status xrt_remote_symbol_file(const struct xrt_target *, const struct xrt_file_request *,
-                                      int *fd, uint64_t *resident);
+                                      int *fd, uint64_t *resident, struct xrt_file_identity *identity);
 /* Worker-owned symbol projection: at most 64 MiB of selected sections, each
  * read at most 64 KiB. Successful start owns the view; failed start does not.
  * The local application uses this when a full-image snapshot is too large.

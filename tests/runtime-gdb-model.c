@@ -352,7 +352,7 @@ static void release_guard(void)
         assert(xrt_remote_health(NULL) == XRT_REMOTE_IO_FORBIDDEN);
         assert(xrt_remote_fail(NULL, XRT_OK) == XRT_REMOTE_IO_FORBIDDEN);
         assert(xrt_remote_file(NULL, NULL, NULL, NULL) == XRT_REMOTE_IO_FORBIDDEN);
-        assert(xrt_remote_symbol_file(NULL, NULL, NULL, NULL) == XRT_REMOTE_IO_FORBIDDEN);
+        assert(xrt_remote_symbol_file(NULL, NULL, NULL, NULL, NULL) == XRT_REMOTE_IO_FORBIDDEN);
     }
     assert(xrt_remote_io_violation_count() == before + 1024);
     xrt_remote_io_guard(false);
@@ -391,7 +391,7 @@ static void owner_guard(void)
             if (which == 4) (void)xrt_remote_health(NULL);
             if (which == 5) (void)xrt_remote_fail(NULL, XRT_OK);
             if (which == 6) (void)xrt_remote_file(NULL, NULL, NULL, NULL);
-            if (which == 7) (void)xrt_remote_symbol_file(NULL, NULL, NULL, NULL);
+            if (which == 7) (void)xrt_remote_symbol_file(NULL, NULL, NULL, NULL, NULL);
             _exit(1);
         }
         int status; assert(waitpid(child, &status, 0) == child);

@@ -177,7 +177,9 @@ pub const State = struct {
                 return error.BinarySnapshotLimit;
             }
         }
-        if (local) try session.modules.rememberMetadataIdentity(region, @bitCast(identity));
+        // The worker notices a change only while its view is open. A view
+        // reopened over the agent must match the identity stored for this file.
+        try session.modules.rememberMetadataIdentity(region, @bitCast(identity));
         var job: ?*c.struct_xmd_job = null;
         const status = if (kind == .image)
             c.xmd_start_image(view, &job)

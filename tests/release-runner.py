@@ -150,12 +150,19 @@ class RunnerTests(unittest.TestCase):
             for variant in ('chain', 'debug-frame', 'companions'):
                 self.assertIn('tests/module-unwind.py', steps['module-unwind-'+variant])
             self.assertNotIn('module-unwind-eviction', steps)
+            self.assertNotIn('module-unwind-eviction-agent-lane', steps)
         for tier in ('periodic', 'periodic-gui'):
             steps = {name: cmd for name, cmd, _ in gate.plan(tier)}
             for variant in ('eviction', 'budget', 'full-dwarf', 'large-companions'):
                 self.assertIn('--'+variant, steps['module-unwind-'+variant])
             self.assertIn('tests/cfi-job.py', steps['cfi-job'])
             self.assertIn('--agent', steps['cfi-job'])
+        periodic = {name: cmd for name, cmd, _ in gate.plan('periodic')}
+        lane = periodic['module-unwind-eviction-agent-lane']
+        self.assertEqual(lane[:2], ['env', 'XODB_TEST_RUNTIME_AGENT=./zig-out/bin/xodb-agent'])
+        self.assertIn('--eviction', lane)
+        self.assertNotIn('module-unwind-eviction-agent-lane', {name for name, _, _ in gate.plan('periodic-gui')})
+        self.assertNotIn('module-unwind-eviction-agent-lane', {name for name, _, _ in gate.plan('periodic', headless=True)})
 
     def test_jai_demo_lanes(self):
         for tier in ('host', 'all'):

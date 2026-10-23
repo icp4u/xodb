@@ -44,6 +44,10 @@ is written to disk; the debugger still reads what the headers claim.
 Cases run with SMALL budgets (256 MiB an image, 1 GiB in all) unless they say
 otherwise, so that 300 MiB images stand for large ones; OPTIN is the larger
 pair a user may ask for.
+The agent lane selects fixture callers explicitly and tests budget advice below
+its separate synchronous-transfer cap; local sizes stay unchanged. The large
+optin and tabs cases still require source from their original large images.
+Every agent case runs even after a failure; the final exit status stays nonzero.
 --wrong-result expects the lookup to read every image and must fail."""
 import argparse
 import ctypes
@@ -55,6 +59,7 @@ import runpy
 import struct
 import subprocess
 import time
+import traceback
 from client import Client
 from helpers.input import load_scale
 
@@ -146,10 +151,43 @@ class Run:
             self.session = self.client.stopped(seconds=30)
         except BaseException:
             self.kill(); raise
-    def stack(self):
+    def stack(self, select=()):
+        """Select only the requested fixture callers before checking full images.
+
+        Remote automatic unwinding deliberately leaves caller DWARF unloaded.
+        Do not load unrelated system images just to exercise a fixture's budget.
+        """
         deadline = time.monotonic() + 30
+        requested = set()
+        self.source_refusals = {}
+        regions = []
+        if self.client.runtime_agent and select:
+            cursor = None
+            while True:
+                page = self.client.inspect('list_modules', limit=512, **({'cursor': cursor} if cursor else {}))
+                regions += [r for r in page['regions'] if r['path'] in {str(p) for p in select}]
+                cursor = page.get('next')
+                if not cursor: break
         while True:
             found = self.client.inspect('get_stack', generation=self.session['generation'], tid=self.tid)
+            selected = False
+            for frame in found['frames']:
+                pc = frame['lookup_pc']
+                if pc in requested or not any(r['start'] <= pc < r['end'] for r in regions): continue
+                reply = self.client.tool('get_source_location', address=hex(pc))['result']
+                if reply.get('isError'):
+                    why = errors(reply)[0]
+                    self.source_refusals[pc] = why
+                    assert why in ('BinarySnapshotLimit', 'CompressedDebugBudget', 'NoDebugInfoAtAddress',
+                                   'NoSourceAtAddress', 'MalformedDebugInfo', 'TableLimit', 'DebugMetadataPending'), reply
+                    if why == 'DebugMetadataPending':
+                        assert time.monotonic() < deadline, reply
+                        time.sleep(.005)
+                        selected = True
+                        continue
+                requested.add(pc)
+                selected = True
+            if selected: continue
             if not any(f['diagnostic'] == 'DebugMetadataPending' for f in found['frames']): return found
             assert time.monotonic() < deadline, found
             time.sleep(.005)
@@ -297,7 +335,7 @@ def lookup(w, a, result):
 
 
 def total(w, a, result):
-    size = 257 * MIB
+    size = (129 if a.remote else 257) * MIB
     one, two = w/'tt1.so', w/'tt2.so'
     for lib in (one, two): lib.write_bytes((w/'lk_ok.so').read_bytes()); os.truncate(lib, size)
     try:
@@ -305,17 +343,22 @@ def total(w, a, result):
         limit = 3 * size - MIB
         r = Run(w, w/'host', [one, two], options=('--image-limit', '1G', '--image-total-limit', str(limit)), env={'CHAIN': '1'})
         try:
-            found = r.stack()
+            found = r.stack(select=(one, two))
             assert named(found, 'probe_wait') and named(found, 'probe_call') and found['image_budget'] is None, found
             session_bytes = r.held()['held']
             assert 2 * size <= session_bytes <= limit, session_bytes
             # A capture of the same process holds the same files: one copy, charged once.
             opened = r.client.inspect('start_profile', generation=r.session['generation'], duration_ms=60000, frequency_hz=99, tids=[r.tid])['capture']
             history = r.client.inspect('get_profile')['capture']['mapping_history']
-            assert history['snapshot_bytes'] >= 2 * size, history  # the probe saw the capture hold both
+            if a.remote:
+                # Separate remote readers have distinct immutable snapshots.
+                # At this total a capture cannot duplicate both session images.
+                assert history['snapshot_bytes'] < 2 * size and history['images_not_searched'] >= 2, history
+            else:
+                assert history['snapshot_bytes'] >= 2 * size, history  # the probe saw the capture hold both
             spent = r.held()
             assert spent['total_limit'] == limit and spent['peak'] <= limit, spent
-            assert spent['held'] < session_bytes + history['snapshot_bytes'], (spent, history)
+            if not a.remote: assert spent['held'] < session_bytes + history['snapshot_bytes'], (spent, history)
             assert spent['held'] < 2 * size + 64 * MIB, spent  # the capture added only small system images
             rss = r.peak_rss()
             assert rss < limit + 128 * MIB, rss
@@ -328,12 +371,17 @@ def total(w, a, result):
         limit = size + 32 * MIB
         r = Run(w, w/'host', [one, two], options=('--image-limit', '1G', '--image-total-limit', str(limit)), env={'CHAIN': '1'})
         try:
-            found = r.stack()
-            assert named(found, 'probe_wait') and not named(found, 'probe_call') and found['image_budget'], found
-            assert 'left of the' in found['image_budget'] and '/tt2.so is 257 MiB' in found['image_budget'], found
+            found = r.stack(select=(one, two))
+            inner, outer = named(found, 'probe_wait'), named(found, 'probe_call')
+            assert inner and inner['source'] and found['image_budget'], found
+            assert (outer and not outer['source']) if a.remote else not outer, found
+            assert 'left of the' in found['image_budget'] and f'/tt2.so is {size // MIB} MiB' in found['image_budget'], found
             opened = r.client.inspect('start_profile', generation=r.session['generation'], duration_ms=60000, frequency_hz=99, tids=[r.tid])['capture']
             history = r.client.inspect('get_profile')['capture']['mapping_history']
-            assert size <= history['snapshot_bytes'] < 2 * size, history
+            if a.remote:
+                assert history['snapshot_bytes'] < size and history['images_not_searched'] >= 2, history
+            else:
+                assert size <= history['snapshot_bytes'] < 2 * size, history
             spent = r.held()
             assert size <= spent['held'] <= limit and spent['peak'] <= limit, spent
             assert r.peak_rss() < limit + 128 * MIB
@@ -353,12 +401,14 @@ def phantom(w, a, result):
     # .debug_info declares nearly the whole 2 GiB total; its stream is the real, tiny one.
     e = Elf(packed); h = e.sh(e.index('.debug_info'))
     assert h['flags'] & SHF_COMPRESSED, h
-    struct.pack_into('<Q', e.b, h['offset'] + 8, (2 << 30) - 600 * 1024)
+    # A remote native top frame also holds libc. Leave measured-small-image
+    # headroom so this tests failed inflation, not a legitimate total refusal.
+    struct.pack_into('<Q', e.b, h['offset'] + 8, (2 << 30) - (16 * MIB if a.remote else 600 * 1024))
     liar = e.save(w/'ph_liar.so')
     # probe_wait is in the liar and is read first; probe_call is in the honest image.
     r = Run(w, w/'host', [liar, honest], options=('--image-limit', '2G', '--image-total-limit', '2G'), env={'CHAIN': '1'})
     try:
-        found = r.stack()
+        found = r.stack(select=(liar, honest))
         inner, outer = named(found, 'probe_wait'), named(found, 'probe_call')
         assert inner and inner['inline_diagnostic'] and not inner['source'], found  # the probe saw the lie fail to inflate
         assert outer and outer['source'] and outer['diagnostic'] is None, found
@@ -372,11 +422,11 @@ def phantom(w, a, result):
 
 
 def sections(w, a, result):
-    size = 257 * MIB
+    size = (129 if a.remote else 257) * MIB
     plain = w/'sc_ok.so'; plain.write_bytes((w/'lk_ok.so').read_bytes()); os.truncate(plain, size)
     r = Run(w, w/'host', [plain], options=OPTIN)
     try:
-        t = time.monotonic(); found = r.stack(); honest = time.monotonic() - t
+        t = time.monotonic(); found = r.stack(select=(plain,)); honest = time.monotonic() - t
         assert named(found, 'probe_wait'), found
         r.close()
     finally:
@@ -396,8 +446,13 @@ def sections(w, a, result):
     try:
         r = Run(w, w/'host', [lib], options=OPTIN)
         try:
-            t = time.monotonic(); found = r.stack(); seconds = time.monotonic() - t
-            assert any(f['diagnostic'] == 'TableLimit' for f in found['frames']) and not named(found, 'probe_wait'), found
+            t = time.monotonic(); found = r.stack(select=(lib,)); seconds = time.monotonic() - t
+            if a.remote:
+                assert 'TableLimit' in r.source_refusals.values(), r.source_refusals
+                assert any(f['diagnostic'] == 'DebugMetadataLimit' for f in found['frames']), found
+            else:
+                assert any(f['diagnostic'] == 'TableLimit' for f in found['frames']), found
+            assert not named(found, 'probe_wait'), found
             # Unbounded, this walk is 20,000 scans of 64 MiB: minutes. Reading the file is the honest cost.
             assert seconds < max(1.0, 10 * honest), (seconds, honest)
             _, leave = r.close()
@@ -611,7 +666,10 @@ def definers(w, a, result):
             held = r.holds(0, 16 * MIB)
             assert set(answers) == {'PythonImageBudgetExceeded'}, answers
             refusals = [f.get('detail') or '' for f in load_failures(r.client)]
-            assert any('.so is 300 MiB; a language view may read 256 MiB of the image it finds its runtime in' in d for d in refusals), refusals
+            if a.remote:
+                assert any('.so: remote image transfer is capped at 256 MiB outside the background main-image job' in d for d in refusals), refusals
+            else:
+                assert any('.so is 300 MiB; a language view may read 256 MiB of the image it finds its runtime in' in d for d in refusals), refusals
             result['definers'] = {'images': len(libs), 'image_bytes': BIG, 'held_bytes': held, 'answer': answers[0]}
             r.close()
         finally:
@@ -621,11 +679,16 @@ def definers(w, a, result):
     # Within the bounds the defining images are read, and no more of them than a scan holds.
     r = Run(w, w/'host', [w/'df_ok.so'])
     try:
+        native = 0
+        if a.remote:
+            frame = named(r.stack(), 'probe_wait')
+            assert frame and not frame['source'], frame
+            native = r.holds(0, 16 * MIB)
         why = view(r)
         assert why != 'PythonImageBudgetExceeded', why
         figures = r.modules().get('image_bytes')
-        assert not figures or figures['held'] > 0, figures  # the probe saw the one small definer loaded
-        result['definers']['small'] = {'answer': why, 'held_bytes': r.holds(0, MIB)}
+        assert not figures or figures['held'] > native, figures  # the probe saw the one small definer loaded
+        result['definers']['small'] = {'answer': why, 'native_bytes': native, 'held_bytes': r.holds(native, native + MIB)}
         r.close()
     finally:
         r.kill()
@@ -853,34 +916,44 @@ def refused(w, a, result):
 
 
 def defaults(w, a, result):
+    # Budget advice must be tested below the independent synchronous transport
+    # cap. The large opt-in case below retains its 1 GiB acceptance requirement.
+    size = 129 * MIB if a.remote else BIG
+    low = 128 if a.remote else 256
+    advised = 200 if a.remote else 400
     one, two = w/'dflt1.so', w/'dflt2.so'
-    for lib in (one, two): lib.write_bytes((w/'lk_ok.so').read_bytes()); os.truncate(lib, BIG)
+    for lib in (one, two): lib.write_bytes((w/'lk_ok.so').read_bytes()); os.truncate(lib, size)
     advice = re.compile(r'; rerun with ((?:--image-(?:total-)?limit \d+[MG] ?)+) or set symbols\.image_(?:total_)?bytes')
     try:
-        # Nothing asked for: 1 GiB an image, 4 GiB in all, and both 300 MiB images load.
+        # Nothing asked for: 1 GiB an image, 4 GiB in all; both images load.
         r = Run(w, w/'host', [one, two], env={'CHAIN': '1'}, budget=())
         try:
             figures = r.modules().get('image_bytes')
             assert figures and figures['image_limit'] == 1024 * MIB and figures['total_limit'] == 4096 * MIB, figures
-            found = r.stack()
+            found = r.stack(select=(one, two))
             assert all(named(found, name) and named(found, name)['source'] for name in ('probe_wait', 'probe_call')) and found.get('image_budget') is None, found
             r.close()
         finally:
             r.kill()
-        # With less asked for, a 300 MiB image is refused unread.
+        # With less asked for, each image is refused unread.
         options, said = dict(zip(SMALL[::2], SMALL[1::2])), []
+        options['--image-limit'] = f'{low}M'
         for attempt in range(4):
             r = Run(w, w/'host', [one, two], options=[x for pair in options.items() for x in pair], env={'CHAIN': '1'}, budget=())
             try:
-                found = r.stack()
+                native = 0
+                if a.remote:
+                    r.stack()
+                    native = r.holds(0, 16 * MIB)
+                found = r.stack(select=(one, two))
                 loaded = [name for name in ('probe_wait', 'probe_call') if named(found, name) and named(found, name)['source']]
-                r.holds(len(loaded) * BIG, len(loaded) * BIG + MIB)  # a refused image is not read; the small executable is
+                r.holds(native + len(loaded) * size, native + len(loaded) * size + MIB)
                 if len(loaded) == 2:
                     assert found.get('image_budget') is None, found
                     r.close(); break
                 # The sentence names the image and says what to rerun with; do exactly that.
                 notice = found.get('image_budget')
-                assert notice and '.so is 300 MiB; ' in notice, found
+                assert notice and f'.so is {size // MIB} MiB; ' in notice, found
                 match = advice.search(notice)
                 assert match, notice
                 words = match.group(1).split()
@@ -891,7 +964,7 @@ def defaults(w, a, result):
         else:
             raise AssertionError(f'following the refusals did not load both images: {said}')
         # Both images fit after the per-image advice at that total.
-        assert said and 'image budget 256 MiB; rerun with --image-limit 400M' in said[0] and len(said) == 1, said
+        assert said and f'image budget {low} MiB; rerun with --image-limit {advised}M' in said[0] and len(said) == 1, said
         result['defaults'] = {'refusals': said, 'options': options}
     finally:
         for lib in (one, two): lib.unlink(missing_ok=True)
@@ -903,7 +976,7 @@ def optin(w, a, result):
     try:
         r = Run(w, w/'host', [lib], options=OPTIN)
         try:
-            t = time.monotonic(); found = r.stack(); seconds = time.monotonic() - t
+            t = time.monotonic(); found = r.stack(select=(lib,)); seconds = time.monotonic() - t
             frame = named(found, 'probe_wait')
             assert frame and frame['source'] and frame['diagnostic'] is None and found['image_budget'] is None, found
             figures = r.modules().get('image_bytes')
@@ -958,11 +1031,13 @@ def starved(w, a, result, key, capture):
                 held = r.holds(0, share + 16 * MIB)
                 # So the frame the thread is stopped in still loads, with source.
                 r.session = r.client.session()
-                found = r.stack()
+                found = r.stack(select=(honest,))
                 frame = named(found, 'probe_wait')
                 assert frame and frame['source'] and frame['diagnostic'] is None and found['image_budget'] is None, (found, held)
                 # And the reply did not pass a partial search off as a whole one.
-                assert skipped and skipped >= 1 and first and re.search(r' is \d+ MiB; ', first), (skipped, first)
+                bounded = first and (re.search(r' is \d+ MiB; ', first) or
+                    (a.remote and label == 'optin' and first.endswith(': remote image transfer is capped at 256 MiB outside the background main-image job')))
+                assert skipped and skipped >= 1 and bounded, (skipped, first)
                 if not capture: assert len(texts) == 2 and texts[1].startswith(f'{skipped} images not searched; ') and ' MiB' in texts[1], (texts, skipped)
                 if capture: r.client.inspect('stop_profile', generation=r.client.session()['generation'], capture_id=opened['id'])
                 result[key][label] = {'mapped_bytes': sum(lib.stat().st_size for lib in libs), 'total_bytes': total, 'sweep_share_bytes': share, 'held_after_search_bytes': held, 'images_not_searched': skipped, 'first': first.replace(str(w), '.')}
@@ -1020,7 +1095,8 @@ def tabs(w, a, result):
             time.sleep(.005)
     def refusal(r, lib):
         found = [f.get('detail') or '' for f in load_failures(r.client) if f['path'] == str(lib)]
-        assert len(found) == 1 and ' is 300 MiB; a language view may read 256 MiB of the image it finds its runtime in' in found[0], found
+        expected = ': remote image transfer is capped at 256 MiB outside the background main-image job' if a.remote else ' is 300 MiB; a language view may read 256 MiB of the image it finds its runtime in'
+        assert len(found) == 1 and expected in found[0], found
         return found[0]
     libs = []
     try:
@@ -1035,7 +1111,7 @@ def tabs(w, a, result):
             assert before['status'] == 'unavailable' and before['reason'] == 'PerlImageBudgetExceeded', before
             said = refusal(r, libs[-1])
             r.holds(0, 0)
-            frame = named(r.stack(), 'probe_wait')
+            frame = named(r.stack(select=(libs[-1],)), 'probe_wait')
             assert frame and frame['source'], frame  # the probe saw the stack load the image
             r.holds(BIG, BIG + MIB)
             # The view can read the image now, so the tab is looked at again: it no longer blames the budget.
@@ -1149,22 +1225,40 @@ def main():
     p.add_argument('--work', required=True, type=Path)
     p.add_argument('--only', default=','.join(CASES))
     p.add_argument('--wrong-result', action='store_true')
+    p.add_argument('--keep-going', action='store_true', help='Record every case failure; automatic in the agent lane')
     a = p.parse_args()
+    # Run attaches to its owned target; Client's launch-only agent variable
+    # does not apply. This is the same switch as the registered agent lane.
+    a.remote = bool(os.environ.get('XODB_TEST_RUNTIME_AGENT'))
+    selected = a.only.split(',')
+    if any(key not in CASES for key in selected): p.error('unknown case in --only')
     root = Path(__file__).resolve().parents[1]; os.chdir(root); os.umask(0o022)
     w = a.work.resolve(); w.mkdir(parents=True, mode=0o755)
     (w/'host.c').write_text(HOST); (w/'lib.c').write_text(LIB)
     subprocess.run(['cc', '-g', '-O1', '-rdynamic', '-fno-optimize-sibling-calls', str(w/'host.c'), '-o', str(w/'host'), '-ldl'], check=True, timeout=60)
     subprocess.run(['cc', '-g', '-O1', '-fno-optimize-sibling-calls', '-shared', '-fPIC', str(w/'lib.c'), '-o', str(w/'lk_ok.so')], check=True, timeout=60)
-    result = {'status': 'running', 'seconds': {}}; started = time.monotonic()
+    result = {'status': 'running', 'seconds': {}, 'cases': {}}; started = time.monotonic()
     try:
-        for key in a.only.split(','):
-            t = time.monotonic(); CASES[key](w, a, result); result['seconds'][key] = round(time.monotonic() - t, 3)
-        result['status'] = 'pass'
+        for key in selected:
+            t = time.monotonic()
+            try:
+                CASES[key](w, a, result)
+                result['cases'][key] = {'status': 'pass'}
+            except Exception as error:
+                result['cases'][key] = {'status': 'fail', 'error': f'{type(error).__name__}: {error}'}
+                result['status'] = 'fail'
+                traceback.print_exc()
+                if not (a.keep_going or a.remote): raise
+            finally:
+                result['seconds'][key] = round(time.monotonic() - t, 3)
+                print(f"{key}: {result['cases'].get(key, {}).get('status', 'interrupted')}", flush=True)
+        result['status'] = 'fail' if any(v['status'] == 'fail' for v in result['cases'].values()) else 'pass'
     finally:
         result['elapsed_seconds'] = round(time.monotonic() - started, 3)
         (w/'results.json').write_text(json.dumps(result, indent=2).replace(str(w), '.') + '\n')
     print('image budget, hostile target: ' + '; '.join(f'{key} {seconds} s' for key, seconds in result['seconds'].items()))
+    return 0 if result['status'] == 'pass' else 1
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())
