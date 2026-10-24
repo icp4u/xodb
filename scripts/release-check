@@ -299,9 +299,12 @@ AGENT_INELIGIBLE = {
     'frame-host': 'opens saved frame streams; that mode has no target for the C agent',
     'macos-views': 'a GDB remote replay stub, not the C agent',
     'macos-names': 'a GDB remote replay stub, not the C agent',
+    'macos-names-matrix': 'a GDB remote replay stub, not the C agent',
     'macos-debug': 'a GDB remote replay stub, not the C agent',
     'macos-debug-objects': 'a GDB remote replay stub, not the C agent',
     'macos-debug-hostile': 'a GDB remote replay stub, not the C agent',
+    'm2-sampled': 'launches xodb itself and does not read the lane switch, so the agent never starts',
+    'm2-limits': 'launches xodb itself and does not read the lane switch, so the agent never starts',
     'remote-exit-export': 'the C agent is the subject of this step, behind its own proxy',
     'remote-exit-export-stdio': 'the C agent is the subject of this step, behind its own proxy',
     'runtime-host': 'names its own --runtime-agent binary, so the lane switch cannot reach it',
@@ -814,7 +817,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps.append((label, [sys.executable, '-B', 'tests/proton-metadata.py', '--work', '.work/' + label,
                           *(['--agent', 'zig-out/bin/xodb-agent'] if agent else [])], 30))
         steps.append(('module-symbols', [sys.executable, '-B', 'tests/module-symbols.py', '--work', '.work/module-symbols'], 60))
-        for variant in ('chain', 'debug-frame', 'companions'):
+        for variant in ('chain', 'debug-frame', 'companions', 'mixed'):
             label = 'module-unwind-' + variant
             steps.append((label, [sys.executable, '-B', 'tests/module-unwind.py', *([] if variant == 'chain' else ['--'+variant]), '--work', '.work/'+label], 60))
         for remote in (False, True):

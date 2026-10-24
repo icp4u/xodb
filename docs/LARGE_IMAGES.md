@@ -641,10 +641,16 @@ checks; `XODB_LARGE_IMAGE_STORAGE` selects its large-fixture destination.
 Remote stack walks use the background CFI reader for caller modules whose full
 DWARF has not been loaded. They keep source and inline information unavailable
 with `DebugMetadataNotLoaded` instead of downloading whole libraries during
-automatic stack decoration. Selecting a caller for explicit locals inspection
+automatic stack decoration. Two cases load the caller's whole library once,
+within the image budgets: it has `.debug_frame` and no usable `.eh_frame`, or
+its `.eh_frame` does not cover the PC and it has `.debug_frame`. A library the
+per-image budget refused is not fetched again until that limit is raised.
+Selecting a caller for explicit locals inspection
 can still load its full debug image; later stack walks reuse that image. The top
 frame and explicit source/locals operations retain their existing synchronous
-small-image path.
+small-image path. Over the agent, automatic debug companions are looked up on
+the debugger host's disk. A matching companion does not make stack decoration
+load the caller; a full load of that caller still uses it.
 
 If an explicit image request was refused by a budget, `get_stack.image_budget`
 also reports that recorded refusal for an unloaded caller. An image that has not

@@ -2,6 +2,7 @@
 """Native CFI: exact compiler return PCs, sparse images and cache eviction.
 
 Fast default: 12 stripped 64 MiB DSOs in one optimized, frame-pointer-less callchain.
+Fast --mixed: real .eh_frame that misses the walked PC, with .debug_frame kept.
 Fast --companions: repeated wrong-CRC companion lookups share one decision.
 Periodic --large-companions and --full-dwarf exercise companion I/O and summary budgets.
 Periodic --eviction: 66 small DSOs in successive stacks, cold reload, changed-file refusal.
@@ -17,6 +18,18 @@ import struct
 import time
 from client import Client
 
+def section_size(path, name):
+    data = Path(path).read_bytes()
+    assert data[:6] == b'\x7fELF\x02\x01', path
+    shoff = struct.unpack_from('<Q', data, 40)[0]
+    width, sections, names = struct.unpack_from('<HHH', data, 58)
+    rows = [struct.unpack_from('<IIQQQQIIQQ', data, shoff + i * width) for i in range(sections)]
+    strings = data[rows[names][4]:rows[names][4] + rows[names][5]]
+    for header in rows:
+        if strings[header[0]:].split(b'\0', 1)[0] == name:
+            return header[5]
+    return None
+
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--work', type=Path, required=True)
 p.add_argument('--binary', type=Path, default=Path('zig-out/bin/xodb'))
@@ -24,6 +37,7 @@ p.add_argument('--baseline', action='store_true')
 variants = p.add_mutually_exclusive_group()
 variants.add_argument('--eviction', action='store_true')
 variants.add_argument('--debug-frame', action='store_true', help='fast: preserve debug_frame without debug_info')
+variants.add_argument('--mixed', action='store_true', help='fast: eh_frame misses the walked PC; debug_frame remains')
 variants.add_argument('--budget', action='store_true', help='periodic: oversized CFI working set must refuse honestly')
 variants.add_argument('--companions', action='store_true')
 variants.add_argument('--large-companions', action='store_true')
@@ -58,7 +72,27 @@ if a.debug_frame:
                     '--remove-section=.debug_str', '--remove-section=.debug_line_str',
                     '--remove-section=.debug_loclists', '--remove-section=.debug_rnglists',
                     str(w/'library.so')], check=True, timeout=30)
-count = 66 if a.eviction else 4 if a.debug_frame or companions else 12
+elif a.mixed:
+    # anchor's .eh_frame does not cover walk. walk keeps .debug_frame only.
+    (w/'anchor.c').write_text('__attribute__((noinline)) void anchor(void) { __asm__ volatile("" ::: "memory"); }\n')
+    subprocess.run(['cc', '-O2', '-fPIC', '-c', '-fasynchronous-unwind-tables',
+                    str(w/'anchor.c'), '-o', str(w/'anchor.o')], check=True, timeout=30)
+    subprocess.run(['cc', '-O2', '-g', '-fPIC', '-c', '-fomit-frame-pointer', '-fno-optimize-sibling-calls',
+                    '-fno-asynchronous-unwind-tables', '-fno-unwind-tables',
+                    str(w/'library.c'), '-o', str(w/'walk.o')], check=True, timeout=30)
+    subprocess.run(['cc', '-shared', '-fPIC', '-Wl,--build-id=none',
+                    str(w/'anchor.o'), str(w/'walk.o'), '-o', str(w/'library.so')], check=True, timeout=30)
+    subprocess.run(['objcopy', '--remove-section=.debug_info', '--remove-section=.debug_abbrev',
+                    '--remove-section=.debug_aranges', '--remove-section=.debug_line',
+                    '--remove-section=.debug_str', '--remove-section=.debug_line_str',
+                    '--remove-section=.debug_loclists', '--remove-section=.debug_rnglists',
+                    str(w/'library.so')], check=True, timeout=30)
+    eh = section_size(w/'library.so', b'.eh_frame')
+    frame = section_size(w/'library.so', b'.debug_frame')
+    assert eh is not None and eh > 4, eh
+    assert frame not in (None, 0), frame
+    assert section_size(w/'library.so', b'.debug_info') is None
+count = 66 if a.eviction else 4 if a.debug_frame or a.mixed or companions else 12
 for i in range(count):
     path = w/f'lib{i:02}.so'
     shutil.copyfile(w/'library.so', path)
@@ -86,7 +120,7 @@ for i in range(count):
         struct.pack_into('<IIQQQQIIQQ', data, shoff+index*width, *h)
         with path.open('wb') as f:
             f.write(data); f.seek(h[4]); f.write(payload); f.truncate(h[4]+h[5])
-    elif not a.eviction and not a.debug_frame and not companions:
+    elif not a.eviction and not a.debug_frame and not a.mixed and not companions:
         with path.open('r+b') as f:
             f.truncate(64*1024*1024)
 fixture = w/'fixture'
@@ -114,7 +148,7 @@ def action(client, name, **arguments):
 
 # These variants were sized against a 256 MiB image and 512 MiB total budget.
 c = Client('control', str(fixture), args=[str(w), str(w/'oracle'), str(count), 'eviction' if a.eviction else 'chain'], options=['--image-limit', '256M', '--image-total-limit', '512M'])
-report = dict(status='running', baseline=a.baseline, eviction=a.eviction, budget=a.budget, debug_frame=a.debug_frame, companions=companions, full_dwarf=a.full_dwarf, stacks=[])
+report = dict(status='running', baseline=a.baseline, eviction=a.eviction, budget=a.budget, debug_frame=a.debug_frame, mixed=a.mixed, companions=companions, full_dwarf=a.full_dwarf, stacks=[])
 try:
     c.stopped()
     action(c, 'set_breakpoint', symbol='unwind_stop')
@@ -147,10 +181,11 @@ try:
         if not a.baseline:
             assert len(metadata) <= 64, metadata
             assert sum(j['retained_unwind_bytes'] for j in metadata) <= 128*1024*1024, metadata
-            if a.debug_frame:
+            if a.debug_frame or a.mixed:
                 assert all(f['unwind_method']=='debug_frame' for f in frames[2:2+count]), stack
+            if a.debug_frame:
                 assert not any(j['image'].endswith('lib00.so') for j in metadata), metadata
-            if index == 0 and not a.budget and not a.debug_frame and not a.full_dwarf:
+            if index == 0 and not a.budget and not a.debug_frame and not a.mixed and not a.full_dwarf:
                 assert any(j['image'].endswith('lib00.so') and j['state']=='ready' for j in metadata), metadata
                 original_id = next(j['id'] for j in metadata if j['image'].endswith('lib00.so'))
             if a.eviction and index == 2:
@@ -181,9 +216,25 @@ try:
             cursor = page['next']
             if cursor is None:
                 break
-        deferred = sorted({r['path'] for r in regions if r['full_image_deferred']})
-        assert len(deferred) > 1, deferred
-        report['deferred'] = deferred
+        if c.runtime_agent:
+            # Over the agent these callers stay on the bounded CFI view.
+            # DWARF source is present only after the full image is admitted.
+            # full_image_deferred marks a refusal, not a download, and a
+            # symbol view can set file_source without loading that image.
+            loaded = []
+            for item in report['stacks']:
+                frames = item['stack']['frames']
+                for frame in frames[2:2 + count]:
+                    if frame.get('source') is not None:
+                        loaded.append(frame.get('pc'))
+                    # These libraries have DWARF: never say NoDebugInfo here.
+                    assert frame.get('inline_diagnostic') == 'DebugMetadataNotLoaded', frame
+            assert not loaded, loaded
+            report['callers_loaded'] = []
+        else:
+            deferred = sorted({r['path'] for r in regions if r['full_image_deferred']})
+            assert len(deferred) > 1, deferred
+            report['deferred'] = deferred
     report.update(after=usage(c.p.pid), load=os.getloadavg(), status='pass')
 finally:
     if report['status'] != 'pass':
@@ -201,7 +252,7 @@ finally:
                 assert len(rejections) == count, rejections
                 for i in range(count):
                     assert sum(f'lib{i:02}.debug' in line for line in rejections) == 1, rejections
-            if a.full_dwarf:
+            if a.full_dwarf and not c.runtime_agent:
                 assert report['diagnostics'].count('module budget:') == 1, report['diagnostics']
     except BaseException:
         report['status'] = 'fail'

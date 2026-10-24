@@ -232,15 +232,18 @@ the direction (`outbound` when the packet's source is the socket's local end).
 
 All three tools are read-only and callable in every agent scope. Decrypted TLS
 bytes and mitmproxy headers, URLs and body bytes are private evidence: only the
-direct `observe`-scope MCP connection of the xodb process that opened the file
-can receive them. A controller, shared-session peer, `--listen` TCP client or
-remote worker receives counts and public protocol metadata; hashes of TLS
-plaintext and mitmproxy bodies are also null because they can confirm a guessed
-short value. An explicit private-payload request, a private protocol-text
-filter (HTTP `method`, DNS `dns_name`), or a mitmproxy `method` filter is
-refused. `--redact` also refuses every `include_raw` request, including packet
-bytes and decrypted content, and withholds private hashes, HTTP method/target,
-DNS names, mitmproxy headers and URL fields.
+direct `observe`-scope MCP connection of the xodb process that opened the
+evidence source can receive them. This includes the owning stdio session when
+its target uses `--runtime-agent` or `--runtime-ssh`: the local xodb session
+remains the opener of its live evidence. A controller, shared-session peer or
+`--listen` TCP client receives counts and public protocol metadata; hashes of
+TLS plaintext and mitmproxy bodies are also null because they can confirm a
+guessed short value. An explicit private-payload request, a private
+protocol-text filter (HTTP `method`, DNS `dns_name`), or a mitmproxy `method`
+filter is refused.
+`--redact` takes precedence for every transport: it refuses every `include_raw`
+request, including packet bytes and decrypted content, and withholds private
+hashes, HTTP method/target, DNS names, mitmproxy headers and URL fields.
 
 ## Archive storage (format 2.10)
 
@@ -288,6 +291,19 @@ The X2 fixture is an executable producer, not a capture file: it constructs
 classic-pcap bytes at runtime for synthetic 127.0.0.1 HTTP/1 and DNS exchanges.
 No tracked file begins with pcap/pcapng magic and no real interface is read by
 the test.
+
+Showing private evidence to the owning session over `--runtime-agent` and
+`--runtime-ssh` is an explicit product choice: the session that started the
+live capture is its direct observer. Over the agent the only private source is
+`--live-capture`, which runs on the local host, so the owner sees HTTP
+method/target, DNS names and `include_raw` packet bytes, as a local session
+does. Private ownership is currently inferred once from the MCP connection mode;
+it is not represented by an opener-bound capability. The accepted gap: any
+client that drives the owner's stdio MCP (for example a proxy that multiplexes
+several agents onto it) is treated as the owner. Known non-owner transports
+(shared-session peers and `--listen`) stay withheld, but a future transport
+that multiplexes owners and peers will need a capability bound to the client
+that opened the evidence stream before it can make the same distinction.
 
 ## Layout
 

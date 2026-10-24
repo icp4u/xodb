@@ -579,7 +579,16 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
         if (!mcp and shared == null) return;
     }
     const server = try a.create(Server);
-    const private_transport: @import("mcp/evidence.zig").Transport = if (listen != null) .listen else if (runtime_remote) .remote else .stdio;
+    // Only the session that owns a runtime-agent channel gets private evidence.
+    // Generic gdb-remote sessions remain fail-closed.
+    const private_transport: @import("mcp/evidence.zig").Transport = if (listen != null)
+        .listen
+    else if (runtime_agent != null or runtime_ssh != null)
+        .runtime_owner
+    else if (gdb_remote != null)
+        .unavailable
+    else
+        .stdio;
     server.* = .{
         .source_path = source,
         .overview_shared = if (shared) |*endpoint| endpoint.collector() else null,

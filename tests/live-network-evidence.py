@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 from client import Client
+from helpers.tasks import children as task_children
 
 
 root = Path(__file__).resolve().parents[1]
@@ -114,11 +115,18 @@ try:
         time.sleep(0.01)
     orphan_pid = int(pid_file.read_text())
     supervisor_pid = parent_of(orphan_pid)
+    # The agent lane gives xodb a second owned child. SIGKILL reparents both
+    # it and the capture supervisor to this subreaper, so retain every direct
+    # child now and reap each one after checking the capture exit rule.
+    adopted_pids = set(task_children(killed.p.pid))
+    assert supervisor_pid in adopted_pids, (supervisor_pid, adopted_pids)
     os.kill(killed.p.pid, 9)
     killed.p.wait(timeout=5)
     assert wait_gone(orphan_pid), f'capture tool {orphan_pid} outlived a SIGKILLed xodb'
     assert wait_gone(supervisor_pid), f'capture supervisor {supervisor_pid} outlived a SIGKILLed xodb'
-    os.waitpid(supervisor_pid, 0)
+    for pid in sorted(adopted_pids):
+        assert wait_gone(pid), f'owned child {pid} outlived a SIGKILLed xodb'
+        os.waitpid(pid, 0)
 finally:
     del os.environ['XODB_FAKE_CAPTURE_NO_PDEATHSIG']
     if killed.p.poll() is None:

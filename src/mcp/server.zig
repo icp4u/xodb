@@ -88,7 +88,7 @@ pub const Server = struct {
     overview_shared: ?*overview.State = null,
     overview_only: bool = false,
     overview_capture: ?*const ?*Session = null,
-    private_access: @import("evidence.zig").PrivateAccess = .init(.remote, false),
+    private_access: @import("evidence.zig").PrivateAccess = .init(.unavailable, false),
     pub fn overviewTick(self: *Server) !void {
         if (self.overview_shared == null) _ = try self.overview.tick(@import("../target/linux.zig").now(), 0, false);
     }

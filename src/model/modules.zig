@@ -88,6 +88,9 @@ pub const Modules = struct {
         companion_automatic: bool = true,
         companion: ?union(enum) { absent, found: *const @import("../binary/debug_files.zig").File, failure: anyerror } = null,
         metadata_only: ?bool = null,
+        /// Size of a full image the per-image budget refused. A remote file
+        /// crosses whole before that check; do not fetch it again to refuse.
+        refused_size: ?u64 = null,
     };
     const SymbolImage = struct {
         region: Region,
@@ -873,6 +876,11 @@ pub const Modules = struct {
             if (why == .frame) module.debug_sweep = false;
             return module;
         }
+        // Until the limit is raised, the answer is the same: refuse without reading.
+        if (self.identityIndex(region)) |i| if (self.identities.items[i].refused_size) |size| if (size > snapshot.per_image_limit) {
+            self.refusal = snapshot.refusal(size);
+            return error.BinarySnapshotLimit;
+        };
         const expected = if (self.core_source != null) try self.coreId(region.path) else null;
         const selected_path = if (self.core_executable) |exe| (if (expected != null and std.mem.eql(u8, expected.?, exe.id)) exe.path else region.path) else region.path;
         const path = try self.allocator.dupeZ(u8, selected_path);
@@ -930,7 +938,12 @@ pub const Modules = struct {
                 self.refusal = .{ .size = entry.size, .limit = @min(bound.?.each, snapshot.sweepLeft()), .which = .sweep, .sweep_each = bound.?.each };
                 return error.BinarySnapshotLimit;
             }
-            if (err == error.BinarySnapshotLimit) self.refusal = snapshot.refusal(entry.size);
+            if (err == error.BinarySnapshotLimit) {
+                self.refusal = snapshot.refusal(entry.size);
+                if (entry.size > snapshot.per_image_limit) if (self.identityIndex(region)) |i| {
+                    self.identities.items[i].refused_size = entry.size;
+                };
+            }
             return err;
         };
         errdefer snapshot.free(mapped);
@@ -1035,8 +1048,10 @@ pub const Modules = struct {
     }
     /// Keep ordinary stripped-library stack frames on the bounded CFI path.
     /// Full DWARF (including verified companions) retains source/inline views.
-    /// A remote caller is loaded whole only when it has .debug_frame and no
-    /// .eh_frame. Every other remote caller stays on the bounded CFI worker.
+    /// A remote caller is classified for a full load only when it has
+    /// .debug_frame and no usable .eh_frame. Usable .eh_frame stays on the
+    /// bounded worker; Session.stack retries one full load when that frame
+    /// does not cover the PC and the symbol view has .debug_frame.
     pub fn prefersUnwindMetadata(self: *Modules, address: u64) !bool {
         if (self.immutable or self.target == null) return false;
         const remote = rt.xrt_target_is_remote(self.target);
@@ -1066,6 +1081,19 @@ pub const Modules = struct {
             return !full;
         }
         return error.UnmappedAddress;
+    }
+    /// Whether the cached symbol view at `address` contains DWARF CFI.
+    /// False when that view was not opened: do not full-load on a guess.
+    pub fn symbolHasDebugFrame(self: *const Modules, address: u64) bool {
+        for (self.regions.items) |region| {
+            if (address < region.start or address >= region.end) continue;
+            for (self.symbol_images.items) |*item| {
+                if (!sameFile(item.region, region)) continue;
+                return item.image.sectionByName(".debug_frame") != null or item.image.sectionByName(".zdebug_frame") != null;
+            }
+            return false;
+        }
+        return false;
     }
     fn identityIndex(self: *const Modules, region: Region) ?usize {
         for (self.identities.items, 0..) |file, i| if (sameFile(file.region, region)) return i;

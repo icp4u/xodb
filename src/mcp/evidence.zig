@@ -12,7 +12,7 @@ const dbus = @import("../evidence/dbus.zig");
 const Value = std.json.Value;
 const Allocator = std.mem.Allocator;
 
-pub const Transport = enum { stdio, listen, session_socket, remote };
+pub const Transport = enum { unavailable, stdio, listen, session_socket, runtime_owner };
 
 pub const PrivateDecision = enum {
     allowed,
@@ -36,7 +36,7 @@ pub const PrivateDecision = enum {
 /// Connection-invariant inputs are captured once. Resolve the effective
 /// decision for each call so live scope changes revoke and restore access.
 pub const PrivateAccess = struct {
-    transport: Transport = .remote,
+    transport: Transport = .unavailable,
     redact: bool = false,
 
     pub fn init(transport: Transport, redact: bool) PrivateAccess {
@@ -45,19 +45,24 @@ pub const PrivateAccess = struct {
 
     pub fn resolve(self: PrivateAccess, observer: bool) PrivateDecision {
         if (self.redact) return .redacted;
-        return if (self.transport == .stdio and observer) .allowed else .unavailable;
+        const owner = self.transport == .stdio or self.transport == .runtime_owner;
+        return if (owner and observer) .allowed else .unavailable;
     }
 };
 
-test "private evidence access follows live scope for every MCP transport" {
+test "private evidence access follows live scope and connection ownership" {
     const local = PrivateAccess.init(.stdio, false);
     try std.testing.expectEqual(PrivateDecision.allowed, local.resolve(true));
     try std.testing.expectError(error.PrivateEvidenceUnavailable, local.resolve(false).payload(true));
     try std.testing.expectEqual(PrivateDecision.allowed, local.resolve(true));
+    const runtime_owner = PrivateAccess.init(.runtime_owner, false);
+    try std.testing.expectEqual(PrivateDecision.allowed, runtime_owner.resolve(true));
+    try std.testing.expectError(error.PrivateEvidenceUnavailable, runtime_owner.resolve(false).payload(true));
     try std.testing.expectError(error.PrivateEvidenceUnavailable, PrivateAccess.init(.listen, false).resolve(true).payload(true));
     try std.testing.expectError(error.PrivateEvidenceUnavailable, PrivateAccess.init(.session_socket, false).resolve(true).payload(true));
-    try std.testing.expectError(error.PrivateEvidenceUnavailable, PrivateAccess.init(.remote, false).resolve(true).payload(true));
+    try std.testing.expectError(error.PrivateEvidenceUnavailable, PrivateAccess.init(.unavailable, false).resolve(true).payload(true));
     try std.testing.expectError(error.RawPayloadRedacted, PrivateAccess.init(.stdio, true).resolve(true).payload(true));
+    try std.testing.expectError(error.RawPayloadRedacted, PrivateAccess.init(.runtime_owner, true).resolve(true).payload(true));
 }
 
 pub fn handles(name: []const u8) bool {

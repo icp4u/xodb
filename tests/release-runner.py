@@ -147,8 +147,9 @@ class RunnerTests(unittest.TestCase):
         for tier in ('host', 'all'):
             steps = {name: cmd for name, cmd, _ in gate.plan(tier)}
             self.assertIn('tests/module-symbols.py', steps['module-symbols'])
-            for variant in ('chain', 'debug-frame', 'companions'):
+            for variant in ('chain', 'debug-frame', 'companions', 'mixed'):
                 self.assertIn('tests/module-unwind.py', steps['module-unwind-'+variant])
+            self.assertIn('--mixed', steps['module-unwind-mixed'])
             self.assertNotIn('module-unwind-eviction', steps)
             self.assertNotIn('module-unwind-eviction-agent-lane', steps)
         for tier in ('periodic', 'periodic-gui'):
@@ -678,6 +679,20 @@ class RunnerTests(unittest.TestCase):
         self.assertIn('Redot debugger', redot_why['redot-protocol'])
         self.assertIn('no target', redot_why['gdscript-demo'])
         self.assertIn(gate.AGENT_INELIGIBLE['core-debugging'], dict(notes)['core-debugging'])
+        # These three are periodic steps. The host lane never schedules them.
+        # Their agent forms are omitted from the periodic plan, with a reason.
+        moved, moved_notes = gate.apply_agent_lane(gate.plan('host', moved=True))
+        moved_names = [step.name for step in moved]
+        moved_why = dict(moved_notes)
+        self.assertNotIn('macos-names-matrix-agent-lane', moved_names)
+        self.assertIn('a GDB remote replay stub', moved_why['macos-names-matrix'])
+        self.assertNotIn('m2-sampled-agent-lane', moved_names)
+        self.assertNotIn('m2-limits-agent-lane', moved_names)
+        self.assertIn('does not read the lane switch', moved_why['m2-sampled'])
+        self.assertIn('does not read the lane switch', moved_why['m2-limits'])
+        for variant in ('chain', 'debug-frame', 'companions', 'mixed'):
+            self.assertIn('module-unwind-' + variant + '-agent-lane', names)
+        self.assertNotIn('module-unwind-eviction', gate.AGENT_INELIGIBLE)
         self.assertNotIn('memory-search-speed', names)
         self.assertIn('memory-search-speed-agent', names)
         self.assertNotIn('memory-search-speed-agent-lane', names)
@@ -691,6 +706,10 @@ class RunnerTests(unittest.TestCase):
         self.assertIn('run-control-agent-lane', periodic_names)
         self.assertNotIn('core-debugging-agent-lane', periodic_names)
         self.assertNotIn('runtime-host-agent-lane', periodic_names)
+        self.assertNotIn('macos-names-matrix-agent-lane', periodic_names)
+        self.assertNotIn('m2-sampled-agent-lane', periodic_names)
+        self.assertNotIn('m2-limits-agent-lane', periodic_names)
+        self.assertIn('module-unwind-eviction-agent-lane', periodic_names)
         self.assertNotIn('memory-search-speed-agent-lane', periodic_names)
         self.assertNotIn('run-control-agent-lane', {step.name for step in gate.plan('periodic', headless=True)})
         present = set(periodic_names)

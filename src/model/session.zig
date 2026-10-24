@@ -2264,40 +2264,59 @@ pub const Session = struct {
                 frame.module_id = symbol.module_id;
             } else |_| {}
             const step: info.Unwind = step: {
-                // A remote caller downloads its library only when classification
+                // A remote caller downloads its library when classification
                 // says it has .debug_frame and no usable .eh_frame. Other remote
-                // callers stay on the bounded CFI worker.
-                const module = (if (metadata_only) self.modules.cachedAt(frame.lookup_pc) else self.modules.at(frame.lookup_pc)) catch |err| {
-                    if (err == error.PeDebugInfoUnavailable and arch_ == .x86_64) {
-                        frame.inline_diagnostic = "PeDebugInfoUnavailable";
-                        const image = self.modules.peAt(pc) catch |pe_error| {
-                            frame.diagnostic = @errorName(pe_error);
-                            try frames.append(a, frame);
-                            break :stack_walk;
-                        };
-                        frame.module_id = image.id;
-                        frame.source = self.sourceAt(a, frame.lookup_pc) catch null;
-                        break :step image.unwind(self.target.handle.?, pc, registers) catch |pe_error| {
-                            frame.diagnostic = @errorName(pe_error);
-                            try frames.append(a, frame);
-                            break :stack_walk;
-                        };
+                // callers stay on the bounded CFI worker unless that .eh_frame
+                // misses this PC and the symbol view has .debug_frame.
+                const module = module: {
+                    if (if (metadata_only) self.modules.cachedAt(frame.lookup_pc) else self.modules.at(frame.lookup_pc)) |found| {
+                        break :module found;
+                    } else |err| {
+                        if (err == error.PeDebugInfoUnavailable and arch_ == .x86_64) {
+                            frame.inline_diagnostic = "PeDebugInfoUnavailable";
+                            const image = self.modules.peAt(pc) catch |pe_error| {
+                                frame.diagnostic = @errorName(pe_error);
+                                try frames.append(a, frame);
+                                break :stack_walk;
+                            };
+                            frame.module_id = image.id;
+                            frame.source = self.sourceAt(a, frame.lookup_pc) catch null;
+                            break :step image.unwind(self.target.handle.?, pc, registers) catch |pe_error| {
+                                frame.diagnostic = @errorName(pe_error);
+                                try frames.append(a, frame);
+                                break :stack_walk;
+                            };
+                        }
+                        if ((err == error.BinarySnapshotLimit or err == error.DebugMetadataNotLoaded) and self.target.core == null) {
+                            // Lazy callers can still have an explicit source/locals
+                            // refusal. Do not hide that known budget behind NoDebugInfo.
+                            // A remote caller can have DWARF and still be unloaded.
+                            // NoDebugInfo is only for a local metadata-only frame.
+                            frame.inline_diagnostic = if (self.modules.budgetFailure(frame.lookup_pc)) |failure|
+                                failure.diagnostic
+                            else if (metadata_only and !remote_caller) "NoDebugInfo" else @errorName(err);
+                            if (self.metadata.unwind(self, a, frame.lookup_pc, registers)) |unwound| {
+                                break :step unwound;
+                            } else |metadata_error| {
+                                // A real .eh_frame can miss this PC. One full load then
+                                // uses .debug_frame. Do not try the worker again.
+                                if (metadata_error == error.NoUnwindInfo and remote_caller and self.modules.symbolHasDebugFrame(frame.lookup_pc)) {
+                                    frame.inline_diagnostic = null;
+                                    break :module (self.modules.at(frame.lookup_pc) catch |load_error| {
+                                        frame.diagnostic = @errorName(load_error);
+                                        try frames.append(a, frame);
+                                        break :stack_walk;
+                                    });
+                                }
+                                frame.diagnostic = @errorName(metadata_error);
+                                try frames.append(a, frame);
+                                break :stack_walk;
+                            }
+                        }
+                        frame.diagnostic = @errorName(err);
+                        try frames.append(a, frame);
+                        break :stack_walk;
                     }
-                    if ((err == error.BinarySnapshotLimit or err == error.DebugMetadataNotLoaded) and self.target.core == null) {
-                        // Lazy callers can still have an explicit source/locals
-                        // refusal. Do not hide that known budget behind NoDebugInfo.
-                        frame.inline_diagnostic = if (self.modules.budgetFailure(frame.lookup_pc)) |failure|
-                            failure.diagnostic
-                        else if (metadata_only) "NoDebugInfo" else @errorName(err);
-                        break :step self.metadata.unwind(self, a, frame.lookup_pc, registers) catch |metadata_error| {
-                            frame.diagnostic = @errorName(metadata_error);
-                            try frames.append(a, frame);
-                            break :stack_walk;
-                        };
-                    }
-                    frame.diagnostic = @errorName(err);
-                    try frames.append(a, frame);
-                    break :stack_walk;
                 };
                 module.debug_sweep = false;
                 frame.module_id = module.id;
