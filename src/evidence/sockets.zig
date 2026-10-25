@@ -54,15 +54,36 @@ pub const max_processes = 1024;
 pub const max_tables = 8;
 pub const max_pairs = 8;
 
+pub const JoinRefusal = enum {
+    missing_network_context,
+    missing_usb_context,
+    record_without_tuple,
+    not_collected_remote,
+
+    pub fn render(self: JoinRefusal) []const u8 {
+        return switch (self) {
+            .missing_network_context => "no capture context: open with --open-capture an archive recorded with socket tables",
+            .missing_usb_context => "no capture context: open with --open-capture an archive containing USB fd tables",
+            .record_without_tuple => "record has no 5-tuple (undecoded, or not TCP/UDP)",
+            .not_collected_remote => "not collected: remote",
+        };
+    }
+};
+
 pub const Collection = enum(u8) {
     collected,
     not_collected_remote,
 
-    pub fn reason(self: Collection) ?[]const u8 {
+    pub fn joinRefusal(self: Collection) ?JoinRefusal {
         return switch (self) {
             .collected => null,
-            .not_collected_remote => "not collected: remote",
+            .not_collected_remote => .not_collected_remote,
         };
+    }
+
+    pub fn reason(self: Collection) ?[]const u8 {
+        const refusal = self.joinRefusal() orelse return null;
+        return refusal.render();
     }
 };
 
@@ -80,17 +101,17 @@ pub const Context = struct {
 
     pub const JoinPrecondition = union(enum) {
         ready: *const Context,
-        unavailable: []const u8,
+        unavailable: JoinRefusal,
     };
 
     /// Resolve the context shared by network and USB joins. A caller may
     /// supply a record-specific refusal that is more useful than the
     /// collection state. It comes after a missing-context refusal, preserving
     /// the established order: no context, invalid record, then not collected.
-    pub fn joinPrecondition(context: *const ?Context, missing_context: []const u8, record_unavailable: ?[]const u8) JoinPrecondition {
+    pub fn joinPrecondition(context: *const ?Context, missing_context: JoinRefusal, record_unavailable: ?JoinRefusal) JoinPrecondition {
         const ctx = if (context.*) |*value| value else return .{ .unavailable = missing_context };
-        if (record_unavailable) |reason| return .{ .unavailable = reason };
-        if (ctx.collection.reason()) |reason| return .{ .unavailable = reason };
+        if (record_unavailable) |refusal| return .{ .unavailable = refusal };
+        if (ctx.collection.joinRefusal()) |refusal| return .{ .unavailable = refusal };
         return .{ .ready = ctx };
     }
 
@@ -98,6 +119,37 @@ pub const Context = struct {
         return clock.fromPairs(self.pairs);
     }
 };
+
+test "join preconditions use typed refusals in precedence order" {
+    const collected = Context{ .capture_started_ns = 1, .pid = 7, .pairs = &.{}, .tables = &.{} };
+    const remote = Context{ .capture_started_ns = 1, .pid = 7, .pairs = &.{}, .tables = &.{}, .collection = .not_collected_remote };
+    const Case = struct {
+        context: ?Context,
+        missing: JoinRefusal,
+        record: ?JoinRefusal,
+        expected: ?JoinRefusal,
+        expected_text: ?[]const u8,
+    };
+    var cases = [_]Case{
+        .{ .context = null, .missing = .missing_network_context, .record = .record_without_tuple, .expected = .missing_network_context, .expected_text = "no capture context: open with --open-capture an archive recorded with socket tables" },
+        .{ .context = null, .missing = .missing_usb_context, .record = null, .expected = .missing_usb_context, .expected_text = "no capture context: open with --open-capture an archive containing USB fd tables" },
+        .{ .context = remote, .missing = .missing_network_context, .record = .record_without_tuple, .expected = .record_without_tuple, .expected_text = "record has no 5-tuple (undecoded, or not TCP/UDP)" },
+        .{ .context = remote, .missing = .missing_network_context, .record = null, .expected = .not_collected_remote, .expected_text = "not collected: remote" },
+        .{ .context = collected, .missing = .missing_network_context, .record = .record_without_tuple, .expected = .record_without_tuple, .expected_text = "record has no 5-tuple (undecoded, or not TCP/UDP)" },
+        .{ .context = collected, .missing = .missing_network_context, .record = null, .expected = null, .expected_text = null },
+    };
+    for (&cases) |*case| switch (Context.joinPrecondition(&case.context, case.missing, case.record)) {
+        .unavailable => |got| {
+            const expected = case.expected orelse return error.TestExpectedReady;
+            try std.testing.expectEqual(expected, got);
+            try std.testing.expectEqualStrings(case.expected_text.?, got.render());
+        },
+        .ready => |ctx| {
+            if (case.expected != null) return error.TestExpectedRefusal;
+            try std.testing.expectEqual(Collection.collected, ctx.collection);
+        },
+    };
+}
 
 // ------------------------------------------------------------- /proc/net
 

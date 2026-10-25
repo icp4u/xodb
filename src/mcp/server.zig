@@ -471,7 +471,7 @@ pub const Server = struct {
                 if (std.mem.eql(u8, name, read)) break;
             } else return error.OfflineSession;
         }
-        if (std.mem.eql(u8, name, "list_locals")) return @import("locals_list.zig").call(a, session, args);
+        if (std.mem.eql(u8, name, "list_locals")) return @import("locals_list.zig").call(a, session, args, &self.error_detail);
         if (std.mem.eql(u8, name, "list_modules")) return @import("module_list.zig").call(a, session, args);
         if (args != .object) return error.InvalidArguments;
         var fields = args.object.iterator();
@@ -569,8 +569,7 @@ pub const Server = struct {
         if (std.mem.eql(u8, name, "get_source_location")) {
             const pc = try address(args);
             const site = session.sourceAt(a, pc) catch |err| {
-                if (err == error.BinarySnapshotLimit or err == error.CompressedDebugBudget)
-                    self.error_detail = if (session.modules.budgetDetail(pc)) |detail| try a.dupe(u8, detail) else null;
+                self.error_detail = try session.modules.debugDetail(a, pc, err);
                 return err;
             };
             return asValue(a, .{ .generation = session.target.snapshot().generation, .source = site });

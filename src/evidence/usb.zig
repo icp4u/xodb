@@ -217,11 +217,11 @@ pub const Stream = struct {
         const record = self.records[index];
         const ctx = switch (sockets.Context.joinPrecondition(
             &self.parent.context,
-            "no capture context: open with --open-capture an archive containing USB fd tables",
+            .missing_usb_context,
             null,
         )) {
             .ready => |ctx| ctx,
-            .unavailable => |reason| return .{ .reason = reason },
+            .unavailable => |refusal| return .{ .reason = refusal.render() },
         };
         return sockets.correlateUsb(ctx, record.bus, record.device, self.parent.timeOf(record.source_record).monotonic_ns);
     }

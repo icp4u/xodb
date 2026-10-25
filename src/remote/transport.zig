@@ -21,6 +21,7 @@ pub const c = @cImport({
 extern "c" fn connect(c_int, *const c.sockaddr, c.socklen_t) c_int;
 extern "c" fn bind(c_int, *const c.sockaddr, c.socklen_t) c_int;
 extern "c" fn accept4(c_int, ?*c.sockaddr, ?*c.socklen_t, c_int) c_int;
+extern "c" fn getsockname(c_int, *c.sockaddr, *c.socklen_t) c_int;
 extern "c" fn xodb_macos_spawn_ssh([*:null]const ?[*:0]const u8, c_int, c_int, *c.pid_t) c_int;
 const a = std.heap.page_allocator;
 pub fn now() u64 {
@@ -36,10 +37,10 @@ const Address = struct {
     storage: c.sockaddr_storage = std.mem.zeroes(c.sockaddr_storage),
     len: c.socklen_t,
     family: c_int,
-    fn parse(text: []const u8) !Address {
+    fn parse(text: []const u8, allow_zero_port: bool) !Address {
         const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return error.ExpectedNumericAddressAndPort;
         const port = std.fmt.parseInt(u16, text[colon + 1 ..], 10) catch return error.InvalidPort;
-        if (port == 0) return error.InvalidPort;
+        if (port == 0 and !allow_zero_port) return error.InvalidPort;
         var host = text[0..colon];
         const ipv6 = host.len > 2 and host[0] == '[' and host[host.len - 1] == ']';
         if (ipv6) host = host[1 .. host.len - 1];
@@ -58,6 +59,14 @@ const Address = struct {
             if (c.inet_pton(c.AF_INET, z, &addr.sin_addr) != 1) return error.ExpectedNumericAddressAndPort;
         }
         return result;
+    }
+    fn boundPort(self: *const Address) u16 {
+        if (self.family == c.AF_INET6) {
+            const address: *const c.sockaddr_in6 = @ptrCast(@alignCast(&self.storage));
+            return std.mem.bigToNative(u16, address.sin6_port);
+        }
+        const address: *const c.sockaddr_in = @ptrCast(@alignCast(&self.storage));
+        return std.mem.bigToNative(u16, address.sin_port);
     }
 };
 pub const Stream = struct {
@@ -87,7 +96,7 @@ pub const Stream = struct {
         }
     }
     pub fn tcp(endpoint: []const u8, cancel: *const std.atomic.Value(bool)) !Stream {
-        var address = try Address.parse(endpoint);
+        var address = try Address.parse(endpoint, false);
         const fd = if (macos) c.socket(address.family, c.SOCK_STREAM, 0) else c.socket(address.family, c.SOCK_STREAM | c.SOCK_CLOEXEC | c.SOCK_NONBLOCK, 0);
         if (fd < 0) return error.RemoteSocketFailed;
         errdefer _ = c.close(fd);
@@ -153,7 +162,7 @@ pub fn shellCommand(allocator: std.mem.Allocator, args: []const [:0]const u8) ![
 }
 /// Accept exactly one connection before touching the target. No daemon/reconnect.
 pub fn acceptOne(endpoint: []const u8, quitting: *volatile c.sig_atomic_t) !Stream {
-    var address = try Address.parse(endpoint);
+    var address = try Address.parse(endpoint, true);
     const fd = c.socket(address.family, c.SOCK_STREAM | c.SOCK_CLOEXEC | c.SOCK_NONBLOCK, 0);
     if (fd < 0) return error.RemoteSocketFailed;
     defer _ = c.close(fd);
@@ -161,7 +170,11 @@ pub fn acceptOne(endpoint: []const u8, quitting: *volatile c.sig_atomic_t) !Stre
     _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_REUSEADDR, &yes, @sizeOf(c_int));
     if (bind(fd, @ptrCast(&address.storage), address.len) < 0) return error.RemoteBindFailed;
     if (c.listen(fd, 1) < 0) return error.RemoteListenFailed;
-    log.warn(.runtime, "xodb: listening on {s}; one client, plaintext TCP without authentication\n", .{endpoint});
+    if (getsockname(fd, @ptrCast(&address.storage), &address.len) < 0) return error.RemoteBoundAddressFailed;
+    const bound_port = address.boundPort();
+    if (bound_port == 0) return error.RemoteBoundAddressFailed;
+    const colon = std.mem.lastIndexOfScalar(u8, endpoint, ':').?;
+    log.warn(.runtime, "xodb: listening on {s}:{d}; one client, plaintext TCP without authentication\n", .{ endpoint[0..colon], bound_port });
     while (quitting.* == 0) {
         var p = c.pollfd{ .fd = fd, .events = c.POLLIN, .revents = 0 };
         if (c.poll(&p, 1, 50) <= 0) continue;
@@ -182,10 +195,11 @@ test "SSH arguments preserve shell metacharacters and quotes literally" {
     try std.testing.expectEqualStrings("exec '/a b/xodb' 'a'\\''b' '$(touch nope);`echo nope`' ''", command);
 }
 test "TCP endpoint requires explicit numeric address and nonzero port" {
-    _ = try Address.parse("127.0.0.1:4317");
-    _ = try Address.parse("[::1]:4317");
-    try std.testing.expectError(error.ExpectedNumericAddressAndPort, Address.parse("jetty:4317"));
-    try std.testing.expectError(error.InvalidPort, Address.parse("127.0.0.1:0"));
+    _ = try Address.parse("127.0.0.1:4317", false);
+    _ = try Address.parse("[::1]:4317", false);
+    try std.testing.expectError(error.ExpectedNumericAddressAndPort, Address.parse("jetty:4317", false));
+    try std.testing.expectError(error.InvalidPort, Address.parse("127.0.0.1:0", false));
+    try std.testing.expectEqual(@as(u16, 0), (try Address.parse("127.0.0.1:0", true)).boundPort());
 }
 
 fn tuneTcp(fd: c_int) void {

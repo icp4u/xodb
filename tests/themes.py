@@ -3,8 +3,8 @@
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
-import socket
 import subprocess
 import time
 from PIL import Image
@@ -112,15 +112,12 @@ try:
     # Reuse the private compositor for the separate remote GUI and a loopback server.
     d.app.stdin.close()
     d.app.wait(timeout=5)
-    listener = socket.socket()
-    listener.bind(('127.0.0.1', 0))
-    port = listener.getsockname()[1]
-    listener.close()
     server_log = work / 'server.log'
     with server_log.open('wb') as log:
-        server = subprocess.Popen([str(root / 'zig-out/bin/xodb'), '--headless', '--mcp', '--listen', f'127.0.0.1:{port}', '--', str(root / 'zig-out/bin/xodb-m1-fixture'), 'w'], env=d.env, stdout=log, stderr=log)
+        server = subprocess.Popen([str(root / 'zig-out/bin/xodb'), '--headless', '--mcp', '--listen', '127.0.0.1:0', '--', str(root / 'zig-out/bin/xodb-m1-fixture'), 'w'], env=d.env, stdout=log, stderr=log)
     d.procs.append(server)
     wait_for(lambda: 'listening on' in server_log.read_text())
+    port = int(re.search(r'^xodb: listening on 127\.0\.0\.1:([0-9]+); ', server_log.read_text(), re.M).group(1))
     remote_log = work / 'remote.log'
     with remote_log.open('wb') as log:
         remote = subprocess.Popen([str(root / 'zig-out/bin/xodb'), '--connect', f'127.0.0.1:{port}', '--theme', str(path)], env=d.env, stdout=log, stderr=log)

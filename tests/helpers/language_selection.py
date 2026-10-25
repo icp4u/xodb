@@ -26,6 +26,20 @@ def check_layout(display, language, reason=None):
 def check_native_values(display, tid, language, label):
     generation = display.session()['generation']
     display.tool('select_native_frame', generation=generation, tid=tid, frame=0)
+    # A mapped/focused GUI and a stopped target do not prove that the
+    # incremental language probe has reached this runtime yet.
+    deadline = time.monotonic() + 180
+    readiness_polls = 0
+    while True:
+        readiness_polls += 1
+        reply = display.tool('get_language_tabs', generation=generation)
+        assert reply['generation'] == generation, reply
+        tabs = reply['view']
+        if any(t['tab'] == language and t['visible'] and t['status'] == 'ready' for t in tabs['tabs']): break
+        # A finished probe that rules the runtime out will not change while stopped.
+        assert not (tabs.get('complete') and any(t['tab'] == language and t['status'] in ('absent', 'disabled', 'not_requested') for t in tabs['tabs'])), tabs
+        assert time.monotonic() < deadline, tabs
+        time.sleep(.03)
     display.tool('select_language_tab', generation=generation, tab=language)
     locals_ = display.tool('list_locals', tid=tid, frame=0)['locals']
     values = [v for v in locals_ if v['value'].get('visualization') and v['value']['visualization'].get(language)]
@@ -51,16 +65,9 @@ def check_native_values(display, tid, language, label):
         time.sleep(.1)
     Path(screenshot+'.native-ocr.txt').write_text(text)
     check_layout(display, language)
-    return {'name':values[0]['name'], 'display':values[0]['value']['display'], 'count':len(values)}
+    return {'name':values[0]['name'], 'display':values[0]['value']['display'], 'count':len(values), 'readiness_polls':readiness_polls}
 
 def check(display, tid, language, label):
-    deadline = time.monotonic() + 180
-    while True:
-        tabs = display.tool('get_language_tabs')['view']
-        if any(t['tab'] == language and t['visible'] and t['status'] == 'ready' for t in tabs['tabs']):
-            break
-        assert time.monotonic() < deadline, tabs
-        time.sleep(.03)
     native_values = check_native_values(display, tid, language, label)
     generation = display.session()['generation']
     registers = display.tool('get_registers', tid=tid)

@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+"""Fail when Zig calls a translated C function that takes or returns a
+multi-field struct of 16 bytes or less by value.
+
+Translated headers are classified from their cimport (host LP64 size and the
+flattened scalar leaves: an array counts each element, a nested struct its
+leaves, a union one leaf). A struct of 16 bytes or less with two or more
+leaves is reported; two 8-byte leaves (the {u64,u64} shape) pass. So a single
+array or nested-struct field ({u32 v[2]}, {struct {u32,u32} x}) is reported,
+while a single scalar, a bare union and anything over 16 bytes pass. A direct
+c.name() call, a function-pointer call and the use of a translated
+function-pointer typedef are all reported. A pointer to the struct is not.
+
+The host step stays red while src/platform/x11.zig calls the roots iterator
+by value. Zig functions that C calls are not this check.
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+
+unions = set()
+fnptrs = {}
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+INTS = {
+    "u8": 1, "i8": 1, "u16": 2, "i16": 2, "u32": 4, "i32": 4, "u64": 8, "i64": 8,
+    "c_char": 1, "c_schar": 1, "c_uchar": 1, "c_short": 2, "c_ushort": 2,
+    "c_int": 4, "c_uint": 4, "c_long": 8, "c_ulong": 8, "c_longlong": 8,
+    "c_ulonglong": 8, "usize": 8, "isize": 8, "f32": 4, "f64": 8, "bool": 1,
+}
+PROTOCOLS = (
+    ("/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml", "xdg-shell-client-protocol.h"),
+    ("/usr/share/wayland-protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml", "xdg-decoration-unstable-v1-client-protocol.h"),
+    ("/usr/share/wayland-protocols/unstable/primary-selection/primary-selection-unstable-v1.xml", "primary-selection-unstable-v1-client-protocol.h"),
+    ("/usr/share/wayland-protocols/staging/cursor-shape/cursor-shape-v1.xml", "cursor-shape-v1-client-protocol.h"),
+    ("/usr/share/wayland-protocols/stable/linux-dmabuf/linux-dmabuf-v1.xml", "linux-dmabuf-v1-client-protocol.h"),
+    ("/usr/share/wayland-protocols/staging/fractional-scale/fractional-scale-v1.xml", "fractional-scale-v1-client-protocol.h"),
+    ("/usr/share/wayland-protocols/stable/viewporter/viewporter.xml", "viewporter-client-protocol.h"),
+    ("/usr/share/wayland-protocols/stable/presentation-time/presentation-time.xml", "presentation-time-client-protocol.h"),
+)
+
+
+def extract_blocks(text):
+    key = "@cImport("
+    out = []
+    i = 0
+    while True:
+        j = text.find(key, i)
+        if j < 0:
+            break
+        depth = 0
+        p = j + len(key) - 1
+        while p < len(text):
+            if text[p] == "(":
+                depth += 1
+            elif text[p] == ")":
+                depth -= 1
+                if depth == 0:
+                    out.append(text[j + len(key):p])
+                    i = p + 1
+                    break
+            p += 1
+        else:
+            break
+    return out
+
+
+def zig_sources(extra):
+    if extra:
+        return [os.path.abspath(p) for p in extra]
+    found = []
+    for dirpath, dirs, files in os.walk(os.path.join(ROOT, "src")):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for name in files:
+            if name.endswith(".zig") and "abi_lint_gen" not in name:
+                found.append(os.path.join(dirpath, name))
+    return found
+
+
+def protocols(dest):
+    os.makedirs(dest, exist_ok=True)
+    scanner = "wayland-scanner"
+    if subprocess.call(["sh", "-c", "command -v wayland-scanner >/dev/null"]) != 0:
+        return
+    for xml, name in PROTOCOLS:
+        if not os.path.isfile(xml):
+            continue
+        out = os.path.join(dest, name)
+        if not os.path.isfile(out):
+            subprocess.check_call([scanner, "client-header", xml, out])
+
+
+def include_flags(proto):
+    flags = []
+    for dirpath, dirs, _files in os.walk(os.path.join(ROOT, "src")):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        flags.extend(["-I", dirpath])
+    if os.path.isdir(proto):
+        flags.extend(["-I", proto])
+    for lib in ("vulkan", "freetype2", "xkbcommon", "xcb", "harfbuzz"):
+        got = subprocess.run(["pkg-config", "--cflags", lib], capture_output=True, text=True)
+        if got.returncode == 0:
+            flags.extend(a for a in got.stdout.split() if a.startswith("-I"))
+    return flags
+
+
+def compile_blocks(blocks, includes, env, gen_dir):
+    os.makedirs(gen_dir, exist_ok=True)
+    failed = []
+
+    def one(group, tag):
+        parts = [
+            "const gui: bool = true;\n",
+            "const macos = @import(\"builtin\").os.tag == .macos;\n",
+        ]
+        for n, (_origin, body) in enumerate(group):
+            parts.append(f"const c{n} = @cImport({body});\n")
+        parts.append("export fn abi_lint_use() void {\n")
+        for n in range(len(group)):
+            parts.append(f"    _ = c{n};\n")
+        parts.append("}\n")
+        path = os.path.join(gen_dir, tag + ".zig")
+        obj = os.path.join(gen_dir, tag + ".o")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("".join(parts))
+        cmd = ["zig", "build-obj", "-lc", "-ODebug", "-femit-bin=" + obj, path, *includes]
+        ran = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True)
+        if ran.returncode != 0:
+            sys.stderr.write(ran.stderr[-4000:])
+            return False
+        return True
+
+    if one(blocks, "all"):
+        return []
+    sys.stderr.write("abi-lint: combined translate failed; retrying each block\n")
+    for n, block in enumerate(blocks):
+        if not one([block], f"b{n}"):
+            failed.append(block[0])
+            sys.stderr.write(f"abi-lint: translate failed {block[0]}\n")
+    return failed
+
+
+def parse_cimports(cache_dirs):
+    structs, aliases, enums, funcs = {}, {}, {}, {}
+    serial = 0
+    struct_re = re.compile(r"^(?:pub )?const (\w+) = extern (struct|union) \{")
+    fnptr_re = re.compile(r"^pub const (\w+) = \?\*const fn \((.*)\) callconv\(\.c\) (.+);$")
+    alias_re = re.compile(r"^pub const (\w+) = (\w+);$")
+    enum_re = re.compile(r"^pub const (\w+) = enum\((\w+)\) \{")
+    for cache in cache_dirs:
+        for dirpath, _dirs, files in os.walk(cache):
+            if "cimport.zig" not in files:
+                continue
+            text = open(os.path.join(dirpath, "cimport.zig"), encoding="utf-8", errors="replace").read()
+            # File-local names (union_unnamed_N, ...) repeat across cimports.
+            serial += 1
+            for local in set(re.findall(r"^const (\w+) = extern ", text, re.M)):
+                text = re.sub(r"\b" + local + r"\b", f"{local}__{serial}", text)
+            lines = text.splitlines()
+            i = 0
+            while i < len(lines):
+                line = lines[i]
+                matched = struct_re.match(line) or enum_re.match(line)
+                if struct_re.match(line):
+                    name = struct_re.match(line).group(1)
+                    depth = line.count("{") - line.count("}")
+                    buf = [line]
+                    while depth > 0 and i + 1 < len(lines):
+                        i += 1
+                        buf.append(lines[i])
+                        depth += lines[i].count("{") - lines[i].count("}")
+                    inner = "\n".join(buf).split("{", 1)[1].rsplit("}", 1)[0]
+                    fields = []
+                    for raw in inner.splitlines():
+                        fls = raw.strip()
+                        if not fls or fls.startswith("pub const") or fls.startswith("//"):
+                            continue
+                        fm = re.match(r"([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.+?)(?:\s*=\s*.+)?\s*,?\s*$", fls)
+                        if fm:
+                            fields.append((fm.group(1), fm.group(2).strip().rstrip(",")))
+                    structs[name] = fields
+                    if struct_re.match(line).group(2) == "union":
+                        unions.add(name)
+                elif enum_re.match(line):
+                    enums[enum_re.match(line).group(1)] = enum_re.match(line).group(2)
+                elif fnptr_re.match(line):
+                    fm = fnptr_re.match(line)
+                    fnptrs[fm.group(1)] = (fm.group(2), fm.group(3).strip())
+                elif alias_re.match(line) and alias_re.match(line).group(1) != alias_re.match(line).group(2):
+                    aliases[alias_re.match(line).group(1)] = alias_re.match(line).group(2)
+                elif line.startswith("pub extern fn "):
+                    buf = line
+                    while ";" not in buf and i + 1 < len(lines):
+                        i += 1
+                        buf += lines[i]
+                    fm = re.match(r"pub extern fn (\w+)\((.*)\) (.+);$", buf)
+                    if fm:
+                        funcs[fm.group(1)] = (fm.group(2), fm.group(3).strip())
+                i += 1
+    return structs, aliases, enums, funcs
+
+
+def resolve(name, aliases, structs, enums, seen=()):
+    if name in structs or name in INTS or name in enums:
+        return name
+    if name in aliases and name not in seen:
+        return resolve(aliases[name], aliases, structs, enums, seen + (name,))
+    return name
+
+
+def is_ptr(t):
+    t = t.strip()
+    if t.startswith("const "):
+        t = t[6:].strip()
+    return t.startswith("*") or t.startswith("?*") or t.startswith("[*") or t.startswith("?[*")
+
+
+def sizeof(t, structs, aliases, enums, seen=()):
+    t = t.strip()
+    if not t or is_ptr(t):
+        return (8, 8) if t else (None, None)
+    am = re.match(r"^\[(\d+)\](.+)$", t)
+    if am:
+        es, ea = sizeof(am.group(2).strip(), structs, aliases, enums, seen)
+        if es is None:
+            return (None, None)
+        return (int(am.group(1)) * es, ea)
+    if t in INTS:
+        return (INTS[t], INTS[t])
+    name = resolve(t, aliases, structs, enums)
+    if name in INTS:
+        return (INTS[name], INTS[name])
+    if name in enums:
+        return sizeof(enums[name], structs, aliases, enums, seen + (name,))
+    if name in structs:
+        if name in seen:
+            return (None, None)
+        off, mal = 0, 1
+        for _fn, ft in structs[name]:
+            fs, fa = sizeof(ft, structs, aliases, enums, seen + (name,))
+            if fs is None:
+                return (None, None)
+            if name in unions:
+                off = max(off, fs)
+            else:
+                off = (off + fa - 1) // fa * fa
+                off += fs
+            mal = max(mal, fa)
+        return ((off + mal - 1) // mal * mal, mal)
+    return (None, None)
+
+
+def leaves(t, structs, aliases, enums, seen=()):
+    """Scalar leaf sizes of t, flattened; a union is one leaf."""
+    t = t.strip()
+    am = re.match(r"^\[(\d+)\](.+)$", t)
+    if am:
+        one = leaves(am.group(2), structs, aliases, enums, seen)
+        return None if one is None else one * int(am.group(1))
+    name = resolve(t, aliases, structs, enums)
+    if name in structs and name not in unions:
+        if name in seen:
+            return None
+        out = []
+        for _fn, ft in structs[name]:
+            one = leaves(ft, structs, aliases, enums, seen + (name,))
+            if one is None:
+                return None
+            out += one
+        return out
+    size, _al = sizeof(t, structs, aliases, enums)
+    return None if size is None else [size]
+
+
+def bad_types(structs, aliases, enums):
+    bad = set()
+    for name in structs:
+        if name in unions:
+            continue
+        size, _al = sizeof(name, structs, aliases, enums)
+        if size is None or size > 16:
+            continue
+        flat = leaves(name, structs, aliases, enums)
+        if flat is None or len(flat) < 2 or flat == [8, 8]:
+            continue
+        bad.add(name)
+    for alias, target in list(aliases.items()):
+        if resolve(target, aliases, structs, enums) in bad:
+            bad.add(alias)
+    return bad
+
+
+def type_is_bad(t, bad, aliases, structs, enums):
+    t = t.strip().rstrip(",")
+    if not t or t in ("void", "anyopaque", "anyerror"):
+        return False, None
+    if t.startswith("const "):
+        return type_is_bad(t[6:], bad, aliases, structs, enums)
+    if is_ptr(t):
+        return False, None
+    if t.startswith("?") and not t.startswith("?*") and not t.startswith("?["):
+        return type_is_bad(t[1:], bad, aliases, structs, enums)
+    leaf = t.split(".")[-1].strip()
+    name = resolve(leaf, aliases, structs, enums)
+    if name in bad or leaf in bad:
+        return True, leaf
+    return False, None
+
+
+def split_top(text, sep=","):
+    parts, depth, cur = [], 0, ""
+    for ch in text:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == sep and depth == 0:
+            parts.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        parts.append(cur.strip())
+    return parts
+
+
+def param_type(param):
+    param = param.strip()
+    if not param or param == "...":
+        return None
+    depth, cut = 0, None
+    for i, ch in enumerate(param):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == ":" and depth == 0:
+            cut = i
+    return param if cut is None else param[cut + 1:].strip()
+
+
+def signature_reasons(params, ret, bad, aliases, structs, enums):
+    reasons = []
+    bad_ret, leaf = type_is_bad(ret, bad, aliases, structs, enums)
+    if bad_ret:
+        reasons.append("returns " + leaf)
+    for param in split_top(params):
+        ty = param_type(param)
+        if not ty:
+            continue
+        bad_ty, leaf = type_is_bad(ty, bad, aliases, structs, enums)
+        if bad_ty:
+            reasons.append("takes " + leaf)
+    return reasons
+
+
+def fn_bad(funcs, bad, aliases, structs, enums):
+    found = {}
+    for name, (params, ret) in funcs.items():
+        reasons = signature_reasons(params, ret, bad, aliases, structs, enums)
+        if reasons:
+            found[name] = reasons
+    return found
+
+
+def mask(text):
+    chars = list(text)
+    i, n = 0, len(text)
+    while i < n:
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            for k in range(i, j):
+                chars[k] = " "
+            i = j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            for k in range(i, j):
+                chars[k] = " "
+            i = j
+        elif text[i] in "\"'":
+            q = text[i]
+            chars[i] = " "
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    chars[i] = " "
+                    if i + 1 < n:
+                        chars[i + 1] = " "
+                    i += 2
+                    continue
+                chars[i] = " "
+                if text[i] == q:
+                    i += 1
+                    break
+                i += 1
+        else:
+            i += 1
+    return "".join(chars)
+
+
+def parse_after_fn(text, fn_at):
+    i = fn_at + 2
+    while i < len(text) and text[i] in " \t\n":
+        i += 1
+    name = None
+    if i < len(text) and text[i] != "(":
+        j = i
+        while j < len(text) and (text[j].isalnum() or text[j] == "_"):
+            j += 1
+        name = text[i:j]
+        i = j
+        while i < len(text) and text[i] in " \t\n":
+            i += 1
+    if i >= len(text) or text[i] != "(":
+        return None
+    depth = 0
+    start = i
+    while i < len(text):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                params = text[start + 1:i]
+                i += 1
+                break
+        i += 1
+    else:
+        return None
+    while i < len(text) and text[i] in " \t\n":
+        i += 1
+    if not text.startswith("callconv(.c)", i):
+        return None
+    i += len("callconv(.c)")
+    while i < len(text) and text[i] in " \t\n":
+        i += 1
+    ret_s = i
+    depth = 0
+    while i < len(text):
+        ch = text[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif ch in ",;={\n" and depth == 0:
+            break
+        i += 1
+    return name, params, text[ret_s:i].strip()
+
+
+def field_before(text, fn_at):
+    chunk = text[max(0, fn_at - 160):fn_at]
+    found = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*(?::|=)\s*(?:\*+\s*const\s+|\*+\s*)?$", chunk)
+    return found.group(1) if found else None
+
+
+def scan_file(path, bad, fns, ptr_fns, aliases, structs, enums):
+    raw = open(path, encoding="utf-8", errors="replace").read()
+    text = mask(raw)
+    rel = os.path.relpath(path, ROOT)
+    hits = []
+    callees = {}
+    for match in re.finditer(r"\bfn\b", text):
+        parsed = parse_after_fn(text, match.start())
+        if not parsed or parsed[0] is not None:
+            continue
+        _name, params, ret = parsed
+        reasons = signature_reasons(params, ret, bad, aliases, structs, enums)
+        if not reasons:
+            continue
+        field = field_before(text, match.start())
+        if field:
+            callees.setdefault(field, reasons)
+    reported = set()
+    for field, reasons in callees.items():
+        for call in re.finditer(r"(?<![\w])" + re.escape(field) + r"\s*\(", text):
+            line = text.count("\n", 0, call.start()) + 1
+            key = (line, field)
+            if key in reported:
+                continue
+            reported.add(key)
+            hits.append(f"{rel}:{line}: call {field} " + ", ".join(reasons))
+    for name, reasons in ptr_fns.items():
+        for use in re.finditer(r"\b" + re.escape(name) + r"\b", text):
+            line = text.count("\n", 0, use.start()) + 1
+            key = (line, name)
+            if key in reported:
+                continue
+            reported.add(key)
+            hits.append(f"{rel}:{line}: uses {name} " + ", ".join(reasons))
+    for name, reasons in fns.items():
+        for call in re.finditer(r"\." + re.escape(name) + r"\s*\(", text):
+            line = text.count("\n", 0, call.start()) + 1
+            key = (line, name)
+            if key in reported:
+                continue
+            reported.add(key)
+            hits.append(f"{rel}:{line}: call {name} " + ", ".join(reasons))
+    return hits
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Lint Zig calls of small C structs by value")
+    parser.add_argument("--scan", action="append", default=[], help="scan this file instead of src")
+    parser.add_argument("--expect-pass", action="store_true")
+    parser.add_argument("--expect-fail", action="store_true")
+    args = parser.parse_args()
+    os.chdir(ROOT)
+    sources = zig_sources(args.scan)
+    blocks = []
+    seen = set()
+    for path in sources:
+        text = open(path, encoding="utf-8", errors="replace").read()
+        for body in extract_blocks(text):
+            key = (os.path.dirname(path), body)
+            if key in seen:
+                continue
+            seen.add(key)
+            blocks.append((os.path.relpath(path, ROOT), body))
+    work = os.path.join(ROOT, ".work", "abi-lint")
+    proto = os.path.join(work, "proto")
+    protocols(proto)
+    env = os.environ.copy()
+    env["ZIG_LOCAL_CACHE_DIR"] = os.path.join(work, "zcache")
+    env["ZIG_GLOBAL_CACHE_DIR"] = os.path.join(work, "gcache")
+    os.makedirs(env["ZIG_LOCAL_CACHE_DIR"], exist_ok=True)
+    os.makedirs(env["ZIG_GLOBAL_CACHE_DIR"], exist_ok=True)
+    failed = compile_blocks(blocks, include_flags(proto), env, os.path.join(work, "gen"))
+    structs, aliases, enums, funcs = parse_cimports([env["ZIG_LOCAL_CACHE_DIR"], env["ZIG_GLOBAL_CACHE_DIR"]])
+    if "xcb_screen_iterator_t" not in structs and "xcb_screen_iterator_t" not in aliases:
+        sys.stderr.write("abi-lint: xcb_screen_iterator_t was not translated\n")
+        return 2
+    bad = bad_types(structs, aliases, enums)
+    fns = fn_bad(funcs, bad, aliases, structs, enums)
+    ptr_fns = fn_bad(fnptrs, bad, aliases, structs, enums)
+    hits = []
+    for path in sources:
+        hits.extend(scan_file(path, bad, fns, ptr_fns, aliases, structs, enums))
+    for line in hits:
+        print(line)
+    if failed:
+        sys.stderr.write("abi-lint: untranslated " + ", ".join(failed) + "\n")
+    if args.expect_pass:
+        return 1 if hits or failed else 0
+    if args.expect_fail:
+        return 0 if hits else 1
+    if hits:
+        return 1
+    if failed:
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

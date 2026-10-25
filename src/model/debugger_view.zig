@@ -256,7 +256,8 @@ pub const Capture = struct {
             if (session.sourceAt(a, address)) |site| self.followSource(session, site) else |_| {}
         }
         const variables = session.locals(a, request.tid, self.value.selected_frame) catch |err| {
-            self.value.local_diagnostic = @errorName(err);
+            const pc = if (self.value.selected_frame < self.value.frames.len) self.value.frames[self.value.selected_frame].lookup_pc else 0;
+            self.value.local_diagnostic = (session.modules.debugDetail(a, pc, err) catch null) orelse @errorName(err);
             return;
         };
         var rows: std.ArrayList(LocalRow) = .empty;

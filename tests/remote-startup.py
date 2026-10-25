@@ -172,17 +172,15 @@ def run(args):
                         redirected = (directory/'input').open('rb')
                     argv = [str(binary), '--headless', '--mcp', '--agent-scope', 'control', '--runtime-agent', str(wrapper)]
                     if stop == 'socket-eof':
-                        with socket.socket() as reservation:
-                            reservation.bind(('127.0.0.1', 0))
-                            port = reservation.getsockname()[1]
-                        argv += ['--listen', '127.0.0.1:'+str(port)]
+                        argv += ['--listen', '127.0.0.1:0']
                     if operation == 'BP_SET': argv += ['--break', 'main']
                     argv += ['--', str(fixture)]
                     process = subprocess.Popen(argv, env=env, stdin=redirected or subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, bufsize=0)
                     if stop == 'socket-eof':
                         def connect():
-                            try: return socket.create_connection(('127.0.0.1', port), timeout=.2)
-                            except OSError: return None
+                            # The listener reports its kernel-chosen port only after listen().
+                            bound = re.search(rb'^xodb: listening on 127\.0\.0\.1:([0-9]+); ', (directory/'stderr.log').read_bytes(), re.M)
+                            return bound and socket.create_connection(('127.0.0.1', int(bound.group(1))), timeout=5)
                         peer = helper.wait(connect, 'owned MCP listener did not open')
                     fault = helper.wait(lambda: json.loads((directory/'fault.json').read_text()) if (directory/'fault.json').exists() else None, 'startup fault not reached')
                     owned = fault['owned']

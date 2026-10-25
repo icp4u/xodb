@@ -50,6 +50,27 @@ def lane(tier, *args, **flags):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_vulkan_filter_retry_requires_its_report(self):
+        from helpers.vulkan_outcomes import reported_filter_retry
+        rules = 'poison=1;fail=vkCreateInstance@1:oodm'
+        summary = {'calls': {'vkCreateInstance': [2, 0]}}
+        report = 'Vulkan early loader filter gave no instance (OutOfDeviceMemory); loading every driver'
+        self.assertTrue(reported_filter_retry(rules, summary, report))
+        # Plant the missing-report regression: two calls alone are not proof.
+        self.assertFalse(reported_filter_retry(rules, summary, ''))
+        self.assertFalse(reported_filter_retry(rules, summary, 'loading every driver'))
+        self.assertFalse(reported_filter_retry(rules, {'calls': {'vkCreateInstance': [1, 0]}}, report))
+
+    def test_vulkan_empty_device_selector_is_automatic(self):
+        from helpers.vulkan_outcomes import requested_error
+        self.assertIsNone(requested_error('start-devices-0', {}))
+        for value in ('', ' \t'):
+            self.assertIsNone(requested_error('start-devices-0', {'XODB_VK_DEVICE': value}))
+            self.assertIsNone(requested_error('start-families-0', {'XODB_VK_DEVICE': value}))
+        for value in ('NVIDIA', '0'):
+            self.assertEqual(requested_error('start-devices-0', {'XODB_VK_DEVICE': value}), 'VulkanDeviceNotFound')
+            self.assertEqual(requested_error('start-families-0', {'XODB_VK_DEVICE': value}), 'VulkanDeviceCannotPresent')
+
     def test_snapshot_keeps_native_build_entry(self):
         def tracked(argv, **kwargs):
             del kwargs

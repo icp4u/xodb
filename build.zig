@@ -23,6 +23,12 @@ const macos_seam_sources = [_][]const u8{ "cancel.c", "gdb_packet.c", "gdb_link.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // LoongArch64 Zig 0.16 mis-lowers a multi-field struct of 16 bytes or less
+    // passed or returned by value across the C ABI. Two 8-byte fields are the
+    // shape that still matches gcc and clang. The step is red while such a call
+    // remains.
+    const abi_lint = b.step("abi-lint", "Fail when Zig calls a translated C function with a multi-field struct of 16 bytes or less by value");
+    abi_lint.dependOn(&b.addSystemCommand(&.{ "python3", "-B", "scripts/abi-lint" }).step);
     if (target.result.os.tag == .macos) return @import("build_macos.zig").build(b, target, optimize);
     const runtime_sources = loadRuntimeSources(b);
     // Helpers are copied to other machines: never inherit the build host ISA.
@@ -158,6 +164,11 @@ pub fn build(b: *std.Build) void {
     // X11 libraries are loaded at run time. An x11-only build still needs xkbcommon,
     // which the Wayland and linux builds already link above.
     if (gui and platform == .x11) module.linkSystemLibrary("xkbcommon", .{});
+    if (gui and (platform == .linux or platform == .x11)) {
+        // xcb_setup_roots_iterator returns the screen iterator by value.
+        // The C file performs that call so Zig does not.
+        module.addCSourceFile(.{ .file = b.path("src/platform/x11_roots.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+    }
     if (gui and platform == .cocoa) {
         // This C ABI is the boundary for the future Objective-C/AppKit shim.
         // The checked-in native stub makes the whole GUI compile on Linux and

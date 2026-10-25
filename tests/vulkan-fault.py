@@ -14,6 +14,7 @@ artifact directory; its path must contain /.work/ for the private shim gate.
 """
 import importlib.util, json, os, re, signal, subprocess, sys, time
 from pathlib import Path
+from helpers.vulkan_outcomes import requested_error, reported_filter_retry
 
 os.umask(0o022)
 root = Path(__file__).resolve().parents[1]
@@ -88,13 +89,10 @@ def run_case(d, shim, name, rules, frames, seconds, expect):
     # Automatic selection retries an empty/unusable inventory. An explicit
     # device request instead needs correction and is fatal at startup. A gate
     # may pin a GPU; keep that coverage, but require the precise refusal.
-    request_error = {
-        'start-devices-0': 'VulkanDeviceNotFound',
-        'start-families-0': 'VulkanDeviceCannotPresent',
-    }.get(name) if env.get('XODB_VK_DEVICE', '').strip() else None
+    request_error = requested_error(name, env)
     started = time.monotonic()
     with log.open('wb') as stream:
-        app = subprocess.Popen([binary, '--frames', str(frames)], env=env, stdout=stream, stderr=stream)
+        app = subprocess.Popen([binary, '--log', 'render=debug', '--frames', str(frames)], env=env, stdout=stream, stderr=stream)
         stopped = False
         rss = []
         def sample():
@@ -188,7 +186,7 @@ def run_case(d, shim, name, rules, frames, seconds, expect):
         # A loader filtered to the display's driver that gives no instance
         # loads every driver in the same attempt (init and prepare alike):
         # the failed call followed by a successful one is that recovery.
-        filter_fallback = rules.endswith('fail=vkCreateInstance@1:oodm') and summary and summary['calls'].get('vkCreateInstance', [0, 0])[0] > 1
+        filter_fallback = reported_filter_retry(rules, summary, text)
         if not (r['init_failures'] + r['frame_failures'] or filter_fallback): problems.append('no renderer failure occurred before recovery')
     if expect == 'retry' and not request_error:
         if rendered: problems.append('rendered despite unusable startup')
@@ -237,6 +235,9 @@ try:
     # Keep this probe even for prefix selections, and record its result separately.
     baseline = run_case(d, shim, 'baseline', '', 20, 15, 'render')
     roster = baseline['present_candidates']
+    # This is the renderer's queried roster, not a full-driver inventory.
+    # A preferred-driver filter may expose only one adapter; the discrete
+    # cases below remain explicitly unproved/skipped in that configuration.
     capabilities = dict(healthy_baseline=baseline['ok'], present_candidates=roster,
                         nvidia=any('NVIDIA' in name for name in roster),
                         alternate=any('NVIDIA' not in name for name in roster))

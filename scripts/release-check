@@ -161,12 +161,13 @@ COVERS = (
       'src/evidence/sockets.zig', 'src/mcp/evidence.zig', 'src/render/vulkan.zig', 'tests/redact.py'),
      ('redact', 'gui-redact')),
     (('src/*.zig', 'src/*.c', 'src/*.h', 'src/*.cc', 'src/*.inc', 'src/*/Makefile', 'build.zig'), ('deps',)),
+    (('scripts/abi-lint', 'tests/fixtures/abi-lint/*', 'build.zig', 'src/*.zig', 'src/*/*.zig', 'src/*/*/*.zig', 'src/*/*/*/*.zig'), ('abi-lint',)),
     (('docs/*', '*.md', 'packaging/*', 'scripts/package-source'), ('package-source',)),
 )
 
 # Cheap steps that cover every source file without counting as its coverage in
 # `affected`: a file only they cover still selects the full gui tier.
-ALWAYS = ('deps',)
+ALWAYS = ('deps', 'abi-lint')
 
 # GUI steps that must run alone under --jobs: they assert frame time, CPU or
 # RSS, inject compositor/Vulkan timeouts, rank processes by CPU, make many
@@ -581,6 +582,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
     steps.append(('build-tests', ['scripts/build', 'test', '--summary', 'all',
                   '-Dgui=' + str(not headless).lower(), '-Doptimize=' + optimize], 600,
                   dict(kind='build', needs=() if headless else ('headless-app',))))
+    if live:
+        steps.append(('abi-lint', [sys.executable, '-B', 'scripts/abi-lint'], 600, dict(kind='build')))
     if macos and not headless and tier in ('gui', 'all', 'periodic'):
         steps.append(('macos-native', [sys.executable, '-B', 'tests/macos-native.py', '--ssh', macos], 420))
         steps.append(('macos-bootstrap', [sys.executable, '-B', 'tests/macos-native.py', '--ssh', macos, '--bootstrap'], 420))
@@ -870,6 +873,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 steps.append((name + '-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', *args], 180))
         steps.append(('metadata-session', [sys.executable, '-B', 'tests/metadata-session.py', '--work', '.work/ms'], 180))
         steps.append(('image-transfer', [sys.executable, '-B', 'tests/image-transfer.py', '--work', '.work/imtr', '--agent', 'zig-out/bin/xodb-agent'], 60))
+        steps.append(('nodebug-message', [sys.executable, '-B', 'tests/nodebug-message.py', '--work', '.work/ndm'], 60))
         steps.append(('metadata-session-agent', [sys.executable, '-B', 'tests/metadata-session.py', '--work', '.work/ma', '--agent', 'zig-out/bin/xodb-agent'], 240))
         steps.append(('language-tabs', [sys.executable, '-B', 'tests/language-tabs.py', '--work', '.work/lt', *language_args], 900 if node else 240))
         steps.append(('language-tabs-agent', [sys.executable, '-B', 'tests/language-tabs.py', '--work', '.work/la', '--agent', 'zig-out/bin/xodb-agent', *language_args], 900 if node else 300))
@@ -1078,6 +1082,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ('gui-inline', ['tests/optimized-gui.py', 'zig-out']),
             ('gui-image-budget', ['tests/image-budget-gui.py', 'zig-out']),
             ('gui-image-transfer', ['tests/image-transfer-gui.py', '--work', '.work/input-imtr']),
+            ('gui-nodebug-message', ['tests/nodebug-message.py', '--gui', '--work', '.work/input-ndm']),
             ('gui-profile', ['scripts/gui-smoke.py', '--profile']),
             ('gui-flame-status', ['tests/flame-status-gui.py']),
             ('gui-capture-setup', ['tests/m2-capture-setup.py']),

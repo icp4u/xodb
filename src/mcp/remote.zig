@@ -128,7 +128,8 @@ fn inspect(a: A, session: *model.Session, view: *wire.View, diagnostics: *std.Ar
     view.frames = frame_rows;
     if (view.frame >= frames.len) view.frame = 0;
     const locals = session.locals(a, view.tid, view.frame) catch |err| blk: {
-        try diagnostics.append(a, .{ .component = "locals", .message = @errorName(err) });
+        const pc = if (view.frame < frames.len) frames[view.frame].lookup_pc else 0;
+        try diagnostics.append(a, .{ .component = "locals", .message = (try session.modules.debugDetail(a, pc, err)) orelse @errorName(err) });
         break :blk &.{};
     };
     const local_rows = try a.alloc(wire.Local, @min(locals.len, 128));

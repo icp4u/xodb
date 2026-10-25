@@ -28,6 +28,13 @@ const clip = platform.clip;
 const Node = @import("../render/vk_select.zig").Node;
 pub const Keyboard = @import("xkb.zig").Keyboard;
 
+// The screen iterator is three fields returned by value. C performs that call.
+extern fn xodb_xcb_setup_roots(
+    roots: *const fn (*const c.xcb_setup_t) callconv(.c) c.xcb_screen_iterator_t,
+    setup: *const c.xcb_setup_t,
+    out: *c.xcb_screen_iterator_t,
+) void;
+
 const atom_names = [_][]const u8{
     "WM_PROTOCOLS",
     "WM_DELETE_WINDOW",
@@ -350,7 +357,8 @@ pub const Window = struct {
             return error.X11Unavailable;
         }
         const setup = api.get_setup(conn);
-        var iter = api.roots(setup);
+        var iter: c.xcb_screen_iterator_t = undefined;
+        xodb_xcb_setup_roots(api.roots, setup, &iter);
         var left = screen;
         while (left > 0 and iter.rem > 1) : (left -= 1) api.screen_next(&iter);
         if (iter.rem < 1 or iter.data == null) return error.X11Disconnected;

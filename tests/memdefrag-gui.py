@@ -384,6 +384,9 @@ if 'buttons' in sections:
                     boxes.setdefault(f[11].strip().replace('Resume', 'Pause'), (int(f[6]) + int(f[8]) // 2, int(f[7]) + int(f[9]) // 2))
         check('the four buttons are on screen', len(boxes) == 4, boxes)
         if len(boxes) == 4:
+            x, y = boxes['Pause']
+            paused_text = ocr(shot, (x - 60, y - 13, x + 60, y + 13)).strip()
+            check('paused fixture is Resume, not the expected resumed Pause', paused_text == 'Resume', paused_text)
             d.click(*boxes['Legend'])
             shot = d.shot('legend')
             save(shot, 'win9x-legend.png')
@@ -397,8 +400,15 @@ if 'buttons' in sections:
             check('Hide Details shows the compact dialog', ('Show Details' in text or 'Complete' in text) and count_rgb(shot, WIN9X['anon'], 6) < 50, text[:200])
             d.tap('d')
             d.click(*boxes['Pause'])
-            text = ocr(d.shot('resumed'))
-            check('Resume (paused start) toggles to Pause', 'Pau' in text and 'Resume' not in text, text[-200:])
+            # The busy grid makes whole-window OCR drop this button on RADV.
+            # Read the actual clicked button, not unrelated page text/status.
+            x, y = boxes['Pause']
+            deadline = time.monotonic() + 20
+            while True:
+                text = ocr(d.shot('resumed'), (x - 60, y - 13, x + 60, y + 13)).strip()
+                if text == 'Pause' or time.monotonic() >= deadline: break
+                time.sleep(.05)
+            check('Resume (paused start) toggles to Pause', text == 'Pause', text)
             d.click(*boxes['Stop'])
             shot = d.shot('stopped')
             text = ocr(shot)

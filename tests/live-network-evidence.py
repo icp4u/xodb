@@ -4,6 +4,8 @@ import errno
 import importlib.util
 import json
 import os
+import re
+import select
 import signal
 import socket
 import subprocess
@@ -25,6 +27,26 @@ options = ['--live-capture', 'lo', '--capture-tool', str(tool), '--capture-ring-
 private_fields = 'available only to the direct observer that opened this stream'
 private_error = 'PrivateEvidenceUnavailable'
 secrets = (b'/owned', b'unit.test')
+
+
+def read_bound_listen_port(process, timeout=5):
+    """Read the post-listen endpoint line and retain consumed diagnostics."""
+    deadline = time.monotonic() + timeout
+    startup = bytearray()
+    pattern = re.compile(rb'^xodb: listening on 127\.0\.0\.1:([0-9]+); one client, plaintext TCP without authentication\n$')
+    while True:
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, f'listener did not report its bound port: {startup.decode(errors="replace")}'
+        ready, _, _ = select.select([process.stderr], [], [], remaining)
+        assert ready, f'listener did not report its bound port: {startup.decode(errors="replace")}'
+        line = process.stderr.readline()
+        startup += line
+        assert line, f'listener exited before reporting its bound port: {startup.decode(errors="replace")}'
+        match = pattern.fullmatch(line)
+        if match is not None:
+            port = int(match.group(1))
+            assert 0 < port <= 65535, line
+            return port, bytes(startup)
 
 
 def alive(pid):
@@ -197,27 +219,17 @@ if agent_args:
     controller_stderr = controller.p.stderr.read()
     assert not any(secret in controller_stderr for secret in secrets), controller_stderr
 
-    listen_socket = socket.socket()
-    listen_socket.bind(('127.0.0.1', 0))
-    listen_port = listen_socket.getsockname()[1]
-    listen_socket.close()
     listener = subprocess.Popen(
         [os.environ.get('XODB_BIN', './zig-out/bin/xodb'), '--headless', '--mcp',
-         '--agent-scope', 'observe', '--listen', f'127.0.0.1:{listen_port}',
+         '--agent-scope', 'observe', '--listen', '127.0.0.1:0',
          *agent_args, *options],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
     )
     remote = None
+    listener_startup = b''
     try:
-        deadline = time.monotonic() + 5
-        while True:
-            assert listener.poll() is None, listener.stderr.read().decode()
-            try:
-                remote = socket.create_connection(('127.0.0.1', listen_port), timeout=.2)
-                break
-            except OSError:
-                assert time.monotonic() < deadline, 'listen endpoint did not accept'
-                time.sleep(.01)
+        listen_port, listener_startup = read_bound_listen_port(listener)
+        remote = socket.create_connection(('127.0.0.1', listen_port), timeout=5)
         remote.settimeout(5)
         with remote, remote.makefile('rwb') as wire:
             serial = [0]
@@ -259,7 +271,7 @@ if agent_args:
         if listener.poll() is None:
             listener.send_signal(signal.SIGINT)
         assert listener.wait(timeout=10) == 0, listener.stderr.read().decode()
-    listen_stderr = listener.stderr.read()
+    listen_stderr = listener_startup + listener.stderr.read()
     assert not any(secret in listen_stderr for secret in secrets), listen_stderr
 
     spec = importlib.util.spec_from_file_location('live_shared', root / 'tests/shared-sessions.py')

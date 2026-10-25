@@ -122,11 +122,11 @@ pub const Stream = struct {
         const flow = self.summaries[i].flow();
         const ctx = switch (sockets.Context.joinPrecondition(
             &self.context,
-            "no capture context: open with --open-capture an archive recorded with socket tables",
-            if (flow == null) "record has no 5-tuple (undecoded, or not TCP/UDP)" else null,
+            .missing_network_context,
+            if (flow == null) .record_without_tuple else null,
         )) {
             .ready => |ctx| ctx,
-            .unavailable => |reason| return .{ .reason = reason },
+            .unavailable => |refusal| return .{ .reason = refusal.render() },
         };
         return sockets.correlate(ctx, flow.?, self.timeOf(i).monotonic_ns);
     }

@@ -12,6 +12,36 @@ pub const File = struct {
     verification: enum { explicit_build_id, build_id, debuglink_crc } = .explicit_build_id,
     crc: ?u32 = null,
 };
+/// Lookup evidence, not paths: build-ID and debuglink yield at most two
+/// distinct basenames even when several search roots are configured.
+pub const Search = struct {
+    pub const Attempt = struct {
+        name: [255]u8 = undefined,
+        len: u8 = 0,
+        rejection: ?anyerror = null,
+        pub fn basename(self: *const Attempt) []const u8 {
+            return self.name[0..self.len];
+        }
+    };
+    attempts: [2]Attempt = @splat(.{}),
+    count: usize = 0,
+    fn record(self: *Search, path: []const u8, rejection: ?anyerror) void {
+        // A build-ID name keeps its two-digit directory so it reads as the
+        // whole ID: .build-id/ab/cdef....debug, never the search root.
+        const name = if (std.mem.lastIndexOf(u8, path, "/.build-id/")) |at| path[at + 1 ..] else std.fs.path.basename(path);
+        if (name.len > 255) return;
+        for (self.attempts[0..self.count]) |*item| if (std.mem.eql(u8, item.basename(), name)) {
+            if (rejection != null) item.rejection = rejection;
+            return;
+        };
+        if (self.count == self.attempts.len) return;
+        const item = &self.attempts[self.count];
+        @memcpy(item.name[0..name.len], name);
+        item.len = @intCast(name.len);
+        item.rejection = rejection;
+        self.count += 1;
+    }
+};
 pub const Files = struct {
     allocator: std.mem.Allocator,
     items: std.ArrayList(*File) = .empty,
@@ -104,13 +134,20 @@ pub const Files = struct {
         self.auto_retained += file.bytes.len;
         return file;
     }
-    fn attempt(self: *Files, runtime: *const elf.Image, path: [:0]const u8, crc: ?u32) ?*const File {
+    fn attempt(self: *Files, runtime: *const elf.Image, path: [:0]const u8, crc: ?u32, search: *Search) ?*const File {
+        search.record(path, null);
         return self.candidate(runtime, path, crc) catch |err| {
+            search.record(path, err);
             log.warn(.session, "xodb: automatic debug companion rejected: {s}; {s}\n", .{ @errorName(err), path });
             return null;
         };
     }
     pub fn discover(self: *Files, image: *const elf.Image, path: []const u8) !?*const File {
+        var search: Search = .{};
+        return self.discoverWithSearch(image, path, &search);
+    }
+    pub fn discoverWithSearch(self: *Files, image: *const elf.Image, path: []const u8, search: *Search) !?*const File {
+        search.* = .{};
         if (try self.matching(image)) |file| return file;
         if (!self.automatic or image.sectionByName(".debug_info") != null or image.sectionByName(".zdebug_info") != null) return null;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -125,7 +162,7 @@ pub const Files = struct {
                 hex[2 * i] = digits[v >> 4];
                 hex[2 * i + 1] = digits[v & 15];
             }
-            for (roots) |root| if (self.attempt(image, try std.fmt.allocPrintSentinel(a, "{s}/.build-id/{s}/{s}.debug", .{ root, hex[0..2], hex[2..] }, 0), null)) |file| return file;
+            for (roots) |root| if (self.attempt(image, try std.fmt.allocPrintSentinel(a, "{s}/.build-id/{s}/{s}.debug", .{ root, hex[0..2], hex[2..] }, 0), null, search)) |file| return file;
         };
         const section = image.sectionByName(".gnu_debuglink") orelse return null;
         const bytes = try image.sectionData(section);
@@ -137,8 +174,8 @@ pub const Files = struct {
         if (crc_at > bytes.len or bytes.len - crc_at != 4) return error.InvalidDebugLink;
         const crc = std.mem.readInt(u32, bytes[crc_at..][0..4], .little);
         const dir = std.fs.path.dirname(path) orelse return null;
-        for ([_][]const u8{ "", ".debug/" }) |middle| if (self.attempt(image, try std.fmt.allocPrintSentinel(a, "{s}/{s}{s}", .{ dir, middle, name }, 0), crc)) |file| return file;
-        if (dir.len > 0 and dir[0] == '/') for (roots) |root| if (self.attempt(image, try std.fmt.allocPrintSentinel(a, "{s}{s}/{s}", .{ root, dir, name }, 0), crc)) |file| return file;
+        for ([_][]const u8{ "", ".debug/" }) |middle| if (self.attempt(image, try std.fmt.allocPrintSentinel(a, "{s}/{s}{s}", .{ dir, middle, name }, 0), crc, search)) |file| return file;
+        if (dir.len > 0 and dir[0] == '/') for (roots) |root| if (self.attempt(image, try std.fmt.allocPrintSentinel(a, "{s}{s}/{s}", .{ root, dir, name }, 0), crc, search)) |file| return file;
         return null;
     }
 };
@@ -199,4 +236,19 @@ test "debug companions require build identity and matching virtual layout" {
     defer snapshot.free(foreign_bytes);
     const foreign = try elf.Image.parse(foreign_bytes);
     try t.expect(try files.matching(&foreign) == null);
+}
+
+test "companion search evidence keeps basenames and preserves rejections across roots" {
+    var search: Search = .{};
+    search.record("/first/build.debug", error.DebugFileCrcMismatch);
+    search.record("/second/build.debug", null);
+    search.record("/third/other.debug", null);
+    try std.testing.expectEqual(@as(usize, 2), search.count);
+    try std.testing.expectEqualStrings("build.debug", search.attempts[0].basename());
+    try std.testing.expectEqual(error.DebugFileCrcMismatch, search.attempts[0].rejection.?);
+    try std.testing.expectEqualStrings("other.debug", search.attempts[1].basename());
+    try std.testing.expect(search.attempts[1].rejection == null);
+    var by_id: Search = .{};
+    by_id.record("/root/.build-id/ab/cdef.debug", null);
+    try std.testing.expectEqualStrings(".build-id/ab/cdef.debug", by_id.attempts[0].basename());
 }

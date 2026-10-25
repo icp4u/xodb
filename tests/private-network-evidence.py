@@ -11,6 +11,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import select
 import shutil
 import signal
@@ -32,6 +33,26 @@ parser.add_argument('--work', default='.work/private-network-' + datetime.now().
 options = parser.parse_args()
 work = Path(options.work)
 work.mkdir(parents=True, exist_ok=True)
+
+
+def read_bound_listen_port(process, timeout=5):
+    """Read the post-listen endpoint line and retain consumed diagnostics."""
+    deadline = time.monotonic() + timeout
+    startup = bytearray()
+    pattern = re.compile(rb'^xodb: listening on 127\.0\.0\.1:([0-9]+); one client, plaintext TCP without authentication\n$')
+    while True:
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, f'listener did not report its bound port: {startup.decode(errors="replace")}'
+        ready, _, _ = select.select([process.stderr], [], [], remaining)
+        assert ready, f'listener did not report its bound port: {startup.decode(errors="replace")}'
+        line = process.stderr.readline()
+        startup += line
+        assert line, f'listener exited before reporting its bound port: {startup.decode(errors="replace")}'
+        match = pattern.fullmatch(line)
+        if match is not None:
+            port = int(match.group(1))
+            assert 0 < port <= 65535, line
+            return port, bytes(startup)
 
 
 def block(kind, body):
@@ -329,22 +350,14 @@ finally:
     close_and_check(controller, [session['request'] for session in sessions] + [session['response'] for session in sessions])
 
 # A --listen TCP client is remote, not the process-local opener.
-listen_probe = socket.socket()
-listen_probe.bind(('127.0.0.1', 0))
-listen_port = listen_probe.getsockname()[1]
-listen_probe.close()
 listener = subprocess.Popen([os.environ.get('XODB_BIN', str(root / 'zig-out/bin/xodb')), '--headless', '--mcp', '--agent-scope', 'observe',
-                             '--listen', f'127.0.0.1:{listen_port}', '--open-pcap', str(capture), '--tls-key-log', str(keylog)],
+                             '--listen', '127.0.0.1:0', '--open-pcap', str(capture), '--tls-key-log', str(keylog)],
                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+remote = None
+listener_startup = b''
 try:
-    for _ in range(100):
-        try:
-            remote = socket.create_connection(('127.0.0.1', listen_port))
-            break
-        except OSError:
-            time.sleep(.05)
-    else:
-        raise AssertionError('--listen did not accept')
+    listen_port, listener_startup = read_bound_listen_port(listener)
+    remote = socket.create_connection(('127.0.0.1', listen_port), timeout=5)
     with remote, remote.makefile('rwb') as wire:
         def remote_call(ident, method, params):
             wire.write((json.dumps({'jsonrpc': '2.0', 'id': ident, 'method': method, 'params': params}) + '\n').encode())
@@ -367,7 +380,7 @@ finally:
     if listener.poll() is None:
         listener.send_signal(signal.SIGINT)
     listener.wait(timeout=5)
-    listener_logs = listener.stderr.read()
+    listener_logs = listener_startup + listener.stderr.read()
     listener.stderr.close()
     for session in sessions:
         assert session['request'] not in listener_logs and session['response'] not in listener_logs

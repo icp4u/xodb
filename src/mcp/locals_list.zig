@@ -46,7 +46,7 @@ fn checkView(args: V, view: *const [64]u8, start: u64) !void {
         if (!std.mem.eql(u8, given.string, view)) return error.StaleLocalsView;
     } else if (start != 0) return error.LocalsViewRequired;
 }
-pub fn call(a: A, session: *model.Session, args: V) !V {
+pub fn call(a: A, session: *model.Session, args: V, error_detail: *?[]const u8) !V {
     try wire.fields(args, &.{ "tid", "generation", "frame", "inline_depth", "start", "limit", "view_id" });
     const tid = try wire.number(args, "tid", null);
     const frame = try wire.number(args, "frame", 0);
@@ -58,7 +58,10 @@ pub fn call(a: A, session: *model.Session, args: V) !V {
     const frames = try session.stack(a, @intCast(tid), @intCast(frame + 1));
     if (frame >= frames.len) return error.InvalidFrame;
     const selected = frames[@intCast(frame)];
-    const locals = try session.frameLocalsAtDepth(a, selected, @intCast(depth));
+    const locals = session.frameLocalsAtDepth(a, selected, @intCast(depth)) catch |err| {
+        error_detail.* = try session.modules.debugDetail(a, selected.lookup_pc, err);
+        return err;
+    };
     if (start > locals.len) return error.InvalidArguments;
     const snap = session.target.snapshot();
     const view = identity(.{ .session_id = session.id, .generation = snap.generation, .epoch = snap.image_epoch, .metadata_revision = session.metadata.revision, .debug_files = session.symbolFiles().items.items.len, .tid = tid, .frame = @intCast(frame), .depth = @intCast(depth), .pc = selected.lookup_pc, .cfa = selected.cfa }, locals);

@@ -87,6 +87,7 @@ pub const Modules = struct {
         companion_revision: u64 = 0,
         companion_automatic: bool = true,
         companion: ?union(enum) { absent, found: *const @import("../binary/debug_files.zig").File, failure: anyerror } = null,
+        companion_search: @import("../binary/debug_files.zig").Search = .{},
         metadata_only: ?bool = null,
         /// Size of a full image the per-image budget refused. A remote file
         /// crosses whole before that check; do not fetch it again to refuse.
@@ -685,6 +686,56 @@ pub const Modules = struct {
         else
             log.warn(.session, "xodb: module budget: {d} full images loaded, {d} mapped files deferred\n", .{ counts.loaded, counts.deferred });
     }
+    /// Presentation-only explanation of the image actually examined. Never
+    /// reopen a path, start metadata work, or confuse a budget with no DWARF.
+    pub fn debugDetail(self: *Modules, a: std.mem.Allocator, address: u64, err: anyerror) !?[]const u8 {
+        if (err == error.BinarySnapshotLimit or err == error.CompressedDebugBudget)
+            return if (self.budgetDetail(address)) |detail| try a.dupe(u8, detail) else null;
+        if (err != error.NoDebugInfo and err != error.NoDebugInfoAtAddress) return null;
+        const module = self.cachedAt(address) catch return null;
+        if (module.debug_file != null or module.image.sectionByName(".debug_info") != null or module.image.sectionByName(".zdebug_info") != null) return null;
+        var out = std.Io.Writer.Allocating.init(a);
+        defer out.deinit();
+        const w = &out.writer;
+        try w.print("no DWARF in {s} (build ID ", .{std.fs.path.basename(module.path)});
+        if (module.image.buildId()) |id| {
+            for (id[0..@min(id.len, 4)]) |byte| try w.print("{x:0>2}", .{byte});
+        } else try w.writeAll("unavailable");
+        try w.writeAll("); no .debug_info section; ");
+        const symbols: []const u8 = symbols: {
+            if (module.image.symbols(.symtab) catch null) |table| if (table.count() > 1) break :symbols "symbols only";
+            if (module.image.symbols(.dynsym) catch null) |table| {
+                var i: u32 = 1;
+                while (i < @min(table.count(), 4096)) : (i += 1) {
+                    const symbol = table.get(i) catch continue;
+                    if (symbol.hasAddress()) break :symbols "dynamic symbols only";
+                }
+                if (table.count() > 4096) break :symbols "dynamic symbol table present";
+            }
+            break :symbols "stripped; no defined symbols";
+        };
+        try w.writeAll(symbols);
+        for (self.regions.items) |region| if (address >= region.start and address < region.end) {
+            if (self.identityIndex(region)) |index| {
+                const file = &self.identities.items[index];
+                for (file.companion_search.attempts[0..file.companion_search.count]) |*attempt| {
+                    try w.print("; separate debug {s}: ", .{attempt.basename()});
+                    if (attempt.rejection) |reason| try w.print("rejected ({s})", .{@errorName(reason)}) else try w.writeAll("not found");
+                }
+                if (file.companion) |decision| if (decision == .failure)
+                    try w.print("; separate debug lookup rejected ({s})", .{@errorName(decision.failure)});
+                // Companions are opened on this host even for a remote target:
+                // a file beside the target binary is never seen.
+                if (file.companion_search.count > 0 and self.core_source == null and rt.xrt_target_is_remote(self.target))
+                    try w.writeAll(" (searched on the debugger host, not the target)");
+            }
+            break;
+        };
+        // The diagnostic contains basenames only even without --redact; the
+        // shared policy also protects names embedded in those basenames.
+        if (@import("../redact.zig").active()) |policy| return try policy.scrubAlloc(a, out.written());
+        return try a.dupe(u8, out.written());
+    }
     /// The image, its size and the budget for a full image refused at
     /// `address`, or for the first one refused when no address is given.
     /// Valid until the next map refresh.
@@ -1131,6 +1182,7 @@ pub const Modules = struct {
             file.companion_revision = revision;
             file.companion_automatic = automatic;
             file.companion = null;
+            file.companion_search = .{};
             file.metadata_only = null;
         }
     }
@@ -1143,7 +1195,7 @@ pub const Modules = struct {
             .found => |file| file,
             .failure => |err| err,
         };
-        const found = files.discover(image, path) catch |err| {
+        const found = files.discoverWithSearch(image, path, &self.identities.items[index].companion_search) catch |err| {
             self.identities.items[index].companion = .{ .failure = err };
             return err;
         };

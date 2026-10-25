@@ -97,6 +97,15 @@ when using `--connect`. TCP accepts numeric IPv4 and bracketed IPv6 endpoints,
 for example `127.0.0.1:4317` or `[::1]:4317`; use SSH aliases for hostname-based
 connections in this first version.
 
+Use `--listen 127.0.0.1:0` to let the kernel choose an available loopback
+port. After the socket is listening, xodb writes one line to stderr (or to the
+`--log-file`), in this exact form, and only then accepts the client:
+
+    xodb: listening on 127.0.0.1:41234; one client, plaintext TCP without authentication
+
+Connect to the reported port. `-qq` hides this line, so do not combine it with
+port 0.
+
 **Plain TCP has no authentication or encryption. Anyone who can reach the
 listener can claim its session and exercise the configured scope. Use it only
 on a trusted LAN, or bind loopback; use SSH elsewhere.** No network listener,

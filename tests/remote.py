@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Real single-client TCP lifecycle and bounded remote view, using owned fixtures."""
-import argparse, json, os, select, socket, subprocess, time, signal
+import argparse, json, os, re, select, socket, subprocess, time, signal
 from pathlib import Path
 
 root = Path.cwd() if __file__ == '<stdin>' else Path(__file__).resolve().parents[1]
@@ -18,22 +18,18 @@ def wait_for(fn, timeout=10):
         time.sleep(.02)
     raise AssertionError('Timed out')
 
-def free_port():
-    with socket.socket() as sock:
-        sock.bind(('127.0.0.1',0))
-        return sock.getsockname()[1]
-
 class Server:
     def __init__(self, scope='control', attach=None):
-        self.port = free_port()
-        argv = [str(bin/'xodb'),'--headless','--mcp','--listen',f'127.0.0.1:{self.port}',
+        argv = [str(bin/'xodb'),'--headless','--mcp','--listen','127.0.0.1:0',
                 '--source','tests/fixtures/m1.c','--agent-scope',scope]
         argv += ['--attach',str(attach)] if attach else ['--',str(bin/'xodb-m1-fixture'),'w']
         self.p = subprocess.Popen(argv, stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         ready = select.select([self.p.stderr],[],[],10)[0]
         assert ready, 'Listener did not start'
         line = self.p.stderr.readline().decode()
-        assert 'listening on' in line, line + self.p.stderr.read().decode()
+        bound = re.fullmatch(r'xodb: listening on 127\.0\.0\.1:([0-9]+); one client, plaintext TCP without authentication\n', line)
+        assert bound, line + self.p.stderr.read().decode()
+        self.port = int(bound.group(1))
         self.sock = socket.create_connection(('127.0.0.1',self.port),timeout=10)
         self.f = self.sock.makefile('rb')
         self.seq = 0
