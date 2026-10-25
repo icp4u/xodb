@@ -22,7 +22,7 @@ pub const ArmRegisters = c.struct_xrt_arm_registers;
 pub const Registers = struct {
     raw: c.struct_xrt_registers,
     fn row(self: Registers) ?*const c.struct_xrt_arch {
-        return c.xrt_arch_resolve(self.raw.abi);
+        return c.xrt_arch_resolve_id(&self.raw.abi);
     }
     pub fn architecture(self: Registers) @import("arch.zig").Arch {
         return @enumFromInt(self.raw.abi.machine);
@@ -182,7 +182,8 @@ pub fn coreRegisters(words: *const [27]u64) !Registers {
     var bytes: [27 * 8]u8 = undefined;
     for (words, 0..) |word, i| std.mem.writeInt(u64, bytes[i * 8 ..][0..8], word, .little);
     const arch = c.xrt_arch_get(c.XRT_X86_64) orelse return error.UnsupportedArchitecture;
-    const abi = c.xrt_arch_abi(arch);
+    var abi: c.struct_xrt_abi_id = undefined;
+    c.xrt_arch_abi_copy(arch, &abi);
     var regs: c.struct_xrt_registers = undefined;
     try check(c.xrt_registers_decode(&abi, &bytes, bytes.len, &regs));
     return .{ .raw = regs };

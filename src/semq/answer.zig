@@ -261,7 +261,8 @@ pub fn slice(a: Allocator, session: ?*Session, analysis: *host.Analysis, op_id: 
     var b = budget(limits);
     var result = std.mem.zeroes(c.struct_xsq_result);
     defer c.xsq_result_free(&result);
-    const status = c.xsq_slice(g, .{ .op_id = op_id, .vn_id = c.XSQ_NONE, .input = if (input) |k| @intCast(k) else -1, .flags = if (data_only) c.XSQ_SLICE_DATA_ONLY else 0 }, &b, &result);
+    const selector: c.struct_xsq_selector = .{ .op_id = op_id, .vn_id = c.XSQ_NONE, .input = if (input) |k| @intCast(k) else -1, .flags = if (data_only) c.XSQ_SLICE_DATA_ONLY else 0 };
+    const status = c.xsq_slice_ref(g, &selector, &b, &result);
     switch (status) {
         c.XSQ_OK, c.XSQ_PARTIAL, c.XSQ_CANCELLED => {},
         else => return error.StaticQueryFailed,
@@ -336,7 +337,8 @@ pub fn controls(a: Allocator, session: ?*Session, analysis: *host.Analysis, op_i
             var cb = budget(limits);
             var cond = std.mem.zeroes(c.struct_xsq_result);
             defer c.xsq_result_free(&cond);
-            const s = c.xsq_slice(g, .{ .op_id = c.XSQ_NONE, .vn_id = g.vns[ctl.condition_vn].id, .input = -2, .flags = c.XSQ_SLICE_DATA_ONLY }, &cb, &cond);
+            const selector: c.struct_xsq_selector = .{ .op_id = c.XSQ_NONE, .vn_id = g.vns[ctl.condition_vn].id, .input = -2, .flags = c.XSQ_SLICE_DATA_ONLY };
+            const s = c.xsq_slice_ref(g, &selector, &cb, &cond);
             if (s == c.XSQ_OK or s == c.XSQ_PARTIAL) feeds = try parameters(a, analysis, &cond);
         }
         try rows.append(a, .{

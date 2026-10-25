@@ -45,8 +45,15 @@ result = {'status': 'running', 'runs': [], 'load': os.getloadavg(), 'cpus': os.c
 
 def usage(c):
     fields = Path(f'/proc/{c.p.pid}/stat').read_text().rsplit(')', 1)[1].split()
+    mapped = 0
+    for row in Path(f'/proc/{c.p.pid}/maps').read_text().splitlines():
+        if '/memfd:xodb-image-sections ' not in row: continue
+        columns = row.split(); first, last = (int(v, 16) for v in columns[0].split('-'))
+        assert columns[1] == 'r--p', row
+        mapped += last - first
     return {'cpu_seconds': (int(fields[11]) + int(fields[12])) / os.sysconf('SC_CLK_TCK'),
-            'rss_bytes': int(Path(f'/proc/{c.p.pid}/statm').read_text().split()[1]) * os.sysconf('SC_PAGESIZE')}
+            'rss_bytes': int(Path(f'/proc/{c.p.pid}/statm').read_text().split()[1]) * os.sysconf('SC_PAGESIZE'),
+            'prepared_mapping_bytes': mapped}
 
 
 def open_client(legacy=False, slow=False):
@@ -80,6 +87,8 @@ def finish(c):
     ready = jobs(c)
     assert len(ready) == 1 and ready[0]['state'] == 'ready', ready
     assert ready[0]['image_bytes'] == ready[0]['image_total'] < 4*mib, ready
+    # The snapshot maps the worker's immutable pages, not another full copy.
+    assert usage(c)['prepared_mapping_bytes'] == 300*mib, usage(c)
     # Full image semantics, not just a successful metadata schema.
     found = c.inspect('find_symbol', name='marker_value')
     memory = c.inspect('read_memory', address=found['address'], length=4)

@@ -104,6 +104,8 @@ enum xsvc_result xsvc_events(const struct xsvc *service, uint64_t after,
  * Invalid identities fail closed, even for a controller. */
 enum xsvc_job_kind { XSVC_JOB_HUMAN, XSVC_JOB_STDIO, XSVC_JOB_SHARED };
 struct xsvc_job_owner { uint64_t client; unsigned kind; };
-bool xsvc_job_may_change(struct xsvc_job_owner owner,
-                          struct xsvc_job_owner requester, bool controller);
+/* Pointers, not values: Zig 0.16.0 passes small multi-field structs
+ * incorrectly by value on LoongArch64. */
+bool xsvc_job_may_change(const struct xsvc_job_owner *owner,
+                         const struct xsvc_job_owner *requester, bool controller);
 #endif

@@ -1233,6 +1233,12 @@ done:
     return finish(&c);
 }
 
+enum xsq_status xsq_slice_ref(const struct xsq_graph *g, const struct xsq_selector *sel,
+                              const struct xsq_budget *budget, struct xsq_result *r)
+{
+    return xsq_slice(g, *sel, budget, r);
+}
+
 enum xsq_relevance xsq_relevance(const struct xsq_result *r, uint32_t vn, uint32_t *node)
 {
     *node = XSQ_NONE;

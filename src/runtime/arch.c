@@ -372,6 +372,20 @@ const struct xrt_arch *xrt_arch_resolve(struct xrt_abi_id id)
     return xrt_arch_resolve_in(id, rows, count);
 }
 
+const struct xrt_arch *xrt_arch_resolve_id(const struct xrt_abi_id *id)
+{
+    if (!id)
+        return NULL;
+    return xrt_arch_resolve(*id);
+}
+
+void xrt_arch_abi_copy(const struct xrt_arch *arch, struct xrt_abi_id *out)
+{
+    if (!out)
+        return;
+    *out = xrt_arch_abi(arch);
+}
+
 const struct xrt_arch *xrt_arch_native(void)
 {
     const struct xrt_arch *arch = NULL;

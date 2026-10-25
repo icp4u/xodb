@@ -329,6 +329,10 @@ struct xsq_selector { uint32_t op_id, vn_id; int input; unsigned flags; };
 
 enum xsq_status xsq_slice(const struct xsq_graph *graph, struct xsq_selector selector,
                           const struct xsq_budget *budget, struct xsq_result *result);
+/* The Zig boundary: Zig 0.16.0 passes this 16-byte struct incorrectly by
+ * value on LoongArch64. */
+enum xsq_status xsq_slice_ref(const struct xsq_graph *graph, const struct xsq_selector *selector,
+                              const struct xsq_budget *budget, struct xsq_result *result);
 enum xsq_status xsq_controls(const struct xsq_graph *graph, uint32_t op_id,
                              const struct xsq_budget *budget, struct xsq_result *result);
 void xsq_result_free(struct xsq_result *result);

@@ -238,12 +238,26 @@ def resident(client):
 
 def holds(client, low, high, slack=128 * MIB, **route):
     """The debugger holds between `low` and `high` bytes of images: by what it
-    reports, and by its resident memory, which is what it read whatever it
-    reports. A tree without the reported figure is judged on memory alone."""
+    reports and by retained memory. Remote sealed mappings need not fault in
+    their unused pages; count their nonresident extent for the lower bound,
+    while preserving the resident upper bound. Local copies stay resident."""
     figures = client.inspect('list_modules', limit=1, **route).get('image_bytes')
     if figures: assert low <= figures['held'] <= high and figures['peak'] <= high, (figures, low, high)
     rss = resident(client)
-    assert low <= rss < high + slack, (rss, low, high)
+    backing = backing_rss = 0
+    if client.runtime_agent:
+        active = False
+        for row in Path(f'/proc/{client.p.pid}/smaps').read_text().splitlines():
+            if re.match(r'^[0-9a-f]+-[0-9a-f]+ ', row):
+                active = any(name in row for name in ('/memfd:xodb-target-file ', '/memfd:xodb-image-sections '))
+                if active:
+                    columns = row.split(); first, last = (int(v, 16) for v in columns[0].split('-'))
+                    assert columns[1] == 'r--p', row
+                    backing += last - first
+            elif active and row.startswith('Rss:'):
+                backing_rss += int(row.split()[1]) * 1024
+    assert low <= rss + max(0, backing - backing_rss) and rss < high + slack, (rss, backing, backing_rss, low, high)
+    assert backing < high + slack, (backing, high)
     return figures['held'] if figures else rss
 
 
@@ -350,15 +364,10 @@ def total(w, a, result):
             # A capture of the same process holds the same files: one copy, charged once.
             opened = r.client.inspect('start_profile', generation=r.session['generation'], duration_ms=60000, frequency_hz=99, tids=[r.tid])['capture']
             history = r.client.inspect('get_profile')['capture']['mapping_history']
-            if a.remote:
-                # Separate remote readers have distinct immutable snapshots.
-                # At this total a capture cannot duplicate both session images.
-                assert history['snapshot_bytes'] < 2 * size and history['images_not_searched'] >= 2, history
-            else:
-                assert history['snapshot_bytes'] >= 2 * size, history  # the probe saw the capture hold both
+            assert history['snapshot_bytes'] >= 2 * size, history  # the probe saw the capture hold both
             spent = r.held()
             assert spent['total_limit'] == limit and spent['peak'] <= limit, spent
-            if not a.remote: assert spent['held'] < session_bytes + history['snapshot_bytes'], (spent, history)
+            assert spent['held'] < session_bytes + history['snapshot_bytes'], (spent, history)
             assert spent['held'] < 2 * size + 64 * MIB, spent  # the capture added only small system images
             rss = r.peak_rss()
             assert rss < limit + 128 * MIB, rss
@@ -378,10 +387,7 @@ def total(w, a, result):
             assert 'left of the' in found['image_budget'] and f'/tt2.so is {size // MIB} MiB' in found['image_budget'], found
             opened = r.client.inspect('start_profile', generation=r.session['generation'], duration_ms=60000, frequency_hz=99, tids=[r.tid])['capture']
             history = r.client.inspect('get_profile')['capture']['mapping_history']
-            if a.remote:
-                assert history['snapshot_bytes'] < size and history['images_not_searched'] >= 2, history
-            else:
-                assert size <= history['snapshot_bytes'] < 2 * size, history
+            assert size <= history['snapshot_bytes'] < 2 * size, history
             spent = r.held()
             assert size <= spent['held'] <= limit and spent['peak'] <= limit, spent
             assert r.peak_rss() < limit + 128 * MIB

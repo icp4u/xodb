@@ -85,6 +85,13 @@ if prefixes:
 def run_case(d, shim, name, rules, frames, seconds, expect):
     log = Path(d.dir) / f'{name}.log'
     env = dict(d.env, LD_PRELOAD=str(shim), XODB_VKFAULT=rules)
+    # Automatic selection retries an empty/unusable inventory. An explicit
+    # device request instead needs correction and is fatal at startup. A gate
+    # may pin a GPU; keep that coverage, but require the precise refusal.
+    request_error = {
+        'start-devices-0': 'VulkanDeviceNotFound',
+        'start-families-0': 'VulkanDeviceCannotPresent',
+    }.get(name) if env.get('XODB_VK_DEVICE', '').strip() else None
     started = time.monotonic()
     with log.open('wb') as stream:
         app = subprocess.Popen([binary, '--frames', str(frames)], env=env, stdout=stream, stderr=stream)
@@ -140,6 +147,7 @@ def run_case(d, shim, name, rules, frames, seconds, expect):
     m = re.search(r'xodb: (\d+) frames, clean shutdown \(reason=(\w+)', text)
     rendered = int(m.group(1)) if m else None
     r = dict(name=name, rules=rules, frames=frames, expect=expect, returncode=app.returncode, sigint=stopped, seconds=round(elapsed, 3),
+             request_error=request_error,
              rendered=rendered, reason=m.group(2) if m else None, log=str(log),
              init_failures=text.count('Renderer initialization failed'), frame_failures=text.count('Frame failed'),
              swapchain_requests=text.count('vkfault: swapchain request'),
@@ -150,14 +158,20 @@ def run_case(d, shim, name, rules, frames, seconds, expect):
              summary=summary, retirements=retirements, rss_kib=rss, tail=text.splitlines()[-8:])
     problems = []
     if r['panic']: problems.append('crash/panic')
-    if app.returncode != 0: problems.append(f'exit {app.returncode}')
-    if rendered is None: problems.append('no clean shutdown line')
+    if request_error:
+        if app.returncode != 1 or stopped: problems.append('requested unavailable device did not fail at startup')
+        if f'error: {request_error}' not in text.splitlines(): problems.append('missing exact device-request refusal')
+        if rendered is not None or r['init_failures']: problems.append('device-request refusal entered the render/retry loop')
+    else:
+        if app.returncode != 0: problems.append(f'exit {app.returncode}')
+        if rendered is None: problems.append('no clean shutdown line')
     if summary is None: problems.append('no shim summary (abnormal exit)')
     else:
         if summary['leaks']: problems.append(f"{summary['leaks']} leaked objects")
         if summary['violations']: problems.append(f"{summary['violations']} lifetime violations")
         if summary['live_at_exit']: problems.append(f"{summary['live_at_exit']} live objects at exit")
         if summary['created'] != summary['destroyed']: problems.append('unbalanced Vulkan object creation/destruction')
+        if request_error and summary['created']['device']: problems.append('created a logical device despite unusable inventory')
         allocations = summary['allocations']
         if allocations['live_bytes'] or allocations['leaked_bytes'] or allocations['allocated_bytes'] != allocations['freed_bytes']:
             problems.append('unbalanced Vulkan allocation bytes')
@@ -176,7 +190,7 @@ def run_case(d, shim, name, rules, frames, seconds, expect):
         # the failed call followed by a successful one is that recovery.
         filter_fallback = rules.endswith('fail=vkCreateInstance@1:oodm') and summary and summary['calls'].get('vkCreateInstance', [0, 0])[0] > 1
         if not (r['init_failures'] + r['frame_failures'] or filter_fallback): problems.append('no renderer failure occurred before recovery')
-    if expect == 'retry':
+    if expect == 'retry' and not request_error:
         if rendered: problems.append('rendered despite unusable startup')
         if not r['init_failures']: problems.append('no init failure reported')
     if expect == 'cycle' and not (r['init_failures'] + r['frame_failures']): problems.append('fault never surfaced')

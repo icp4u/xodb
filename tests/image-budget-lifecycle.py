@@ -256,7 +256,7 @@ class T:
         return r
     def stack(self, process=1, label='stack'):
         t = time.monotonic(); deadline = t + 300
-        if a.agent:
+        if self.client.runtime_agent:
             # Remote caller frames use metadata-only unwinding until their image
             # is explicitly selected. Selecting its address must have headroom.
             deadline_symbol = time.monotonic() + 30
@@ -338,12 +338,9 @@ def run(case):
             t.w2 = os.open(t.cmd2, os.O_RDWR)
             t.send('f', 'forked'); t.wait('child'); t.stop(2); t.line(2)
             t.send('X', 'ready'); after = t.held()['sweep_held']
-            if a.agent:
-                # Separate agent file transfers have distinct snapshot identities:
-                # the child's refused sweep retained only its small executable.
-                assert 0 < after < before and after == t.held()['held'], (before, after, t.held())
-            else:
-                assert after == before, (before, after)
+            # The child maps the same file versions: locally and through the
+            # agent (same boot, same agent identity) it shares, charging nothing.
+            assert after == before, (before, after)
             t.line(); t.stop(2); t.stack(2); t.stack()
         finally: t.close()
     elif case in ('s9', 'replace'):

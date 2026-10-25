@@ -390,6 +390,17 @@ What it does **not** do:
 | Debug through gdbserver or QEMU | `xodb --gdb-remote 127.0.0.1:2345` after preparing the stub | Inspect raw registers/memory and use address breakpoints; see [GDB_REMOTE.md](GDB_REMOTE.md) for supported targets and QEMU interrupt limits |
 | Debug a process on a Mac | Start Apple's `debugserver` on the Mac's loopback, forward the port with `ssh -L`, then `xodb --gdb-remote 127.0.0.1:PORT` | Registers, memory, address breakpoints, watchpoints, Darwin signals, regions and images; no symbols or source yet. See [MACOS.md](MACOS.md) |
 
+## Native LoongArch64
+
+A LoongArch64 Linux host builds the debugger and the C agent with Zig 0.16.0. The host ISA is selected when xodb is compiled. Build the private Capstone 6 prefix, then the ReleaseSafe app:
+
+```sh
+python3 scripts/build-capstone
+zig build app -Doptimize=ReleaseSafe -Dcapstone=vendored
+```
+
+That installs `xodb` and `xodb-agent`. Hardware watches, CPU, syscall and allocation capture, and uprobes stay unsupported. Instruction step uses the software step. When the Vulkan loader does not see the driver manifest in its default directories, set `VK_ICD_FILENAMES` to that manifest and run `xodb --vk-list`.
+
 ## The window is blank
 
 GPU selection or driver loading can leave a window blank. xodb reports detected problems on stderr

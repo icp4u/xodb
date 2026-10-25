@@ -523,16 +523,16 @@ static void job_owners(void) {
         {1, XSVC_JOB_SHARED}, {2, XSVC_JOB_SHARED}
     };
     for (size_t o = 0; o < 4; ++o) for (size_t r = 0; r < 4; ++r) {
-        CHECK(xsvc_job_may_change(owners[o], owners[r], false) == (r == 0 || o == r));
-        CHECK(xsvc_job_may_change(owners[o], owners[r], true));
+        CHECK(xsvc_job_may_change(&owners[o], &owners[r], false) == (r == 0 || o == r));
+        CHECK(xsvc_job_may_change(&owners[o], &owners[r], true));
     }
     const struct xsvc_job_owner bad[] = {
         {1, XSVC_JOB_HUMAN}, {1, XSVC_JOB_STDIO}, {0, XSVC_JOB_SHARED},
         {XSVC_MAX_ID + 1, XSVC_JOB_SHARED}, {0, 3}, {0, UINT32_MAX}
     };
     for (size_t i = 0; i < sizeof bad / sizeof bad[0]; ++i) {
-        CHECK(!xsvc_job_may_change(bad[i], owners[0], true));
-        CHECK(!xsvc_job_may_change(owners[0], bad[i], true));
+        CHECK(!xsvc_job_may_change(&bad[i], &owners[0], true));
+        CHECK(!xsvc_job_may_change(&owners[0], &bad[i], true));
     }
 }
 

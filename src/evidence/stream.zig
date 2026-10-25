@@ -119,10 +119,16 @@ pub const Stream = struct {
         return self.parsed.data(self.bytes, i);
     }
     pub fn correlate(self: *const Stream, i: usize) sockets.Join {
-        const ctx = self.context orelse return .{ .reason = "no capture context: open with --open-capture an archive recorded with socket tables" };
-        const flow = self.summaries[i].flow() orelse return .{ .reason = "record has no 5-tuple (undecoded, or not TCP/UDP)" };
-        if (ctx.collection.reason()) |reason| return .{ .reason = reason };
-        return sockets.correlate(&ctx, flow, self.timeOf(i).monotonic_ns);
+        const flow = self.summaries[i].flow();
+        const ctx = switch (sockets.Context.joinPrecondition(
+            &self.context,
+            "no capture context: open with --open-capture an archive recorded with socket tables",
+            if (flow == null) "record has no 5-tuple (undecoded, or not TCP/UDP)" else null,
+        )) {
+            .ready => |ctx| ctx,
+            .unavailable => |reason| return .{ .reason = reason },
+        };
+        return sockets.correlate(ctx, flow.?, self.timeOf(i).monotonic_ns);
     }
 
     pub const Clock = enum { stream, capture };
@@ -199,7 +205,9 @@ test "stream decodes, groups flows and correlates" {
     try std.testing.expect(s.matches(1, .{ .port = 5000, .protocol = 6 }));
     try std.testing.expect(!s.matches(1, .{ .clock = .capture, .from_ns = 0 }));
     try std.testing.expect(s.matches(1, .{ .from_ns = base + 15, .to_ns = base + 21 }));
-    try std.testing.expectEqual(sockets.Basis.none, s.correlate(0).basis);
+    try std.testing.expectEqualStrings("no capture context: open with --open-capture an archive recorded with socket tables", s.correlate(0).reason);
+    // A missing context outranks the record-specific absence of a tuple.
+    try std.testing.expectEqualStrings("no capture context: open with --open-capture an archive recorded with socket tables", s.correlate(2).reason);
 
     // Capture started at monotonic 1000; realtime base maps to monotonic 1000.
     const table_sockets = [_]sockets.Socket{.{ .pid = 9, .fd = 5, .inode = 77, .protocol = .tcp, .family = .ipv4, .local = lo, .local_port = 40000, .remote = lo, .remote_port = 5000, .state = 1 }};

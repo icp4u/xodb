@@ -203,7 +203,7 @@ pub const Bytes = []align(std.heap.page_size_min) u8;
 // a capture of the same process, or every followed process that maps one
 // library. The key is the identity the reader already checks around its read;
 // the bytes are read-only once stored.
-const Stamp = struct { device: u64, inode: u64, size: i64, mtime: [2]i64, ctime: [2]i64 };
+const Stamp = struct { device: u64, inode: u64, size: i64, mtime: [2]i64, ctime: [2]i64, remote_boot: ?[36]u8 = null };
 const Shared = struct { stamp: Stamp, offset: u64, bytes: Bytes, holders: usize, sweep_bytes: usize };
 var store_lock: std.atomic.Mutex = .unlocked;
 var store: std.ArrayList(Shared) = .empty;
@@ -255,20 +255,27 @@ pub fn read(fd: c_int, limit: usize, cancel: ?*const std.atomic.Value(bool)) !By
 /// applied here. A version of the file some reader already holds is shared
 /// and costs nothing more.
 pub fn readRange(fd: c_int, file_offset: u64, size: usize, limit: usize, cancel: ?*const std.atomic.Value(bool)) !Bytes {
-    return readRangeFor(fd, file_offset, size, limit, cancel, null);
+    return readRangeFor(fd, file_offset, size, limit, cancel, null, null);
 }
 /// A new image is charged to the sweep share until its last reader releases
 /// it. Sharing across a fork or capture never transfers or forgets that charge.
 pub fn readSweepRange(fd: c_int, file_offset: u64, size: usize, limit: usize, each: usize) !Bytes {
-    return readRangeFor(fd, file_offset, size, limit, null, each);
+    return readRangeFor(fd, file_offset, size, limit, null, each, null);
 }
-fn readRangeFor(fd: c_int, file_offset: u64, size: usize, limit: usize, cancel: ?*const std.atomic.Value(bool), sweep: ?usize) !Bytes {
+/// The agent has already validated this original file version. Its transport
+/// memfd has a different inode on every open; that is not the sharing key.
+/// A boot ID separates remote filesystems and keeps local stat keys distinct.
+pub fn readRemoteRange(fd: c_int, file_offset: u64, size: usize, limit: usize, sweep: ?usize, identity: c.struct_xrt_file_identity, boot: ?[36]u8) !Bytes {
+    const key: ?Stamp = if (boot) |id| .{ .device = identity.device, .inode = identity.inode, .size = identity.size, .mtime = .{ identity.mtime_sec, identity.mtime_ns }, .ctime = .{ identity.ctime_sec, identity.ctime_ns }, .remote_boot = id } else null;
+    return readRangeFor(fd, file_offset, size, limit, null, sweep, key);
+}
+fn readRangeFor(fd: c_int, file_offset: u64, size: usize, limit: usize, cancel: ?*const std.atomic.Value(bool), sweep: ?usize, original: ?Stamp) !Bytes {
     var before: c.struct_stat = undefined;
     if (c.fstat(fd, &before) != 0 or before.st_mode & c.S_IFMT != c.S_IFREG or before.st_size <= 0 or size == 0) return error.BinaryUnavailable;
     if (size > limit) return error.BinarySnapshotLimit;
     const end = std.math.add(u64, file_offset, size) catch return error.BinaryUnavailable;
     if (end > @as(u64, @intCast(before.st_size))) return error.BinaryUnavailable;
-    const key = stamp(&before);
+    const key = original orelse stamp(&before);
     lockStore();
     const shared = held(key, file_offset, size);
     store_lock.unlock();
@@ -281,14 +288,25 @@ fn readRangeFor(fd: c_int, file_offset: u64, size: usize, limit: usize, cancel: 
     defer if (!owned) releaseSweep(swept_bytes);
     const charged = try reserve(size);
     defer if (!owned) release(charged);
-    const ptr = c.mmap(null, size, c.PROT_READ | c.PROT_WRITE, c.MAP_PRIVATE | c.MAP_ANONYMOUS, -1, 0);
+    // Sealed memfds cannot change or shrink under a retained mapping. Mapping
+    // those pages keeps the job and snapshot on one physical copy; mutable
+    // files still require an anonymous snapshot to avoid truncation faults.
+    const seals = c.fcntl(fd, c.F_GET_SEALS);
+    const required = c.F_SEAL_WRITE | c.F_SEAL_GROW | c.F_SEAL_SHRINK;
+    const sealed = seals >= 0 and seals & required == required and file_offset % std.heap.pageSize() == 0;
+    if (cancel) |flag| if (flag.load(.acquire)) return error.ArchiveCancelled;
+    // A sealed file that cannot be mapped here (hugetlbfs alignment, say) is
+    // still readable: fall back to the anonymous copy rather than refusing.
+    const direct: ?*anyopaque = if (sealed) c.mmap(null, size, c.PROT_READ, c.MAP_PRIVATE, fd, @intCast(file_offset)) else std.c.MAP_FAILED;
+    const mapped = direct != std.c.MAP_FAILED;
+    const ptr = if (mapped) direct else c.mmap(null, size, c.PROT_READ | c.PROT_WRITE, c.MAP_PRIVATE | c.MAP_ANONYMOUS, -1, 0);
     if (ptr == std.c.MAP_FAILED) return error.OutOfMemory;
     const bytes: Bytes = @as([*]align(std.heap.page_size_min) u8, @ptrCast(@alignCast(ptr.?)))[0..size];
     defer if (!owned) {
         _ = c.munmap(bytes.ptr, bytes.len);
     };
     var offset: usize = 0;
-    while (offset < size) {
+    while (!mapped and offset < size) {
         if (cancel) |flag| if (flag.load(.acquire)) return error.ArchiveCancelled;
         const n = c.pread(fd, bytes.ptr + offset, @min(1024 * 1024, size - offset), @intCast(file_offset + offset));
         if (n < 0 and std.c._errno().* == c.EINTR) continue;
@@ -296,8 +314,8 @@ fn readRangeFor(fd: c_int, file_offset: u64, size: usize, limit: usize, cancel: 
         offset += @intCast(n);
     }
     var after: c.struct_stat = undefined;
-    if (c.fstat(fd, &after) != 0 or !std.meta.eql(key, stamp(&after))) return error.BinaryChangedDuringRead;
-    if (c.mprotect(bytes.ptr, size, c.PROT_READ) != 0) return error.BinaryUnavailable;
+    if (c.fstat(fd, &after) != 0 or !std.meta.eql(stamp(&before), stamp(&after))) return error.BinaryChangedDuringRead;
+    if (!mapped and c.mprotect(bytes.ptr, size, c.PROT_READ) != 0) return error.BinaryUnavailable;
     lockStore();
     defer store_lock.unlock();
     // Another thread may have read the same version meanwhile: keep theirs.
@@ -431,6 +449,53 @@ test "a file version is read once and shared by every holder" {
     const d = try read(fd, per_image_limit, null);
     try std.testing.expectEqual(@as(u8, 'x'), d[0]);
     free(d);
+    try std.testing.expectEqual(start, used());
+}
+
+test "remote sealed images share original identity, not transport descriptors" {
+    const saved = .{ per_image_limit, total_limit };
+    defer per_image_limit = saved[0];
+    defer total_limit = saved[1];
+    try configure(mib, 3 * mib / 2);
+    const start = used();
+    var files: [2]c_int = @splat(-1);
+    defer for (files) |fd| {
+        if (fd >= 0) _ = c.close(fd);
+    };
+    for (&files) |*fd| {
+        fd.* = c.memfd_create("xodb-remote-snapshot-test", c.MFD_CLOEXEC | c.MFD_ALLOW_SEALING);
+        try std.testing.expect(fd.* >= 0);
+        try std.testing.expectEqual(@as(c_int, 0), c.ftruncate(fd.*, mib));
+        try std.testing.expectEqual(@as(isize, 1), c.pwrite(fd.*, "z", 1, 0));
+        try std.testing.expectEqual(@as(c_int, 0), c.fcntl(fd.*, c.F_ADD_SEALS, @as(c_int, c.F_SEAL_WRITE | c.F_SEAL_GROW | c.F_SEAL_SHRINK | c.F_SEAL_SEAL)));
+    }
+    var identity: c.struct_xrt_file_identity = undefined;
+    try std.testing.expectEqual(@as(c_uint, c.XRT_OK), c.xrt_file_identity(files[0], &identity));
+    var other: c.struct_xrt_file_identity = undefined;
+    try std.testing.expectEqual(@as(c_uint, c.XRT_OK), c.xrt_file_identity(files[1], &other));
+    try std.testing.expect(identity.inode != other.inode);
+    const boot: [36]u8 = "11111111-1111-1111-1111-111111111111".*;
+    const first = try readRemoteRange(files[0], 0, mib, mib, null, identity, boot);
+    const second = try readRemoteRange(files[1], 0, mib, mib, null, identity, boot);
+    try std.testing.expectEqual(first.ptr, second.ptr);
+    try std.testing.expectEqual(start + mib, used());
+    try std.testing.expectEqual(@as(u8, 'z'), second[0]);
+    // Different files, versions, boots and local namespaces must not alias.
+    try std.testing.expectError(error.BinarySnapshotLimit, readRemoteRange(files[1], 0, mib, mib, null, other, boot));
+    var changed = identity;
+    changed.mtime_sec += 1;
+    try std.testing.expectError(error.BinarySnapshotLimit, readRemoteRange(files[1], 0, mib, mib, null, changed, boot));
+    try std.testing.expectError(error.BinarySnapshotLimit, readRemoteRange(files[1], 0, mib, mib, null, identity, "22222222-2222-2222-2222-222222222222".*));
+    try std.testing.expectError(error.BinarySnapshotLimit, read(files[0], mib, null));
+    try std.testing.expectError(error.BinarySnapshotLimit, readRemoteRange(files[1], 0, mib, mib - 1, null, identity, boot));
+    free(first);
+    for (&files) |*fd| {
+        _ = c.close(fd.*);
+        fd.* = -1;
+    }
+    try std.testing.expectEqual(start + mib, used());
+    try std.testing.expectEqual(@as(u8, 'z'), second[0]);
+    free(second);
     try std.testing.expectEqual(start, used());
 }
 

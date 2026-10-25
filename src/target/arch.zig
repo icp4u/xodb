@@ -65,7 +65,8 @@ pub const Arch = enum(u16) {
 pub const native: Arch = switch (@import("builtin").cpu.arch) {
     .x86_64 => .x86_64,
     .aarch64 => .aarch64,
-    else => @compileError("native targets currently require x86-64 or AArch64 Linux"),
+    .loongarch64 => .loongarch64,
+    else => @compileError("native targets currently require x86-64, AArch64, or LoongArch64 Linux"),
 };
 test "breakpoint PC and caller lookup have separate ISA rules" {
     try std.testing.expectEqual(@as(?u64, 0x1000), Arch.aarch64.breakpointPc(0x1000));

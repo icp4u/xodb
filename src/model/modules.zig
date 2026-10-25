@@ -163,6 +163,8 @@ pub const Modules = struct {
     const FileMaps = struct { regions: std.ArrayList(u32) = .empty, placed: std.ArrayList(Placed) = .empty };
     target: ?*const rt.struct_xrt_target = null,
     owner_target: ?*rt.struct_xrt_target = null,
+    remote_boot: ?[36]u8 = null,
+    remote_boot_checked: bool = false,
     // Worker-owned immutable snapshots must not read the owner's changing ISA.
     expected_machine: ?u16 = null,
     core_source: ?*const @import("../binary/core.zig").Core = null,
@@ -930,7 +932,18 @@ pub const Modules = struct {
         // ELF/libdw slices must only reference owned, bounded snapshots.
         // The reader shares a version another owner holds and charges the
         // process-wide total for a new one; it says no before allocating.
-        const mapped = (if (why == .sweep)
+        const remote = self.core_source == null and rt.xrt_target_is_remote(self.target);
+        if (remote and !self.remote_boot_checked) {
+            self.remote_boot = snapshot.bootIdTarget(self.target);
+            self.remote_boot_checked = true;
+        }
+        const original: ?rt.struct_xrt_file_identity = if (remote) identity: {
+            const index = self.identityIndex(region) orelse return error.BinaryIdentityUnavailable;
+            break :identity self.identities.items[index].identity orelse return error.BinaryIdentityUnavailable;
+        } else null;
+        const mapped = (if (remote)
+            snapshot.readRemoteRange(fd, entry.offset, entry.size, snapshot.per_image_limit, if (why == .sweep) @intCast(bound.?.each) else null, @bitCast(original.?), self.remote_boot)
+        else if (why == .sweep)
             snapshot.readSweepRange(fd, entry.offset, entry.size, snapshot.per_image_limit, @intCast(bound.?.each))
         else
             snapshot.readRange(fd, entry.offset, entry.size, snapshot.per_image_limit, null)) catch |err| {

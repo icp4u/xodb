@@ -2,7 +2,7 @@
 """Periodic honest-library, compressed-debug and opt-in budget invariants.
 Also checks capture release guards and stderr through repeated real stops.
 """
-import argparse, importlib.util, json, os, re, select, struct, subprocess, time
+import argparse, importlib.util, json, os, re, select, struct, subprocess, time, traceback
 from pathlib import Path
 from client import Client
 spec = importlib.util.spec_from_file_location('hostile', Path(__file__).with_name('image-budget-hostile.py'))
@@ -86,11 +86,12 @@ def packed(w,a):
     r=h.Run(w,w/'host',[lib])
     try:
         before=stats(r.client)
-        if a.agent:
+        if r.client.runtime_agent:
             reply=r.client.tool('set_breakpoint',generation=r.client.session()['generation'],file='lib.c',line=4)['result']
             assert reply['isError'] and 'images not searched' in text(reply),reply
-        found=r.stack();notice=found['image_budget']
-        assert notice and 'decompressed debug data' in notice and '301 MiB' in notice and '--image-limit 400M' in notice,found
+        found=r.stack(select=(lib,));notice=found['image_budget']
+        wanted='302 MiB' if a.wrong_result else '301 MiB'
+        assert notice and 'decompressed debug data' in notice and wanted in notice and '--image-limit 400M' in notice,found
         failures=h.load_failures(r.client)
         assert any(f['diagnostic']=='CompressedDebugBudget' and f['detail']==notice for f in failures),failures
         reply=r.client.tool('set_breakpoint',generation=r.client.session()['generation'],file='lib.c',line=4)['result']
@@ -106,8 +107,8 @@ def packed(w,a):
     struct.pack_into('<Q',image.b,section['offset']+8,(1<<64)-1);image.save(lib)
     r=h.Run(w,w/'host',[lib])
     try:
-        if a.agent:r.client.tool('set_breakpoint',generation=r.client.session()['generation'],file='lib.c',line=4)
-        found=r.stack();notice=found['image_budget']
+        if r.client.runtime_agent:r.client.tool('set_breakpoint',generation=r.client.session()['generation'],file='lib.c',line=4)
+        found=r.stack(select=(lib,));notice=found['image_budget']
         assert notice and 'decompressed debug data' in notice and 'no accepted --image-limit is that large' in notice,found
         assert r.held()['held']<8*MIB,r.held()
         print(json.dumps({'case':'compressed-saturated','notice':notice.replace(str(w),'.')}),flush=True)
@@ -173,5 +174,13 @@ def client(scope,executable=None,**kwargs):
     if a.agent:kwargs['options']=['--runtime-agent',str(Path(a.agent).resolve()),*kwargs.get('options',[])]
     return Client(scope,executable,**kwargs)
 h.Client=client
-for case in a.only.split(','):globals()[case](w,a)
+failures=[]
+for case in a.only.split(','):
+    try:globals()[case](w,a)
+    except Exception as error:
+        if not (a.agent or os.environ.get('XODB_TEST_RUNTIME_AGENT')):raise
+        failures.append(case)
+        print(json.dumps({'case':case,'status':'failed','error':str(error)}),flush=True)
+        traceback.print_exc()
+if failures:raise SystemExit('image budget regressions failed: '+', '.join(failures))
 print('image budget regressions: pass')

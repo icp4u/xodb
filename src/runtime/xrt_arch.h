@@ -374,6 +374,10 @@ const struct xrt_arch *xrt_arch_get(uint16_t machine);
 const struct xrt_arch *xrt_arch_resolve(struct xrt_abi_id id);
 const struct xrt_arch *xrt_arch_resolve_in(struct xrt_abi_id id,
                                            const struct xrt_arch *const *rows, size_t count);
+/* Zig 0.16.0 passes and returns this 8-byte, 2-aligned struct incorrectly on
+ * LoongArch64. C keeps the by-value calls. The pointer forms are the boundary. */
+const struct xrt_arch *xrt_arch_resolve_id(const struct xrt_abi_id *id);
+void xrt_arch_abi_copy(const struct xrt_arch *arch, struct xrt_abi_id *out);
 const struct xrt_arch *xrt_arch_native(void);
 struct xrt_abi_id xrt_arch_abi(const struct xrt_arch *arch);
 enum xrt_status xrt_arch_validate(const struct xrt_arch *arch);

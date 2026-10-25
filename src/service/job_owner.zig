@@ -6,7 +6,7 @@ pub const Owner = struct {
         return .{ .value = .{ .client = client orelse 0, .kind = if (client != null) c.XSVC_JOB_SHARED else c.XSVC_JOB_STDIO } };
     }
     pub fn require(self: Owner, requester: Requester) !void {
-        if (!c.xsvc_job_may_change(self.value, requester.owner.value, requester.controller)) return error.JobNotOwned;
+        if (!c.xsvc_job_may_change(&self.value, &requester.owner.value, requester.controller)) return error.JobNotOwned;
     }
 };
 pub const Requester = struct { owner: Owner = .{}, controller: bool = false };

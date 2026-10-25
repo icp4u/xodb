@@ -78,6 +78,22 @@ pub const Context = struct {
     /// Written under --redact (schema 2): private addresses are tags, names masked.
     redacted: bool = false,
 
+    pub const JoinPrecondition = union(enum) {
+        ready: *const Context,
+        unavailable: []const u8,
+    };
+
+    /// Resolve the context shared by network and USB joins. A caller may
+    /// supply a record-specific refusal that is more useful than the
+    /// collection state. It comes after a missing-context refusal, preserving
+    /// the established order: no context, invalid record, then not collected.
+    pub fn joinPrecondition(context: *const ?Context, missing_context: []const u8, record_unavailable: ?[]const u8) JoinPrecondition {
+        const ctx = if (context.*) |*value| value else return .{ .unavailable = missing_context };
+        if (record_unavailable) |reason| return .{ .unavailable = reason };
+        if (ctx.collection.reason()) |reason| return .{ .unavailable = reason };
+        return .{ .ready = ctx };
+    }
+
     pub fn mapping(self: *const Context) clock.Mapping {
         return clock.fromPairs(self.pairs);
     }
