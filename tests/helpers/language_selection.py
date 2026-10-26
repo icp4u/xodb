@@ -35,12 +35,16 @@ def check_native_values(display, tid, language, label):
         reply = display.tool('get_language_tabs', generation=generation)
         assert reply['generation'] == generation, reply
         tabs = reply['view']
-        if any(t['tab'] == language and t['visible'] and t['status'] == 'ready' for t in tabs['tabs']): break
+        selected = display.request('tools/call', {'name': 'select_language_tab',
+                                   'arguments': {'generation': generation, 'tab': language}})
+        pending = selected and selected.get('isError') and selected.get('content') == [{'type': 'text', 'text': 'LanguageTabPending'}]
+        if not pending:
+            assert selected and 'structuredContent' in selected, selected
+            if any(t['tab'] == language and t['visible'] and t['status'] == 'ready' for t in tabs['tabs']): break
         # A finished probe that rules the runtime out will not change while stopped.
         assert not (tabs.get('complete') and any(t['tab'] == language and t['status'] in ('absent', 'disabled', 'not_requested') for t in tabs['tabs'])), tabs
         assert time.monotonic() < deadline, tabs
         time.sleep(.03)
-    display.tool('select_language_tab', generation=generation, tab=language)
     locals_ = display.tool('list_locals', tid=tid, frame=0)['locals']
     values = [v for v in locals_ if v['value'].get('visualization') and v['value']['visualization'].get(language)]
     assert values, (language, locals_)

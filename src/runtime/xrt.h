@@ -90,7 +90,11 @@ enum xrt_status {
     /* Local lifecycle results; never put these on the agent wire. */
     XRT_REMOTE_CANCELLED,
     XRT_REMOTE_OUTCOME_UNKNOWN,
-    XRT_REMOTE_IO_FORBIDDEN
+    XRT_REMOTE_IO_FORBIDDEN,
+    /* Appended so earlier values stay stable. A current agent sends this when
+     * its shared file table is full. An older agent still reports that case
+     * as XRT_FILE_UNAVAILABLE. */
+    XRT_FILE_SLOT_LIMIT
 };
 
 #endif

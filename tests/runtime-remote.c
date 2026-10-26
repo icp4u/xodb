@@ -86,8 +86,20 @@ static void files(struct xrt_target *t, const char *self, bool latency)
             continue;
         request = (struct xrt_file_request){
             .kind = XRT_FILE_MAPPED, .mapping = {start, end, offset, major, minor, inode, path}};
+        struct xrt_file_identity agent_identity, host_identity;
         int binary = -1;
-        OK(xrt_target_file(t, &request, &binary));
+        OK(xrt_target_file_open(t, &request, &binary, &agent_identity));
+        OK(xrt_file_identity(binary, &host_identity));
+        assert(agent_identity.inode == inode && agent_identity.size > 0);
+        assert(host_identity.inode != agent_identity.inode);
+        assert(xrt_target_file_slots(t) == XRT_AGENT_FILE_SLOTS);
+        struct xrt_file_view *view = NULL;
+        OK(xrt_target_file_view_open(t, &request, &view));
+        const struct xrt_file_identity *held = xrt_file_view_identity(view);
+        assert(held && held->inode == agent_identity.inode && held->device == agent_identity.device &&
+               held->size == agent_identity.size);
+        assert(xrt_file_view_source(view) == XRT_FILE_SOURCE_REMOTE && xrt_file_view_remote(view));
+        OK(xrt_file_view_close(view));
         char elf[4];
         assert(read(binary, elf, 4) == 4 && !memcmp(elf, "\177ELF", 4));
         assert(write(binary, "x", 1) == -1 && errno == EPERM);
@@ -144,8 +156,28 @@ static void files(struct xrt_target *t, const char *self, bool latency)
             OK(xrt_remote_call(t, &open));
         }
         open.value = &unused;
+        assert(xrt_remote_call(t, &open) == XRT_FILE_SLOT_LIMIT);
+        assert(xrt_remote_symbol_file(t, &request, &binary, &resident, NULL) == XRT_FILE_SLOT_LIMIT);
+        /* A host that did not ask for the slot count gets the older status;
+         * it would drop the connection on an unknown one. */
+        uint64_t machine = 0;
+        unsigned char hello[32];
+        size_t hello_size = 0;
+        const uint32_t remote_id = t->remote_id;
+        t->remote_id = 0; /* HELLO is a connection call, not a target call. */
+        OK(xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_HELLO,
+            .args = {XRT_RPC_HELLO_CAPABILITIES, XRT_RPC_CAP_ADDRESS_SPACE}, .value = &machine,
+            .out = hello, .capacity = sizeof(hello), .length = &hello_size}));
+        assert(hello_size == 24);
+        t->remote_id = remote_id;
         assert(xrt_remote_call(t, &open) == XRT_FILE_UNAVAILABLE);
-        assert(xrt_remote_symbol_file(t, &request, &binary, &resident, NULL) == XRT_FILE_UNAVAILABLE);
+        t->remote_id = 0;
+        OK(xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_HELLO,
+            .args = {XRT_RPC_HELLO_CAPABILITIES, XRT_RPC_CAP_ADDRESS_SPACE | XRT_RPC_CAP_FILE_SLOTS},
+            .value = &machine, .out = hello, .capacity = sizeof(hello), .length = &hello_size}));
+        assert(hello_size == 32);
+        t->remote_id = remote_id;
+        assert(xrt_remote_call(t, &open) == XRT_FILE_SLOT_LIMIT);
         for (unsigned i = 0; i < 32; ++i)
             OK(xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_FILE_CLOSE, .args = {handles[i]}}));
         ++request.mapping.inode;

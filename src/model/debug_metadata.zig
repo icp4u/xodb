@@ -9,9 +9,15 @@ const loc = @import("../debug/location.zig");
 const A = std.heap.page_allocator;
 const Kind = enum { javascript, unwind, image };
 const max_unwind_jobs = 64;
-// Every unwind job keeps its file view open. The C agent holds 32 open files
-// for all features (symbols, sources, file requests); keep half for them.
+// Every unwind job keeps its file view open. The agent file table is shared
+// with symbols, sources and other file requests, so unwind takes half of the
+// count HELLO advertised. An older agent omits the count; keep the historical
+// half of a 32-slot table.
 const max_remote_unwind_jobs = 16;
+fn remoteUnwindLimit(slots: u32) usize {
+    if (slots == 0) return max_remote_unwind_jobs;
+    return @as(usize, slots) / 2;
+}
 const max_jobs = max_unwind_jobs + 4;
 const unwind_budget: u64 = 128 * 1024 * 1024;
 const Entry = struct {
@@ -142,7 +148,7 @@ pub const State = struct {
             return error.BinarySnapshotLimit;
         };
         if (kind == .unwind) {
-            try self.reserveUnwind(runtime.c.xrt_target_is_remote(session.target.handle));
+            try self.reserveUnwind(runtime.c.xrt_target_is_remote(session.target.handle), runtime.c.xrt_target_file_slots(session.target.handle));
         } else {
             var count: usize = 0;
             for (self.entries) |slot| if (slot) |entry| {
@@ -208,8 +214,8 @@ pub const State = struct {
         try check(c.xmd_image_result(entry.job, &fd), if (progress.reason) |reason| std.mem.span(reason) else null);
         return session.modules.loadMainImage(region, fd, if (why == .frame) .frame else .sweep);
     }
-    fn reserveUnwind(self: *State, remote: bool) !void {
-        const limit: usize = if (remote) max_remote_unwind_jobs else max_unwind_jobs;
+    fn reserveUnwind(self: *State, remote: bool, slots: u32) !void {
+        const limit: usize = if (remote) remoteUnwindLimit(slots) else max_unwind_jobs;
         while (true) {
             var used: u64 = 0;
             var count: usize = 0;
@@ -442,4 +448,11 @@ fn check(status: c_uint, reason: ?[]const u8) !void {
         c.XBO_NOT_FOUND => error.DebugMetadataUnavailable,
         else => error.DebugMetadataUnavailable,
     };
+}
+
+test "remote unwind budget is half the advertised file slots" {
+    try std.testing.expectEqual(@as(usize, 16), remoteUnwindLimit(0));
+    try std.testing.expectEqual(@as(usize, 16), remoteUnwindLimit(32));
+    try std.testing.expectEqual(@as(usize, 8), remoteUnwindLimit(16));
+    try std.testing.expectEqual(@as(usize, 0), remoteUnwindLimit(1));
 }

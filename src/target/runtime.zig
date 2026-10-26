@@ -139,6 +139,7 @@ pub fn check(status: c.enum_xrt_status) !void {
         c.XRT_FILE_UNAVAILABLE => return error.BinaryIdentityUnavailable,
         c.XRT_FILE_CHANGED => return error.BinaryChangedDuringRead,
         c.XRT_FILE_LIMIT => return error.BinarySnapshotLimit,
+        c.XRT_FILE_SLOT_LIMIT => return error.AgentFileSlotLimit,
         c.XRT_DISCOVERY_CANCELLED => return error.SymbolDiscoveryCancelled,
         c.XRT_DISCOVERY_PENDING => return error.SymbolDiscoveryPending,
         c.XRT_DISCOVERY_BUDGET => return error.SymbolDiscoveryBudgetExceeded,

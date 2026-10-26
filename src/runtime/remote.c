@@ -59,6 +59,7 @@ struct xrt_connection {
     pid_t child;
     uint64_t request, producer_ns, host_ns, uncertainty_ns;
     uint64_t capabilities;
+    uint32_t file_slots; /* HELLO count; zero when the agent did not advertise */
     uint32_t tick_hz, page_size;
     uint16_t machine; /* HELLO: the row a newly created agent target starts on */
     enum xrt_status failed;
@@ -399,8 +400,11 @@ static enum xrt_status invoke(const struct xrt_target *target, const struct xrt_
         (void)broken(c, status);
         return mutation ? XRT_REMOTE_OUTCOME_UNKNOWN : status;
     }
+    /* Statuses above the ambiguous-match value are host-local, except the
+     * appended file-slot refusal, which a current agent sends. */
     if (reply.flags != 1 || reply.request != frame.request || reply.op != frame.op ||
-        reply.target != frame.target || reply.status > XRT_AMBIGUOUS_MATCH)
+        reply.target != frame.target ||
+        (reply.status > XRT_AMBIGUOUS_MATCH && reply.status != XRT_FILE_SLOT_LIMIT))
         return invalid_reply(c, mutation);
     struct xrt_codec in = xrt_codec(c->reply, reply.size, true);
     uint64_t value = 0;
@@ -788,11 +792,12 @@ enum xrt_status xrt_target_remote_cancel(const char *const argv[], struct xrt_ta
     /* Repeat after transport startup. Pick the shortest round trip so SSH
      * authentication/startup delay does not dominate the clock estimate. */
     for (unsigned probe = 0; probe < 4 && status == XRT_OK; ++probe) {
-        uint8_t meta[24];
+        uint8_t meta[32];
         size_t meta_size = 0;
         const uint64_t before = xrt_now();
         status = xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_HELLO,
-                                                       .args = {XRT_RPC_HELLO_CAPABILITIES, XRT_RPC_CAP_ADDRESS_SPACE},
+                                                       .args = {XRT_RPC_HELLO_CAPABILITIES,
+                                                                XRT_RPC_CAP_ADDRESS_SPACE | XRT_RPC_CAP_FILE_SLOTS},
                                                        .value = &machine,
                                                        .out = meta,
                                                        .capacity = sizeof(meta),
@@ -806,17 +811,21 @@ enum xrt_status xrt_target_remote_cancel(const char *const argv[], struct xrt_ta
         xrt_codec_u64(&in, &producer);
         xrt_codec_u32(&in, &hz);
         xrt_codec_u32(&in, &page);
-        uint64_t capabilities = 0;
-        if (in.size == 24) xrt_codec_u64(&in, &capabilities);
-        if (!in.ok || in.at != in.size || !hz || !page || (page & (page - 1)) || after < before) {
+        uint64_t capabilities = 0, slots = 0;
+        if (in.size == 24 || in.size == 32) xrt_codec_u64(&in, &capabilities);
+        if (in.size == 32) xrt_codec_u64(&in, &slots);
+        const bool advertised = (capabilities & XRT_RPC_CAP_FILE_SLOTS) != 0;
+        if (!in.ok || in.at != in.size || !hz || !page || (page & (page - 1)) || after < before ||
+            advertised != (in.size == 32) || (advertised && (slots == 0 || slots > UINT32_MAX))) {
             status = XRT_PROTOCOL_ERROR;
             break;
         }
-        if (probe && c->capabilities != capabilities) {
+        if (probe && (c->capabilities != capabilities || c->file_slots != (uint32_t)slots)) {
             status=XRT_PROTOCOL_ERROR;
             break;
         }
         c->capabilities=capabilities;
+        c->file_slots=(uint32_t)slots;
         if (after - before < shortest) {
             shortest = after - before;
             c->producer_ns = producer;
@@ -849,6 +858,10 @@ uint64_t xrt_target_remote_image_limit(const struct xrt_target *t)
 {
     return t && t->connection && !(t->connection->capabilities & XRT_RPC_CAP_LARGE_IMAGES) ?
         XRT_LEGACY_REMOTE_IMAGE_LIMIT : XRT_REMOTE_IMAGE_LIMIT;
+}
+uint32_t xrt_target_file_slots(const struct xrt_target *t)
+{
+    return t && t->connection ? t->connection->file_slots : 0;
 }
 enum xrt_status xrt_remote_destroy(struct xrt_target *t)
 {
@@ -1270,7 +1283,9 @@ enum xrt_status xrt_remote_file(const struct xrt_target *t, const struct xrt_fil
         status = XRT_FILE_UNAVAILABLE;
         goto done;
     }
-    const uint64_t limit = regular ? (uint64_t)identity.size : UINT64_C(4) * 1024 * 1024;
+    /* Proc files are not regular. The ceiling stays bounded and still admits
+     * a maps file for a library mapped many times. */
+    const uint64_t limit = regular ? (uint64_t)identity.size : UINT64_C(32) * 1024 * 1024;
     uint64_t at = 0;
     for (;;) {
         if ((status = budget_status(budget)) != XRT_OK) {

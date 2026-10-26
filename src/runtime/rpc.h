@@ -23,6 +23,10 @@
  * snapshot is followed by an address_space_unstable bool. Old hosts keep
  * their original reply shape; hosts without this evidence bypass read caches. */
 #define XRT_RPC_CAP_ADDRESS_SPACE UINT64_C(2)
+/* HELLO arg[1] asks for one more u64: the agent's open-file slot count.
+ * Old hosts omit the bit and keep the 24-byte reply. Old agents ignore the
+ * bit and omit the count; the host then keeps today's per-feature caps. */
+#define XRT_RPC_CAP_FILE_SLOTS UINT64_C(8)
 enum xrt_rpc_op {
     XRT_RPC_HELLO = 1,
     XRT_RPC_CREATE,
@@ -162,6 +166,7 @@ static inline enum xrt_rpc_class xrt_rpc_classify(uint16_t op)
 
 _Static_assert(XRT_FILE_LIMIT == 70, "status 70 is the file limit");
 _Static_assert(XRT_AMBIGUOUS_MATCH == 76, "status 76 is ambiguous probe match");
+_Static_assert(XRT_FILE_SLOT_LIMIT == 84, "file-slot exhaustion stays appended");
 _Static_assert(XRT_RPC_ALLOCATIONS_START == 52, "allocation start stays 52");
 _Static_assert(XRT_RPC_FUNCTION_START == 53, "function start stays 53");
 _Static_assert(XRT_RPC_CONTROL_WRITE == 54, "control write is opcode 54");

@@ -287,25 +287,44 @@ def lookup(w, a, result):
     program = oversized_symbols(w/'host', w/'lk_host')  # exe_marker stays in .dynsym
     try:
         if os.environ.get('XODB_TEST_RUNTIME_AGENT'):
-            # Remote name scans do not use the local /proc/exe full-image
-            # fallback, even when this is the target's main executable.
-            for options in (OPTIN, (*OPTIN, '--break', 'xodb_no_such_symbol')):
-                r = Run(w, program, libs, options=options)
-                try:
-                    r.holds(0, 0)
-                    for name in ('exe_marker', 'exe_marker', 'xodb_no_such_symbol', 'xodb_no_such_symbol_2'):
-                        reply, _ = r.symbol(name)
-                        texts = errors(reply)
-                        assert texts[0] == ('SymbolNotFound' if a.wrong_result else 'ImageBudgetExceeded'), reply
-                        assert len(texts) == 2 and str(program) in texts[1], reply
-                        assert 'symbol tables too large to search by name' in texts[1], reply
-                    held = r.holds(0, 0)
-                    assert r.client.session()['generation'] == r.session['generation']
-                    result['lookup'] = {'policy': 'remote name fallback unavailable', 'images': count + 1,
-                                        'image_bytes': BIG, 'held_bytes': held, 'peak_rss_bytes': r.peak_rss()}
-                    r.close()
-                finally:
-                    r.kill()
+            # A name query still does not read the main executable. --break
+            # NAME does, through the background job, the same as a local
+            # breakpoint. The owner does not block on that job.
+            r = Run(w, program, libs, options=OPTIN)
+            try:
+                r.holds(0, 0)
+                for name in ('exe_marker', 'exe_marker', 'xodb_no_such_symbol', 'xodb_no_such_symbol_2'):
+                    reply, _ = r.symbol(name)
+                    texts = errors(reply)
+                    assert texts[0] == ('SymbolNotFound' if a.wrong_result else 'ImageBudgetExceeded'), reply
+                    assert len(texts) == 2 and str(program) in texts[1], reply
+                    assert 'symbol tables too large to search by name' in texts[1], reply
+                held = r.holds(0, 0)
+                assert r.client.session()['generation'] == r.session['generation']
+                result['lookup'] = {'policy': 'remote name fallback unavailable', 'images': count + 1,
+                                    'image_bytes': BIG, 'held_bytes': held, 'peak_rss_bytes': r.peak_rss()}
+                r.close()
+            finally:
+                r.kill()
+            r = Run(w, program, libs, options=(*OPTIN, '--break', 'xodb_no_such_symbol'))
+            try:
+                deadline = time.monotonic() + 30
+                while r.held().get('held', 0) < BIG:
+                    assert time.monotonic() < deadline, r.held()
+                    time.sleep(.02)
+                held = r.holds(BIG, BIG)  # the main executable, not the eight libraries
+                found = r.stack()
+                # The stopped frame's library is also over the synchronous cap,
+                # so it is not copied and the frame has no source. A native
+                # frame may hold libc beside the executable.
+                frame = named(found, 'probe_wait')
+                assert frame is None or not frame.get('source'), frame
+                after = r.holds(held, held + 16 * MIB)
+                assert after < BIG * 2
+                result['lookup']['break_peak_bytes'] = after
+                r.close()
+            finally:
+                r.kill()
             return
         r = Run(w, program, libs, options=OPTIN)
         try:
@@ -489,6 +508,19 @@ def pending(w, a, result):
         lib.unlink(missing_ok=True)
 
 
+def mapped_libc(pid):
+    """The libc file this process has mapped. One path, measured, not assumed."""
+    found = []
+    for line in Path(f'/proc/{pid}/maps').read_text().splitlines():
+        parts = line.split()
+        if len(parts) < 6 or not parts[-1].startswith('/'): continue
+        base = os.path.basename(parts[-1])
+        if base.startswith('libc.so') or base.startswith('libc-'): found.append(parts[-1])
+    assert found, 'no mapped libc'
+    assert all(path == found[0] for path in found), found
+    return Path(found[0])
+
+
 def path(w, a, result):
     # 512 bytes is where the path is cut: put a three-byte character across it
     # and an escape sequence in the file name.
@@ -499,13 +531,22 @@ def path(w, a, result):
     lib = Path(stem + 'p' * (507 - len(os.fsencode(stem))) + '€' + 'q' * 20 + '\x1b[31m.so')
     raw = os.fsencode(str(lib))
     assert len(raw) > 512 and raw[507:510] == '€'.encode(), len(raw)  # the cut falls inside it
-    lib.write_bytes((w/'lk_ok.so').read_bytes()); os.truncate(lib, 2 * MIB)
+    # The remote top frame is the native libc and is loaded in full, so the
+    # budget has to admit it: measure it, and size the fixture above that.
+    limit_mib = 1
+    if a.remote:
+        libc_bytes = mapped_libc(os.getpid()).stat().st_size
+        limit_mib = max(1, (libc_bytes + MIB - 1) // MIB + 1)
+    image_mib = 2 * limit_mib
+    assert image_mib < 90, image_mib  # the advice below stays 100M
+    advice = f'is {image_mib} MiB; image budget {limit_mib} MiB; rerun with --image-limit 100M or set symbols.image_bytes'
+    lib.write_bytes((w/'lk_ok.so').read_bytes()); os.truncate(lib, image_mib * MIB)
     try:
-        r = Run(w, w/'host', [lib], options=('--image-limit', '1M'))
+        r = Run(w, w/'host', [lib], options=('--image-limit', f'{limit_mib}M'))
         try:
-            found = r.stack()
+            found = r.stack(select=(lib,) if a.remote else ())
             notice = found['image_budget']
-            assert isinstance(notice, str) and notice.endswith('... is 2 MiB; image budget 1 MiB; rerun with --image-limit 100M or set symbols.image_bytes'), found
+            assert isinstance(notice, str) and notice.endswith('... ' + advice), found
             assert notice.startswith(stem) and len(notice.encode()) < 512 + 288 and not any(ord(ch) < 32 or 127 <= ord(ch) < 160 for ch in notice), notice
             page = r.client.inspect('list_modules', limit=512)
             assert page['image_budget'] == notice, page['image_budget']
@@ -514,17 +555,17 @@ def path(w, a, result):
             err, _ = r.close()
             line = next(l for l in err.split(b'\n') if b'module budget:' in l)
             assert line.endswith(notice.encode()) and b'\x1b' not in line, line
-            result['path'] = {'path_bytes': len(raw), 'notice_bytes': len(notice.encode())}
+            result['path'] = {'path_bytes': len(raw), 'notice_bytes': len(notice.encode()), 'image_limit_mib': limit_mib}
         finally:
             r.kill()
         # A short name keeps its characters; only the control bytes change.
         short = w/'café\x1b[2J.so'
-        short.write_bytes((w/'lk_ok.so').read_bytes()); os.truncate(short, 2 * MIB)
+        short.write_bytes((w/'lk_ok.so').read_bytes()); os.truncate(short, image_mib * MIB)
         try:
-            r = Run(w, w/'host', [short], options=('--image-limit', '1M'))
+            r = Run(w, w/'host', [short], options=('--image-limit', f'{limit_mib}M'))
             try:
-                notice = r.stack()['image_budget']
-                assert notice == f'{w}/café?[2J.so is 2 MiB; image budget 1 MiB; rerun with --image-limit 100M or set symbols.image_bytes', notice
+                notice = r.stack(select=(short,) if a.remote else ())['image_budget']
+                assert notice == f'{w}/café?[2J.so {advice}', notice
                 err, _ = r.close()
                 assert b'\x1b' not in next(l for l in err.split(b'\n') if b'module budget:' in l), err
             finally:
@@ -577,7 +618,10 @@ def container(w, a, result):
                 # Neither library is read, by the pending --break or by the request.
                 held = holds(c, 0, 0)
                 texts = errors(missing)
-                assert texts[0] == 'ImageBudgetExceeded' and '/padded.apk is 300 MiB and has no symbols-only view' in texts[1] and '256 MiB each, 512 MiB per process' in texts[1], texts
+                if a.remote:
+                    assert texts[0] == 'ImageBudgetExceeded' and '/padded.apk' in texts[1] and 'remote image transfer is capped at 256 MiB outside the background main-image job' in texts[1], texts
+                else:
+                    assert texts[0] == 'ImageBudgetExceeded' and '/padded.apk is 300 MiB and has no symbols-only view' in texts[1] and '256 MiB each, 512 MiB per process' in texts[1], texts
                 assert errors(find('apk_left_tick'))[0] == 'ImageBudgetExceeded'
             else:
                 # Within the bounds both are read and searched, as before.
@@ -984,9 +1028,10 @@ def optin(w, a, result):
         try:
             t = time.monotonic(); found = r.stack(select=(lib,)); seconds = time.monotonic() - t
             frame = named(found, 'probe_wait')
-            assert frame and frame['source'] and frame['diagnostic'] is None and found['image_budget'] is None, found
             figures = r.modules().get('image_bytes')
             assert not figures or (figures['image_limit'], figures['total_limit']) == (2 << 30, 8 << 30), figures
+            # Remotely this stays red until prepared images: the stack must load it.
+            assert frame and frame['source'] and frame['diagnostic'] is None and found['image_budget'] is None, found
             result['optin'] = {'image_bytes': size, 'held_bytes': r.holds(size, size + MIB), 'stack_seconds': round(seconds, 3)}
             r.close()
         finally:
@@ -1118,6 +1163,7 @@ def tabs(w, a, result):
             said = refusal(r, libs[-1])
             r.holds(0, 0)
             frame = named(r.stack(select=(libs[-1],)), 'probe_wait')
+            # Remotely this stays red until prepared images: the stack must load it.
             assert frame and frame['source'], frame  # the probe saw the stack load the image
             r.holds(BIG, BIG + MIB)
             # The view can read the image now, so the tab is looked at again: it no longer blames the budget.
@@ -1139,9 +1185,16 @@ def tabs(w, a, result):
             before = tab(r, 'python')
             assert before['status'] == 'unavailable' and before['reason'] == 'PythonImageBudgetExceeded', before
             said = refusal(r, libs[-1])
-            assert said.endswith('; it has no debug info, so a stack does not load it either'), said
+            if a.remote:
+                assert 'remote image transfer is capped at 256 MiB outside the background main-image job' in said, said
+            else:
+                assert said.endswith('; it has no debug info, so a stack does not load it either'), said
             assert named(r.stack(), 'probe_wait')  # named from the symbols-only view
-            r.holds(0, MIB)  # and indeed not loaded
+            if a.remote:
+                native = r.holds(0, 16 * MIB)  # libc may be held; the library is not
+                assert native < BIG
+            else:
+                r.holds(0, MIB)  # and indeed not loaded
             after = tab(r, 'python')
             assert after['status'] == 'unavailable' and after['reason'] == 'PythonImageBudgetExceeded', after  # the tab says what the view says
             result['tabs']['stripped'] = said.replace(str(w), '.')
@@ -1160,6 +1213,7 @@ def views(w, a, result):
     libs = []
     for i in range(4): libs.append(w/f'vw{i}.so'); libs[-1].write_bytes((w/'lk_ok.so').read_bytes()); os.truncate(libs[-1], BIG)
     result['views'] = {}
+    native = None
     try:
         for label, options, expected in (('small', SMALL, 0), ('optin', OPTIN, BIG)):
             r = Run(w, program, [w/'lk_ok.so', *libs], options=options)
@@ -1175,7 +1229,18 @@ def views(w, a, result):
                     answers[language] = why
                 # Within the image budget the executable is read, once; over it, it is not.
                 # (A view may also look at the frames' own small library.)
-                result['views'][label] = {'answers': answers, 'held_bytes': r.holds(expected, expected + MIB)}
+                # Remote small views may hold the native baseline. The remote
+                # opt-in label stays red: these views do not start the
+                # background main-image job, so the 300 MiB executable is not
+                # transferred. That transfer belongs to prepared-image work.
+                if a.remote and label == 'small':
+                    if native is None:
+                        native = r.holds(0, 16 * MIB)
+                        assert native != BIG
+                    held = r.holds(native, native + MIB)
+                else:
+                    held = r.holds(expected, expected + MIB)
+                result['views'][label] = {'answers': answers, 'held_bytes': held}
                 r.close()
             finally:
                 r.kill()
@@ -1209,8 +1274,16 @@ def restore(w, a, result):
                 probe = next(b for b in c.inspect('get_breakpoints')['breakpoints'] if b['id'] == saved)
                 if options is OPTIN:
                     # Restored in the new process, by reading the one library it is in.
+                    # Remotely the symbols-only identity places it, so the 300 MiB
+                    # library is not transferred. A native frame may hold libc.
                     assert not probe['pending'] and probe['address'], probe
-                    held = holds(c, BIG, BIG + MIB)
+                    if a.remote:
+                        reported = c.inspect('list_modules', limit=1).get('image_bytes') or {}
+                        ceiling = 16 * MIB if reported.get('held', 0) > MIB else MIB
+                        held = holds(c, 0, ceiling)
+                        assert held != BIG
+                    else:
+                        held = holds(c, BIG, BIG + MIB)
                 else:
                     # Over the small budget the image is not read, and the breakpoint waits.
                     assert probe['pending'], probe

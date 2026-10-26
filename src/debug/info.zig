@@ -623,6 +623,10 @@ pub const Image = struct {
         // Only an explicit undefined rule declares the outermost frame. Failed
         // evaluation or an unreadable saved address must remain a partial walk.
         if (!outermost and caller[self.architecture.ra()] == null) return error.ReturnAddressUnavailable;
+        // AArch64 pac-ret signs the return address. Its PAC bits sit above the
+        // user VA, so an unstripped value is not a code address. Stop here
+        // instead of naming a bogus caller; stripping needs the PAC mask.
+        if (self.architecture == .aarch64) if (caller[self.architecture.ra()]) |ra| if (ra >> 48 != 0) return error.PointerAuthenticationUnsupported;
         caller[self.architecture.sp()] = cfa;
         if (self.architecture == .aarch64) caller[self.architecture.pc()] = caller[self.architecture.ra()];
         return .{ .cfa = cfa, .caller = caller, .method = method, .outermost = outermost };

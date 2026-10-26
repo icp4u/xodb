@@ -227,6 +227,10 @@ The private protocol is experimental version 2, with no compatibility guarantee
 between development revisions. Build host and agent from the same revision.
 The source-fetch capability is negotiated with an optional HELLO suffix, so
 agents predating that operation keep their original handshake.
+A host that asks also receives the agent's open-file slot count. An older
+agent omits it, and the host keeps its existing per-feature caps. Unwind
+uses half of an advertised count. A full table returns a distinct file-slot
+status; an older agent still reports that case as file unavailable.
 The 32-byte big-endian header contains `XRT1`, u16 version/opcode, u64 request ID,
 and u32 target/status/body length/flags. Requests use flags 0; replies use flags 1.
 IDs must increase by one. Frames have a 1 MiB ceiling and a 10-second deadline;
@@ -244,7 +248,7 @@ status; the host retains failed-cleanup handles.
 The connection supports 128 target handles, 32 file transfers and 32 collectors.
 Each target has at most 1,024 threads, 4,096 retained events, 128 software probes
 and four hardware watch slots. Mapped ELF transfers are identity-checked before,
-during and after reading (256 MiB ceiling); bounded proc metadata uses a 4 MiB
+during and after reading (256 MiB ceiling); bounded proc metadata uses a 32 MiB
 ceiling. Host copies are sealed memfds, so analysis never silently opens the
 target's path on the host. Large debug assets must fit the existing snapshot
 budgets. Target page size, clock tick rate, register widths and endianness come

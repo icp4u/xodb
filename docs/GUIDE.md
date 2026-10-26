@@ -164,6 +164,11 @@ This changes presentation scope only, not runtime identity or witness policy.
 
 `get_language_tabs` reads this state; a controller holding the
 shared-session lease uses `select_language_tab` with `generation` and `tab`.
+A runtime not yet shown and not yet checked returns `LanguageTabPending`;
+retry after discovery has progressed. `LanguageTabUnavailable` means the
+check finished without the runtime, rather than that discovery is still
+running. A shown tab stays selectable while its runtime is rechecked after a
+stop.
 Tab selection does not change registers or resume the target. The cycle goes
 from C/C++ through each available language tab, then Regs; reaching Regs can
 take more than one press. A detected runtime that cannot be read shows its

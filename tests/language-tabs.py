@@ -79,6 +79,11 @@ def case(label, executable, language=None, args=()):
             t['reason'] == 'breakpoint' for t in x['threads']), 'main breakpoint', timeout=30)
         generation, tid = stopped['generation'], next(t['tid'] for t in stopped['threads'] if t['state'] == 'stopped')
         registers = observer.tool('get_registers', tid=tid)
+        # Selection itself starts discovery. An unchecked runtime is pending,
+        # not proof of absence; refusal must leave presentation unchanged.
+        s.expect_error(observer.raw('select_language_tab', generation=generation, tab='ruby'), 'ControlLeaseRequired')
+        s.expect_error(owner.raw('select_language_tab', generation=generation, tab='ruby'), 'LanguageTabPending')
+        report['selected_during_discovery'] = True
         before = ready(observer)
         # Cold metadata discovery may outlive the control lease. Claim it for
         # the following controller assertions, not for a guessed duration.
@@ -86,6 +91,7 @@ def case(label, executable, language=None, args=()):
         visible = [t['tab'] for t in before['view']['tabs'] if t['visible']]
         assert visible == ['registers', 'native'] + ([language] if language else []), before
         assert before['view']['selected'] == 'native', before
+        s.expect_error(owner.raw('select_language_tab', generation=generation, tab='ruby'), 'LanguageTabUnavailable')
         s.expect_error(observer.raw('select_native_frame', generation=generation, tid=tid, frame=0), 'ControlLeaseRequired')
         s.expect_error(observer.raw('select_language_frame', generation=generation, tid=tid, language=language or 'lua', segment=0, frame=0), 'ControlLeaseRequired')
         assert 'select_native_frame' not in s.listed_tools(observer) and 'select_language_frame' not in s.listed_tools(observer)

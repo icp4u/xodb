@@ -53,6 +53,7 @@ static enum xrt_status file_view_open(const struct xrt_target *t,
                 v->identity.ctime_ns < 0 || v->identity.ctime_ns >= 1000000000)
                 status = xrt_remote_fail(t, XRT_PROTOCOL_ERROR);
             else {
+                /* Identity is the agent's stat. This view has no host copy. */
                 v->target = t;
                 v->source = XRT_FILE_SOURCE_REMOTE;
                 __atomic_add_fetch(&((struct xrt_target *)t)->remote_files, 1, __ATOMIC_SEQ_CST);

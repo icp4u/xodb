@@ -36,7 +36,9 @@ pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: std
         if (!session.agent_controller) return error.AgentScopeDenied;
         if (args.object.get("generation") == null) return error.GenerationRequired;
         if (selecting_tab) {
-            try session.language_tabs.select(try tab(args, "tab"));
+            const selected = try tab(args, "tab");
+            session.language_tabs.enabled = true;
+            try session.language_tabs.select(selected);
         } else {
             const tid = try number(args, "tid", std.math.maxInt(i32));
             if (tid == 0) return error.InvalidArguments;

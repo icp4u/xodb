@@ -72,13 +72,17 @@ separate from this headless result.
 | Unwinding | CFI uses ARM LR column 30, SP 31 and PC 32; separate breakpoint and caller-PC rules |
 | Optimized fixture | GCC O2 without frame pointers unwinds; `next=12`; `amount` is explicitly unavailable (`EntryValueUnavailable`), also unavailable in installed GDB |
 | Hardware watches | Up to four aligned 1/2/4/8-byte write/read-write watches; MCP investigations and remote GUI controls; native lifecycle/completion tests pass ([semantics/evidence](research/arm64-watchpoints/integration.md)); hardware execution breakpoints remain unsupported |
-| Profiling | CPU sampling and sampled-stack CFI flames; register tables are unit-tested, with no native ARM64 run yet; syscall and allocation sampling stay x86-64; captures are not saved (`ArchiveUnsupportedArchitecture`) |
+| Profiling | Native CPU sampling on a PAC-capable ARM64 machine: sampled stacks of a frame-pointer fixture unwind through the C library to `_start`, matching the breakpoint stack. In a `pac-ret` build the saved return addresses are signed. Live and sampled walks name the leaf and the first signing function, then stop with `PointerAuthenticationUnsupported` instead of reporting a signed address as a caller. Syscall and allocation sampling stay x86-64; captures are not saved (`ArchiveUnsupportedArchitecture`) |
 | Archives | Existing x86 format retained; incompatible ELF assets are rejected even if their content hash matches |
 | GUI / remote protocol | Workstation GUI controls native ARM64 over SSH or TCP ([demo](REMOTE_DEBUGGING.md)); GUI rendering on Jetty remains pending |
 
 Jetty's libdw predates `dwarf_get_units`; its adapter uses `dwarf_next_unit` for
 DWARF 4 and explicitly rejects newer unit versions. Newer libdw keeps the
-existing DWARF 4/5 path. Signal-frame unwinding, PAC/tag handling, SIMD/SVE state,
+existing DWARF 4/5 path. Pointer authentication: unwinding does not strip PAC bits
+yet. A return address with bits above 47 stops the walk. Stripping needs the
+insn mask from `PTRACE_GETREGSET` `NT_ARM_PAC_MASK` (recorded with each capture
+for sampled stacks), or `xpaclri` when the debugger runs on the target.
+Signal-frame unwinding, tag handling, SIMD/SVE state,
 32-bit compatibility targets and general optimized entry-value reconstruction
 are outside this first native slice. Native target and ELF ISA checks prevent
 interpreting another machine's register or debug layout as the current target.

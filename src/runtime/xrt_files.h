@@ -12,7 +12,12 @@ struct xrt_target;
 /* Synchronous whole-file transfers run on the target owner thread, uncached and
  * uncancellable. Larger main images use the background ranged image job. */
 #define XRT_REMOTE_SYNC_IMAGE_LIMIT XRT_LEGACY_REMOTE_IMAGE_LIMIT
+/* Shared agent file table. HELLO reports this count only when the host asks. */
+#define XRT_AGENT_FILE_SLOTS 32u
 uint64_t xrt_target_remote_image_limit(const struct xrt_target *);
+/* Slots the connected agent advertised. Zero means an older agent that did
+ * not report a count; callers keep today's caps. Local targets return zero. */
+uint32_t xrt_target_file_slots(const struct xrt_target *);
 struct xrt_file_identity {
     uint64_t device, inode;
     int64_t size, mtime_sec, mtime_ns, ctime_sec, ctime_ns;
@@ -52,7 +57,9 @@ enum xrt_status xrt_target_file(const struct xrt_target *, const struct xrt_file
                                 int *fd);
 enum xrt_status xrt_process_file(int32_t pid, const struct xrt_file_request *, int *fd);
 /* Optional source output is set only on success. Identity checks and lookup
- * order are identical to the ordinary open calls. */
+ * order are identical to the ordinary open calls. On a remote target the
+ * identity is the agent's stat of the target file, not the stat of the
+ * sealed host copy. */
 enum xrt_status xrt_target_file_resolved(const struct xrt_target *, const struct xrt_file_request *,
         int *, struct xrt_file_identity *, enum xrt_file_source *);
 enum xrt_status xrt_process_file_resolved(int32_t, const struct xrt_file_request *,

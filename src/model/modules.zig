@@ -186,6 +186,13 @@ pub const Modules = struct {
     /// The one file a name lookup may read in full when its symbol tables
     /// are too large for the symbols-only view: the main executable.
     name_fallback: ?FileKey = null,
+    /// Kernel PHDR for `maps_revision`. Zero means this map reported none.
+    remote_main_revision: u64 = std.math.maxInt(u64),
+    remote_main_phdr: u64 = 0,
+    /// File that contains that PHDR. The header mapping and the executable
+    /// mapping are different VMAs of one inode.
+    remote_main_file_revision: u64 = std.math.maxInt(u64),
+    remote_main_file: ?FileKey = null,
     /// Region index of the first image the last findSymbol could not search
     /// by name, for this map.
     unsearched: ?Unsearched = null,
@@ -1325,7 +1332,18 @@ pub const Modules = struct {
         var identity: ?rt.struct_xrt_file_identity = null;
         var projected = std.mem.zeroes(rt.struct_xrt_file_identity);
         if (rt.xrt_target_is_remote(self.target)) {
-            try runtime_api.check(rt.xrt_remote_symbol_file(self.target, &request, &fd, &resident, &projected));
+            // A finished refusal is the file's, not the mapping's. The local
+            // reader remembers it below; a remote open used to be retried once
+            // per alias.
+            runtime_api.check(rt.xrt_remote_symbol_file(self.target, &request, &fd, &resident, &projected)) catch |err| {
+                switch (err) {
+                    error.SymbolDiscoveryPending, error.SymbolDiscoveryCancelled, error.SymbolDiscoveryBudgetExceeded => {},
+                    // A full agent file table or a broken transport is not the file's answer.
+                    error.AgentFileSlotLimit, error.TransportFailed, error.RemoteCancelled, error.RemoteOutcomeUnknown, error.ProtocolError, error.OutOfMemory => {},
+                    else => self.symbol_refusals.put(self.allocator, fileKey(region), err) catch {},
+                }
+                return err;
+            };
         } else {
             var pinned: rt.struct_xrt_file_identity = undefined;
             self.localSymbolFile(region, &request, &fd, &resident, &source, &pinned, self.identities.items[file_index].identity) catch |err| {
@@ -1407,8 +1425,8 @@ pub const Modules = struct {
         }
     }
     fn verifySymbolIdentity(self: *const Modules, region: Region, fd: c_int) !void {
-        // A remote file is a sealed host copy. Its host stat is not the
-        // target's identity; the agent's identity is compared instead.
+        // A remote fd is a sealed host copy. That stat is a different domain
+        // from the agent identity recorded when the file was opened.
         if (self.core_source == null and rt.xrt_target_is_remote(self.target)) return;
         const index = self.identityIndex(region) orelse return;
         const expected = self.identities.items[index].identity orelse return;
@@ -1532,6 +1550,27 @@ pub const Modules = struct {
         if (!std.mem.eql(u8, id, build_id)) return error.BreakpointBuildIdMismatch;
         return module.runtimeAddress(offset);
     }
+    pub const ProjectedSite = struct { id: []const u8, offset: u64, path: []const u8 };
+    /// Build id and link offset from the symbols-only view. Used when a
+    /// synchronous copy refused a regular file that the image budget would
+    /// still allow. The caller does not transfer the whole file.
+    pub fn projectedRestore(self: *Modules, address: u64) !ProjectedSite {
+        if (self.core_source != null or !rt.xrt_target_is_remote(self.target)) return error.BreakpointAddressNotRestorable;
+        const region = for (self.regions.items) |r| {
+            if (address >= r.start and address < r.end and r.inode != 0 and r.path.len > 0 and r.path[0] == '/') break r;
+        } else return error.UnmappedAddress;
+        const image = try self.symbolImage(region);
+        const index = self.identityIndex(region) orelse return error.BinaryIdentityUnavailable;
+        const stored = self.identities.items[index].identity orelse return error.BinaryIdentityUnavailable;
+        if (stored.size <= 0) return error.BinaryIdentityUnavailable;
+        const size: u64 = @intCast(stored.size);
+        if (size <= rt.XRT_REMOTE_SYNC_IMAGE_LIMIT) return error.BreakpointAddressNotRestorable;
+        if (size > snapshot.per_image_limit or size > snapshot.remaining()) return error.BinarySnapshotLimit;
+        const id = image.buildId() orelse return error.BreakpointImageHasNoBuildId;
+        const p = try self.placement(image, 0, region, false);
+        if (address < p.bias) return error.UnmappedAddress;
+        return .{ .id = id, .offset = address - p.bias, .path = region.path };
+    }
     /// Whether `r` is the main executable, the one image `lookupRead` may
     /// read in full for a name. Once one file has been chosen for this
     /// process image no other ever is.
@@ -1540,13 +1579,71 @@ pub const Modules = struct {
     }
     /// The same question for a sweep, which a capture's own (immutable)
     /// module set asks of a live process too.
+    /// A remote executable is the file that contains the kernel program
+    /// headers. Those headers sit in the read-only header mapping, while a
+    /// name lookup visits the executable mapping of the same inode.
+    /// `/proc/PID/exe` is not a file on this host.
     fn mainExecutable(self: *Modules, r: Region) bool {
         const key = fileKey(r);
         if (self.name_fallback) |chosen| return std.meta.eql(chosen, key);
-        if (self.pid <= 0 or self.core_source != null or rt.xrt_target_is_remote(self.target)) return false;
+        if (self.pid <= 0 or self.core_source != null) return false;
+        if (rt.xrt_target_is_remote(self.target)) {
+            if (r.inode == 0 or r.path.len == 0 or r.path[0] != '/') return false;
+            const main = self.remoteMainFile() orelse return false;
+            if (!std.meta.eql(main, key)) return false;
+            self.name_fallback = key;
+            return true;
+        }
         if (!isExecutable(self.pid, r)) return false;
         self.name_fallback = key;
         return true;
+    }
+    fn cachedMainPhdr(self: *Modules) ?u64 {
+        if (self.remote_main_revision == self.maps_revision) {
+            return if (self.remote_main_phdr == 0) null else self.remote_main_phdr;
+        }
+        self.remote_main_revision = self.maps_revision;
+        self.remote_main_phdr = 0;
+        if (self.target == null) return null;
+        var loader = std.mem.zeroes(rt.struct_xrt_loader);
+        if (rt.xrt_target_loader(self.target, &loader, null) != rt.XRT_OK) return null;
+        self.remote_main_phdr = loader.main_phdr;
+        return if (loader.main_phdr == 0) null else loader.main_phdr;
+    }
+    /// One scan per map revision. Later aliases of the same file compare keys.
+    fn remoteMainFile(self: *Modules) ?FileKey {
+        if (self.remote_main_file_revision == self.maps_revision) return self.remote_main_file;
+        self.remote_main_file_revision = self.maps_revision;
+        self.remote_main_file = null;
+        const phdr = self.cachedMainPhdr() orelse return null;
+        for (self.regions.items) |other| {
+            if (phdr < other.start or phdr >= other.end) continue;
+            if (other.inode == 0 or other.path.len == 0 or other.path[0] != '/') continue;
+            self.remote_main_file = fileKey(other);
+            break;
+        }
+        return self.remote_main_file;
+    }
+    /// Address of the kernel-proved main image, when this target has one.
+    pub fn mainImageAddress(self: *Modules) ?u64 {
+        if (!rt.xrt_target_is_remote(self.target)) return null;
+        return self.cachedMainPhdr();
+    }
+    /// A stat of the mapped file, not a copy. True when a synchronous
+    /// transfer would refuse it. Discovery yield and cancellation propagate.
+    fn remoteExceedsSync(self: *Modules, region: Region) !bool {
+        const path = try self.allocator.dupeZ(u8, region.path);
+        defer self.allocator.free(path);
+        const request = std.mem.zeroInit(rt.struct_xrt_file_request, .{
+            .kind = rt.XRT_FILE_MAPPED,
+            .mapping = .{ .start = region.start, .end = region.end, .offset = region.offset, .device_major = region.device_major, .device_minor = region.device_minor, .inode = region.inode, .path = path.ptr },
+        });
+        var view: ?*rt.struct_xrt_file_view = null;
+        try self.openFileView(&request, &view);
+        defer _ = rt.xrt_file_view_close(view);
+        const identity = rt.xrt_file_view_identity(view).*;
+        if (identity.size <= 0) return false;
+        return @as(u64, @intCast(identity.size)) > rt.XRT_REMOTE_SYNC_IMAGE_LIMIT;
     }
     extern fn xodb_mapped_file_matches(fd: c_int, pid: c_int, start: u64, end: u64, device_major: u64, device_minor: u64, inode: u64, strict: c_int) c_int;
     /// Whether mapping `r` of `pid` is the file `/proc/PID/exe` names: same
@@ -1573,7 +1670,9 @@ pub const Modules = struct {
     ///    breakpoint by symbol, --break NAME in the process it was given
     ///    for) may read one image whose tables are too large for that view:
     ///    the main executable, once per process image, under the image
-    ///    budgets.
+    ///    budgets. Over a runtime agent, a main executable larger than the
+    ///    synchronous transfer cap is not copied here. The caller drives the
+    ///    background main-image job, which still obeys those budgets.
     /// 3. An image with no symbols-only view (an entry inside a container,
     ///    any image of a core or of another session without a live process)
     ///    is read in full by explicit and automatic lookups alike, but only
@@ -1588,10 +1687,12 @@ pub const Modules = struct {
         if (why == .tables) {
             if (!explicit or !self.nameFallback(r)) return null;
             if (self.fallback_failure) |failed| if (failed.revision == self.maps_revision) return failed.err;
+            if (rt.xrt_target_is_remote(self.target) and try self.remoteExceedsSync(r)) return error.MainImageRequired;
         }
         return self.load(r, .name) catch |err| {
             // A full read of the executable that failed is not repeated for this map.
-            if (why == .tables and err != error.OutOfMemory) self.fallback_failure = .{ .revision = self.maps_revision, .err = err };
+            // MainImageRequired is not a failure: the background job may still admit it.
+            if (why == .tables and err != error.OutOfMemory and err != error.MainImageRequired) self.fallback_failure = .{ .revision = self.maps_revision, .err = err };
             return err;
         };
     }
@@ -1604,12 +1705,29 @@ pub const Modules = struct {
         return std.fmt.bufPrint(buffer, "{s}: symbol tables too large to search by name until the image is loaded; only the main executable is read in full for a name", .{snapshot.printable(&name, self.regions.items[missed.region].path, name.len)}) catch null;
     }
     pub const unsearched_text = 512 + 160;
+    /// A name absent from one mapping of a file is absent from the rest.
+    /// The bound is files examined, not aliases; past it, aliases are scanned.
+    const symbol_miss_limit = 128;
+    fn symbolMissed(missed: []const FileKey, region: Region) bool {
+        if (region.inode == 0) return false;
+        const key = fileKey(region);
+        for (missed) |old| if (std.meta.eql(old, key)) return true;
+        return false;
+    }
+    fn noteSymbolMiss(missed: *[symbol_miss_limit]FileKey, n: *usize, region: Region) void {
+        if (region.inode == 0 or n.* == missed.len or symbolMissed(missed[0..n.*], region)) return;
+        missed[n.*] = fileKey(region);
+        n.* += 1;
+    }
     fn symbolLookup(self: *Modules, name: []const u8, automatic: bool, fallback: bool, intent: SymbolIntent, cursor: *SymbolCursor) !Symbol {
         var failure = cursor.failure;
         defer cursor.failure = failure;
         var classified: usize = 0;
+        var missed: [symbol_miss_limit]FileKey = undefined;
+        var missed_n: usize = 0;
         regions: while (cursor.next < self.regions.items.len) : (cursor.next += 1) {
             const r = self.regions.items[cursor.next];
+            if (symbolMissed(missed[0..missed_n], r)) continue;
             // Reuse an existing full image (and its verified debug companion).
             for (self.loaded.items) |module| {
                 if (r.inode != module.inode or r.device_major != module.device_major or
@@ -1617,14 +1735,14 @@ pub const Modules = struct {
                 if (module.explicit_gdb) {
                     if (module.symbols().findSymbol(name)) |symbol| {
                         if (symbol.hasAddress()) return publishedSymbol(module.image.header.machine, module.id, symbol, symbol.value);
-                    }
+                    } else if (module.file_offset == 0) noteSymbolMiss(&missed, &missed_n, r);
                     continue :regions;
                 }
                 const p = self.placement(&module.image, module.file_offset, r, false) catch continue;
                 if (p.bias != module.bias) continue;
                 if (module.symbols().findSymbol(name)) |symbol| {
                     if (symbol.hasAddress()) return publishedSymbol(module.image.header.machine, module.id, symbol, try module.runtimeAddress(symbol.value));
-                }
+                } else if (module.file_offset == 0) noteSymbolMiss(&missed, &missed_n, r);
                 continue :regions;
             }
             if (r.offset != 0 and r.permissions[2] != 'x') continue;
@@ -1673,6 +1791,7 @@ pub const Modules = struct {
                         continue;
                     };
                     if (found) |symbol| return symbol;
+                    noteSymbolMiss(&missed, &missed_n, r);
                     continue;
                 } else |err| switch (err) {
                     error.NotPe => {},
@@ -1685,7 +1804,10 @@ pub const Modules = struct {
             }
             // Offset-0 data mappings are admitted above for PE headers only.
             if (automatic and r.permissions[2] != 'x') continue;
-            if (!no_reader and self.file_kinds.contains(fileKey(r)) and (self.fileKind(r) catch null) == .pe) continue;
+            if (!no_reader and self.file_kinds.contains(fileKey(r)) and (self.fileKind(r) catch null) == .pe) {
+                noteSymbolMiss(&missed, &missed_n, r);
+                continue;
+            }
             var why: Unviewed = .no_reader;
             const view: ?*const elf.Image = if (no_reader) null else self.symbolImage(r) catch |err| blk: {
                 switch (err) {
@@ -1695,10 +1817,13 @@ pub const Modules = struct {
                     error.NotElf, error.BinaryIdentityUnavailable => {
                         if (intent == .elf and r.inode != 0 and r.permissions[2] == 'x')
                             lookupFailure(&failure, intent, error.BinaryIdentityUnavailable);
+                        // The file is not an ELF symbol image. Every other mapping agrees.
+                        noteSymbolMiss(&missed, &missed_n, r);
                         continue;
                     },
                     else => {
                         lookupFailure(&failure, intent, err);
+                        noteSymbolMiss(&missed, &missed_n, r);
                         continue;
                     },
                 }
@@ -1706,6 +1831,18 @@ pub const Modules = struct {
             };
             const image = view orelse {
                 const module = (self.lookupRead(r, why, fallback) catch |err| {
+                    switch (err) {
+                        error.SymbolDiscoveryPending, error.SymbolDiscoveryCancelled, error.SymbolDiscoveryBudgetExceeded => return err,
+                        error.MainImageRequired => {
+                            // Search the other images first. Only a breakpoint
+                            // lookup may start the background main-image job;
+                            // a name query reports the unsearched executable.
+                            if (automatic) failure = error.MainImageRequired else lookupFailure(&failure, intent, error.BinarySnapshotLimit);
+                            if (self.unsearched == null) self.unsearched = .{ .region = cursor.next, .revision = self.maps_revision };
+                            continue;
+                        },
+                        else => {},
+                    }
                     if (err != error.NotElf and err != error.NoBinaryImage)
                         lookupFailure(&failure, intent, err)
                     else if (intent == .elf and r.inode != 0 and r.permissions[2] == 'x')
@@ -1716,7 +1853,11 @@ pub const Modules = struct {
                     if (self.unsearched == null) self.unsearched = .{ .region = cursor.next, .revision = self.maps_revision };
                     continue;
                 };
-                const symbol = module.symbols().findSymbol(name) orelse continue;
+                const symbol = module.symbols().findSymbol(name) orelse {
+                    // A container holds several ELF entries under one file key.
+                    if (why != .container and module.file_offset == 0) noteSymbolMiss(&missed, &missed_n, r);
+                    continue;
+                };
                 if (symbol.hasAddress()) return publishedSymbol(module.image.header.machine, module.id, symbol, try module.runtimeAddress(symbol.value));
                 continue;
             };
@@ -1724,7 +1865,10 @@ pub const Modules = struct {
                 const companion = self.companionFor(r, image, r.path) catch null;
                 break :blk if (companion) |file| &file.image else image;
             } else image;
-            const symbol = symbols.findSymbol(name) orelse continue;
+            const symbol = symbols.findSymbol(name) orelse {
+                noteSymbolMiss(&missed, &missed_n, r);
+                continue;
+            };
             if (!symbol.hasAddress()) continue;
             const p = self.placement(image, 0, r, false) catch |err| {
                 lookupFailure(&failure, intent, err);

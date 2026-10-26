@@ -90,7 +90,13 @@ pub const State = struct {
         return index < 2 or self.entries[index - 2].present;
     }
     pub fn select(self: *State, tab: Tab) !void {
-        if (!self.visible(tab)) return error.LanguageTabUnavailable;
+        // A shown tab stays selectable while its runtime is rechecked; a
+        // hidden one is pending until checked, then unavailable.
+        if (!self.visible(tab)) {
+            const index = @intFromEnum(tab);
+            if (self.enabled and !self.entries[index - 2].checked) return error.LanguageTabPending;
+            return error.LanguageTabUnavailable;
+        }
         if (self.selected != tab) {
             self.selected = tab;
             if (self.logical_selection) |value| if (value.language != tab) {
@@ -355,4 +361,23 @@ test "tab selection belongs to each process and cycles only detected runtimes" {
     try std.testing.expectEqual(Tab.native, second.selected);
     try second.select(.registers);
     try std.testing.expectEqual(Tab.lua, first.selected);
+}
+
+test "unchecked tab selection is pending, not absent, without changing selection" {
+    var state = State{ .enabled = true };
+    const revision = state.revision;
+    try std.testing.expectError(error.LanguageTabPending, state.select(.ruby));
+    try std.testing.expectEqual(Tab.native, state.selected);
+    try std.testing.expectEqual(revision, state.revision);
+    const ruby = &state.entries[@intFromEnum(Tab.ruby) - 2];
+    ruby.present = true; // A previously detected runtime is being rechecked.
+    state.cycle();
+    try std.testing.expectEqual(Tab.ruby, state.selected);
+    try state.select(.native);
+    ruby.checked = true;
+    ruby.present = false;
+    try std.testing.expectError(error.LanguageTabUnavailable, state.select(.ruby));
+    ruby.present = true;
+    try state.select(.ruby);
+    try std.testing.expectEqual(Tab.ruby, state.selected);
 }

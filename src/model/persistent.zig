@@ -61,10 +61,19 @@ test "a yielded install or image read keeps resolution pending until retried" {
         pub fn restoredAddress(_: *@This(), _: modules.Region, _: []const u8, _: u64) !u64 {
             return error.SymbolDiscoveryPending;
         }
+        pub fn mainImageAddress(_: *@This()) ?u64 {
+            return null;
+        }
+    };
+    const MockMetadata = struct {
+        pub fn mainImage(_: *@This(), _: anytype, _: u64, _: anytype) !void {
+            return error.DebugMetadataPending;
+        }
     };
     const MockSession = struct {
         target: MockTarget = .{},
         modules: MockModules = .{},
+        metadata: MockMetadata = .{},
         pub fn refreshMaps(_: *@This()) !void {}
     };
     var manager = Manager{};
@@ -74,21 +83,21 @@ test "a yielded install or image read keeps resolution pending until retried" {
     for ([_]anyerror{ error.SymbolDiscoveryPending, error.SymbolDiscoveryBudgetExceeded }) |err| {
         session.target.failure = err;
         const revision = manager.display_revision;
-        try manager.resolve(&session);
+        try manager.resolve(&session, false);
         try std.testing.expect(manager.display_revision > revision);
         const settled_revision = manager.display_revision;
-        try manager.resolve(&session);
+        try manager.resolve(&session, false);
         try std.testing.expectEqual(settled_revision, manager.display_revision);
         try std.testing.expect(manager.resolving);
         try std.testing.expect(session.target.site[0].pending);
         try std.testing.expectEqualStrings(@errorName(err), manager.entries.items[0].diagnostic.?);
     }
     session.target.failure = error.RemoteOutcomeUnknown;
-    try std.testing.expectError(error.RemoteOutcomeUnknown, manager.resolve(&session));
+    try std.testing.expectError(error.RemoteOutcomeUnknown, manager.resolve(&session, false));
     try std.testing.expectEqualStrings("RemoteOutcomeUnknown", manager.entries.items[0].diagnostic.?);
     session.target.failure = null;
     const diagnostic_revision = manager.display_revision;
-    try manager.resolve(&session);
+    try manager.resolve(&session, false);
     try std.testing.expect(manager.display_revision > diagnostic_revision);
     try std.testing.expect(!manager.resolving);
     try std.testing.expect(!session.target.site[0].pending);
@@ -99,7 +108,7 @@ test "a yielded install or image read keeps resolution pending until retried" {
     manager.entries.items[0].symbol = .{};
     manager.entries.items[0].build_id_len = 1;
     manager.entries.items[0].path = try A.dupe(u8, "fixture");
-    try manager.resolve(&session);
+    try manager.resolve(&session, false);
     try std.testing.expect(manager.resolving);
     try std.testing.expectEqualStrings("SymbolDiscoveryPending", manager.entries.items[0].diagnostic.?);
 }
@@ -177,7 +186,7 @@ pub const Manager = struct {
             if (v.inherited) {
                 v.inherited = false;
                 v.cursor = .{};
-                try self.resolve(session);
+                try self.resolve(session, true);
             }
             return v.id;
         };
@@ -191,7 +200,7 @@ pub const Manager = struct {
         errdefer _ = self.entries.pop();
         self.epoch = session.target.snapshot().image_epoch;
         if (!self.resolving) self.file_reads = std.mem.zeroes(rt.struct_xrt_file_budget);
-        try self.resolve(session);
+        try self.resolve(session, true);
         try self.installHook(session);
         self.observed = session.target.snapshot().generation;
         return id;
@@ -218,7 +227,21 @@ pub const Manager = struct {
                         item.path = try A.dupe(u8, module.path);
                     } else item.diagnostic = "BuildIdTooLong";
                 } else item.diagnostic = "BreakpointImageHasNoBuildId";
-            } else |_| item.diagnostic = "BreakpointAddressNotRestorable";
+            } else |err| {
+                // A remote file over the synchronous cap still has a symbols-only
+                // identity. Record that when the image budget would allow the
+                // file; a later restart places it without copying the file.
+                if (err == error.BinarySnapshotLimit) {
+                    if (session.modules.projectedRestore(v.address)) |site| {
+                        if (site.id.len <= item.build_id.len) {
+                            @memcpy(item.build_id[0..site.id.len], site.id);
+                            item.build_id_len = site.id.len;
+                            item.offset = site.offset;
+                            item.path = try A.dupe(u8, site.path);
+                        } else item.diagnostic = "BuildIdTooLong";
+                    } else |_| item.diagnostic = "BreakpointAddressNotRestorable";
+                } else item.diagnostic = "BreakpointAddressNotRestorable";
+            }
             errdefer item.deinit();
             try self.entries.append(A, item);
             self.display_revision +%= 1;
@@ -297,7 +320,25 @@ pub const Manager = struct {
             else => return false,
         }
     }
-    fn resolve(self: *Manager, session: anytype) !void {
+    /// An explicit breakpoint starts the background main-image job and
+    /// returns. The owner thread does not wait. The stop-handler poll
+    /// checks once.
+    fn awaitMainImage(self: *Manager, session: anytype, wait_main: bool) !void {
+        const address = session.modules.mainImageAddress() orelse return error.BinarySnapshotLimit;
+        const start = @import("../target/linux.zig").now();
+        const explicit_main_image_ns: u64 = 0;
+        while (true) {
+            if (self.cancel) |flag| if (flag.* != 0) return error.SymbolDiscoveryCancelled;
+            if (session.metadata.mainImage(session, address, .frame)) |_| {
+                return;
+            } else |err| {
+                if (err != error.DebugMetadataPending) return err;
+                if (!wait_main or @import("../target/linux.zig").now() >= start + explicit_main_image_ns) return error.SymbolDiscoveryPending;
+                _ = @import("../c.zig").api.usleep(2_000);
+            }
+        }
+    }
+    fn resolve(self: *Manager, session: anytype, wait_main: bool) !void {
         self.resolving = false;
         var pending = false;
         for (self.entries.items) |item| if (probe(session, item.id)) |current| {
@@ -308,6 +349,10 @@ pub const Manager = struct {
         };
         if (!pending) return;
         try session.refreshMaps();
+        // Auxv is a few hundred bytes. Read the kernel PHDR before the
+        // discovery slice, or an expired slice caches "no main image" for
+        // this map and the background job never starts.
+        if (rt.xrt_target_is_remote(session.target.handle)) _ = session.modules.mainImageAddress();
         var slice = std.mem.zeroInit(rt.struct_xrt_file_budget, .{
             .limit_bytes = 128 * 1024,
             .deadline_ns = @import("../target/linux.zig").now() + 25_000_000,
@@ -327,10 +372,34 @@ pub const Manager = struct {
             if (!current.pending) continue;
             var address: ?u64 = null;
             if (item.symbol.len > 0) {
-                if (if (item.inherited) session.modules.automaticSymbolAddress(item.symbol.slice(), &item.cursor) else session.modules.breakpointSymbolAddress(item.symbol.slice(), &item.cursor)) |resolved| address = resolved else |err| {
-                    if (try self.resolutionError(item, err)) return;
-                    continue;
-                }
+                const first = if (item.inherited)
+                    session.modules.automaticSymbolAddress(item.symbol.slice(), &item.cursor)
+                else
+                    session.modules.breakpointSymbolAddress(item.symbol.slice(), &item.cursor);
+                address = if (first) |resolved| resolved else |err| found: {
+                    // Inherited lookups stay on the symbol projection. An
+                    // explicit name may start the background main-image job.
+                    // The owner's discovery slice must not cover that open.
+                    if (err != error.MainImageRequired or item.inherited) {
+                        if (try self.resolutionError(item, err)) return;
+                        continue;
+                    }
+                    _ = rt.xrt_target_file_budget(session.target.handle, null);
+                    const waited = self.awaitMainImage(session, wait_main);
+                    slice.deadline_ns = @import("../target/linux.zig").now() + 25_000_000;
+                    try runtime.check(rt.xrt_target_file_budget(session.target.handle, &slice));
+                    waited catch |wait_err| {
+                        if (try self.resolutionError(item, wait_err)) return;
+                        continue;
+                    };
+                    // The scan finished the other images before asking for the
+                    // main image; search again from the start now it is loaded.
+                    item.cursor = .{};
+                    break :found session.modules.breakpointSymbolAddress(item.symbol.slice(), &item.cursor) catch |retry_err| {
+                        if (try self.resolutionError(item, retry_err)) return;
+                        continue;
+                    };
+                };
             } else if (item.build_id_len > 0) {
                 for (session.modules.regions.items) |region| {
                     if (region.permissions[2] != 'x' or !std.mem.eql(u8, region.path, item.path)) continue;
@@ -390,7 +459,7 @@ pub const Manager = struct {
         self.observed = session.target.snapshot().generation;
         defer self.observed = session.target.snapshot().generation;
         if (continuing) {
-            try self.resolve(session);
+            try self.resolve(session, false);
             return;
         }
         try self.installHook(session);
@@ -412,7 +481,7 @@ pub const Manager = struct {
             }
             if (state != 0) return;
         }
-        try self.resolve(session);
+        try self.resolve(session, false);
         self.observed = session.target.snapshot().generation;
     }
 };
