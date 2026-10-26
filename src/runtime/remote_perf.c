@@ -238,7 +238,8 @@ enum xrt_perf_drain_status xrt_remote_perf_drain(struct xrt_perf *p, xrt_perf_de
                                            .head = tail + length,
                                            .tail = tail,
                                            .thread = &thread};
-        struct xrt_perf_consumed consumed = decode(context, &view);
+        struct xrt_perf_consumed consumed = {.status = XRT_PERF_DRAIN_MALFORMED};
+        decode(context, &view, &consumed);
         if (consumed.bytes > length || (consumed.bytes & 7)) {
             status = XRT_PERF_DRAIN_MALFORMED;
             break;

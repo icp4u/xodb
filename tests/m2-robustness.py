@@ -79,9 +79,12 @@ for mode in ('thread', 'fork', 'burst', 'limit'):
         assert graph['samples'] + graph['excluded_by_node_limit'] == timeline['samples'] == capture['stored_samples']
         if mode == 'limit': assert graph['unverified_mapping_samples'] == graph['samples']
         # Replacing completed captures must release all per-thread event fds.
+        # The deadline is wall time. A short window can close on the server
+        # poll before this process lists descriptors, which is not a leaked fd.
         for _ in range(3):
-            again = client.action('start_profile', duration_ms=100)['capture']
-            assert again['id'] > capture['id'] and len(perf_fds(client)) == 1, again
+            again = client.action('start_profile', duration_ms=5000)['capture']
+            fds = perf_fds(client)
+            assert again['id'] > capture['id'] and again['status'] == 'collecting' and len(fds) == 1, (len(fds), again['status'], again['id'])
             ended = client.action('stop_profile', capture_id=again['id'])['capture']
             assert ended['status'] == 'manual' and not perf_fds(client), ended
         client.action('remove_breakpoint', id=end)

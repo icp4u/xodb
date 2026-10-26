@@ -453,7 +453,8 @@ enum xrt_perf_drain_status xrt_perf_drain(struct xrt_perf *p, xrt_perf_decoder d
             return status;
         if (!ring.size)
             continue;
-        const struct xrt_perf_consumed result = decode(context, &ring);
+        struct xrt_perf_consumed result = {.status = XRT_PERF_DRAIN_MALFORMED}; /* a decoder that writes nothing fails closed */
+        decode(context, &ring, &result);
         status = xrt_perf_commit(p, &ring, result);
         if (status != XRT_PERF_DRAIN_OK)
             return status;

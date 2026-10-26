@@ -441,7 +441,7 @@ struct sampled {
     uint64_t tail;
     struct xrt_perf *perf;
 };
-static struct xrt_perf_consumed samples(void *raw, const struct xrt_perf_ring *ring)
+static void samples(void *raw, const struct xrt_perf_ring *ring, struct xrt_perf_consumed *out)
 {
     struct sampled *state = raw;
     unsigned *count = &state->count;
@@ -468,7 +468,8 @@ static struct xrt_perf_consumed samples(void *raw, const struct xrt_perf_ring *r
             }
             state->retry = true;
             state->tail = ring->tail;
-            return (struct xrt_perf_consumed){0, XRT_PERF_DRAIN_CAPACITY};
+            *out = (struct xrt_perf_consumed){0, XRT_PERF_DRAIN_CAPACITY};
+            return;
         }
         assert(ring->tail == state->tail);
         state->retried = true;
@@ -486,7 +487,7 @@ static struct xrt_perf_consumed samples(void *raw, const struct xrt_perf_ring *r
             ++*count;
         tail += size;
     }
-    return (struct xrt_perf_consumed){tail - ring->tail, XRT_PERF_DRAIN_OK};
+    *out = (struct xrt_perf_consumed){tail - ring->tail, XRT_PERF_DRAIN_OK};
 }
 static void collectors(const char *agent, const char *self)
 {

@@ -68,7 +68,7 @@ pub const Collector = struct {
         out: []Item,
         result: Drain = .{},
         stop: bool = false,
-        fn decode(raw: ?*anyopaque, view: [*c]const rt.struct_xrt_perf_ring) callconv(.c) rt.struct_xrt_perf_consumed {
+        fn decode(raw: ?*anyopaque, view: [*c]const rt.struct_xrt_perf_ring, out: [*c]rt.struct_xrt_perf_consumed) callconv(.c) void {
             const ctx: *@This() = @ptrCast(@alignCast(raw.?));
             const ring = view[0];
             var tail = ring.tail;
@@ -76,7 +76,7 @@ pub const Collector = struct {
                 ctx.result.failure = fail("allocations.drain", 0, ring.thread[0].tid, @errorName(err));
                 break :blk rt.XRT_PERF_DRAIN_MALFORMED;
             };
-            return .{ .bytes = tail - ring.tail, .status = status };
+            out[0] = .{ .bytes = tail - ring.tail, .status = status };
         }
         fn consume(ctx: *@This(), ring: rt.struct_xrt_perf_ring, tail: *u64) !c_uint {
             const self = ctx.self;

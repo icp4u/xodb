@@ -23,14 +23,24 @@ def run(options):
         assert select.select([target.stdout],[],[],60)[0], 'torch readiness timeout'
         assert target.stdout.readline()=='ready\n',target.stderr.read()
         c=Client('control',None,options=['--attach',str(target.pid),*options],reply_seconds=90);s=c.stopped();before=stats(c.p.pid)
-        cap=c.inspect('start_profile',generation=s['generation'],duration_ms=2000,frequency_hz=499,tids=[target.pid])['capture']
-        history=cap['mapping_history'];c.action('continue');deadline=time.monotonic()+60
+        # The wall deadline starts before the image snapshot and the continue,
+        # so a slow start can spend it all with the target stopped. Use none:
+        # sample two seconds of running time, then stop.
+        cap=c.inspect('start_profile',generation=s['generation'],duration_ms=0,frequency_hz=499,tids=[target.pid])['capture']
+        history=cap['mapping_history'];c.action('continue');deadline=time.monotonic()+45
+        running_since=None
         while True:
             cap=c.inspect('get_profile')['capture']
-            if cap['status']!='collecting':break
-            assert time.monotonic()<deadline,cap
+            state=c.session()['state']
+            if state=='running' and running_since is None: running_since=time.monotonic()
+            if running_since is not None and time.monotonic()-running_since>=2: break
+            if cap['status']!='collecting': break
+            assert time.monotonic()<deadline,(cap['status'],cap['stored_samples'],state)
             time.sleep(.02)
+        if cap['status']=='collecting':
+            cap=c.action('stop_profile',capture_id=cap['id'])['capture']
         if c.session()['state']=='running':c.action('interrupt');c.stopped()
+        assert cap['stored_samples'],(cap['status'],cap.get('diagnostic'))
         rows=[];start=0;view=None
         while True:
             graph=c.inspect('get_flamegraph',capture_id=cap['id'],revision=cap['revision'],start=start,limit=64,**({'view_id':view} if view else {}))

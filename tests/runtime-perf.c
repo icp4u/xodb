@@ -21,12 +21,14 @@ struct decoding {
     size_t calls, records;
     bool overconsume;
 };
-static struct xrt_perf_consumed consume(void *raw, const struct xrt_perf_ring *r)
+static void consume(void *raw, const struct xrt_perf_ring *r, struct xrt_perf_consumed *out)
 {
     struct decoding *d = raw;
     ++d->calls;
-    if (d->overconsume)
-        return (struct xrt_perf_consumed){.bytes = r->head - r->tail + 8};
+    if (d->overconsume) {
+        *out = (struct xrt_perf_consumed){.bytes = r->head - r->tail + 8};
+        return;
+    }
     uint64_t used = 0;
     while (used < r->head - r->tail) {
         struct perf_event_header h;
@@ -36,7 +38,7 @@ static struct xrt_perf_consumed consume(void *raw, const struct xrt_perf_ring *r
         used += h.size;
         ++d->records;
     }
-    return (struct xrt_perf_consumed){.bytes = used};
+    *out = (struct xrt_perf_consumed){.bytes = used};
 }
 static void rings(void)
 {

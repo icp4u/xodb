@@ -244,7 +244,7 @@ pub const Collector = struct {
         used_stack: usize = 0,
         skipped: u32 = 0,
         reason: []const u8 = "",
-        fn decode(raw: ?*anyopaque, ring_: [*c]const rt.struct_xrt_perf_ring) callconv(.c) rt.struct_xrt_perf_consumed {
+        fn decode(raw: ?*anyopaque, ring_: [*c]const rt.struct_xrt_perf_ring, out: [*c]rt.struct_xrt_perf_consumed) callconv(.c) void {
             const ctx: *@This() = @ptrCast(@alignCast(raw.?));
             const self = ctx.self;
             const ring = ring_[0];
@@ -274,7 +274,7 @@ pub const Collector = struct {
             ctx.used_stack += report.user_stack_bytes;
             ctx.skipped += report.skipped_unknown;
             ctx.reason = report.reason;
-            return .{ .bytes = report.consumed, .status = @intFromEnum(report.status) };
+            out[0] = .{ .bytes = report.consumed, .status = @intFromEnum(report.status) };
         }
     };
     pub fn drain(self: *Collector) Drain {

@@ -12,7 +12,8 @@ c.name() call, a function-pointer call and the use of a translated
 function-pointer typedef are all reported. A pointer to the struct is not.
 
 The host step stays red while src/platform/x11.zig calls the roots iterator
-by value. Zig functions that C calls are not this check.
+by value. A Zig function C can call (callconv(.c) or export) with such a struct in its
+signature is reported too: the callee side has the same lowering bug.
 """
 import argparse
 import os
@@ -401,7 +402,7 @@ def mask(text):
     return "".join(chars)
 
 
-def parse_after_fn(text, fn_at):
+def parse_after_fn(text, fn_at, exported=False):
     i = fn_at + 2
     while i < len(text) and text[i] in " \t\n":
         i += 1
@@ -432,15 +433,18 @@ def parse_after_fn(text, fn_at):
         return None
     while i < len(text) and text[i] in " \t\n":
         i += 1
-    if not text.startswith("callconv(.c)", i):
+    if text.startswith("callconv(.c)", i):
+        i += len("callconv(.c)")
+    elif not exported:
         return None
-    i += len("callconv(.c)")
     while i < len(text) and text[i] in " \t\n":
         i += 1
     ret_s = i
     depth = 0
     while i < len(text):
         ch = text[i]
+        if ch in ",;={\n" and depth == 0:
+            break
         if ch in "([{":
             depth += 1
         elif ch in ")]}":
@@ -466,12 +470,18 @@ def scan_file(path, bad, fns, ptr_fns, aliases, structs, enums):
     hits = []
     callees = {}
     for match in re.finditer(r"\bfn\b", text):
-        parsed = parse_after_fn(text, match.start())
-        if not parsed or parsed[0] is not None:
+        exported = re.search(r"\bexport\s+$", text[max(0, match.start() - 16):match.start()]) is not None
+        parsed = parse_after_fn(text, match.start(), exported)
+        if not parsed:
             continue
-        _name, params, ret = parsed
+        name, params, ret = parsed
         reasons = signature_reasons(params, ret, bad, aliases, structs, enums)
         if not reasons:
+            continue
+        if name is not None:
+            # C calls this Zig function: the same lowering bug on the callee side.
+            line = text.count("\n", 0, match.start()) + 1
+            hits.append(f"{rel}:{line}: defines C-callable {name} " + ", ".join(reasons))
             continue
         field = field_before(text, match.start())
         if field:

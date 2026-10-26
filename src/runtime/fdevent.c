@@ -246,12 +246,14 @@ fail:
     return status;
 }
 
-static struct xrt_perf_consumed consume(void *opaque, const struct xrt_perf_ring *ring)
+static void consume(void *opaque, const struct xrt_perf_ring *ring, struct xrt_perf_consumed *out)
 {
     struct xrt_fdevent *c = opaque;
     uint64_t consumed = 0;
-    if (ring->index >= c->counter.snapshot.threads || ring->thread->tid != c->tids[ring->index])
-        return (struct xrt_perf_consumed){0, XRT_PERF_DRAIN_MALFORMED};
+    if (ring->index >= c->counter.snapshot.threads || ring->thread->tid != c->tids[ring->index]) {
+        *out = (struct xrt_perf_consumed){0, XRT_PERF_DRAIN_MALFORMED};
+        return;
+    }
     /* The largest accepted record is 1024 bytes. A ring with less room may
      * already have rejected a reservation, including on kernels without LOST. */
     if (ring->size - (ring->head - ring->tail) < 1024)
@@ -263,26 +265,34 @@ static struct xrt_perf_consumed consume(void *opaque, const struct xrt_perf_ring
                                              .enter_type = c->enter_type,
                                              .exit_type = c->exit_type};
     while (consumed < ring->head - ring->tail) {
-        if (c->drained == c->drain_limit)
-            return (struct xrt_perf_consumed){consumed, XRT_PERF_DRAIN_CAPACITY};
+        if (c->drained == c->drain_limit) {
+            *out = (struct xrt_perf_consumed){consumed, XRT_PERF_DRAIN_CAPACITY};
+            return;
+        }
         unsigned char record[1024];
         const uint64_t available = ring->head - ring->tail - consumed;
         if (available < 8 ||
-            !xrt_perf_copy(ring->data, ring->size, ring->tail + consumed, record, 8))
-            return (struct xrt_perf_consumed){consumed, XRT_PERF_DRAIN_MALFORMED};
+            !xrt_perf_copy(ring->data, ring->size, ring->tail + consumed, record, 8)) {
+            *out = (struct xrt_perf_consumed){consumed, XRT_PERF_DRAIN_MALFORMED};
+            return;
+        }
         uint16_t size;
         memcpy(&size, record + 6, sizeof(size));
         if (size < 8 || size > sizeof(record) || size % 8 || size > available ||
-            !xrt_perf_copy(ring->data, ring->size, ring->tail + consumed, record, size))
-            return (struct xrt_perf_consumed){consumed, XRT_PERF_DRAIN_MALFORMED};
+            !xrt_perf_copy(ring->data, ring->size, ring->tail + consumed, record, size)) {
+            *out = (struct xrt_perf_consumed){consumed, XRT_PERF_DRAIN_MALFORMED};
+            return;
+        }
         struct xrt_fdevent_record event;
-        if (!xrt_fdevent_decode(record, size, &who, &event))
-            return (struct xrt_perf_consumed){consumed, XRT_PERF_DRAIN_MALFORMED};
+        if (!xrt_fdevent_decode(record, size, &who, &event)) {
+            *out = (struct xrt_perf_consumed){consumed, XRT_PERF_DRAIN_MALFORMED};
+            return;
+        }
         fd_event_counter_feed(&c->counter, ring->index, &event);
         ++c->drained;
         consumed += size;
     }
-    return (struct xrt_perf_consumed){consumed, XRT_PERF_DRAIN_OK};
+    *out = (struct xrt_perf_consumed){consumed, XRT_PERF_DRAIN_OK};
 }
 enum xrt_status xrt_fdevent_drain(struct xrt_fdevent *c, struct xrt_fdevent_snapshot *out)
 {

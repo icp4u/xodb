@@ -98,7 +98,7 @@ struct evidence {
     bool stacks;
     uint64_t entry_sp, caller, entry_time;
 };
-static struct xrt_perf_consumed decode(void *raw, const struct xrt_perf_ring *ring)
+static void decode(void *raw, const struct xrt_perf_ring *ring, struct xrt_perf_consumed *out)
 {
     struct evidence *e = raw;
     uint64_t used = 0;
@@ -173,7 +173,7 @@ static struct xrt_perf_consumed decode(void *raw, const struct xrt_perf_ring *ri
             ++e->returns;
         }
     }
-    return (struct xrt_perf_consumed){.bytes=used};
+    *out = (struct xrt_perf_consumed){.bytes=used};
 }
 struct worker_open {
     const struct xrt_target *remote_target;

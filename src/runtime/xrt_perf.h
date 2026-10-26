@@ -73,7 +73,9 @@ struct xrt_perf_consumed {
     uint64_t bytes;
     enum xrt_perf_drain_status status;
 };
-typedef struct xrt_perf_consumed (*xrt_perf_decoder)(void *, const struct xrt_perf_ring *);
+/* The decoder writes *out. Returning this struct by value does not match a
+ * callconv(.c) callee on LoongArch. */
+typedef void (*xrt_perf_decoder)(void *, const struct xrt_perf_ring *, struct xrt_perf_consumed *out);
 typedef int (*xrt_perf_opener)(void *, int32_t tid, int group_fd, size_t event_index,
                                const struct xrt_perf_attr *);
 struct xrt_perf *xrt_perf_create(unsigned data_pages, size_t max_threads, uint64_t budget);
