@@ -6,8 +6,14 @@ const records = @import("records.zig");
 const mappings = @import("mappings.zig");
 const loc = @import("../debug/location.zig");
 const info = @import("../debug/info.zig");
+const Arch = @import("../target/arch.zig").Arch;
 // v5 preserves a typed boundary when the return-address rule cannot be read.
 pub const algorithm = "xodb-sampled-x86_64-v5";
+/// x86-64 keeps `algorithm`, so existing analysis ids stay put. AArch64 and
+/// LoongArch64 share one CFI walk identity.
+pub fn algorithmFor(arch: Arch) []const u8 {
+    return if (arch == .x86_64) algorithm else "xodb-sampled-cfi-v1";
+}
 pub const max_frames = 32;
 pub const Reason = enum {
     complete,
@@ -168,7 +174,7 @@ fn walkWith(batch: *Batch, ordinal: usize) !Result {
     if (capture.collector != null) return error.ArchiveStillCollecting;
     if (ordinal >= capture.samples.len()) return error.InvalidSampleOrdinal;
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update(algorithm);
+    hash.update(algorithmFor(capture.architecture));
     hashInt(&hash, ordinal);
     hashInt(&hash, capture.started_ns);
     hashInt(&hash, capture.trusted_before_ns);
@@ -239,19 +245,18 @@ fn walkInner(batch: *Batch, sample: records.Sample, hash: *std.crypto.hash.sha2.
     const state = entry.state;
     hashInt(hash, state.abi);
     hashInt(hash, state.regs_mask);
-    for (state.regs) |reg| hashInt(hash, reg);
+    // Masks inside the x86 file hash the original 24 words, including zeros.
+    const hashed_regs = if (state.regs_mask >> records.x86_user_regs == 0) records.x86_user_regs else state.regs.len;
+    for (state.regs[0..hashed_regs]) |reg| hashInt(hash, reg);
     hashInt(hash, state.stack_size);
     hashInt(hash, state.stack_dyn);
     hash.update(capture.user_state.stack(entry));
     if (!state.regs_present) return .{ .reason = .registers_absent };
     if (state.abi != records.regs_abi_64) return .{ .reason = .unsupported_abi };
-    var registers: loc.RegisterSet = @splat(null);
-    const perf_to_dwarf = [_]i8{ 0, 3, 2, 1, 4, 5, 6, 7, 16, -1, -1, -1, -1, -1, -1, -1, 8, 9, 10, 11, 12, 13, 14, 15 };
-    for (perf_to_dwarf, 0..) |dwarf, index| if (dwarf >= 0 and state.regs_mask & (@as(u64, 1) << @intCast(index)) != 0) {
-        registers[@intCast(dwarf)] = state.regs[index];
-    };
-    const initial_sp = registers[7] orelse return .{ .reason = .registers_unavailable };
-    const initial_pc = registers[16] orelse return .{ .reason = .registers_unavailable };
+    const applied = applyPerfRegs(capture.architecture, state) orelse return .{ .reason = .registers_unavailable };
+    var registers = applied.registers;
+    const initial_sp = applied.sp;
+    const initial_pc = applied.pc;
     if (!sample.time_present or !sample.ip_present or sample.cpu_mode != .user or sample.ip != initial_pc or sample.time_ns < capture.started_ns) return .{ .reason = .invalid_sample };
     var result = Result{};
     // Even a partial result retains the sampled leaf, without inventing callers.
@@ -369,11 +374,12 @@ fn walkInner(batch: *Batch, sample: records.Sample, hash: *std.crypto.hash.sha2.
             };
         };
         frame.method = @tagName(step.method);
-        const pc = step.caller[16] orelse {
+        const arch = capture.architecture;
+        const pc = framePc(arch, step.caller) orelse {
             result.reason = if (step.outermost) .complete else if (window.failed) .stack_window else .registers_unavailable;
             return result;
         };
-        const sp = step.caller[7] orelse {
+        const sp = frameSp(arch, step.caller) orelse {
             result.reason = .registers_unavailable;
             return result;
         };
@@ -381,6 +387,10 @@ fn walkInner(batch: *Batch, sample: records.Sample, hash: *std.crypto.hash.sha2.
             result.reason = .complete;
             return result;
         }
+        const lookup = arch.callerLookup(pc) orelse {
+            result.reason = .invalid_sample;
+            return result;
+        };
         for (result.frames[0..result.count]) |old| if (old.pc == pc and old.sp == sp) {
             result.reason = .cycle;
             return result;
@@ -389,10 +399,53 @@ fn walkInner(batch: *Batch, sample: records.Sample, hash: *std.crypto.hash.sha2.
             result.reason = .depth_limit;
             return result;
         }
-        result.frames[result.count] = .{ .pc = pc, .sp = sp, .lookup_pc = pc - 1 };
+        result.frames[result.count] = .{ .pc = pc, .sp = sp, .lookup_pc = lookup };
         result.count += 1;
         registers = step.caller;
     }
+}
+fn framePc(arch: Arch, caller: loc.RegisterSet) ?u64 {
+    const slot = if (arch.pc() < arch.count()) arch.pc() else arch.ra();
+    if (slot >= caller.len) return null;
+    return caller[slot];
+}
+fn frameSp(arch: Arch, caller: loc.RegisterSet) ?u64 {
+    const slot = arch.sp();
+    if (slot >= caller.len) return null;
+    return caller[slot];
+}
+/// Copies a perf user-register file into the DWARF register set and returns
+/// the sampled PC and SP. LoongArch perf index 0 is the PC, not DWARF r0.
+fn applyPerfRegs(arch: Arch, state: records.UserState) ?struct { registers: loc.RegisterSet, pc: u64, sp: u64 } {
+    const file = records.perfFile(@intFromEnum(arch)) orelse return null;
+    if (state.regs_mask & (@as(u64, 1) << file.pc) == 0) return null;
+    if (state.regs_mask & (@as(u64, 1) << file.sp) == 0) return null;
+    var registers: loc.RegisterSet = @splat(null);
+    switch (arch) {
+        .x86_64 => {
+            const perf_to_dwarf = [_]i8{ 0, 3, 2, 1, 4, 5, 6, 7, 16, -1, -1, -1, -1, -1, -1, -1, 8, 9, 10, 11, 12, 13, 14, 15 };
+            for (perf_to_dwarf, 0..) |dwarf, index| if (dwarf >= 0 and state.regs_mask & (@as(u64, 1) << @intCast(index)) != 0) {
+                registers[@intCast(dwarf)] = state.regs[index];
+            };
+        },
+        .aarch64 => {
+            var index: usize = 0;
+            while (index < file.limit) : (index += 1) {
+                if (state.regs_mask & (@as(u64, 1) << @as(u6, @intCast(index))) == 0) continue;
+                registers[index] = state.regs[index];
+            }
+        },
+        .loongarch64 => {
+            var index: usize = 1;
+            while (index < file.limit) : (index += 1) {
+                if (state.regs_mask & (@as(u64, 1) << @as(u6, @intCast(index))) == 0) continue;
+                registers[index] = state.regs[index];
+            }
+        },
+        else => return null,
+    }
+    const sp = registers[arch.sp()] orelse return null;
+    return .{ .registers = registers, .pc = state.regs[file.pc], .sp = sp };
 }
 test "captured memory reads cannot escape the saved window including overflow addresses" {
     var window = Window{ .start = 0x1000, .bytes = &.{ 1, 2, 3, 4 } };
@@ -402,4 +455,73 @@ test "captured memory reads cannot escape the saved window including overflow ad
     try std.testing.expectError(error.CapturedStackUnavailable, Window.read(&window, 0x1003, &out));
     try std.testing.expectError(error.CapturedStackUnavailable, Window.read(&window, 0xfff, &out));
     try std.testing.expectError(error.CapturedStackUnavailable, Window.read(&window, std.math.maxInt(u64), &out));
+}
+
+test "perf register machine numbers match the target arch enum" {
+    try std.testing.expectEqual(records.machine_x86_64, @intFromEnum(Arch.x86_64));
+    try std.testing.expectEqual(records.machine_aarch64, @intFromEnum(Arch.aarch64));
+    try std.testing.expectEqual(records.machine_loongarch64, @intFromEnum(Arch.loongarch64));
+    try std.testing.expectEqual(records.machine_riscv64, @intFromEnum(Arch.riscv64));
+    try std.testing.expect(records.perfFile(@intFromEnum(Arch.ppc64le)) == null);
+    try std.testing.expect(records.perfFile(@intFromEnum(Arch.m68k)) == null);
+}
+
+test "perf registers map onto the dwarf file and the next frame uses that isa" {
+    try std.testing.expectEqualStrings(algorithm, algorithmFor(.x86_64));
+    try std.testing.expectEqualStrings("xodb-sampled-cfi-v1", algorithmFor(.aarch64));
+    try std.testing.expectEqualStrings("xodb-sampled-cfi-v1", algorithmFor(.loongarch64));
+
+    var x86 = records.UserState{ .regs_mask = records.user_regs_gpr_mask };
+    x86.regs[8] = 0x1000;
+    x86.regs[7] = 0x2000;
+    x86.regs[0] = 0x11;
+    x86.regs[1] = 0x22;
+    const applied_x86 = applyPerfRegs(.x86_64, x86).?;
+    try std.testing.expectEqual(@as(u64, 0x1000), applied_x86.registers[16].?);
+    try std.testing.expectEqual(@as(u64, 0x2000), applied_x86.registers[7].?);
+    try std.testing.expectEqual(@as(u64, 0x11), applied_x86.registers[0].?);
+    try std.testing.expectEqual(@as(u64, 0x22), applied_x86.registers[3].?);
+    try std.testing.expectEqual(@as(u64, 0x1000), applied_x86.pc);
+    try std.testing.expectEqual(@as(u64, 0x2000), applied_x86.sp);
+
+    var loong = records.UserState{ .regs_mask = records.perfFile(@intFromEnum(Arch.loongarch64)).?.mask };
+    loong.regs[0] = 0x4000;
+    loong.regs[1] = 0x4004;
+    loong.regs[3] = 0x8000;
+    loong.regs[22] = 0x7000;
+    const applied_loong = applyPerfRegs(.loongarch64, loong).?;
+    try std.testing.expectEqual(@as(?u64, null), applied_loong.registers[0]);
+    try std.testing.expectEqual(@as(u64, 0x4004), applied_loong.registers[1].?);
+    try std.testing.expectEqual(@as(u64, 0x8000), applied_loong.registers[3].?);
+    try std.testing.expectEqual(@as(u64, 0x7000), applied_loong.registers[22].?);
+    try std.testing.expectEqual(@as(u64, 0x4000), applied_loong.pc);
+    try std.testing.expectEqual(@as(u64, 0x8000), applied_loong.sp);
+
+    var arm = records.UserState{ .regs_mask = records.perfFile(@intFromEnum(Arch.aarch64)).?.mask };
+    arm.regs[32] = 0x9000;
+    arm.regs[31] = 0x9100;
+    arm.regs[30] = 0x9200;
+    arm.regs[29] = 0x9300;
+    const applied_arm = applyPerfRegs(.aarch64, arm).?;
+    try std.testing.expectEqual(@as(u64, 0x9000), applied_arm.registers[32].?);
+    try std.testing.expectEqual(@as(u64, 0x9100), applied_arm.registers[31].?);
+    try std.testing.expectEqual(@as(u64, 0x9200), applied_arm.registers[30].?);
+    try std.testing.expectEqual(@as(u64, 0x9300), applied_arm.registers[29].?);
+    try std.testing.expectEqual(@as(u64, 0x9000), applied_arm.pc);
+    try std.testing.expectEqual(@as(u64, 0x9100), applied_arm.sp);
+
+    var caller: loc.RegisterSet = @splat(null);
+    caller[16] = 0x111;
+    caller[7] = 0x222;
+    try std.testing.expectEqual(@as(?u64, 0x111), framePc(.x86_64, caller));
+    try std.testing.expectEqual(@as(?u64, 0x222), frameSp(.x86_64, caller));
+    caller[32] = 0x333;
+    caller[31] = 0x444;
+    try std.testing.expectEqual(@as(?u64, 0x333), framePc(.aarch64, caller));
+    try std.testing.expectEqual(@as(?u64, 0x444), frameSp(.aarch64, caller));
+    caller[1] = 0x555;
+    caller[3] = 0x666;
+    caller[0] = 0x777;
+    try std.testing.expectEqual(@as(?u64, 0x555), framePc(.loongarch64, caller));
+    try std.testing.expectEqual(@as(?u64, 0x666), frameSp(.loongarch64, caller));
 }

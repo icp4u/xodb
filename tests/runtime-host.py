@@ -72,7 +72,9 @@ try:
         assert stepped[pc] != regs[pc], (stepped[pc], regs[pc])
         assert stepped['r0'] == regs['r0'], (stepped['r0'], regs['r0'])
         refused('set_watchpoint', 'UnsupportedArchitecture', address=symbol['address'], length=8)
-        refused('start_profile', 'ProfilingUnsupportedArchitecture')
+        # CPU sampling opens on LoongArch64. Allocation and observation stay x86-64.
+        capture = c.action('start_profile')['capture']
+        c.action('stop_profile', capture_id=capture['id'])
         refused('start_allocations', 'UnsupportedAllocationArchitecture', tids=[tid])
         refused('start_observation', 'UnsupportedObservationArchitecture', tids=[tid], mapping_address='0x1000', functions=['malloc'])
         assert c.session()['state'] == 'stopped'
@@ -159,7 +161,7 @@ try:
         assert time.monotonic() < until
         time.sleep(.002)
     if a.arch == 'loongarch64':
-        print(f'C agent host integration passed (loongarch64): symbols, registers, breakpoint, stack, expression; {disasm_note}; software step; watchpoints, profile and uprobes refused')
+        print(f'C agent host integration passed (loongarch64): symbols, registers, breakpoint, stack, expression; {disasm_note}; software step; profile opened; watchpoints and uprobes refused')
     elif a.arch == 'riscv64':
         print(f'C agent host integration passed (riscv64): symbols, registers, breakpoint, stack, expression; {disasm_note}; software step; x0 omitted; watchpoints, profile and uprobes refused')
     elif a.arch == 'ppc64le':

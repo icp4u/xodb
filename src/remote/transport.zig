@@ -163,6 +163,7 @@ pub fn shellCommand(allocator: std.mem.Allocator, args: []const [:0]const u8) ![
 /// Accept exactly one connection before touching the target. No daemon/reconnect.
 pub fn acceptOne(endpoint: []const u8, quitting: *volatile c.sig_atomic_t) !Stream {
     var address = try Address.parse(endpoint, true);
+    const requested_ephemeral_port = address.boundPort() == 0;
     const fd = c.socket(address.family, c.SOCK_STREAM | c.SOCK_CLOEXEC | c.SOCK_NONBLOCK, 0);
     if (fd < 0) return error.RemoteSocketFailed;
     defer _ = c.close(fd);
@@ -174,7 +175,13 @@ pub fn acceptOne(endpoint: []const u8, quitting: *volatile c.sig_atomic_t) !Stre
     const bound_port = address.boundPort();
     if (bound_port == 0) return error.RemoteBoundAddressFailed;
     const colon = std.mem.lastIndexOfScalar(u8, endpoint, ':').?;
-    log.warn(.runtime, "xodb: listening on {s}:{d}; one client, plaintext TCP without authentication\n", .{ endpoint[0..colon], bound_port });
+    const announcement = "xodb: listening on {s}:{d}; one client, plaintext TCP without authentication\n";
+    if (requested_ephemeral_port)
+        // Port zero makes this line required output: it is the only way for the
+        // client to learn the selected port, including when -qq is active.
+        log.err(.runtime, announcement, .{ endpoint[0..colon], bound_port })
+    else
+        log.warn(.runtime, announcement, .{ endpoint[0..colon], bound_port });
     while (quitting.* == 0) {
         var p = c.pollfd{ .fd = fd, .events = c.POLLIN, .revents = 0 };
         if (c.poll(&p, 1, 50) <= 0) continue;

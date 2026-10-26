@@ -11,13 +11,49 @@ pub const max_record_bytes: usize = 8192;
 /// Ceiling used when a sample carries a user stack. The default record limit
 /// stays `max_record_bytes`.
 pub const max_record_span: usize = 16384;
-/// PERF_REG_X86_64_MAX. XMM registers are not captured.
-pub const max_user_regs: usize = 24;
+/// In-memory slots. 33 covers the AArch64 PC at perf index 32. XMM registers
+/// are not captured. This is not a DWARF map.
+pub const max_user_regs: usize = 33;
+/// PERF_REG_X86_64_MAX. Masks with no bit at or above this index keep the
+/// 24-word hash and USTA layout, including the unset slots.
+pub const x86_user_regs: usize = 24;
 pub const max_user_stack: u32 = 8192;
 /// Total user-stack bytes one drain may retain, independent of the sample cap.
 pub const max_retained_user_stack: usize = 256 * 1024;
 /// AX, BX, CX, DX, SI, DI, BP, SP, IP, and R8–R15. Skips flags and segment regs.
 pub const user_regs_gpr_mask: u64 = 0x1ff | (0xff << 16);
+/// Kernel perf user-register file for one architecture. Indices are perf
+/// positions, not DWARF numbers. LoongArch perf index 0 is the PC.
+pub const PerfFile = struct {
+    limit: u6,
+    mask: u64,
+    sp: u6,
+    pc: u6,
+};
+/// ELF e_machine values. This file imports nothing outside src/profile, because
+/// scheduling-decode compiles it as its own module. The unwind test checks
+/// these numbers against the target arch enum.
+pub const machine_x86_64: u16 = 62;
+pub const machine_aarch64: u16 = 183;
+pub const machine_loongarch64: u16 = 258;
+pub const machine_riscv64: u16 = 243;
+pub fn perfFile(machine: u16) ?PerfFile {
+    return switch (machine) {
+        machine_x86_64 => .{ .limit = 24, .mask = user_regs_gpr_mask, .sp = 7, .pc = 8 },
+        machine_aarch64 => .{ .limit = 33, .mask = (@as(u64, 1) << 33) - 1, .sp = 31, .pc = 32 },
+        machine_loongarch64 => .{ .limit = 32, .mask = (@as(u64, 1) << 32) - 1, .sp = 3, .pc = 0 },
+        else => null,
+    };
+}
+/// Words stored for one sample. A mask inside the x86 file stays 24 words.
+pub fn archivedUserRegs(mask: u64) usize {
+    return if (mask >> x86_user_regs == 0) x86_user_regs else max_user_regs;
+}
+/// Bytes of one USTA sample excluding the stack dump. 24 words are 221 bytes:
+/// status, abi, registers, stack_size, stack_dyn, stack_len.
+pub fn archivedUserStateBytes(mask: u64) usize {
+    return 221 + (archivedUserRegs(mask) - x86_user_regs) * 8;
+}
 pub const regs_abi_none: u64 = 0;
 pub const regs_abi_32: u64 = 1;
 pub const regs_abi_64: u64 = 2;
@@ -746,4 +782,34 @@ pub fn copyRing(ring: []const u8, offset: u64, dest: []u8) void {
         i += chunk;
         at = 0;
     }
+}
+
+test "perf user register files cover x86-64, aarch64, and loongarch64" {
+    const x86 = perfFile(machine_x86_64).?;
+    try std.testing.expectEqual(user_regs_gpr_mask, x86.mask);
+    try std.testing.expectEqual(@as(u6, 24), x86.limit);
+    try std.testing.expectEqual(@as(u6, 7), x86.sp);
+    try std.testing.expectEqual(@as(u6, 8), x86.pc);
+    try std.testing.expectEqual(@as(u64, 0), x86.mask >> 24);
+    try std.testing.expectEqual(x86_user_regs, archivedUserRegs(x86.mask));
+    try std.testing.expectEqual(@as(usize, 221), archivedUserStateBytes(x86.mask));
+
+    const arm = perfFile(machine_aarch64).?;
+    try std.testing.expectEqual(@as(u6, 31), arm.sp);
+    try std.testing.expectEqual(@as(u6, 32), arm.pc);
+    try std.testing.expect(arm.mask & (@as(u64, 1) << 29) != 0);
+    try std.testing.expect(arm.mask & (@as(u64, 1) << 30) != 0);
+    try std.testing.expectEqual(@as(u64, 0), arm.mask >> 33);
+    try std.testing.expectEqual(max_user_regs, archivedUserRegs(arm.mask));
+
+    const loong = perfFile(machine_loongarch64).?;
+    try std.testing.expectEqual(@as(u6, 0), loong.pc);
+    try std.testing.expectEqual(@as(u6, 3), loong.sp);
+    try std.testing.expect(loong.mask & (@as(u64, 1) << 1) != 0);
+    try std.testing.expect(loong.mask & (@as(u64, 1) << 22) != 0);
+    try std.testing.expectEqual(@as(u64, 0), loong.mask >> 32);
+    try std.testing.expectEqual(max_user_regs, archivedUserRegs(loong.mask));
+    try std.testing.expectEqual(221 + (max_user_regs - x86_user_regs) * 8, archivedUserStateBytes(loong.mask));
+
+    try std.testing.expect(perfFile(machine_riscv64) == null);
 }

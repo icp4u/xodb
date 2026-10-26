@@ -1435,6 +1435,7 @@ test {
     _ = @import("profile/pe_test.zig");
     _ = @import("profile/derived_test.zig");
     std.testing.refAllDecls(@import("profile/sample_state.zig"));
+    std.testing.refAllDecls(@import("profile/records.zig"));
     std.testing.refAllDecls(@import("profile/unwind.zig"));
     if (build_options.gui) {
         std.testing.refAllDecls(@import("render/font.zig"));

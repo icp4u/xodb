@@ -4,6 +4,10 @@ const std = @import("std");
 const log = @import("../log.zig");
 const perf = @import("linux_perf.zig");
 const records = @import("records.zig");
+const Arch = @import("../target/arch.zig").Arch;
+pub fn perfFile(arch: Arch) ?records.PerfFile {
+    return records.perfFile(@intFromEnum(arch));
+}
 const modules = @import("../model/modules.zig");
 const info = @import("../debug/info.zig");
 const activity = @import("activity.zig");
@@ -93,6 +97,9 @@ pub const Capture = struct {
     debugger_events_lost: u64 = 0,
     debugger_sequence: u64 = 0,
     config: Config,
+    /// ISA of the sampled target. Defaults to x86-64 so existing captures,
+    /// including archives, keep the x86 register file and analysis ids.
+    architecture: Arch = .x86_64,
     accepted: perf.Acceptance,
     threads: [perf.max_threads]Thread = undefined,
     thread_count: usize,
@@ -166,7 +173,10 @@ pub const Capture = struct {
         errdefer user_state.deinit(a);
         const syscall_ring_bytes = if (config.syscall_timing) syscall_perf.ringBytes(config.tids.len) else 0;
         if (syscall_ring_bytes >= config.ring_budget_bytes) return error.SyscallRingBudget;
-        const opened = try perf.start(a, .{ .target = @ptrCast(target), .follow_threads = config.follow_threads, .tids = config.tids, .frequency_hz = config.frequency_hz, .max_frames = 64, .mmap_data = true, .data_pages = ringPages(config.tids.len), .ring_budget_bytes = config.ring_budget_bytes - syscall_ring_bytes, .max_sides = perf.max_sides_cap, .context_switch = config.context_switch, .user_regs_mask = if (config.user_stack_bytes != 0) records.user_regs_gpr_mask else 0, .user_stack_bytes = config.user_stack_bytes });
+        const rt = @import("../target/runtime.zig");
+        const arch = std.enums.fromInt(Arch, rt.c.xrt_target_arch(target).*.machine) orelse return error.ProfilingUnsupportedArchitecture;
+        const perf_regs = perfFile(arch) orelse return error.ProfilingUnsupportedArchitecture;
+        const opened = try perf.start(a, .{ .target = @ptrCast(target), .follow_threads = config.follow_threads, .tids = config.tids, .frequency_hz = config.frequency_hz, .max_frames = 64, .mmap_data = true, .data_pages = ringPages(config.tids.len), .ring_budget_bytes = config.ring_budget_bytes - syscall_ring_bytes, .max_sides = perf.max_sides_cap, .context_switch = config.context_switch, .user_regs_mask = if (config.user_stack_bytes != 0) perf_regs.mask else 0, .user_stack_bytes = config.user_stack_bytes });
         switch (opened) {
             .failed => |failure| {
                 user_state.deinit(a);
@@ -191,7 +201,7 @@ pub const Capture = struct {
                         return .{ .failed = full };
                     },
                 };
-                self.* = .{ .allocator = a, .arena = std.heap.ArenaAllocator.init(a), .id = id, .session_id = session_id, .generation = generation, .image_epoch = image_epoch, .pid = pid, .boot_id = @import("../binary/snapshot.zig").bootId(), .producer = @import("producer.zig").describe(target), .started_ns = started_ns, .config = .{ .sample_limit = config.sample_limit, .follow_threads = config.follow_threads, .ring_budget_bytes = config.ring_budget_bytes, .frequency_hz = config.frequency_hz, .duration_ms = config.duration_ms, .context_switch = config.context_switch, .syscall_timing = config.syscall_timing, .syscall_limit = config.syscall_limit, .user_stack_bytes = config.user_stack_bytes, .user_stack_budget_bytes = if (config.user_stack_bytes == 0) 0 else config.user_stack_budget_bytes }, .samples = .{ .max_samples = config.sample_limit }, .user_state = user_state, .accepted = collector.acceptance(), .thread_count = config.tids.len, .collector = collector, .syscall_collector = syscall_collector, .syscalls = .{ .enabled = config.syscall_timing, .limit = config.syscall_limit }, .images = images, .history = history, .missing_images = missing };
+                self.* = .{ .allocator = a, .arena = std.heap.ArenaAllocator.init(a), .id = id, .session_id = session_id, .generation = generation, .image_epoch = image_epoch, .pid = pid, .architecture = arch, .boot_id = @import("../binary/snapshot.zig").bootId(), .producer = @import("producer.zig").describe(target), .started_ns = started_ns, .config = .{ .sample_limit = config.sample_limit, .follow_threads = config.follow_threads, .ring_budget_bytes = config.ring_budget_bytes, .frequency_hz = config.frequency_hz, .duration_ms = config.duration_ms, .context_switch = config.context_switch, .syscall_timing = config.syscall_timing, .syscall_limit = config.syscall_limit, .user_stack_bytes = config.user_stack_bytes, .user_stack_budget_bytes = if (config.user_stack_bytes == 0) 0 else config.user_stack_budget_bytes }, .samples = .{ .max_samples = config.sample_limit }, .user_state = user_state, .accepted = collector.acceptance(), .thread_count = config.tids.len, .collector = collector, .syscall_collector = syscall_collector, .syscalls = .{ .enabled = config.syscall_timing, .limit = config.syscall_limit }, .images = images, .history = history, .missing_images = missing };
                 for (debugger_ids, 0..) |debugger_id, i| {
                     self.threads[i] = .{ .debugger_id = debugger_id, .perf = collector.thread(i).? };
                     self.cpu_before[i] = activity.readTarget(@ptrCast(target), pid, config.tids[i]);

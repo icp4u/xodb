@@ -72,7 +72,7 @@ separate from this headless result.
 | Unwinding | CFI uses ARM LR column 30, SP 31 and PC 32; separate breakpoint and caller-PC rules |
 | Optimized fixture | GCC O2 without frame pointers unwinds; `next=12`; `amount` is explicitly unavailable (`EntryValueUnavailable`), also unavailable in installed GDB |
 | Hardware watches | Up to four aligned 1/2/4/8-byte write/read-write watches; MCP investigations and remote GUI controls; native lifecycle/completion tests pass ([semantics/evidence](research/arm64-watchpoints/integration.md)); hardware execution breakpoints remain unsupported |
-| Profiling | Explicit `ProfilingUnsupportedArchitecture`; T18 integration and capture ABI work remain |
+| Profiling | CPU sampling and sampled-stack CFI flames; register tables are unit-tested, with no native ARM64 run yet; syscall and allocation sampling stay x86-64; captures are not saved (`ArchiveUnsupportedArchitecture`) |
 | Archives | Existing x86 format retained; incompatible ELF assets are rejected even if their content hash matches |
 | GUI / remote protocol | Workstation GUI controls native ARM64 over SSH or TCP ([demo](REMOTE_DEBUGGING.md)); GUI rendering on Jetty remains pending |
 

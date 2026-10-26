@@ -704,7 +704,7 @@ pub const Session = struct {
     }
     pub fn startProfile(self: *Session, request: profile.Config) !u64 {
         if (self.target.core != null) return error.ReadOnlyCore;
-        if (self.target.arch() != .x86_64) return error.ProfilingUnsupportedArchitecture;
+        if (profile.perfFile(self.target.arch()) == null) return error.ProfilingUnsupportedArchitecture;
         self.profile_failure = null;
         self.profile_error = null;
         self.profile_requested_threads = request.tids.len;

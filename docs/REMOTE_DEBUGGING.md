@@ -103,8 +103,9 @@ port. After the socket is listening, xodb writes one line to stderr (or to the
 
     xodb: listening on 127.0.0.1:41234; one client, plaintext TCP without authentication
 
-Connect to the reported port. `-qq` hides this line, so do not combine it with
-port 0.
+Connect to the reported port. For port 0 this required line remains visible at
+every log level, including `-qq`; explicit-port announcements continue to obey
+the configured log level.
 
 **Plain TCP has no authentication or encryption. Anyone who can reach the
 listener can claim its session and exercise the configured scope. Use it only

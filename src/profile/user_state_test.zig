@@ -497,3 +497,28 @@ test "bounded callchain preserves user state and still requires trailing weight"
     try std.testing.expectEqual(@as(u32, 1), samples[0].user_state);
     try std.testing.expectEqual(@as(u64, 99), samples[0].weight);
 }
+
+test "decoder accepts perf register 32 and rejects bit 33" {
+    var mem: [128]u8 = undefined;
+    var w = W{ .b = &mem };
+    sampleHead(&w, 0x1000);
+    w.putU64(records.regs_abi_64);
+    w.putU64(0xabc);
+    const rec = w.finish();
+    var ring: [128]u8 = @splat(0);
+    place(&ring, 0, rec);
+    var samples: [1]records.Sample = undefined;
+    var sides: [1]records.Side = undefined;
+    var states: [1]records.UserState = undefined;
+    var stack: [8]u8 = undefined;
+    const regs_bits = base_bits | records.Bits.regs_user;
+    const accepted = go(&ring, 0, rec.len, input(regs_bits, @as(u64, 1) << 32, 0, &states, &stack), &samples, &sides);
+    try expectOk(accepted);
+    try std.testing.expect(states[0].regs_present);
+    try std.testing.expectEqual(@as(u64, 0xabc), states[0].regs[32]);
+    try std.testing.expectEqual(@as(u64, 0), states[0].regs[0]);
+    const rejected = go(&ring, 0, rec.len, input(regs_bits, @as(u64, 1) << 33, 0, &states, &stack), &samples, &sides);
+    try std.testing.expectEqual(records.Status.malformed, rejected.status);
+    try std.testing.expectEqualStrings("user register mask is invalid", rejected.reason);
+    try std.testing.expectEqual(@as(u64, 0), rejected.consumed);
+}

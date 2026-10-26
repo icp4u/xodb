@@ -72,7 +72,8 @@ pub const Config = struct {
     /// Does not change sample_type, exclude_kernel, or the thread list.
     context_switch: bool = false,
     /// `attr.sample_regs_user`. Zero leaves PERF_SAMPLE_REGS_USER off.
-    /// Bits above the x86 GPR file are rejected.
+    /// The host perf file rejects bits it does not define. On x86-64 that is
+    /// every bit at or above PERF_REG_X86_64_MAX.
     user_regs_mask: u64 = 0,
     /// `attr.sample_stack_user`. Zero leaves PERF_SAMPLE_STACK_USER off.
     /// A non-zero value must be a multiple of 8, from 64 through 8192,

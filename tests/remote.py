@@ -19,21 +19,30 @@ def wait_for(fn, timeout=10):
     raise AssertionError('Timed out')
 
 class Server:
-    def __init__(self, scope='control', attach=None):
+    def __init__(self, scope='control', attach=None, quiet=False):
         argv = [str(bin/'xodb'),'--headless','--mcp','--listen','127.0.0.1:0',
                 '--source','tests/fixtures/m1.c','--agent-scope',scope]
+        if quiet: argv.insert(1,'-qq')
         argv += ['--attach',str(attach)] if attach else ['--',str(bin/'xodb-m1-fixture'),'w']
         self.p = subprocess.Popen(argv, stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-        ready = select.select([self.p.stderr],[],[],10)[0]
-        assert ready, 'Listener did not start'
-        line = self.p.stderr.readline().decode()
-        bound = re.fullmatch(r'xodb: listening on 127\.0\.0\.1:([0-9]+); one client, plaintext TCP without authentication\n', line)
-        assert bound, line + self.p.stderr.read().decode()
-        self.port = int(bound.group(1))
-        self.sock = socket.create_connection(('127.0.0.1',self.port),timeout=10)
-        self.f = self.sock.makefile('rb')
-        self.seq = 0
-        self.call('initialize',{'protocolVersion':'2025-06-18','capabilities':{},'clientInfo':{'name':'remote-test','version':'1'}},fragment=True)
+        try:
+            ready = select.select([self.p.stderr],[],[],10)[0]
+            assert ready, 'Listener did not start'
+            line = self.p.stderr.readline().decode()
+            bound = re.fullmatch(r'xodb: listening on 127\.0\.0\.1:([0-9]+); one client, plaintext TCP without authentication\n', line)
+            assert bound, line
+            self.port = int(bound.group(1))
+            self.sock = socket.create_connection(('127.0.0.1',self.port),timeout=10)
+            self.f = self.sock.makefile('rb')
+            self.seq = 0
+            self.call('initialize',{'protocolVersion':'2025-06-18','capabilities':{},'clientInfo':{'name':'remote-test','version':'1'}},fragment=True)
+        except BaseException:
+            # A listener that never served its client is still ours to stop.
+            self.p.send_signal(signal.SIGINT)
+            try: self.p.wait(timeout=10)
+            except subprocess.TimeoutExpired: self.p.kill(); self.p.wait()
+            print(self.p.stderr.read().decode(errors='replace'), end='', flush=True)
+            raise
         self.sock.sendall(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
     def call(self,method,params=None,fragment=False):
         self.seq += 1
@@ -64,7 +73,7 @@ class Server:
         assert self.p.wait(timeout=10)==0,self.p.stderr.read().decode()
         self.p.stdout.close();self.p.stderr.close()
 
-server=Server(); owned=None
+server=Server(quiet=True); owned=None
 try:
     initial=server.session(); owned=initial['pid']
     summary=server.inspect('get_debug_view',summary_only=True)
@@ -134,4 +143,4 @@ try:
     names={t['name'] for t in server.call('tools/list')['result']['tools']}
     assert 'get_debug_view' in names and 'detach' not in names
 finally: server.close()
-print('Remote TCP passed: fragmented handshake, one client, source/stack/locals/registers, stale rejection, stepping, interrupt, owned cleanup, attach preservation, hangup/probe restoration, detach and scope')
+print('Remote TCP passed: -qq port report, fragmented handshake, one client, source/stack/locals/registers, stale rejection, stepping, interrupt, owned cleanup, attach preservation, hangup/probe restoration, detach and scope')

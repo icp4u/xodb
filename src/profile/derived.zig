@@ -53,7 +53,7 @@ pub const Key = struct {
 pub fn assetSet(capture: *const Capture) u64 {
     var h = std.hash.Wyhash.init(0x16);
     h.update(version);
-    h.update(unwind.algorithm);
+    h.update(unwind.algorithmFor(capture.architecture));
     for (capture.images.loaded.items) |image| {
         h.update(std.mem.asBytes(&image.id));
         h.update(std.mem.asBytes(&image.bias));
@@ -135,7 +135,7 @@ pub fn buildWithLimit(a: std.mem.Allocator, capture: *const Capture, filter: cap
     defer batch.deinit();
     var identity = std.crypto.hash.sha2.Sha256.init(.{});
     identity.update(version);
-    identity.update(unwind.algorithm);
+    identity.update(unwind.algorithmFor(capture.architecture));
     var filter_bytes: [20]u8 = undefined;
     std.mem.writeInt(u64, filter_bytes[0..8], filter.from_ns, .little);
     std.mem.writeInt(u64, filter_bytes[8..16], filter.to_ns, .little);

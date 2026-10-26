@@ -14,6 +14,11 @@ pub fn summary(capture: *const model.Capture, sample: anytype) Summary {
     const entry = capture.user_state.entries[sample.user_state - 1];
     return .{ .status = if (entry.status == .budget) .budget else .captured, .abi = entry.state.abi, .regs_present = entry.state.regs_present, .stack_size = entry.state.stack_size, .valid_bytes = entry.state.stack_dyn, .retained_bytes = entry.state.stack_len, .short = entry.state.stack_short };
 }
+fn stackAddress(a: std.mem.Allocator, capture: *const model.Capture, state: records.UserState) !?[]const u8 {
+    const file = records.perfFile(@intFromEnum(capture.architecture)) orelse return null;
+    if (!state.regs_present or state.regs_mask & (@as(u64, 1) << file.sp) == 0) return null;
+    return try std.fmt.allocPrint(a, "0x{x}", .{state.regs[file.sp]});
+}
 const Counts = struct {
     samples: usize = 0,
     registers: usize = 0,
@@ -107,7 +112,7 @@ pub fn call(a: aType, session: *Session, name: []const u8, args: Value) !Value {
             hex[2 * i] = digits[byte >> 4];
             hex[2 * i + 1] = digits[byte & 15];
         }
-        raw = try common.value(a, .{ .abi = entry.state.abi, .regs_mask = entry.state.regs_mask, .registers = regs.items, .stack_address = if (entry.state.regs_present and entry.state.regs_mask & (1 << 7) != 0) try std.fmt.allocPrint(a, "0x{x}", .{entry.state.regs[7]}) else null, .stack_offset = offset, .stack_hex = hex, .next_offset = if (end < bytes.len) @as(?usize, end) else null });
+        raw = try common.value(a, .{ .abi = entry.state.abi, .regs_mask = entry.state.regs_mask, .registers = regs.items, .stack_address = try stackAddress(a, capture, entry.state), .stack_offset = offset, .stack_hex = hex, .next_offset = if (end < bytes.len) @as(?usize, end) else null });
     } else if (offset != 0) return error.InvalidArguments;
     const job = if (reconstruct) try session.requestProfileStackOwned(@intCast(ordinal), session.jobRequester()) else null;
     var derived: ?Value = null;
@@ -116,7 +121,7 @@ pub fn call(a: aType, session: *Session, name: []const u8, args: Value) !Value {
             const Frame = struct { pc: []const u8, sp: []const u8, lookup_pc: []const u8, mapping_id: u32, module_id: u64, name: []const u8, name_truncated: bool, cfi_method: ?[]const u8 };
             var frames: std.ArrayList(Frame) = .empty;
             for (result.frames[0..result.count]) |f| try frames.append(a, .{ .pc = try std.fmt.allocPrint(a, "0x{x}", .{f.pc}), .sp = try std.fmt.allocPrint(a, "0x{x}", .{f.sp}), .lookup_pc = try std.fmt.allocPrint(a, "0x{x}", .{f.lookup_pc}), .mapping_id = f.mapping_id, .module_id = f.module_id, .name = try a.dupe(u8, f.name[0..f.name_len]), .name_truncated = f.name_truncated, .cfi_method = f.method });
-            derived = try common.value(a, .{ .algorithm = unwind.algorithm, .analysis_id = result.analysis_id[0..], .frames = frames.items, .terminal_reason = result.reason, .detail = result.detail, .mapping_coverage = @import("../profile/mappings.zig").coverage, .basis = "saved perf registers/stack, timestamped mappings, matching retained ELF/PE bytes; original callchain unchanged" });
+            derived = try common.value(a, .{ .algorithm = unwind.algorithmFor(capture.architecture), .analysis_id = result.analysis_id[0..], .frames = frames.items, .terminal_reason = result.reason, .detail = result.detail, .mapping_coverage = @import("../profile/mappings.zig").coverage, .basis = "saved perf registers/stack, timestamped mappings, matching retained ELF/PE bytes; original callchain unchanged" });
         }
     };
     return common.value(a, .{ .capture_id = capture.id, .revision = capture.revision, .sample = ordinal, .artifact_sha256 = if (session.artifact) |*artifact| try a.dupe(u8, &std.fmt.bytesToHex(artifact.source.archive_sha256, .lower)) else null, .state = state, .raw = raw, .job = if (job) |j| j.status() else null, .pending = if (job) |j| !j.reaped else false, .derived = derived });

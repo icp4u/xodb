@@ -298,7 +298,7 @@ lists, source step and step-over, and a signal during a step.
 `tests/riscv64-guest.sh`. The script holds `XODB_GUEST_LEASE`, uses `ssh` from
 `PATH`, builds a fresh guest tree when those remote paths are not executable,
 runs the driver, and removes only the directory it created.
-On LoongArch64 that script steps one instruction, refuses watchpoints, profile and
+On LoongArch64 that script steps one instruction, profiles, refuses watchpoints and
 uprobes, and removes the breakpoint before continuing. Disassembly is refused on
 the system Capstone 5.x build and decoded when the binary was built with
 `-Dcapstone=vendored`. Instruction step and continue-from-breakpoint plant

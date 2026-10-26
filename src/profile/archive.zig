@@ -195,6 +195,8 @@ pub fn encode(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
 }
 fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
     if (capture.collector != null) return error.ArchiveStillCollecting;
+    // The file header and sampled-register container are still x86-64.
+    if (capture.architecture != .x86_64) return error.ArchiveUnsupportedArchitecture;
     try validateSyscalls(capture);
     const sampled = capture.config.user_stack_bytes != 0;
     const typed_images = capture.pe_assets.entries.items.len != 0;
@@ -1534,7 +1536,8 @@ fn decodeAnnotations(r: *Reader, self: *Capture, reports: []const ImageReport) !
     try r.end();
 }
 
-// USTA v1. All lengths are checked independently of the surrounding section CRC.
+// USTA. Version 1 stores 24 register words. Version 2 stores the wider file.
+// Lengths are checked independently of the surrounding section CRC.
 fn validateUserState(self: *const Capture) !void {
     const store = &self.user_state;
     const bits = records.Bits.regs_user | records.Bits.stack_user;
@@ -1544,7 +1547,8 @@ fn validateUserState(self: *const Capture) !void {
         return;
     }
     self.config.validate() catch return error.ArchiveInvalidValue;
-    if (self.accepted.user_stack_bytes != self.config.user_stack_bytes or self.accepted.user_regs_mask != records.user_regs_gpr_mask or self.accepted.sample_type & bits != bits or store.count > store.entries.len or store.used > store.bytes.len or store.used > self.config.user_stack_budget_bytes) return error.ArchiveInconsistent;
+    const perf_regs = records.perfFile(@intFromEnum(self.architecture)) orelse return error.ArchiveUnsupportedArchitecture;
+    if (self.accepted.user_stack_bytes != self.config.user_stack_bytes or self.accepted.user_regs_mask != perf_regs.mask or self.accepted.sample_type & bits != bits or store.count > store.entries.len or store.used > store.bytes.len or store.used > self.config.user_stack_budget_bytes) return error.ArchiveInconsistent;
     var count: usize = 0;
     var used: usize = 0;
     var skipped: usize = 0;
@@ -1578,8 +1582,9 @@ fn validateUserState(self: *const Capture) !void {
 fn encodeUserState(w: Writer, self: *const Capture, state: ?*progress.Progress) !void {
     // All counts were validated. Reserve exactly once: growing a 64 MiB body
     // geometrically would compete with the final container for the codec budget.
-    try w.out.ensureTotalCapacityPrecise(w.a, 28 + self.samples.len() + self.user_state.count * 221 + self.user_state.used);
-    try w.int(u32, 1);
+    const words = records.archivedUserRegs(self.accepted.user_regs_mask);
+    try w.out.ensureTotalCapacityPrecise(w.a, 28 + self.samples.len() + self.user_state.count * records.archivedUserStateBytes(self.accepted.user_regs_mask) + self.user_state.used);
+    try w.int(u32, if (words == records.x86_user_regs) @as(u32, 1) else 2);
     try w.int(u32, self.config.user_stack_bytes);
     try w.int(u32, self.config.user_stack_budget_bytes);
     try w.int(u64, self.accepted.user_regs_mask);
@@ -1594,7 +1599,7 @@ fn encodeUserState(w: Writer, self: *const Capture, state: ?*progress.Progress) 
         const raw = entry.state;
         try w.code(if (entry.status == .captured) 0 else 1);
         try w.int(u64, raw.abi);
-        for (raw.regs) |reg| try w.int(u64, reg);
+        for (raw.regs[0..words]) |reg| try w.int(u64, reg);
         try w.int(u64, raw.stack_size);
         try w.int(u64, raw.stack_dyn);
         try w.int(u32, raw.stack_len);
@@ -1605,13 +1610,18 @@ fn encodeUserState(w: Writer, self: *const Capture, state: ?*progress.Progress) 
     }
 }
 fn decodeUserState(r: *Reader, self: *Capture) !void {
-    if (try r.int(u32) != 1) return error.ArchiveFeatureUnsupported;
+    const words: usize = switch (try r.int(u32)) {
+        1 => records.x86_user_regs,
+        2 => records.max_user_regs,
+        else => return error.ArchiveFeatureUnsupported,
+    };
     self.config.user_stack_bytes = try r.int(u32);
     self.config.user_stack_budget_bytes = try r.int(u32);
     if (self.config.user_stack_bytes == 0) return error.ArchiveInconsistent;
     self.config.validate() catch return error.ArchiveInvalidValue;
     self.accepted.user_stack_bytes = self.config.user_stack_bytes;
     self.accepted.user_regs_mask = try r.int(u64);
+    if (records.archivedUserRegs(self.accepted.user_regs_mask) != words) return error.ArchiveInconsistent;
     const retained = try r.int(u32);
     if (retained > self.config.user_stack_budget_bytes) return error.ArchiveLimit;
     const count = try r.count(self.config.sample_limit, 1);
@@ -1628,7 +1638,7 @@ fn decodeUserState(r: *Reader, self: *Capture) !void {
         };
         var raw = records.UserState{ .abi = try r.int(u64), .regs_mask = self.accepted.user_regs_mask };
         raw.regs_present = raw.abi != records.regs_abi_none;
-        for (&raw.regs) |*reg| reg.* = try r.int(u64);
+        for (raw.regs[0..words]) |*reg| reg.* = try r.int(u64);
         raw.stack_size = try r.int(u64);
         raw.stack_dyn = try r.int(u64);
         raw.stack_present = raw.stack_size != 0;
@@ -1649,6 +1659,15 @@ fn decodeUserState(r: *Reader, self: *Capture) !void {
     }
     if (store.used != retained) return error.ArchiveInconsistent;
     try r.end();
+}
+
+test "non-x86 captures are not written as x86 archives" {
+    const a = std.testing.allocator;
+    const fixture = @import("archive_fixture.zig");
+    const source = try fixture.build(a, .empty, null);
+    defer source.deinit();
+    source.architecture = .loongarch64;
+    try std.testing.expectError(error.ArchiveUnsupportedArchitecture, encode(a, source, .{}));
 }
 
 test "x86 archives reject ARM64 images even with a matching asset identity" {

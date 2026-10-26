@@ -138,8 +138,13 @@ enum xrt_status xrt_agent_perf_dispatch(struct xrt_agent_perf *a, struct xrt_tar
     if (!a || !t)
         return XRT_INVALID_ARGUMENT;
     if (opening) {
-        /* Current host decoders support x86-64 Linux perf record layouts. */
-        if (t->arch->machine != XRT_X86_64)
+        /* Syscall and allocation sampling stay on x86-64. CPU sampling also
+         * accepts the AArch64 and LoongArch64 user register files. */
+        if (op == XRT_RPC_CPU_START) {
+            if (t->arch->machine != XRT_X86_64 && t->arch->machine != XRT_AARCH64 &&
+                t->arch->machine != XRT_LOONGARCH)
+                return XRT_UNSUPPORTED_ARCHITECTURE;
+        } else if (t->arch->machine != XRT_X86_64)
             return XRT_UNSUPPORTED_ARCHITECTURE;
         for (unsigned i = 0; i < 32; ++i)
             if (!a->slots[i].perf) {
