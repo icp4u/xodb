@@ -107,7 +107,10 @@ fn profile(session: *const Context, module: Module) !*const c.struct_xpy_layout 
     try published(session, module, runtime, symbol.value, &bytes);
     if (module.layouts.python == null) {
         // DWARF is optional only for a final release (checked in C).
-        const dwarf: ?*c.Dwarf = if (module.debugInfo()) |debug| debug.dwarf else |_| null;
+        const dwarf: ?*c.Dwarf = if (module.debugInfo()) |debug| debug.dwarf else |err| switch (err) {
+            error.DebugMetadataPending, error.DebugMetadataCancelled => return err,
+            else => null,
+        };
         var layout: c.struct_xpy_layout = undefined;
         if (c.xpy_layout_build(&bytes, bytes.len, dwarf, id.ptr, id.len, &layout)) |why| {
             return refusal(std.mem.span(why));

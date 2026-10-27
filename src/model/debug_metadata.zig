@@ -4,6 +4,8 @@ const c = @import("../c.zig").api;
 const runtime = @import("../target/runtime.zig");
 const Session = @import("session.zig").Session;
 const Region = @import("modules.zig").Region;
+const Modules = @import("modules.zig").Modules;
+const Coverage = @import("../binary/snapshot.zig").Completeness;
 const info = @import("../debug/info.zig");
 const loc = @import("../debug/location.zig");
 const A = std.heap.page_allocator;
@@ -26,6 +28,7 @@ const unwind_budget: u64 = 128 * 1024 * 1024;
 const Entry = struct {
     id: u64,
     kind: Kind,
+    coverage: Coverage = .sections,
     epoch: u64,
     region: Region,
     path: [:0]u8,
@@ -76,7 +79,7 @@ pub const Snapshot = struct {
 };
 /// A main-image job refused before it started. Remembered for the image epoch
 /// so an owner poll does not reopen the remote file to learn the same answer.
-const ImageRefusal = struct { epoch: u64, region: Region, size: u64, reason: @import("../binary/snapshot.zig").Refusal };
+const ImageRefusal = struct { epoch: u64, region: Region, size: u64, identity: runtime.c.struct_xrt_file_identity, reason: @import("../binary/snapshot.zig").Refusal };
 pub const State = struct {
     entries: [max_jobs]?Entry = @splat(null),
     image_refusals: [2]?ImageRefusal = @splat(null),
@@ -128,12 +131,31 @@ pub const State = struct {
         }
         return self.kernel.?;
     }
+    pub fn mainPhdr(self: *State, session: *Session) !u64 {
+        return (try self.placement(session)).main_phdr;
+    }
     fn get(self: *State, session: *Session, kind: Kind, region: Region) !*Entry {
         self.synchronize(session);
+        return self.getFor(&session.modules, kind, region, .sections, .frame);
+    }
+    /// Rebound by the live session before module queries. Jobs remain owned
+    /// here, never by a temporary module reader or a background worker.
+    pub fn bind(self: *State, session: *Session) void {
+        self.synchronize(session);
+        // Generic asynchronous transfer belongs to the remote transport only.
+        // Local image reads retain their synchronous contract.
+        if (!runtime.c.xrt_target_is_remote(session.target.handle)) {
+            session.modules.image_jobs = null;
+            return;
+        }
+        session.modules.image_jobs = .{ .context = self, .prepare = prepareFile, .release = releaseFile };
+    }
+    fn getFor(self: *State, modules: *Modules, kind: Kind, region: Region, coverage: Coverage, why: Modules.Reason) !*Entry {
+        const complete_file = coverage == .full;
         for (&self.entries) |*slot| if (slot.*) |*entry| {
             const old = entry.region;
-            if (!entry.retired and entry.kind == kind and entry.epoch == self.epoch and
-                old.start == region.start and old.end == region.end and old.offset == region.offset and
+            if (!entry.retired and entry.kind == kind and entry.coverage == coverage and entry.epoch == self.epoch and
+                ((kind == .image and coverage == .full) or (old.start == region.start and old.end == region.end and old.offset == region.offset)) and
                 old.inode == region.inode and old.device_major == region.device_major and old.device_minor == region.device_minor)
             {
                 entry.touched_query = self.query;
@@ -146,18 +168,34 @@ pub const State = struct {
                 r.inode != region.inode or r.device_major != region.device_major or r.device_minor != region.device_minor) continue;
             // Cap refusals hold for the epoch; the total may have freed up since.
             const image_budget = @import("../binary/snapshot.zig");
-            const reason = if (old.reason.which == .remote or old.reason.which == .image) old.reason else if (old.size > image_budget.remaining()) image_budget.refusal(old.size) else break;
-            session.modules.refuseImage(region, reason);
+            const reason = if (old.reason.which == .remote or old.reason.which == .image) old.reason else if (old.size > image_budget.remaining() and !modules.sharesRemoteImage(old.identity, coverage)) image_budget.refusal(old.size) else break;
+            if (complete_file) modules.refusal = reason else modules.refuseImage(region, reason);
             return error.BinarySnapshotLimit;
         };
         if (kind == .unwind) {
-            try self.reserveUnwind(runtime.c.xrt_target_is_remote(session.target.handle), runtime.c.xrt_target_file_slots(session.target.handle));
+            try self.reserveUnwind(runtime.c.xrt_target_is_remote(modules.target), runtime.c.xrt_target_file_slots(modules.target));
         } else {
             var count: usize = 0;
             for (self.entries) |slot| if (slot) |entry| {
                 if (entry.kind == kind) count += 1;
             };
-            if (count >= 2) return error.DebugMetadataJobLimit;
+            if (count >= 2) {
+                // A parsed module owns its mapping. Finished image workers
+                // need not pin file handles and starve later source/name scans.
+                if (kind == .image) for (&self.entries) |*item| {
+                    if (item.*) |*entry| {
+                        if (entry.kind != .image or c.xmd_join(entry.job) != c.XBO_OK) continue;
+                        var progress: c.struct_xmd_snapshot = undefined;
+                        c.xmd_poll(entry.job, &progress);
+                        if (progress.state != c.XMD_READY) continue;
+                        entry.deinit();
+                        item.* = null;
+                        count -= 1;
+                        break;
+                    }
+                };
+                if (count >= 2) return if (kind == .image) error.DebugMetadataPending else error.DebugMetadataJobLimit;
+            }
         }
         const slot = for (&self.entries) |*item| {
             if (item.* == null) break item;
@@ -166,31 +204,42 @@ pub const State = struct {
         errdefer A.free(path);
         const request = c.struct_xrt_file_request{ .kind = c.XRT_FILE_MAPPED, .mapping = .{ .start = region.start, .end = region.end, .offset = region.offset, .inode = region.inode, .device_major = region.device_major, .device_minor = region.device_minor, .path = path } };
         var view: ?*c.struct_xrt_file_view = null;
-        try runtime.check(@intCast(c.xrt_target_file_view_open_owner(@ptrCast(session.target.handle), &request, &view)));
+        try modules.openFileView(@ptrCast(&request), @ptrCast(&view));
         errdefer _ = c.xrt_file_view_close(view);
         const local = c.xrt_file_view_remote(view) == 0;
         const identity = c.xrt_file_view_identity(view).*;
         if (kind == .image) {
             const image_budget = @import("../binary/snapshot.zig");
-            const limit = runtime.c.xrt_target_remote_image_limit(session.target.handle);
+            const limit = runtime.c.xrt_target_remote_image_limit(modules.target);
             if (identity.size <= 0) return error.BinaryIdentityUnavailable;
             const size: u64 = @intCast(identity.size);
+            // Container budgets apply to one ELF entry, not to the ZIP. The
+            // bounded worker preserves it for the existing entry parser.
+            var magic: [4]u8 = undefined;
+            if (complete_file and size >= magic.len) try runtime.check(@intCast(c.xrt_file_view_read(view, 0, &magic, magic.len)));
+            const container = complete_file and size >= magic.len and std.mem.eql(u8, &magic, "PK\x03\x04");
+            const shared = modules.sharesRemoteImage(@bitCast(identity), coverage);
+            if (complete_file and !container) try modules.checkImageAllowance(region, size, why, shared);
             const refused: ?image_budget.Refusal = if (size > limit)
                 .{ .size = size, .limit = limit, .which = .remote, .older_agent = limit < image_budget.remote_image_limit }
-            else if (size > image_budget.remaining()) image_budget.refusal(size) else null;
+            else if (!container and (size > image_budget.per_image_limit or (!shared and size > image_budget.remaining()))) image_budget.refusal(size) else null;
             if (refused) |reason| {
                 // Region.path is borrowed from the map snapshot; matching uses identity fields only.
-                self.image_refusals[self.image_refusal_next] = .{ .epoch = self.epoch, .region = region, .size = size, .reason = reason };
+                self.image_refusals[self.image_refusal_next] = .{ .epoch = self.epoch, .region = region, .size = size, .identity = @bitCast(identity), .reason = reason };
                 self.image_refusal_next = (self.image_refusal_next + 1) % self.image_refusals.len;
-                session.modules.refuseImage(region, reason);
+                if (complete_file) modules.refusal = reason else modules.refuseImage(region, reason);
                 return error.BinarySnapshotLimit;
             }
         }
         // The worker notices a change only while its view is open. A view
         // reopened over the agent must match the identity stored for this file.
-        try session.modules.rememberMetadataIdentity(region, @bitCast(identity));
+        try modules.rememberMetadataIdentity(region, @bitCast(identity));
         var job: ?*c.struct_xmd_job = null;
-        const status = if (kind == .image)
+        const status = if (kind == .image and complete_file)
+            (if (modules.cachedTypes(region) != null) c.xmd_start_file_cached(view, &job) else c.xmd_start_file(view, &job))
+        else if (kind == .image and coverage == .types)
+            c.xmd_start_types(view, &job)
+        else if (kind == .image)
             c.xmd_start_image(view, &job)
         else if (kind == .javascript)
             c.xmd_start_javascript_cached(view, &job)
@@ -199,16 +248,68 @@ pub const State = struct {
         else
             c.xmd_start_cfi(view, &job);
         try check(status, null);
-        slot.* = .{ .id = self.next_id, .kind = kind, .epoch = self.epoch, .region = region, .path = path, .job = job.?, .touched_query = self.query };
+        slot.* = .{ .id = self.next_id, .kind = kind, .coverage = coverage, .epoch = self.epoch, .region = region, .path = path, .job = job.?, .touched_query = self.query };
         slot.*.?.region.path = path;
         self.next_id +|= 1;
         self.revision +%= 1;
         return &slot.*.?;
     }
+    fn prepareFile(context: *anyopaque, modules: *Modules, region: Region, why: Modules.Reason) !c_int {
+        const self: *State = @ptrCast(@alignCast(context));
+        if (modules.cachedTypes(region) != null) {
+            // A cancelled upgrade stays cancelled until retried; it does not
+            // take the language view's projection with it.
+            for (self.entries) |slot| if (slot) |full| {
+                const old = full.region;
+                if (full.retired or full.epoch != self.epoch or full.kind != .image or full.coverage != .full or old.inode != region.inode or
+                    old.device_major != region.device_major or old.device_minor != region.device_minor) continue;
+                var state: c.struct_xmd_snapshot = undefined;
+                c.xmd_poll(full.job, &state);
+                if (state.state == c.XMD_CANCELLED) return error.DebugMetadataCancelled;
+            };
+        }
+        if (modules.cachedTypes(region) != null) {
+            modules.releaseTypesForUpgrade(region);
+            // The worker's descriptor also pins the projection's pages.
+            for (&self.entries) |*slot| if (slot.*) |*entry| {
+                const old = entry.region;
+                if (entry.retired or entry.epoch != self.epoch or entry.kind != .image or entry.coverage != .types or old.inode != region.inode or
+                    old.device_major != region.device_major or old.device_minor != region.device_minor) continue;
+                entry.deinit();
+                slot.* = null;
+                self.revision +%= 1;
+            };
+        }
+        const entry = self.getFor(modules, .image, region, .full, why) catch |err| switch (err) {
+            error.SymbolDiscoveryPending, error.SymbolDiscoveryBudgetExceeded => return error.DebugMetadataPending,
+            else => return err,
+        };
+        var progress: c.struct_xmd_snapshot = undefined;
+        c.xmd_poll(entry.job, &progress);
+        if (progress.state == c.XMD_CANCELLED) return error.DebugMetadataCancelled;
+        var fd: c_int = -1;
+        try check(c.xmd_image_result(entry.job, &fd), if (progress.reason) |reason| std.mem.span(reason) else null);
+        return fd;
+    }
+    fn releaseFile(context: *anyopaque, region: Region) void {
+        const self: *State = @ptrCast(@alignCast(context));
+        for (&self.entries) |*slot| if (slot.*) |*entry| {
+            const old = entry.region;
+            if (entry.retired or entry.epoch != self.epoch or entry.kind != .image or entry.coverage != .full or old.inode != region.inode or
+                old.device_major != region.device_major or old.device_minor != region.device_minor) continue;
+            // The borrower has mapped the sealed descriptor or refused it.
+            // Do not retain uncharged backing after the snapshot is released.
+            entry.deinit();
+            slot.* = null;
+            self.revision +%= 1;
+            return;
+        };
+    }
     /// Only the kernel-proved main image takes the runtime's full-image budget.
     /// The context adapter checks PHDR before entering this asynchronous path.
     pub fn mainImage(self: *State, session: *Session, address: u64, why: enum { frame, sweep }) !*@import("modules.zig").Module {
         const region = try mapped(session, address);
+        if (session.modules.cachedTypes(region) != null) return session.modules.load(region, if (why == .frame) .frame else .sweep);
         const entry = try self.get(session, .image, region);
         var progress: c.struct_xmd_snapshot = undefined;
         c.xmd_poll(entry.job, &progress);
@@ -216,6 +317,49 @@ pub const State = struct {
         var fd: c_int = -1;
         try check(c.xmd_image_result(entry.job, &fd), if (progress.reason) |reason| std.mem.span(reason) else null);
         return session.modules.loadMainImage(region, fd, if (why == .frame) .frame else .sweep);
+    }
+    /// Layout-only projection. Ordinary module queries never see this image.
+    pub fn mainTypes(self: *State, session: *Session, address: u64) !*@import("modules.zig").Module {
+        self.synchronize(session);
+        const region = try mapped(session, address);
+        if (session.modules.cachedTypes(region)) |module| {
+            if (!module.preparing_full) return module;
+            // An upgrade cancelled or refused after the projection was given
+            // up: rebuild the projection into the same module slot (below).
+            const rebuilding = for (self.entries) |slot| {
+                const types = slot orelse continue;
+                if (!types.retired and types.epoch == self.epoch and types.kind == .image and types.coverage == .types and types.region.inode == region.inode and
+                    types.region.device_major == region.device_major and types.region.device_minor == region.device_minor) break true;
+            } else false;
+            if (!rebuilding) if (session.modules.load(region, .frame)) |full| return full else |err| switch (err) {
+                error.DebugMetadataCancelled => {
+                    // Cancellation is visible before the worker finishes its
+                    // last RPC. Rebuild only after it releases the cache lease;
+                    // try-join yields Pending, never blocks the owner.
+                    for (self.entries) |slot| if (slot) |full| {
+                        if (!full.retired and full.epoch == self.epoch and full.kind == .image and full.coverage == .full and full.region.inode == region.inode and
+                            full.region.device_major == region.device_major and full.region.device_minor == region.device_minor)
+                        {
+                            try check(c.xmd_join(full.job), null);
+                            // A ready result can be cancelled before adoption;
+                            // validate retires its lease on that path too.
+                            check(c.xmd_validate(full.job), null) catch |cause| {
+                                if (cause != error.DebugMetadataCancelled) return cause;
+                            };
+                        }
+                    };
+                },
+                error.BinarySnapshotLimit => {},
+                else => return err,
+            };
+        }
+        const entry = try self.getFor(&session.modules, .image, region, .types, .frame);
+        var progress: c.struct_xmd_snapshot = undefined;
+        c.xmd_poll(entry.job, &progress);
+        if (progress.state == c.XMD_CANCELLED) return error.DebugMetadataCancelled;
+        var fd: c_int = -1;
+        try check(c.xmd_image_result(entry.job, &fd), if (progress.reason) |reason| std.mem.span(reason) else null);
+        return session.modules.loadTypes(region, fd);
     }
     /// Drops the oldest finished unwind job from an earlier query, closing
     /// its agent file view. False when no such job exists.

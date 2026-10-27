@@ -62,7 +62,13 @@ def run(case, fn):
         record(case, 'fail', f'{type(e).__name__}: {e}')
 
 def tool(c, tool_name, **args):
-    r = c.call('tools/call', {'name': tool_name, 'arguments': args})
+    deadline = time.monotonic() + 30
+    while True:
+        r = c.call('tools/call', {'name': tool_name, 'arguments': args})
+        result = r.get('result', {})
+        if not result.get('isError') or result['content'][0]['text'] not in ('DebugMetadataPending', 'SymbolDiscoveryPending'): break
+        assert time.monotonic() < deadline, r
+        time.sleep(.01)
     if 'error' in r: return {'_protocol_error': r['error']['message']}
     if r['result'].get('isError'): return {'_error': r['result']['content'][0]['text']}
     return r['result']['structuredContent']

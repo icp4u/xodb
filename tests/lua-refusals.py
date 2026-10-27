@@ -38,7 +38,7 @@ for target,expected in [(wrong,'LuaVersionUnsupported'),(stripped,'LuaDwarfUnava
         client.action('set_breakpoint',symbol='xodb_lua_stop');client.action('continue')
         process.stdin.write(b'go\n');process.stdin.flush();client.stopped('breakpoint')
         before=client.inspect('get_registers',tid=process.pid);generation=client.session()['generation']
-        result=client.tool('get_language_stack',tid=process.pid,language='lua')
+        result=client.prepared_tool('get_language_stack',tid=process.pid,language='lua')
         assert result.get('result',{}).get('isError') and result['result']['content'][0]['text']==expected,result
         assert client.inspect('get_registers',tid=process.pid)==before and client.session()['generation']==generation
         evidence.append({'case':target.name,'reason':expected,'session_usable':True})

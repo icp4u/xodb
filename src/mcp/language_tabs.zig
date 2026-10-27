@@ -37,7 +37,7 @@ pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: std
         if (args.object.get("generation") == null) return error.GenerationRequired;
         if (selecting_tab) {
             const selected = try tab(args, "tab");
-            session.language_tabs.enabled = true;
+            session.language_tabs.request(session);
             try session.language_tabs.select(selected);
         } else {
             const tid = try number(args, "tid", std.math.maxInt(i32));
@@ -46,7 +46,7 @@ pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: std
             if (selecting_native) try selection.selectNative(session, @intCast(tid), @intCast(frame)) else try selection.selectLogical(session, @intCast(tid), try tab(args, "language"), @intCast(try number(args, "segment", 63)), @intCast(frame));
         }
     }
-    session.language_tabs.enabled = true;
+    session.language_tabs.request(session);
     const text = try std.json.Stringify.valueAlloc(a, .{ .process_id = session.process_id, .session_id = session.id, .generation = session.target.snapshot().generation, .view = session.language_tabs }, .{});
     return (try std.json.parseFromSlice(std.json.Value, a, text, .{ .allocate = .alloc_always })).value;
 }

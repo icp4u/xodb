@@ -128,9 +128,21 @@ class Client:
         return assert_reply_exact(self.call('tools/call', {'name': tool_name, 'arguments': args}))
 
     def tool(self, name, **args):
-        reply = self.raw(name, **args)
-        assert 'error' not in reply and not reply['result']['isError'], reply
-        return reply['result']['structuredContent']
+        # Like the stdio client's inspect: request a settled answer. raw()
+        # remains available for Pending/cancellation assertions.
+        deadline = time.monotonic() + TIMEOUT
+        while True:
+            reply = self.raw(name, **args)
+            result = reply.get('result', {})
+            pending = (result.get('isError') and result['content'][0]['text'] in ('DebugMetadataPending', 'SymbolDiscoveryPending'))
+            if not pending:
+                assert 'error' not in reply and not result['isError'], reply
+                data = result['structuredContent']
+                pending = name == 'get_stack' and any(f.get('diagnostic') == 'DebugMetadataPending' for f in data['frames'])
+                if not pending:
+                    return data
+            assert time.monotonic() < deadline, reply
+            time.sleep(.01)
 
     def session(self):
         return self.tool('get_session')
@@ -144,9 +156,19 @@ class Client:
     def action(self, name, **args):
         # The generation may advance between the read and the call (metadata
         # arriving, another client): a refused stale snapshot is retried.
-        for _ in range(20):
+        # Source breakpoints resolve all addresses before any breakpoint is
+        # installed, so their metadata wait is also safe to retry.
+        deadline = time.monotonic() + TIMEOUT
+        while True:
             reply = self.raw(name, generation=self.session()['generation'], **args)
-            if 'error' in reply or reply['result'].get('content') != [{'type': 'text', 'text': 'StaleSnapshot'}]: break
+            if 'error' in reply: break
+            reason = reply['result'].get('content')
+            stale = reason == [{'type': 'text', 'text': 'StaleSnapshot'}]
+            pending = name == 'set_breakpoint' and 'file' in args and reason in (
+                [{'type': 'text', 'text': 'DebugMetadataPending'}],
+                [{'type': 'text', 'text': 'SymbolDiscoveryPending'}])
+            if not stale and not pending: break
+            assert time.monotonic() < deadline, reply
             time.sleep(.02)
         assert 'error' not in reply and not reply['result']['isError'], reply
         return reply['result']['structuredContent']

@@ -26,6 +26,11 @@ w.mkdir(mode=0o755, parents=True)
 cache = w / 'cache'
 cache.mkdir(mode=0o700)
 os.environ['XDG_CACHE_HOME'] = str(cache)
+# Static-analysis warm-up loads a forked child's main image on its own, which
+# the inherited-job check below cannot tell from an inherited job. The gate
+# already runs with the sidecar off; a direct run must too (and must not
+# start a private Ghidra JVM that outlives the test).
+os.environ['XODB_GHIDRA_SIDECAR'] = 'off'
 if a.agent:
     os.environ['XODB_RUNTIME_AGENT'] = str(root / 'tests/fixtures/metadata-agent-proxy.py')
     os.environ['XODB_METADATA_AGENT'] = str(a.agent.resolve())
@@ -70,11 +75,13 @@ def state(client, process=1):
     return client.tool('get_session', process_id=process)
 
 
-def jobs(client, process=1):
-    return client.tool('get_debug_metadata', process_id=process)['jobs']
+def jobs(client, process=1, kind=None):
+    found = client.tool('get_debug_metadata', process_id=process)['jobs']
+    return [job for job in found if kind is None or job['kind'] == kind]
 
 
 def action(client, name, process=1, **args):
+    client.claim(ttl_ms=60000)
     return client.tool(name, generation=state(client, process)['generation'], process_id=process, **args)
 
 
@@ -85,14 +92,22 @@ def start(observer, process=1):
     reply = observer.raw('get_language_stack', tid=tid, language='javascript', process_id=process)
     if reply['result']['isError']:
         assert reply['result']['content'][0]['text'] == 'DebugMetadataPending', reply
-    found = jobs(observer, process)
+    # Prepared native frames may have an image job alongside the requested
+    # JavaScript layout. Ownership assertions concern the latter; lifecycle
+    # cleanup below must still empty the entire job collection.
+    found = jobs(observer, process, kind='javascript')
     assert len(found) == 1 and found[0]['kind'] == 'javascript', found
     assert state(observer, process)['generation'] == before['generation']
     return found[0]
 
 
-def ready(observer, ident):
-    result = shared.eventually(lambda: jobs(observer),
+def ready(observer, ident, owner):
+    def current():
+        # Delayed remote preparation can outlive the original control lease;
+        # the active controller renews it while the observer polls read-only.
+        owner.claim(ttl_ms=60000)
+        return jobs(observer, kind='javascript')
+    result = shared.eventually(current,
         lambda j: j and j[0]['state'] in ('ready', 'failed', 'cancelled'), 'job completes', timeout=60)
     assert result[0]['id'] == ident and result[0]['state'] == 'ready', result
     return result[0]
@@ -125,21 +140,24 @@ try:
             tid = original['threads'][0]['tid']
             registers = observer.tool('get_registers', tid=tid)
             job = start(observer)
+            owner.claim(ttl_ms=60000)
             report['initial_state'] = job['state']
             ident = job['id']
+            original_jobs = {entry['id'] for entry in jobs(observer)}
             if name == 'control':
-                ready(observer, ident)
+                ready(observer, ident, owner)
                 for tool in ('cancel_debug_metadata', 'retry_debug_metadata'):
                     assert tool not in shared.listed_tools(observer)
                     shared.expect_error(observer.raw(tool, id=ident), 'ControlLeaseRequired')
-                assert jobs(observer)[0]['state'] == 'ready'
-                cancelled = owner.tool('cancel_debug_metadata', id=ident)['jobs']
+                assert jobs(observer, kind='javascript')[0]['state'] == 'ready'
+                cancelled = [job for job in owner.tool('cancel_debug_metadata', id=ident)['jobs'] if job['id'] == ident]
+                assert len(cancelled) == 1, cancelled
                 assert cancelled[0]['state'] == 'cancelled' and cancelled[0]['reason'] == 'DebugMetadataCancelled', cancelled
                 shared.expect_error(observer.raw('get_language_stack', tid=tid, language='javascript'), 'DebugMetadataCancelled')
-                assert not owner.tool('retry_debug_metadata', id=ident)['jobs']
+                assert not [job for job in owner.tool('retry_debug_metadata', id=ident)['jobs'] if job['kind'] == 'javascript']
                 replacement = start(observer)
                 assert replacement['id'] != ident
-                ready(observer, replacement['id'])
+                ready(observer, replacement['id'], owner)
                 shared.expect_error(owner.raw('cancel_debug_metadata', id=ident), 'UnknownMetadataJob')
                 assert state(observer)['generation'] == original['generation']
                 assert observer.tool('get_registers', tid=tid) == registers
@@ -154,13 +172,15 @@ try:
                 assert after['image_epoch'] > original['image_epoch'] and after['pid'] != original['pid']
                 owned[after['pid']] = shared.process_identity(after['pid'])
                 server.remember_target(after)
-                assert not jobs(observer)
+                assert not jobs(observer, kind='javascript')
+                assert not original_jobs.intersection(entry['id'] for entry in jobs(observer))
                 assert start(observer)['id'] != ident
             elif name == 'exec':
                 action(owner, 'continue')
                 after = shared.eventually(owner.session,
                     lambda s: s['state'] == 'stopped' and s['image_epoch'] > original['image_epoch'], 'exec')
-                assert not jobs(observer)
+                assert not jobs(observer, kind='javascript')
+                assert not original_jobs.intersection(entry['id'] for entry in jobs(observer))
                 assert start(observer)['id'] != ident
             elif name in ('fork', 'vfork'):
                 action(owner, 'continue')
@@ -171,7 +191,9 @@ try:
                     assert snap['state'] == 'stopped', snap
                     owned[snap['pid']] = shared.process_identity(snap['pid'])
                     if ident_ != 1:
-                        assert not jobs(observer, ident_)
+                        # No job kind may be inherited, including a prepared
+                        # native image started alongside JavaScript discovery.
+                        assert not jobs(observer, ident_), jobs(observer, ident_)
                         start(observer, ident_)
                 if name == 'fork':
                     action(owner, 'detach_process_family', process=2)

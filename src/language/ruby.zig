@@ -37,7 +37,7 @@ fn runtimeModule(session: *const Context) !Module {
     // kernel PHDR evidence. A shared-library runtime stays unavailable.
     const main_phdr = session.mainPhdr();
     if (main_phdr == 0) return error.RubyModuleIdentityUnavailable;
-    const module = session.moduleAt(main_phdr) catch return error.RubyModuleIdentityUnavailable;
+    const module = session.moduleAt(main_phdr) catch |err| return context_api.metadataFailure(err, error.RubyModuleIdentityUnavailable);
     if (module.symbols().findSymbol("ruby_version") == null or module.symbols().findSymbol("rb_vm_exec") == null) return error.RubyStaticRuntimeUnavailable;
     return module;
 }
@@ -72,7 +72,7 @@ fn profile(session: *const Context, module: Module) !*const c.struct_xrb_layout 
     try constant(session, module, "ruby_version", c.XRB_VERSION);
     try constant(session, module, "ruby_revision", c.XRB_REVISION);
     if (module.layouts.ruby == null) {
-        const debug = module.debugInfo() catch |err| return if (err == error.DebugMetadataPending) err else error.RubyDwarfUnavailable;
+        const debug = module.debugInfo() catch |err| return context_api.metadataFailure(err, error.RubyDwarfUnavailable);
         var layout: c.struct_xrb_layout = undefined;
         if (c.xrb_layout_build(debug.dwarf, id.ptr, id.len, c.XRB_VERSION, c.XRB_REVISION, &layout)) |why| {
             inline for (.{ error.RubyDwarfMalformed, error.RubyDwarfWorkLimit, error.RubyDwarfAmbiguous, error.RubyDwarfTypesUnavailable, error.RubyDwarfConstantsUnavailable, error.RubyConstantMismatch, error.RubyRuntimeMultiple }) |err| {

@@ -14,7 +14,8 @@
 #include <time.h>
 #include <unistd.h>
 
-enum job_kind { JOB_DWARF, JOB_JAVASCRIPT, JOB_CFI, JOB_IMAGE };
+enum job_kind { JOB_DWARF, JOB_JAVASCRIPT, JOB_CFI, JOB_IMAGE, JOB_FILE, JOB_TYPES, JOB_CACHED_FILE };
+static int section_image(enum job_kind kind) { return kind == JOB_IMAGE || kind == JOB_TYPES || kind == JOB_CACHED_FILE; }
 struct image_range { uint64_t offset, size; };
 struct xmd_job {
     pthread_t thread;
@@ -101,7 +102,7 @@ static void publish(struct xmd_job *job) {
     pthread_mutex_unlock(&job->mutex);
 }
 static void fail(struct xmd_job *job, enum xbo_status status, const char *reason) {
-    if (job->kind == JOB_IMAGE && job->image_fd >= 0) {
+    if ((section_image(job->kind) || job->kind == JOB_FILE) && job->image_fd >= 0) {
         close(job->image_fd);
         job->image_fd = -1;
     }
@@ -112,8 +113,25 @@ static void fail(struct xmd_job *job, enum xbo_status status, const char *reason
         status == XBO_NOMEM ? "DebugMetadataOutOfMemory" : "DebugMetadataUnavailable";
     memset(&job->working.profile, 0, sizeof job->working.profile);
     publish(job);
+    if (section_image(job->kind) || job->kind == JOB_FILE) {
+        /* Keep the terminal job visible until an explicit retry, but do not
+         * keep its range-cache lease. A language projection rebuilt after a
+         * cancelled full upgrade must be able to reuse those same ranges.
+         * No result reader uses the parser after this terminal publication;
+         * the owner joins the worker before inspecting result storage. */
+        xbo_destroy(job->object); job->object = NULL;
+        xbc_destroy(job->cache); job->cache = NULL;
+        if (job->cache_fd >= 0) close(job->cache_fd);
+        job->cache_fd = -1;
+        xcp_release(job->entry); job->entry = NULL;
+        (void)xrt_file_view_release(job->view);
+    }
 }
 static struct xbo_budget budget(struct xmd_job *job) {
+    /* Back off only for a source RPC refused in this slice. A cached slice
+     * can exhaust its CPU/byte budget without touching the source, and must
+     * not inherit a previous slice's foreground-RPC contention. */
+    job->working.runtime_status = XRT_OK;
     return (struct xbo_budget){.bytes_left = 262144, .reads_left = 64,
         .deadline_ns = xbo_now_ns() + UINT64_C(15000000), .context = job, .cancelled = cancelled};
 }
@@ -152,6 +170,22 @@ static int range_order(const void *left, const void *right) {
     const struct image_range *a = left, *b = right;
     return a->offset < b->offset ? -1 : a->offset > b->offset;
 }
+/* Layout discovery needs types, names and TLS/placement metadata, not code,
+ * source lines or location/range lists. Keep this coverage separate from the
+ * ordinary module cache. Compressed sections retain their original bytes. */
+static int type_section(struct xmd_job *job, uint32_t i) {
+    const struct xbo_section *section = xbo_section(job->object, i);
+    if (section->type == 2 || section->type == 3 || section->type == 7 ||
+        section->type == 11 || section->type == 18) return 1;
+    const char *name = xbo_section_name(job->object, i);
+    if (!name) return 0;
+    if (!strncmp(name, ".debug_", 7)) name += 7;
+    else if (!strncmp(name, ".zdebug_", 8)) name += 8;
+    else return 0;
+    return !strcmp(name, "info") || !strcmp(name, "abbrev") ||
+        !strcmp(name, "str") || !strcmp(name, "str_offsets") ||
+        !strcmp(name, "line_str") || !strcmp(name, "addr") || !strcmp(name, "types");
+}
 static enum xbo_status image_start(struct xmd_job *job) {
     uint64_t extent = xbo_identity(job->object)->size;
     if (!extent || extent > XRT_REMOTE_IMAGE_LIMIT) return XBO_LIMIT;
@@ -159,6 +193,15 @@ static enum xbo_status image_start(struct xmd_job *job) {
     if (sections > 65536 || segments > 4096) return XBO_LIMIT;
     job->ranges = calloc((size_t)sections + segments + 3, sizeof *job->ranges);
     if (!job->ranges) return XBO_NOMEM;
+    /* A types projection already populated the immutable range cache. A full
+     * upgrade reads through it, fetching only absent blocks from the target. */
+    if (job->kind == JOB_CACHED_FILE) {
+        enum xbo_status status = image_range(job, 0, extent);
+        if (status != XBO_OK) return status;
+        job->working.image_total = extent;
+        job->image_fd = memfd_create("xodb-target-file", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+        return job->image_fd < 0 || ftruncate(job->image_fd, (off_t)extent) ? XBO_IO : XBO_OK;
+    }
     int wide = xbo_address_size(job->object) == 8;
     enum xbo_status status = image_range(job, 0, wide ? 64 : 52);
     if (status == XBO_OK) status = image_range(job, image_number(job, wide ? 32 : 28, wide ? 8 : 4),
@@ -167,11 +210,13 @@ static enum xbo_status image_start(struct xmd_job *job) {
         (uint64_t)sections * (wide ? 64 : 40));
     for (uint32_t i = 0; status == XBO_OK && i < sections; ++i) {
         const struct xbo_section *section = xbo_section(job->object, i);
+        if (job->kind == JOB_TYPES && !type_section(job, i)) continue;
         if (section->type != 0 && section->type != 8) /* NULL/NOBITS have no payload. */
             status = image_range(job, section->offset, section->size);
     }
     for (uint32_t i = 0; status == XBO_OK && i < segments; ++i) {
         const struct xbo_segment *segment = xbo_segment(job->object, i);
+        if (job->kind == JOB_TYPES && segment->type != 4) continue; /* PT_NOTE */
         if (segment->type) status = image_range(job, segment->offset, segment->file_size);
     }
     if (status != XBO_OK) return status;
@@ -187,7 +232,7 @@ static enum xbo_status image_start(struct xmd_job *job) {
     }
     job->range_count = count;
     for (size_t i = 0; i < count; ++i) job->working.image_total += job->ranges[i].size;
-    job->image_fd = memfd_create("xodb-image-sections", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    job->image_fd = memfd_create(job->kind == JOB_TYPES ? "xodb-image-types" : "xodb-image-sections", MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (job->image_fd < 0 || ftruncate(job->image_fd, (off_t)extent)) return XBO_IO;
     return XBO_OK;
 }
@@ -217,6 +262,21 @@ static enum xbo_status image_step(struct xmd_job *job, struct xbo_budget *slice)
         job->range_done += size;
         job->working.image_bytes += size;
         if (job->range_done == range.size) { ++job->range_next; job->range_done = 0; }
+    }
+    if (job->kind == JOB_TYPES) {
+        /* Never advertise unfetched payload to libdw. Patch only the derived
+         * fd, after copying; the shared range cache retains original bytes. */
+        int wide = xbo_address_size(job->object) == 8;
+        uint64_t table = image_number(job, wide ? 40 : 32, wide ? 8 : 4);
+        unsigned char empty[64] = {0};
+        size_t stride = wide ? 64 : 40;
+        for (uint32_t i = 1; i < xbo_section_count(job->object); ++i) {
+            if (type_section(job, i)) continue;
+            ssize_t n;
+            do { n = pwrite(job->image_fd, empty, stride, (off_t)(table + i * stride)); }
+            while (n < 0 && errno == EINTR);
+            if (n != (ssize_t)stride) return XBO_IO;
+        }
     }
     return XBO_OK;
 }
@@ -308,9 +368,50 @@ static enum xbo_status lookup(struct xmd_job *job, struct xbo_budget *slice) {
     }
     return status;
 }
+static void file_worker(struct xmd_job *job) {
+    enum xbo_status status = source_identity(job, &job->working.identity);
+    if (status != XBO_OK) { fail(job, status, NULL); return; }
+    uint64_t size = job->working.identity.size;
+    if (!size || size > XRT_REMOTE_IMAGE_LIMIT) { fail(job, XBO_LIMIT, NULL); return; }
+    job->working.object.source_size = size;
+    job->working.image_total = size;
+    job->working.state = XMD_IMAGE;
+    job->image_fd = memfd_create("xodb-target-file", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (job->image_fd < 0 || ftruncate(job->image_fd, (off_t)size)) { fail(job, XBO_IO, NULL); return; }
+    while (job->working.image_bytes < size) {
+        uint64_t offset = job->working.image_bytes;
+        size_t count = size - offset < sizeof job->chunk ? (size_t)(size - offset) : sizeof job->chunk;
+        status = source_read(job, offset, job->chunk, count);
+        if (retry(job, status)) continue;
+        if (status != XBO_OK) { fail(job, status, NULL); return; }
+        size_t written = 0;
+        while (written < count) {
+            ssize_t n = pwrite(job->image_fd, job->chunk + written, count - written, (off_t)(offset + written));
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) { fail(job, XBO_IO, NULL); return; }
+            written += (size_t)n;
+        }
+        job->working.image_bytes += count;
+        ++job->working.slices;
+        publish(job);
+    }
+    do { status = runtime_status(job, xrt_file_view_validate(job->view)); }
+    while (!cancelled(job) && retry(job, status));
+    if (cancelled(job)) status = XBO_CANCELLED;
+    if (status != XBO_OK) { fail(job, status, NULL); return; }
+    if (fcntl(job->image_fd, F_ADD_SEALS, F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) < 0) {
+        fail(job, XBO_IO, NULL); return;
+    }
+    status = runtime_status(job, xrt_file_view_release(job->view));
+    if (status != XBO_OK) { fail(job, status, NULL); return; }
+    job->working.state = XMD_READY;
+    job->working.status = XBO_OK;
+    publish(job);
+}
 static void *worker(void *context) {
     struct xmd_job *job = context;
     xrt_file_view_background(job->view);
+    if (job->kind == JOB_FILE) { file_worker(job); return NULL; }
     struct xbo_source source = {job, source_identity, source_read};
     enum xbo_status status = xbo_create(&source, &job->object);
     if (status != XBO_OK) { fail(job, status, NULL); return NULL; }
@@ -390,7 +491,7 @@ static void *worker(void *context) {
             job->working.machine = xbo_machine(job->object);
             job->working.address_size = xbo_address_size(job->object);
             job->working.little_endian = xbo_little_endian(job->object);
-            if (job->kind == JOB_IMAGE) {
+            if (section_image(job->kind)) {
                 job->working.state = XMD_IMAGE;
             } else if (job->kind == JOB_CFI) {
                 status = xcf_create(job->object, &job->unwind);
@@ -441,7 +542,7 @@ static void *worker(void *context) {
             job->working.state = XMD_CHECKING;
             publish(job); continue;
         }
-        status = job->kind == JOB_IMAGE ? image_step(job, &slice) :
+        status = section_image(job->kind) ? image_step(job, &slice) :
                  job->kind == JOB_CFI ? xcf_step(job->unwind, &slice) :
                                       xjs_ranged_step(job->scan, &slice, 4096);
         if (retry(job, status)) continue;
@@ -458,12 +559,16 @@ static void *worker(void *context) {
         if (retry(job, status)) continue;
         if (status != XBO_OK) { fail(job, status, NULL); return NULL; }
         if (cancelled(job)) { fail(job, XBO_CANCELLED, NULL); return NULL; }
-        if (job->kind == JOB_IMAGE && fcntl(job->image_fd, F_ADD_SEALS,
+        if (section_image(job->kind) && fcntl(job->image_fd, F_ADD_SEALS,
                 F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) < 0) {
             fail(job, XBO_IO, NULL); return NULL;
         }
         if (job->scan) {
             status = xjs_ranged_result(job->scan, &job->working.profile);
+            if (status != XBO_OK) { fail(job, status, NULL); return NULL; }
+        }
+        if (section_image(job->kind)) {
+            status = runtime_status(job, xrt_file_view_release(job->view));
             if (status != XBO_OK) { fail(job, status, NULL); return NULL; }
         }
         job->working.state = XMD_READY;
@@ -525,8 +630,26 @@ enum xbo_status xmd_start_image(struct xrt_file_view *view, struct xmd_job **out
     if ((uint64_t)identity->size > XRT_REMOTE_IMAGE_LIMIT) return XBO_LIMIT;
     return start(view, -1, 0, JOB_IMAGE, 1, 0, out);
 }
+enum xbo_status xmd_start_file(struct xrt_file_view *view, struct xmd_job **out) {
+    const struct xrt_file_identity *identity = xrt_file_view_identity(view);
+    if (!identity || identity->size <= 0) return XBO_MALFORMED;
+    if ((uint64_t)identity->size > XRT_REMOTE_IMAGE_LIMIT) return XBO_LIMIT;
+    return start(view, -1, 0, JOB_FILE, 0, 0, out);
+}
+enum xbo_status xmd_start_types(struct xrt_file_view *view, struct xmd_job **out) {
+    const struct xrt_file_identity *identity = xrt_file_view_identity(view);
+    if (!identity || identity->size <= 0) return XBO_MALFORMED;
+    if ((uint64_t)identity->size > XRT_REMOTE_IMAGE_LIMIT) return XBO_LIMIT;
+    return start(view, -1, 0, JOB_TYPES, 1, 0, out);
+}
+enum xbo_status xmd_start_file_cached(struct xrt_file_view *view, struct xmd_job **out) {
+    const struct xrt_file_identity *identity = xrt_file_view_identity(view);
+    if (!identity || identity->size <= 0) return XBO_MALFORMED;
+    if ((uint64_t)identity->size > XRT_REMOTE_IMAGE_LIMIT) return XBO_LIMIT;
+    return start(view, -1, 0, JOB_CACHED_FILE, 1, 0, out);
+}
 enum xbo_status xmd_image_result(struct xmd_job *job, int *fd) {
-    if (!job || !fd || job->kind != JOB_IMAGE) return XBO_MALFORMED;
+    if (!job || !fd || (!section_image(job->kind) && job->kind != JOB_FILE)) return XBO_MALFORMED;
     *fd = -1;
     enum xbo_status status = xmd_join(job);
     if (status == XBO_OK) status = xmd_validate(job);

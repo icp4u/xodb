@@ -41,6 +41,7 @@ pub const Module = struct {
     file_offset: u64 = 0, // ELF entry offset in the backing file; zero for standalone ELF.
     mapping: []align(std.heap.page_size_min) u8,
     owns_mapping: bool = true,
+    preparing_full: bool = false,
     immutable: bool = false,
     explicit_gdb: bool = false,
     file_source: mapped_file.Source = .unopened,
@@ -103,7 +104,7 @@ pub const Modules = struct {
     };
     /// `unexamined` is the first image whose symbols could not be read.
     pub const Definers = struct { modules: []const *Module, unexamined: ?anyerror };
-    const DefinerScan = struct { name: []const u8 = "", revision: u64 = 0, cursor: SymbolCursor = .{}, done: bool = false, count: usize = 0, modules: [4]*Module = undefined };
+    const DefinerScan = struct { name: []const u8 = "", revision: u64 = 0, cursor: SymbolCursor = .{}, pending_address: ?u64 = null, done: bool = false, count: usize = 0, modules: [4]*Module = undefined };
     const Unsearched = struct { region: usize, revision: u64 };
     const NameScan = struct { name: ?[]u8 = null, revision: u64 = 0, cursor: SymbolCursor = .{}, unsearched: ?Unsearched = null };
     /// `detail` names the size and budget of an image refused in full.
@@ -124,6 +125,11 @@ pub const Modules = struct {
     ///   sweep    a search of every mapped image: a source line, the start
     ///            of a capture, an observation recipe
     pub const Reason = enum { frame, name, runtime, restore, sweep };
+    pub const ImageJobs = struct {
+        context: *anyopaque,
+        prepare: *const fn (*anyopaque, *Modules, Region, Reason) anyerror!c_int,
+        release: *const fn (*anyopaque, Region) void,
+    };
     const Bound = struct { each: u64, pool: enum { lookups, sweeps }, which: @FieldType(snapshot.Refusal, "which") };
     /// A loaded image and one load bias its file is mapped at.
     pub const Instance = struct { module: *Module, bias: u64 };
@@ -164,6 +170,9 @@ pub const Modules = struct {
     const FileMaps = struct { regions: std.ArrayList(u32) = .empty, placed: std.ArrayList(Placed) = .empty };
     target: ?*const rt.struct_xrt_target = null,
     owner_target: ?*rt.struct_xrt_target = null,
+    /// Borrowed live-session job registry, rebound before owner queries.
+    /// Immutable/temporary readers never start jobs through this binding.
+    image_jobs: ?ImageJobs = null,
     remote_boot: ?[36]u8 = null,
     remote_boot_checked: bool = false,
     // Worker-owned immutable snapshots must not read the owner's changing ISA.
@@ -177,6 +186,8 @@ pub const Modules = struct {
     allocator: std.mem.Allocator,
     regions: std.ArrayList(Region) = .empty,
     loaded: std.ArrayList(*Module) = .empty,
+    // Types projections must never satisfy source/code/full-image lookups.
+    type_images: std.ArrayList(*Module) = .empty,
     next_id: u64 = 1,
     pe_images: pe.State = .{},
     file_kinds: std.AutoHashMapUnmanaged(FileKey, FileClassification) = .empty,
@@ -221,6 +232,8 @@ pub const Modules = struct {
     refusal: ?snapshot.Refusal = null,
     debug_files: ?*@import("../binary/debug_files.zig").Files = null,
     load_failures: std.ArrayList(LoadFailure) = .empty,
+    prepared_failures: std.AutoHashMapUnmanaged([3]u64, anyerror) = .empty,
+    prepared_failures_revision: u64 = 0,
     budget_reported: ?struct { loaded: usize, deferred: usize } = null,
     identities: std.ArrayList(FileIdentity) = .empty,
     budget_dirty: bool = true,
@@ -273,6 +286,7 @@ pub const Modules = struct {
         self.symbol_names.deinit(self.allocator);
         self.clearFailures();
         self.load_failures.deinit(self.allocator);
+        self.prepared_failures.deinit(self.allocator);
         var ids = self.core_ids.valueIterator();
         while (ids.next()) |value| switch (value.*) {
             .id => |id| self.allocator.free(id),
@@ -285,15 +299,16 @@ pub const Modules = struct {
         }
         for (self.regions.items) |r| self.allocator.free(r.path);
         self.regions.deinit(self.allocator);
-        for (self.loaded.items) |m| {
+        for ([_][]*Module{ self.loaded.items, self.type_images.items }) |items| for (items) |m| {
             if (m.layouts.go_value) |layout| m.debug_allocator.destroy(layout);
             if (m.layouts.go_map) |layout| m.debug_allocator.destroy(layout);
             if (m.debug) |*info| info.deinit();
             if (m.owns_mapping) snapshot.free(m.mapping);
             self.allocator.free(m.path);
             self.allocator.destroy(m);
-        }
+        };
         self.loaded.deinit(self.allocator);
+        self.type_images.deinit(self.allocator);
     }
     pub fn fromCore(self: *Modules, core: *const @import("../binary/core.zig").Core, executable: ?[]const u8) !void {
         self.core_source = core;
@@ -537,6 +552,17 @@ pub const Modules = struct {
     pub fn load(self: *Modules, region: Region, why: Reason) !*Module {
         if (region.path.len == 0 or region.path[0] != '/') return error.NoBinaryImage;
         return self.loadRange(region, false, why, null) catch |err| {
+            // A source sweep restarts at its first region after Pending. A
+            // completed, unplaceable mapping must not start a new worker on
+            // every retry and prevent the sweep from ever reaching its end.
+            if (self.image_jobs != null and rt.xrt_target_is_remote(self.target) and err != error.DebugMetadataPending and
+                err != error.DebugMetadataCancelled and err != error.BinarySnapshotLimit and err != error.OutOfMemory and
+                err != error.SymbolDiscoveryPending and err != error.SymbolDiscoveryBudgetExceeded and err != error.SymbolDiscoveryCancelled and
+                err != error.RemoteCancelled and err != error.RemoteOutcomeUnknown)
+            {
+                if (self.prepared_failures.count() < 16384)
+                    self.prepared_failures.put(self.allocator, .{ region.start, region.end, region.offset }, err) catch {};
+            }
             if (why == .sweep) self.noteSkipped(region, err);
             self.noteFailure(region, err);
             return err;
@@ -551,10 +577,35 @@ pub const Modules = struct {
     /// job. The caller proves the kernel PHDR mapping; this is not a name scan.
     pub fn loadMainImage(self: *Modules, region: Region, fd: c_int, why: enum { frame, sweep }) !*Module {
         defer self.reportBudget();
-        return self.loadRange(region, false, if (why == .frame) .frame else .sweep, fd) catch |err| {
+        return self.loadRange(region, false, if (why == .frame) .frame else .sweep, .{ .fd = fd, .coverage = .sections }) catch |err| {
             self.noteFailure(region, err);
             return err;
         };
+    }
+    pub fn cachedTypes(self: *Modules, region: Region) ?*Module {
+        for (self.type_images.items) |module| {
+            if (module.inode == region.inode and module.device_major == region.device_major and module.device_minor == region.device_minor and
+                region.start >= module.start and region.start < module.end) return module;
+        }
+        return null;
+    }
+    pub fn loadTypes(self: *Modules, region: Region, fd: c_int) !*Module {
+        return self.loadRange(region, false, .frame, .{ .fd = fd, .coverage = .types });
+    }
+    /// Called at an owner query boundary before a full-image worker starts.
+    /// Module/layout slots stay stable; no context borrows old debug bytes
+    /// while replacement is Pending. Types views never go to capture workers.
+    pub fn releaseTypesForUpgrade(self: *Modules, region: Region) void {
+        const module = self.cachedTypes(region) orelse return;
+        if (module.preparing_full) return;
+        if (module.debug) |*debug| debug.deinit();
+        module.debug = null;
+        self.snapshot_bytes -= module.mapping.len;
+        snapshot.free(module.mapping);
+        module.mapping = &.{};
+        module.owns_mapping = false;
+        module.preparing_full = true;
+        self.budget_dirty = true;
     }
     /// The one place that says how much of an image a reader may take, by
     /// why it asks. Null is the image budgets alone. An image this owner has
@@ -573,6 +624,27 @@ pub const Modules = struct {
             // Every new image, including the executable, shares this bound.
             .sweep => .{ .each = if (self.mainExecutable(r)) snapshot.per_image_limit else snapshot.sweep_image_limit, .pool = .sweeps, .which = .sweep },
         };
+    }
+    /// Reject fixed caller bounds before a worker moves a standalone ELF.
+    /// Containers call this with the selected entry's size after preparation.
+    pub fn checkImageAllowance(self: *Modules, region: Region, size: u64, why: Reason, shared: bool) !void {
+        if (self.allowance(why, region)) |b| if (b.pool == .lookups) {
+            const left = lookup_total_limit -| self.lookup_bytes;
+            if (size > b.each or size > left) {
+                self.refusal = .{ .size = size, .limit = @min(b.each, left), .which = b.which, .stack_loads = if (b.which == .runtime) self.stackLoads(region) else null };
+                return error.BinarySnapshotLimit;
+            }
+        } else if (!shared and size <= snapshot.per_image_limit and (size > b.each or size > snapshot.sweepLeft())) {
+            self.refusal = .{ .size = size, .limit = @min(b.each, snapshot.sweepLeft()), .which = .sweep, .sweep_each = b.each };
+            return error.BinarySnapshotLimit;
+        };
+    }
+    pub fn sharesRemoteImage(self: *Modules, identity: rt.struct_xrt_file_identity, completeness: snapshot.Completeness) bool {
+        if (!self.remote_boot_checked) {
+            self.remote_boot = snapshot.bootIdTarget(self.target);
+            self.remote_boot_checked = true;
+        }
+        return identity.size > 0 and snapshot.holdsRemote(@bitCast(identity), self.remote_boot, @intCast(identity.size), completeness);
     }
     /// Forget what earlier sweeps skipped; call before a search of every image.
     pub fn beginSweep(self: *Modules) void {
@@ -614,7 +686,7 @@ pub const Modules = struct {
     fn noteFailure(self: *Modules, region: Region, err: anyerror) void {
         const why = self.refusal;
         self.refusal = null;
-        if (err == error.NotElf or err == error.NoBinaryImage) return;
+        if (err == error.NotElf or err == error.NoBinaryImage or err == error.DebugMetadataPending) return;
         if (err == error.BinarySnapshotLimit or err == error.CompressedDebugBudget) {
             for (self.regions.items) |*item| if (sameFile(item.*, region)) {
                 if (!item.full_image_deferred) self.budget_dirty = true;
@@ -930,26 +1002,39 @@ pub const Modules = struct {
         }
         return null;
     }
-    fn loadRange(self: *Modules, region: Region, observed: bool, why: Reason, prepared: ?c_int) !*Module {
+    const Prepared = struct { fd: c_int, coverage: snapshot.Completeness };
+    fn loadRange(self: *Modules, region: Region, observed: bool, why: Reason, prepared: ?Prepared) !*Module {
         self.refusal = null;
         if (self.cachedRange(region, observed)) |module| {
             if (why == .frame) module.debug_sweep = false;
             return module;
         }
+        if (self.prepared_failures_revision != self.maps_revision) {
+            self.prepared_failures.clearRetainingCapacity();
+            self.prepared_failures_revision = self.maps_revision;
+        }
+        if (prepared == null) if (self.prepared_failures.get(.{ region.start, region.end, region.offset })) |err| return err;
         // Until the limit is raised, the answer is the same: refuse without reading.
         if (self.identityIndex(region)) |i| if (self.identities.items[i].refused_size) |size| if (size > snapshot.per_image_limit) {
             self.refusal = snapshot.refusal(size);
             return error.BinarySnapshotLimit;
         };
+        const generic: ?c_int = if (prepared == null and !self.immutable and self.core_source == null and rt.xrt_target_is_remote(self.target))
+            if (self.image_jobs) |jobs| try jobs.prepare(jobs.context, self, region, why) else null
+        else
+            null;
+        defer if (generic != null) if (self.image_jobs) |jobs| jobs.release(jobs.context, region);
+        const ready_fd = if (prepared) |p| p.fd else generic;
+        const coverage: snapshot.Completeness = if (prepared) |p| p.coverage else .full;
         const expected = if (self.core_source != null) try self.coreId(region.path) else null;
         const selected_path = if (self.core_executable) |exe| (if (expected != null and std.mem.eql(u8, expected.?, exe.id)) exe.path else region.path) else region.path;
         const path = try self.allocator.dupeZ(u8, selected_path);
         errdefer self.allocator.free(path);
         // Only read the inode actually mapped by the target. map_files can need
         // privileges unavailable to run-as, so exe/path retain inode checks.
-        var source: mapped_file.Source = if (prepared != null) .remote_snapshot else if (self.core_source != null) .core_path else .unopened;
+        var source: mapped_file.Source = if (ready_fd != null) .remote_snapshot else if (self.core_source != null) .core_path else .unopened;
         var opened = std.mem.zeroes(rt.struct_xrt_file_identity);
-        const fd = if (prepared) |ready| c.fcntl(ready, c.F_DUPFD_CLOEXEC, @as(c_int, 3)) else if (self.core_source != null) c.open(path, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK) else mapped_file.openResolved(self.target, self.pid, region, &opened, &source) catch |err| {
+        const fd = if (ready_fd) |ready| c.fcntl(ready, c.F_DUPFD_CLOEXEC, @as(c_int, 3)) else if (self.core_source != null) c.open(path, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK) else mapped_file.openResolved(self.target, self.pid, region, &opened, &source) catch |err| {
             // A runtime agent refuses whole files above its own fixed cap.
             if (err == error.BinarySnapshotLimit) {
                 const agent = rt.xrt_target_remote_image_limit(self.target);
@@ -960,7 +1045,7 @@ pub const Modules = struct {
         if (fd < 0) return error.BinaryIdentityUnavailable;
         defer _ = c.close(fd);
         // A prepared remote image was checked when its file view opened.
-        if (prepared == null and self.core_source == null and rt.xrt_target_is_remote(self.target)) try self.rememberMetadataIdentity(region, opened);
+        if (ready_fd == null and self.core_source == null and rt.xrt_target_is_remote(self.target)) try self.rememberMetadataIdentity(region, opened);
         try self.verifySymbolIdentity(region, fd);
         var stat: c.struct_stat = undefined;
         if (c.fstat(fd, &stat) != 0 or stat.st_size <= 0 or stat.st_mode & c.S_IFMT != c.S_IFREG) return error.BinaryUnavailable;
@@ -1000,7 +1085,7 @@ pub const Modules = struct {
             break :identity self.identities.items[index].identity orelse return error.BinaryIdentityUnavailable;
         } else null;
         const mapped = (if (remote)
-            snapshot.readRemoteRange(fd, entry.offset, entry.size, snapshot.per_image_limit, if (why == .sweep) @intCast(bound.?.each) else null, @bitCast(original.?), self.remote_boot)
+            snapshot.readRemoteRange(fd, entry.offset, entry.size, snapshot.per_image_limit, if (why == .sweep) @intCast(bound.?.each) else null, @bitCast(original.?), self.remote_boot, coverage)
         else if (why == .sweep)
             snapshot.readSweepRange(fd, entry.offset, entry.size, snapshot.per_image_limit, @intCast(bound.?.each))
         else
@@ -1031,7 +1116,7 @@ pub const Modules = struct {
         if (expected) |id| if (!std.mem.eql(u8, id, image.buildId() orelse return error.CoreModuleBuildIdMissing)) return error.CoreModuleBuildIdMismatch;
         if (@intFromEnum(image.header.machine) != (self.expected_machine orelse rt.xrt_target_arch(self.target).*.machine)) return error.UnsupportedTargetArchitecture;
         const p = try self.placement(&image, entry.offset, region, observed);
-        const module = try self.allocator.create(Module);
+        var module = try self.allocator.create(Module);
         errdefer self.allocator.destroy(module);
         module.* = .{ .id = try self.moduleId(region, p.bias, entry.offset), .inode = region.inode, .device_major = region.device_major, .device_minor = region.device_minor, .path = path, .image = image, .bias = p.bias, .start = p.first.start, .end = p.end, .mapping = mapped, .file_offset = entry.offset, .immutable = self.immutable, .debug_sweep = why == .sweep };
         module.file_source = source;
@@ -1042,14 +1127,35 @@ pub const Modules = struct {
             };
             if (module.debug_file) |file| log.info(.session, "xodb: debug companion {s} matched {s} offset=0x{x}\n", .{ file.path, path, entry.offset });
         }
-        try self.loaded.append(self.allocator, module);
+        // A module whose projection was given up for an upgrade adopts
+        // whichever image arrives: the full one, or a rebuilt projection
+        // after the upgrade was cancelled. Its address and layouts stay put.
+        const adopt: ?*Module = if (self.cachedTypes(region)) |old| (if (old.preparing_full) old else null) else null;
+        if (coverage == .types) {
+            if (adopt == null) try self.type_images.append(self.allocator, module);
+        } else {
+            try self.loaded.ensureUnusedCapacity(self.allocator, 1);
+        }
+        if (adopt) |old| {
+            if (coverage != .types) for (self.type_images.items, 0..) |item, i| if (item == old) {
+                _ = self.type_images.swapRemove(i);
+                break;
+            };
+            const layouts = old.layouts;
+            self.allocator.free(old.path);
+            old.* = module.*;
+            old.layouts = layouts;
+            self.allocator.destroy(module);
+            module = old;
+        }
+        if (coverage != .types) self.loaded.appendAssumeCapacity(module);
         self.snapshot_bytes += mapped.len;
         if (bound) |b| if (b.pool == .lookups) {
             self.lookup_bytes += mapped.len;
         };
         self.budget_dirty = true;
         self.recordSource(region, source);
-        for (self.regions.items) |*item| if (sameFile(item.*, region)) {
+        for (self.regions.items) |*item| if (coverage != .types and sameFile(item.*, region)) {
             item.full_image_deferred = false;
         };
         return module;
@@ -1279,17 +1385,24 @@ pub const Modules = struct {
         scanning: while (!scan.done) {
             // These callers need native ELF modules for runtime layout/DWARF.
             // A PE export with the same spelling is not a second ELF runtime.
-            const symbol = self.symbolLookup(name, false, false, .elf, &scan.cursor) catch |err| {
-                if (scan.cursor.next < self.regions.items.len) return err;
-                scan.done = true;
-                break;
+            const address = scan.pending_address orelse address: {
+                const symbol = self.symbolLookup(name, false, false, .elf, &scan.cursor) catch |err| {
+                    if (scan.cursor.next < self.regions.items.len) return err;
+                    scan.done = true;
+                    break :scanning;
+                };
+                // Symbol discovery has consumed this file's cursor. Retain
+                // the selected address until its asynchronous image is ready.
+                scan.pending_address = symbol.address;
+                break :address symbol.address;
             };
             // The image that defines the name is wanted in full, and nobody
             // asked: see lookupRead. One more than the scan holds is not read.
-            const module = self.cachedAt(symbol.address) catch blk: {
+            const module = self.cachedAt(address) catch blk: {
                 if (scan.count == scan.modules.len) return error.SymbolDefinerLimit;
-                break :blk try self.definerRead(symbol.address);
+                break :blk try self.definerRead(address);
             };
+            scan.pending_address = null;
             scan.cursor.next += 1;
             for (scan.modules[0..scan.count]) |old| if (old.id == module.id) continue :scanning;
             if (scan.count == scan.modules.len) return error.SymbolDefinerLimit;
@@ -1571,6 +1684,32 @@ pub const Modules = struct {
         if (address < p.bias) return error.UnmappedAddress;
         return .{ .id = id, .offset = address - p.bias, .path = region.path };
     }
+    pub const SavedAddress = struct { build_id: ?[]const u8, path: []const u8, offset: u64 };
+    /// Saving a physical probe needs the same identity/placement projection as
+    /// restoring it, not the debug image. Returned bytes are borrowed.
+    pub fn savedAddress(self: *Modules, address: u64) !SavedAddress {
+        if (rt.xrt_target_is_remote(self.target)) {
+            for (self.regions.items) |region| {
+                if (address < region.start or address >= region.end) continue;
+                const image = self.symbolImage(region) catch |err| {
+                    if (err == error.UnsupportedMode) break; // container fallback
+                    return err;
+                };
+                // Preserve the image-budget policy for oversized saved probes;
+                // their identity can be projected without copying the image.
+                const index = self.identityIndex(region) orelse return error.BinaryIdentityUnavailable;
+                const identity = self.identities.items[index].identity orelse return error.BinaryIdentityUnavailable;
+                if (identity.size > rt.XRT_REMOTE_SYNC_IMAGE_LIMIT) {
+                    const site = try self.projectedRestore(address);
+                    return .{ .build_id = site.id, .path = site.path, .offset = site.offset };
+                }
+                const p = try self.placement(image, 0, region, false);
+                return .{ .build_id = image.buildId(), .path = region.path, .offset = address -% p.bias };
+            }
+        }
+        const module = try self.at(address);
+        return .{ .build_id = module.image.buildId(), .path = module.path, .offset = try module.linkAddress(address) };
+    }
     /// Whether `r` is the main executable, the one image `lookupRead` may
     /// read in full for a name. Once one file has been chosen for this
     /// process image no other ever is.
@@ -1691,8 +1830,8 @@ pub const Modules = struct {
         }
         return self.load(r, .name) catch |err| {
             // A full read of the executable that failed is not repeated for this map.
-            // MainImageRequired is not a failure: the background job may still admit it.
-            if (why == .tables and err != error.OutOfMemory and err != error.MainImageRequired) self.fallback_failure = .{ .revision = self.maps_revision, .err = err };
+            // Readiness is not a failure: the background job may still admit it.
+            if (why == .tables and err != error.OutOfMemory and err != error.MainImageRequired and err != error.DebugMetadataPending) self.fallback_failure = .{ .revision = self.maps_revision, .err = err };
             return err;
         };
     }
@@ -1832,6 +1971,7 @@ pub const Modules = struct {
             const image = view orelse {
                 const module = (self.lookupRead(r, why, fallback) catch |err| {
                     switch (err) {
+                        error.DebugMetadataPending => return error.SymbolDiscoveryPending,
                         error.SymbolDiscoveryPending, error.SymbolDiscoveryCancelled, error.SymbolDiscoveryBudgetExceeded => return err,
                         error.MainImageRequired => {
                             // Search the other images first. Only a breakpoint
@@ -1932,7 +2072,7 @@ pub const Modules = struct {
     fn fileKey(region: Region) FileKey {
         return .{ .inode = region.inode, .device_major = region.device_major, .device_minor = region.device_minor };
     }
-    fn openFileView(self: *Modules, request: *const rt.struct_xrt_file_request, view: *?*rt.struct_xrt_file_view) !void {
+    pub fn openFileView(self: *Modules, request: *const rt.struct_xrt_file_request, view: *?*rt.struct_xrt_file_view) !void {
         try runtime_api.check(if (self.owner_target) |target|
             rt.xrt_target_file_view_open_owner(target, request, view)
         else

@@ -168,7 +168,10 @@ fn functionMapping(session: *Session, recipe: *const Recipe, start_address: ?u64
     defer if (session.modules.skipped().first) |first| log.warn(.session, "xodb: observation recipe: {d} images not searched; {s}\n", .{ session.modules.skipped().count, first });
     for (session.modules.regions.items) |region| {
         if (region.permissions[2] != 'x' or region.inode == 0 or region.path.len == 0 or region.path[0] != '/') continue;
-        const module = session.modules.load(region, .sweep) catch continue;
+        const module = session.modules.load(region, .sweep) catch |err| {
+            if (err == error.DebugMetadataPending) return err;
+            continue;
+        };
         var all = true;
         var first: u64 = 0;
         for (recipe.functions, 0..) |name, i| {
@@ -221,7 +224,17 @@ fn execute(session: *Session, recipe: *const Recipe, quit: *volatile c.sig_atomi
         try session.persistent.poll(session);
     }
     if (recipe.stop) |name| resources.stop = try phase(session, name);
-    const mapping = try functionMapping(session, recipe, start_address);
+    const mapping_started = linux.now();
+    const mapping = while (true) {
+        const address = functionMapping(session, recipe, start_address) catch |err| {
+            if (err != error.DebugMetadataPending) return err;
+            if (linux.now() -| mapping_started > preparation_timeout_ns) return error.ObservationRecipePreparationTimeout;
+            try session.poll();
+            _ = c.usleep(1000);
+            continue;
+        };
+        break address;
+    };
     var tids: [32]i32 = undefined;
     var count: usize = 0;
     switch (recipe.threads) {

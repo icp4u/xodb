@@ -20,6 +20,7 @@ detailed docs. If you just want to try something, jump to
 | Switch between native and language views | **Tab** or click **Regs / C/C++ / Python / Perl / Lua / JS / Ruby / Elisp / GDScript** | Detected runtime tabs show version, layout proof and logical stack evidence; selection is shared with MCP |
 | Catch who changes a native value | **Watchpoint investigation** (**W** on a C/C++ field) | Every write, with the code and stack that made it |
 | Find where time goes | **Profile** (**P**) | Hot functions and flame graphs for the whole process |
+| Find where startup time goes | `xodb --start-profile -- PROGRAM` | Capture from the initial exec stop and open directly in the live flame view |
 | Understand why *some* calls to a function are slow | **Observation** (a recipe) | Every call timed, with its arguments, and fast vs slow compared |
 | Open Python, Ruby or JVM logical stacks | **Logical frames** (`--open-frames FILE`, **L**) | Exact observation counts, source locations and collection provenance, separate from native stacks |
 | See which GDScript function a Godot or Redot game is in | **GDScript** tab (`REDOT=ENGINE scripts/demo-redot`; MCP `get_language_stack` with `gdscript`) | The script call stack with `res://` path and line, each level paired with its native engine frame; read from a running debug-enabled game, no engine debugger needed ([details](GDSCRIPT.md)) |

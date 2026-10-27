@@ -101,6 +101,10 @@ pub const Preferences = struct {
     galaxy: Galaxy = .{},
     gibson: Gibson = .{},
 };
+pub const Loaded = struct {
+    value: Preferences,
+    profile_duration_set: bool = false,
+};
 
 /// CLI wins. File references in preferences are relative to that config file.
 pub fn themeSelection(a: std.mem.Allocator, prefs: *const Preferences, config: ?[:0]const u8, cli: ?[:0]const u8) !?[:0]const u8 {
@@ -112,7 +116,7 @@ pub fn themeSelection(a: std.mem.Allocator, prefs: *const Preferences, config: ?
     defer a.free(joined);
     return try a.dupeZ(u8, joined);
 }
-pub fn parse(a: std.mem.Allocator, bytes: []const u8) !Preferences {
+fn parseLoaded(a: std.mem.Allocator, bytes: []const u8) !Loaded {
     if (bytes.len > max_bytes) return error.PreferencesTooLarge;
     const parsed = try std.json.parseFromSlice(Preferences, a, bytes, .{});
     defer parsed.deinit();
@@ -126,9 +130,18 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8) !Preferences {
     };
     if (parsed.value.appearance.ui_scale) |scale| _ = @import("platform/window.zig").validateScale(scale) catch return error.InvalidUiScale;
     if (parsed.value.decompiler.eager_library_bytes > 1024 * 1024 * 1024) return error.InvalidDecompilerBudget;
-    return parsed.value;
+    const tree = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+    defer tree.deinit();
+    const profile_duration_set = if (tree.value.object.get("profile")) |profile|
+        profile.object.get("duration_ms") != null
+    else
+        false;
+    return .{ .value = parsed.value, .profile_duration_set = profile_duration_set };
 }
-pub fn load(a: std.mem.Allocator, path: [:0]const u8) !Preferences {
+pub fn parse(a: std.mem.Allocator, bytes: []const u8) !Preferences {
+    return (try parseLoaded(a, bytes)).value;
+}
+pub fn loadDetailed(a: std.mem.Allocator, path: [:0]const u8) !Loaded {
     const fd = c.open(path.ptr, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK);
     if (fd < 0) return error.PreferencesOpenFailed;
     defer _ = c.close(fd);
@@ -143,10 +156,13 @@ pub fn load(a: std.mem.Allocator, path: [:0]const u8) !Preferences {
         const n = c.read(fd, bytes.ptr + used, bytes.len - used);
         if (n < 0 and std.c._errno().* == c.EINTR) continue;
         if (n < 0) return error.PreferencesReadFailed;
-        if (n == 0) return parse(a, bytes[0..used]);
+        if (n == 0) return parseLoaded(a, bytes[0..used]);
         used += @intCast(n);
     }
     return error.PreferencesTooLarge;
+}
+pub fn load(a: std.mem.Allocator, path: [:0]const u8) !Preferences {
+    return (try loadDetailed(a, path)).value;
 }
 test "Gibson film and signage preferences validate finite bounded values" {
     const prefs = try parse(std.testing.allocator, "{\"gibson\":{\"film\":true,\"film_speed\":4.5,\"facts\":false,\"facts_alpha\":0.2}}");

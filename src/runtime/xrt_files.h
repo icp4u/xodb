@@ -88,6 +88,11 @@ enum xrt_status xrt_file_view_validate(struct xrt_file_view *);
 /* Owner only after joining the file worker: identity validation participates
  * in foreground ordering instead of reporting transport contention as pending. */
 enum xrt_status xrt_file_view_validate_foreground(struct xrt_file_view *);
+/* Once all reads finish, release the remote slot but keep the identity and
+ * target lifetime guard. Local views stay pinned. A released remote view
+ * can only be validated (by an open/check/close), not read again. Call from
+ * the worker at completion or from its owner after joining, never concurrently. */
+enum xrt_status xrt_file_view_release(struct xrt_file_view *);
 enum xrt_status xrt_file_view_read(struct xrt_file_view *, uint64_t, void *, size_t);
 enum xrt_status xrt_file_view_close(struct xrt_file_view *);
 /* Owner-thread scope for automatic remote symbol discovery. Explicit user

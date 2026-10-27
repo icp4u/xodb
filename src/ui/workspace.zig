@@ -1814,7 +1814,7 @@ pub const Workspace = struct {
             self.runtime_watch_capture.refresh(session);
             self.presentRuntimeWatches(self.runtime_watch_capture.value);
         }
-        session.language_tabs.enabled = true;
+        session.language_tabs.request(session);
         session.language_tabs.syncSelection(session.target.snapshot().generation);
         if (self.last_language_revision != session.language_tabs.revision) {
             self.last_language_revision = session.language_tabs.revision;

@@ -38,6 +38,7 @@ const Entry = struct {
 };
 pub const State = struct {
     enabled: bool = false,
+    live: bool = true,
     selected: Tab = .native,
     follow_tid: ?i32 = null,
     native_selection: ?selection.Native = null,
@@ -61,7 +62,7 @@ pub const State = struct {
     /// Presentation scope only. Do not retain another thread's runtime identity
     /// while an ambiguous process is being resolved for the new selection.
     pub fn followThread(self: *State, tid: i32) void {
-        if (tid <= 0 or self.follow_tid == tid) return;
+        if (!self.live or tid <= 0 or self.follow_tid == tid) return;
         self.follow_tid = tid;
         for (self.entries[0..2]) |*entry| entry.* = .{ .present = entry.present, .found = entry.found };
         self.next = 0;
@@ -87,14 +88,43 @@ pub const State = struct {
     }
     pub fn visible(self: *const State, tab: Tab) bool {
         const index = @intFromEnum(tab);
-        return index < 2 or self.entries[index - 2].present;
+        return index < 2 or (self.live and self.entries[index - 2].present);
+    }
+    pub const Status = enum { ready, not_requested, pending, absent, disabled, unwitnessed, unavailable };
+    pub fn status(self: *const State, tab: Tab) Status {
+        const index = @intFromEnum(tab);
+        if (index < 2) return .ready;
+        if (!self.live) return .unavailable;
+        if (!self.enabled) return .not_requested;
+        const entry = &self.entries[index - 2];
+        if (!entry.checked) return .pending;
+        if (entry.reason) |reason| {
+            if (std.mem.eql(u8, reason, "RuntimeNotDetected")) return .absent;
+            if (std.mem.eql(u8, reason, "LanguageDisabled")) return .disabled;
+        }
+        if (entry.identity == .unwitnessed) return .unwitnessed;
+        return if (entry.reason != null) .unavailable else .ready;
+    }
+    fn syncAvailability(self: *State, session: *const Session) void {
+        const live = !session.offline and session.imported == null;
+        if (self.live == live) return;
+        self.live = live;
+        self.entries = @splat(if (live) .{} else .{ .checked = true, .reason = "OfflineSession" });
+        self.next = if (live) 0 else self.entries.len;
+        self.epoch = std.math.maxInt(u64);
+        self.generation = std.math.maxInt(u64);
+        if (!self.visible(self.selected)) self.selected = .native;
+        self.revision +%= 1;
+    }
+    pub fn request(self: *State, session: *const Session) void {
+        self.enabled = true;
+        self.syncAvailability(session);
     }
     pub fn select(self: *State, tab: Tab) !void {
         // A shown tab stays selectable while its runtime is rechecked; a
         // hidden one is pending until checked, then unavailable.
         if (!self.visible(tab)) {
-            const index = @intFromEnum(tab);
-            if (self.enabled and !self.entries[index - 2].checked) return error.LanguageTabPending;
+            if (self.status(tab) == .pending) return error.LanguageTabPending;
             return error.LanguageTabUnavailable;
         }
         if (self.selected != tab) {
@@ -115,7 +145,8 @@ pub const State = struct {
         }
     }
     pub fn poll(self: *State, session: *Session) void {
-        if (!self.enabled or session.offline or session.imported != null) return;
+        self.syncAvailability(session);
+        if (!self.enabled or !self.live) return;
         const snapshot = session.target.snapshot();
         self.syncSelection(snapshot.generation);
         if (self.epoch != snapshot.image_epoch) {
@@ -307,10 +338,9 @@ pub const State = struct {
         const Item = struct { thread: ?i32 = null, identity: ?@import("../language/types.zig").Identity = null, tab: Tab, title: []const u8, visible: bool, status: []const u8, reason: ?[]const u8, version: ?[]const u8, build_id: ?[]const u8, basis: ?[]const u8, proof_generation: ?u64 };
         var items: [order.len]Item = undefined;
         for (order, 0..) |tab, i| {
-            items[i] = .{ .tab = tab, .title = title(tab), .visible = self.visible(tab), .status = "ready", .reason = null, .version = null, .build_id = null, .basis = null, .proof_generation = null };
+            items[i] = .{ .tab = tab, .title = title(tab), .visible = self.visible(tab), .status = @tagName(self.status(tab)), .reason = null, .version = null, .build_id = null, .basis = null, .proof_generation = null };
             if (i >= 2) {
                 const entry = &self.entries[i - 2];
-                items[i].status = if (!self.enabled) "not_requested" else if (!entry.checked) "pending" else if (entry.reason != null and std.mem.eql(u8, entry.reason.?, "RuntimeNotDetected")) "absent" else if (entry.reason != null and std.mem.eql(u8, entry.reason.?, "LanguageDisabled")) "disabled" else if (entry.identity == .unwitnessed) "unwitnessed" else if (entry.reason != null) "unavailable" else "ready";
                 items[i].identity = entry.identity;
                 items[i].thread = entry.thread;
                 items[i].reason = entry.reason;
@@ -380,4 +410,83 @@ test "unchecked tab selection is pending, not absent, without changing selection
     ruby.present = true;
     try state.select(.ruby);
     try std.testing.expectEqual(Tab.ruby, state.selected);
+}
+
+test "offline and imported tabs are unavailable without discovery or revision churn" {
+    for ([_]Session{ .{ .id = 1, .offline = true }, .{ .id = 2, .imported = .{} } }) |initial| {
+        var session = initial;
+        var state = State{ .selected = .ruby };
+        state.entries[@intFromEnum(Tab.ruby) - 2].present = true;
+        state.poll(&session); // Must not touch an uninitialized live target.
+        state.request(&session);
+        try std.testing.expectEqual(Tab.native, state.selected);
+        try std.testing.expectEqual(state.entries.len, state.next);
+        const revision = state.revision;
+        state.followThread(123);
+        state.poll(&session);
+        state.request(&session);
+        try std.testing.expectEqual(revision, state.revision);
+        const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, state, .{});
+        defer std.testing.allocator.free(encoded);
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
+        defer parsed.deinit();
+        for (order, 0..) |tab, i| {
+            const item = parsed.value.object.get("tabs").?.array.items[i].object;
+            try std.testing.expectEqualStrings(@tagName(state.status(tab)), item.get("status").?.string);
+            if (i < 2) {
+                try std.testing.expectEqual(State.Status.ready, state.status(tab));
+                try state.select(tab);
+            } else {
+                try std.testing.expectEqual(State.Status.unavailable, state.status(tab));
+                try std.testing.expect(!state.visible(tab));
+                try std.testing.expectEqualStrings("OfflineSession", item.get("reason").?.string);
+                try std.testing.expectError(error.LanguageTabUnavailable, state.select(tab));
+            }
+        }
+        session.offline = false;
+        session.imported = null;
+        state.request(&session);
+        try std.testing.expectEqual(@as(usize, 0), state.next);
+        try std.testing.expectEqual(State.Status.pending, state.status(.ruby));
+        try std.testing.expectError(error.LanguageTabPending, state.select(.ruby));
+    }
+}
+
+/// The reported status is the one selection uses, for every state.
+fn expectStatus(state: *const State, tab: Tab, want: State.Status) !void {
+    try std.testing.expectEqual(want, state.status(tab));
+    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, state.*, .{});
+    defer std.testing.allocator.free(encoded);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    const item = parsed.value.object.get("tabs").?.array.items[@intFromEnum(tab)].object;
+    try std.testing.expectEqualStrings(@tagName(want), item.get("status").?.string);
+    if (!state.visible(tab)) {
+        var copy = state.*;
+        try std.testing.expectError(if (want == .pending) error.LanguageTabPending else error.LanguageTabUnavailable, copy.select(tab));
+    }
+}
+test "tab status keeps shown rechecks selectable and preserves diagnostic states" {
+    var state = State{};
+    try expectStatus(&state, .ruby, .not_requested);
+    state.enabled = true;
+    try expectStatus(&state, .ruby, .pending);
+    const entry = &state.entries[@intFromEnum(Tab.ruby) - 2];
+    entry.present = true;
+    try state.select(.ruby);
+    try expectStatus(&state, .ruby, .pending);
+    entry.checked = true;
+    try expectStatus(&state, .ruby, .ready);
+    entry.present = false; // Absent and disabled runtimes are hidden.
+    entry.reason = "RuntimeNotDetected";
+    try expectStatus(&state, .ruby, .absent);
+    entry.reason = "LanguageDisabled";
+    try expectStatus(&state, .ruby, .disabled);
+    entry.present = true;
+    entry.reason = "RuntimeNotSeenExecuting";
+    entry.identity = .unwitnessed;
+    try expectStatus(&state, .ruby, .unwitnessed);
+    entry.identity = null;
+    entry.reason = "DebugMetadataCancelled";
+    try expectStatus(&state, .ruby, .unavailable);
 }

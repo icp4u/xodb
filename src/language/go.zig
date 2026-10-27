@@ -2,8 +2,9 @@
 //! runtime.allgs; layout from the image's own DWARF. No target calls.
 const std = @import("std");
 const c = @import("../c.zig").api;
-const Context = @import("context.zig").Context;
-const Module = @import("context.zig").Module;
+const context_api = @import("context.zig");
+const Context = context_api.Context;
+const Module = context_api.Module;
 const A = std.mem.Allocator;
 fn read(ctx: ?*anyopaque, at: u64, out: ?*anyopaque, n: usize) callconv(.c) c_int {
     const session: *const Context = @ptrCast(@alignCast(ctx.?));
@@ -34,7 +35,7 @@ fn runtimeModule(session: *const Context) !Module {
     // `go build` output), identified by kernel PHDR evidence.
     const main_phdr = session.mainPhdr();
     if (main_phdr == 0) return error.GoModuleIdentityUnavailable;
-    const module = session.moduleAt(main_phdr) catch return error.GoModuleIdentityUnavailable;
+    const module = session.moduleAt(main_phdr) catch |err| return context_api.metadataFailure(err, error.GoModuleIdentityUnavailable);
     if (module.symbols().findSymbol("runtime.buildVersion") == null or module.symbols().findSymbol("runtime.allgs") == null) return error.GoRuntimeUnavailable;
     return module;
 }
@@ -80,7 +81,7 @@ pub fn verifiedModule(session: *const Context) !Module {
 fn profile(session: *const Context, module: Module) !*const c.struct_xgo_layout {
     const id = try verify(session, module);
     if (module.layouts.go == null) {
-        const debug = module.debugInfo() catch |err| return if (err == error.DebugMetadataPending) err else error.GoDwarfUnavailable;
+        const debug = module.debugInfo() catch |err| return context_api.metadataFailure(err, error.GoDwarfUnavailable);
         var layout: c.struct_xgo_layout = undefined;
         if (c.xgo_layout_build(debug.dwarf, id.ptr, id.len, &layout)) |why| {
             inline for (.{ error.GoDwarfMalformed, error.GoDwarfWorkLimit, error.GoDwarfAmbiguous, error.GoDwarfTypesUnavailable, error.GoDwarfTypesUnsupported, error.GoDwarfConstantsUnavailable, error.GoConstantMismatch, error.GoDwarfUnitLimit }) |err| {

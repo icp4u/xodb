@@ -14,6 +14,64 @@ pub const LiveMemory = struct {
 
 pub const DwarfLocation = struct { size: u64, place: location.Place };
 
+/// An incomplete observation is not evidence that pseudo-C has no live values.
+pub fn metadataFailure(err: anyerror) !void {
+    switch (err) {
+        error.DebugMetadataPending,
+        error.DebugMetadataCancelled,
+        error.SymbolDiscoveryPending,
+        error.SymbolDiscoveryCancelled,
+        => return err,
+        else => {},
+    }
+}
+
+pub fn frameMetadata(frame: @import("../debug/frame.zig").Frame) !void {
+    for ([_]?[]const u8{ frame.diagnostic, frame.inline_diagnostic }) |diagnostic| if (diagnostic) |why| {
+        inline for (.{ error.DebugMetadataPending, error.DebugMetadataCancelled, error.SymbolDiscoveryPending, error.SymbolDiscoveryCancelled }) |err| {
+            if (std.mem.eql(u8, why, @errorName(err))) return err;
+        }
+    };
+}
+
+/// Shared test cases exercise each surface's actual reader, including catches.
+pub fn testMetadataReadiness(comptime read: anytype) !void {
+    const Frame = @import("../debug/frame.zig").Frame;
+    const FakeSession = struct {
+        stack_error: ?anyerror = null,
+        locals_error: ?anyerror = null,
+        frames: [1]Frame = .{.{ .index = 0, .pc = 0x1000, .lookup_pc = 0x1000, .registers = @splat(null) }},
+        pub fn stack(self: *@This(), _: std.mem.Allocator, _: i32, _: usize) ![]Frame {
+            if (self.stack_error) |err| return err;
+            return &self.frames;
+        }
+        pub fn frameLocalsAtDepth(self: *@This(), _: std.mem.Allocator, _: Frame, _: usize) ![]debug_info.Local {
+            if (self.locals_error) |err| return err;
+            return &.{};
+        }
+    };
+    var analysis: host.Analysis = undefined;
+    analysis.function.bias = 0;
+    analysis.function.key.entry = 0;
+    analysis.function.key.size = 0; // No values to collect in the successful case.
+    inline for (.{ error.DebugMetadataPending, error.DebugMetadataCancelled, error.SymbolDiscoveryPending, error.SymbolDiscoveryCancelled }) |err| {
+        var session: FakeSession = .{ .stack_error = err };
+        try std.testing.expectError(err, read(std.testing.allocator, &session, &analysis, 1, 0));
+        session = .{ .locals_error = err };
+        try std.testing.expectError(err, read(std.testing.allocator, &session, &analysis, 1, 0));
+        session = .{};
+        session.frames[0].diagnostic = @errorName(err);
+        try std.testing.expectError(err, read(std.testing.allocator, &session, &analysis, 1, 0));
+        session.frames[0].diagnostic = null;
+        session.frames[0].inline_diagnostic = @errorName(err);
+        try std.testing.expectError(err, read(std.testing.allocator, &session, &analysis, 1, 0));
+    }
+    var session: FakeSession = .{ .locals_error = error.NoDebugInfo };
+    try std.testing.expectEqual(@as(usize, 0), (try read(std.testing.allocator, &session, &analysis, 1, 0)).len);
+    session = .{};
+    try std.testing.expectEqual(@as(usize, 0), (try read(std.testing.allocator, &session, &analysis, 1, 0)).len);
+}
+
 fn widthMask(width: u8) u64 {
     return if (width == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(width)) - 1;
 }

@@ -40,7 +40,7 @@ def action(client, name, **args):
 for case in ('complete','renew','release-reclaim','expiry','interrupt','disconnect','generation'):
     case_work=work/case;case_work.mkdir(mode=0o755)
     server=shared.Server(root,case_work,root/'zig-out/bin/xodb',fixture,'control',
-                         options=['--runtime-agent',str(proxy)],fixture_args=[])
+                         options=['--runtime-agent',str(proxy),'--image-limit','256M'],fixture_args=[])
     row={'case':case,'latencies':[]}
     results['cases'].append(row)
     try:
@@ -94,7 +94,12 @@ for case in ('complete','renew','release-reclaim','expiry','interrupt','disconne
             assert counter['hex']=='00000000',counter  # no missed first hit
             row['counter']=counter
             # The full-file path remains capped without failing the connection.
-            row['stack']=two.tool('get_stack',tid=state['pid'])
+            # Inspect the refusal now; unrelated caller images may still be
+            # preparing over this deliberately throttled transport.
+            reply = two.raw('get_stack', tid=state['pid'])['result']
+            assert not reply['isError'], reply
+            row['stack'] = reply['structuredContent']
+            assert 'image budget 256 MiB' in (row['stack']['image_budget'] or ''), row['stack']
             assert two.session()['pid']==state['pid']
             assert resolved['symbol_transfer']['retained_bytes'] < 8*1024*1024,resolved
             row['transfer']=resolved['symbol_transfer']

@@ -68,7 +68,7 @@ for name, side in [('original-side', 'side-hidden.o'), ('altered-side-version', 
             generation = client.session()['generation']
             for tool, args in [('get_language_stack', {'language':'lua'}),
                                ('evaluate_expression', {'frame':1, 'expression':'L'})]:
-                result = client.tool(tool, tid=target.pid, **args)['result']
+                result = client.prepared_tool(tool, tid=target.pid, **args)['result']
                 if tool == 'get_language_stack':
                     assert result.get('isError') and result['content'][0]['text'] == 'LuaRuntimeMultiple', result
                 else:

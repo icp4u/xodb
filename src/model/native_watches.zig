@@ -498,9 +498,14 @@ pub const Source = struct {
         const frames = self.frames[i];
         return .{ .frames = .{ .items = self.views[i], .complete = frames.len > 0 and frames.len < 64 and frames[frames.len - 1].diagnostic == null } };
     }
-    fn frameLocals(self: *Source, tid: i32, index: usize, frame: model.Frame) []const info.Local {
+    fn frameLocals(self: *Source, tid: i32, index: usize, frame: model.Frame) ![]const info.Local {
         for (self.local_keys[0..self.local_count], 0..) |key, i| if (key.tid == tid and key.index == index) return self.locals[i];
-        const values = self.session.frameLocals(self.scratch.allocator(), frame) catch &.{};
+        // A frame whose image is still being prepared is not a frame without
+        // locals: say Pending, and do not remember an empty answer for it.
+        const values = self.session.frameLocals(self.scratch.allocator(), frame) catch |err| switch (err) {
+            error.DebugMetadataPending, error.DebugMetadataCancelled, error.SymbolDiscoveryPending => return err,
+            else => &.{},
+        };
         if (self.local_count < max_entries) {
             self.local_keys[self.local_count] = .{ .tid = tid, .index = index };
             self.locals[self.local_count] = values;
@@ -512,7 +517,7 @@ pub const Source = struct {
         const i = self.slot(tid) orelse return .{ .failed = error.InvalidFrame };
         if (index >= self.frames[i].len) return .{ .failed = error.InvalidFrame };
         const frame = self.frames[i][index];
-        const value = self.session.evaluateInFrame(self.scratch.allocator(), frame, self.frameLocals(tid, index, frame), text) catch |err| return .{ .failed = err };
+        const value = self.session.evaluateInFrame(self.scratch.allocator(), frame, self.frameLocals(tid, index, frame) catch |err| return .{ .failed = err }, text) catch |err| return .{ .failed = err };
         const summary = self.session.summarize(a, value) catch |err| return .{ .failed = err };
         const expandable = value.type.kind == .structure or value.type.kind == .array or (value.type.language == .go and value.type.go_kind == @import("../debug/value_view.zig").go_kind.map);
         const extent_advisory = if (summary.visualization) |v| v.extent_advisory else false;

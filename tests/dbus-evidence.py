@@ -184,6 +184,11 @@ assert kind == 3 and fields[4].startswith('org.freedesktop.DBus.Error.')
 client.sendall(call(6, 'ListNames'))
 kind, fields, body = reply(client, 6)
 assert kind == 2 and fields[8] == 'as'
+# Prove six owned request/reply pairs; the monitor's own startup exchange
+# may precede capture and must not supply the sixth pair by accident.
+client.sendall(call(9, 'GetId'))
+kind, fields, body = reply(client, 9)
+assert kind == 2 and fields[8] == 's'
 before_extra = capture.stat().st_size
 large_bytes = bytes((index % 251 for index in range(5000)))
 client.sendall(message(4, 7, [(1, 'o', '/com/example/xquinellax/private'),

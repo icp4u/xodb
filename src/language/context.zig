@@ -13,6 +13,23 @@ const values = @import("value_types.zig");
 pub const Frame = @import("../debug/frame.zig").Frame;
 const A = std.mem.Allocator;
 const Arch = @import("../target/arch.zig").Arch;
+/// Incomplete metadata is not proof that a runtime or a frame is absent.
+pub fn metadataFailure(err: anyerror, fallback: anyerror) anyerror {
+    return switch (err) {
+        error.DebugMetadataPending,
+        error.DebugMetadataCancelled,
+        error.SymbolDiscoveryPending,
+        error.SymbolDiscoveryCancelled,
+        => err,
+        else => fallback,
+    };
+}
+pub fn requirePreparedFrames(frames: []const Frame) !void {
+    for (frames) |frame| if (frame.diagnostic) |why| {
+        if (std.mem.eql(u8, why, "DebugMetadataPending") or std.mem.eql(u8, why, "SymbolDiscoveryPending")) return error.DebugMetadataPending;
+        if (std.mem.eql(u8, why, "DebugMetadataCancelled") or std.mem.eql(u8, why, "SymbolDiscoveryCancelled")) return error.DebugMetadataCancelled;
+    };
+}
 pub const Snapshot = struct { pid: i32, generation: u64, image_epoch: u64, stopped: bool };
 pub const Symbol = struct { name: []const u8, offset: u64 };
 pub const MemoryRange = struct { start: u64, end: u64 };
@@ -84,6 +101,7 @@ pub const Context = struct {
         runtime_retained: *const fn (*anyopaque, binding.Token) anyerror!Module,
         runtime_owns: *const fn (*anyopaque, Module, Frame) bool,
         stack: *const fn (*anyopaque, A, i32, usize) anyerror![]Frame,
+        unwind_stack: *const fn (*anyopaque, A, i32, usize) anyerror![]Frame,
         frame_locals: *const fn (*anyopaque, A, Frame) anyerror![]info.Local,
         evaluate_in_frame: *const fn (*anyopaque, A, Frame, []const info.Local, []const u8) anyerror!eval.Value,
     };
@@ -165,10 +183,18 @@ pub const Context = struct {
         return self.ops.runtime_owns(self.user, module, frame);
     }
     pub fn stack(self: *const Context, a: A, tid: i32, limit: usize) ![]Frame {
-        return self.ops.stack(self.user, a, tid, limit);
+        const frames = try self.ops.stack(self.user, a, tid, limit);
+        try requirePreparedFrames(frames);
+        return frames;
     }
     pub fn frameLocals(self: *const Context, a: A, frame: Frame) ![]info.Local {
         return self.ops.frame_locals(self.user, a, frame);
+    }
+    /// Native register/CFI join without requesting source or inline metadata.
+    pub fn unwindStack(self: *const Context, a: A, tid: i32, limit: usize) ![]Frame {
+        const frames = try self.ops.unwind_stack(self.user, a, tid, limit);
+        try requirePreparedFrames(frames);
+        return frames;
     }
     pub fn evaluateInFrame(self: *const Context, a: A, frame: Frame, locals: []const info.Local, text: []const u8) !eval.Value {
         return self.ops.evaluate_in_frame(self.user, a, frame, locals, text);

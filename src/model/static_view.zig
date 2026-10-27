@@ -37,6 +37,21 @@ pub const PseudoValue = pseudo_values.PseudoValue;
 const LiveMemory = pseudo_values.LiveMemory;
 const livePseudoValue = pseudo_values.value;
 
+fn preparationFailureStatus(err: anyerror) @FieldType(View, "status") {
+    return switch (err) {
+        error.DebugMetadataPending, error.SymbolDiscoveryPending => .pending,
+        else => .failed,
+    };
+}
+
+test "static live values preserve metadata readiness and retry pending preparation" {
+    try pseudo_values.testMetadataReadiness(livePseudoValues);
+    try std.testing.expectEqual(.pending, preparationFailureStatus(error.DebugMetadataPending));
+    try std.testing.expectEqual(.pending, preparationFailureStatus(error.SymbolDiscoveryPending));
+    try std.testing.expectEqual(.failed, preparationFailureStatus(error.DebugMetadataCancelled));
+    try std.testing.expectEqual(.failed, preparationFailureStatus(error.NoDebugInfo));
+}
+
 fn readSessionMemory(user: *anyopaque, address: u64, bytes: []u8) !usize {
     const session: *Session = @ptrCast(@alignCast(user));
     return session.target.readMemory(address, bytes);
@@ -46,10 +61,14 @@ fn readSessionMemory(user: *anyopaque, address: u64, bytes: []u8) !usize {
 /// identical copy (src/mcp/static_analysis.zig livePseudoValues; the layer
 /// rules keep it from importing this file); both end in pseudo_values.collect
 /// so a variable cannot gain a different live meaning on a different surface.
-pub fn livePseudoValues(a: std.mem.Allocator, session: *Session, analysis: *host.Analysis, tid: i32, frame_index: usize) ![]const PseudoValue {
+pub fn livePseudoValues(a: std.mem.Allocator, session: anytype, analysis: *host.Analysis, tid: i32, frame_index: usize) ![]const PseudoValue {
     if (tid == 0) return &.{};
     const frame_count = std.math.add(usize, frame_index, 1) catch return &.{};
-    const frames = session.stack(a, tid, frame_count) catch return &.{};
+    const frames = session.stack(a, tid, frame_count) catch |err| {
+        try pseudo_values.metadataFailure(err);
+        return &.{};
+    };
+    for (frames) |frame| try pseudo_values.frameMetadata(frame);
     if (frame_index >= frames.len) return &.{};
     const frame = frames[frame_index];
     const link_pc = frame.lookup_pc -% analysis.function.bias;
@@ -57,7 +76,10 @@ pub fn livePseudoValues(a: std.mem.Allocator, session: *Session, analysis: *host
     // parameter may share a name and shadow it at depth 0, so match only the
     // concrete subprogram's DWARF, and refuse when inline scopes are unknown.
     if (frame.inline_diagnostic != null) return &.{};
-    const locals = session.frameLocalsAtDepth(a, frame, frame.inline_frames.len) catch return &.{};
+    const locals = session.frameLocalsAtDepth(a, frame, frame.inline_frames.len) catch |err| {
+        try pseudo_values.metadataFailure(err);
+        return &.{};
+    };
     // DWARF and Ghidra must independently name the same exact runtime stack
     // address. Reading that address in an outer frame observes the variable's
     // current value, including a legitimate change made through an alias.
@@ -365,7 +387,10 @@ pub const Capture = struct {
         const old = self.value orelse return false;
         if (self.session != session.id or self.generation != session.target.snapshot().generation or self.metadata != session.metadata.revision) return true;
         if (old.status == .pending) {
-            if (session.static_analysis.job) |job| if (old.job_id != job.id or !job.running()) return true;
+            // Only a view waiting on an analysis job follows that job. One
+            // waiting on frame metadata (no job id) polls on the timer below,
+            // not on every draw because an earlier analysis job has finished.
+            if (old.job_id) |id| if (session.static_analysis.job) |job| if (id != job.id or !job.running()) return true;
             return @import("../target/linux.zig").now() -| self.refreshed_ns >= 100 * std.time.ns_per_ms;
         }
         return false;
@@ -393,12 +418,16 @@ pub const Capture = struct {
         _ = self.arena.reset(.retain_capacity);
         self.value = .{ .request = request };
         self.prepare(session, request, new_target, new_mode) catch |err| {
-            self.value.?.status = .failed;
+            self.value.?.status = preparationFailureStatus(err);
             self.value.?.title = if ((err == error.NoCodeAtSourceLine or err == error.NoCodeForSourceLine) and session.modules.skipped().count != 0)
                 "No code in the images searched; some are over the image budget (Modules lists them)"
             else
                 @errorName(err);
-            self.value.?.detail = if (err == error.FunctionTooLarge)
+            self.value.?.detail = if (self.value.?.status == .pending)
+                "Waiting for frame metadata before showing live values"
+            else if (err == error.DebugMetadataCancelled or err == error.SymbolDiscoveryCancelled)
+                "Frame metadata preparation was cancelled; live values stay unavailable until it is retried"
+            else if (err == error.FunctionTooLarge)
                 "The function is over the 1 MiB analysis limit"
             else
                 "Static analysis needs function bounds from the session's symbols (ELF or DWARF)";
@@ -585,6 +614,39 @@ pub const Capture = struct {
         }
     }
 };
+
+test "metadata pending refresh ignores an unrelated finished analysis job" {
+    var session = Session.init();
+    defer session.deinit();
+    // changed() reads only these two fields; no worker or sidecar is needed.
+    var job: host.Job = undefined;
+    job.id = 17;
+    job.done = .init(true);
+    session.static_analysis.job = &job;
+    defer session.static_analysis.job = null;
+    var capture: Capture = .{
+        .value = .{ .request = .{ .origin = .{ .pc = 1 } }, .status = .pending },
+        .session = session.id,
+        .generation = session.target.snapshot().generation,
+        .metadata = session.metadata.revision,
+        // Saturating subtraction keeps the timer unexpired without sleeps.
+        .refreshed_ns = std.math.maxInt(u64),
+    };
+    defer capture.deinit();
+    try std.testing.expect(!capture.changed(&session));
+    capture.refreshed_ns = 0;
+    try std.testing.expect(capture.changed(&session));
+    capture.refreshed_ns = std.math.maxInt(u64);
+    capture.value.?.job_id = job.id;
+    try std.testing.expect(capture.changed(&session));
+    job.done.store(false, .release);
+    try std.testing.expect(!capture.changed(&session));
+    job.id += 1;
+    try std.testing.expect(capture.changed(&session));
+    capture.value.?.job_id = null;
+    session.metadata.revision +%= 1;
+    try std.testing.expect(capture.changed(&session));
+}
 
 test "static question identity survives paging but never another artifact" {
     const questions = [_]Question{ .{ .op = 7, .input = 1, .label = "input" }, .{ .op = 7, .input = null, .label = "output" } };

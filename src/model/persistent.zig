@@ -80,7 +80,7 @@ test "a yielded install or image read keeps resolution pending until retried" {
     defer manager.deinit();
     try manager.entries.append(A, .{ .id = 1, .symbol = try policy.Text.init("fixture_hit") });
     var session = MockSession{};
-    for ([_]anyerror{ error.SymbolDiscoveryPending, error.SymbolDiscoveryBudgetExceeded }) |err| {
+    for ([_]anyerror{ error.SymbolDiscoveryPending, error.SymbolDiscoveryBudgetExceeded, error.DebugMetadataPending }) |err| {
         session.target.failure = err;
         const revision = manager.display_revision;
         try manager.resolve(&session, false);
@@ -218,29 +218,18 @@ pub const Manager = struct {
             if (v.internal or v.temporary or self.entry(v.id) != null) continue;
             if (session.run_to) |run| if (run.owns_probe and run.probe == v.id) continue;
             var item = Entry{ .id = v.id, .enabled = v.enabled };
-            if (session.modules.at(v.address)) |module| {
-                if (module.image.buildId()) |id| {
+            if (session.modules.savedAddress(v.address)) |saved| {
+                if (saved.build_id) |id| {
                     if (id.len <= item.build_id.len) {
                         @memcpy(item.build_id[0..id.len], id);
                         item.build_id_len = id.len;
-                        item.offset = try module.linkAddress(v.address);
-                        item.path = try A.dupe(u8, module.path);
+                        item.offset = saved.offset;
+                        item.path = try A.dupe(u8, saved.path);
                     } else item.diagnostic = "BuildIdTooLong";
                 } else item.diagnostic = "BreakpointImageHasNoBuildId";
-            } else |err| {
-                // A remote file over the synchronous cap still has a symbols-only
-                // identity. Record that when the image budget would allow the
-                // file; a later restart places it without copying the file.
-                if (err == error.BinarySnapshotLimit) {
-                    if (session.modules.projectedRestore(v.address)) |site| {
-                        if (site.id.len <= item.build_id.len) {
-                            @memcpy(item.build_id[0..site.id.len], site.id);
-                            item.build_id_len = site.id.len;
-                            item.offset = site.offset;
-                            item.path = try A.dupe(u8, site.path);
-                        } else item.diagnostic = "BuildIdTooLong";
-                    } else |_| item.diagnostic = "BreakpointAddressNotRestorable";
-                } else item.diagnostic = "BreakpointAddressNotRestorable";
+            } else |err| switch (err) {
+                error.DebugMetadataPending, error.SymbolDiscoveryPending, error.SymbolDiscoveryBudgetExceeded => return err,
+                else => item.diagnostic = "BreakpointAddressNotRestorable",
             }
             errdefer item.deinit();
             try self.entries.append(A, item);
@@ -312,7 +301,7 @@ pub const Manager = struct {
         self.diagnostic(item, @errorName(err));
         try runtime.propagateUnknownOutcome(err);
         switch (err) {
-            error.SymbolDiscoveryPending, error.SymbolDiscoveryBudgetExceeded => {
+            error.SymbolDiscoveryPending, error.SymbolDiscoveryBudgetExceeded, error.DebugMetadataPending => {
                 self.resolving = true;
                 return true;
             },

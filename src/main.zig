@@ -12,6 +12,7 @@ const Server = @import("mcp/server.zig").Server;
 const SharedSession = @import("mcp/shared.zig").Endpoint;
 const linux = @import("target/linux.zig");
 const snapshot = @import("binary/snapshot.zig");
+const ProfileConfig = @import("profile/capture.zig").Config;
 var quitting: c.sig_atomic_t = 0;
 fn imageBudgetError(err: anyerror, option: []const u8, value: []const u8) anyerror {
     log.err(.session, "xodb: {s} {s}: expected a size from 1M to {d}G (bytes, or a whole number with K, M or G)\n", .{ option, value, snapshot.max_limit >> 30 });
@@ -19,7 +20,7 @@ fn imageBudgetError(err: anyerror, option: []const u8, value: []const u8) anyerr
 }
 /// The debugger options that are followed by a value. The parser in main and
 /// log.init share the list, so a value is never read as an option.
-const value_options = [_][]const u8{ "--language-off", "--wine-threads", "--observe-recipe", "--observation-out", "--open-observation", "--browse-observation", "--observation-threshold-ns", "--static-analysis", "--decompile", "--function", "--gdb-remote", "--runtime-agent", "--runtime-ssh", "--ssh-config", "--allocation-helper", "--process-limit", "--core", "--exe", "--debug-dir", "--source-map", "--connect", "--ssh", "--remote-xodb", "--session-socket", "--listen", "--config", "--source", "--font", "--theme", "--ui-scale", "--platform", "--expected-start-ticks", "--attach", "--frames", "--vk-device", "--agent-scope", "--break", "--record", "--profile-out", "--capture-out", "--open-frames", "--open-profile", "--compare-capture", "--open-capture", "--open-pcap", "--live-capture", "--capture-tool", "--capture-ring-bytes", "--tls-key-log", "--open-mitmproxy", "--symbols", "--debug-file", "--image-limit", "--image-total-limit" };
+const value_options = [_][]const u8{ "--language-off", "--wine-threads", "--observe-recipe", "--observation-out", "--open-observation", "--browse-observation", "--observation-threshold-ns", "--static-analysis", "--decompile", "--function", "--gdb-remote", "--runtime-agent", "--runtime-ssh", "--ssh-config", "--allocation-helper", "--process-limit", "--core", "--exe", "--debug-dir", "--source-map", "--connect", "--ssh", "--remote-xodb", "--session-socket", "--listen", "--config", "--source", "--font", "--theme", "--ui-scale", "--platform", "--expected-start-ticks", "--attach", "--frames", "--vk-device", "--agent-scope", "--break", "--record", "--profile-duration", "--profile-hz", "--profile-out", "--capture-out", "--open-frames", "--open-profile", "--compare-capture", "--open-capture", "--open-pcap", "--live-capture", "--capture-tool", "--capture-ring-bytes", "--tls-key-log", "--open-mitmproxy", "--symbols", "--debug-file", "--image-limit", "--image-total-limit" };
 fn named(names: []const []const u8, arg: []const u8) bool {
     for (names) |name| if (std.mem.eql(u8, arg, name)) return true;
     return false;
@@ -116,6 +117,8 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
     var hide_wine_threads: ?bool = null;
     var expected_start: ?u64 = null;
     var start_profile = false;
+    var profile_duration: ?u32 = null;
+    var profile_hz: ?u32 = null;
     var redot_debugger = false;
     var redact = false;
     var listen: ?[:0]const u8 = null;
@@ -223,7 +226,9 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
                 \\  Addresses become per-session tags (docs/GUIDE.md "Redaction").
                 \\--record FILE saves investigation evidence at shutdown (must be a new file).
                 \\--expected-start-ticks N refuses attach if the sampled process identity changed.
-                \\--start-profile attaches, starts a 99 Hz / 10 s CPU capture, and resumes the target.
+                \\--start-profile begins a CPU capture before resuming an attach or a launch's initial exec stop.
+                \\--profile-duration MS sets its deadline (0 means until stopped); launch defaults to 0, attach to 10000.
+                \\--profile-hz N sets its sampling rate from 1 to 1000 (default 99).
                 \\--profile-out FILE saves the full CPU aggregate as Speedscope JSON at shutdown (new file).
                 \\--capture-out FILE saves a native archive at shutdown (new file, no durability sync).
                 \\--core FILE opens a read-only x86-64 ELF core; --exe FILE supplies a matching moved executable.
@@ -310,6 +315,8 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
             };
             if (std.mem.eql(u8, arg, "--record")) record_path = args[i];
             if (std.mem.eql(u8, arg, "--expected-start-ticks")) expected_start = try std.fmt.parseInt(u64, args[i], 10);
+            if (std.mem.eql(u8, arg, "--profile-duration")) profile_duration = try std.fmt.parseInt(u32, args[i], 10);
+            if (std.mem.eql(u8, arg, "--profile-hz")) profile_hz = try std.fmt.parseInt(u32, args[i], 10);
             if (std.mem.eql(u8, arg, "--profile-out")) profile_out = args[i];
             if (std.mem.eql(u8, arg, "--capture-out")) capture_out = args[i];
             if (std.mem.eql(u8, arg, "--open-frames")) open_frames = args[i];
@@ -378,7 +385,9 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
     if (ssh != null and attach == null and launch.len == 0) return error.RemoteSshRequiresTarget;
     if (listen != null and (!headless or !mcp)) return error.ListenRequiresHeadlessMcp;
     if (headless and !mcp and session_socket == null and observation_recipe == null and open_observation == null and static_decompile == null) return error.HeadlessRequiresMcp;
-    if ((expected_start != null or start_profile) and (attach == null or runtime_remote or remote_gui)) return error.IdentityRequiresLocalAttach;
+    if ((expected_start != null or (start_profile and attach != null)) and (attach == null or runtime_remote or remote_gui)) return error.IdentityRequiresLocalAttach;
+    if (start_profile and (remote_gui or gdb_remote != null or (attach == null and launch.len == 0))) return error.StartProfileRequiresOwnedTarget;
+    if ((profile_duration != null or profile_hz != null) and !start_profile) return error.ProfileOptionsRequireStartProfile;
     if (attach != null and launch.len > 0) return error.ConflictingTargets;
     if (redot_debugger and (launch.len == 0 or attach != null or runtime_remote or remote_gui or core_file != null or open_capture != null or open_profile != null)) return error.RedotDebuggerRequiresLocalOwnedLaunch;
     if (open_capture != null and (attach != null or launch.len > 0 or initial_breakpoint_count != 0 or source != null)) return error.ConflictingTargets;
@@ -390,11 +399,28 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
     if ((symbols != null or reanalyze) and open_capture == null) return error.SymbolsRequireArchive;
     // Before any thread starts: the policy is read without locks afterwards.
     if (redact) @import("redact.zig").enable();
-    const preferences = if (config_path) |path| @import("preferences.zig").load(a, path) catch |err| {
+    const loaded_preferences = if (config_path) |path| @import("preferences.zig").loadDetailed(a, path) catch |err| {
         log.err(.session, "xodb: preferences failed: {s}; {s}\n", .{ @errorName(err), path });
         if (err == error.InvalidImageBudget) log.err(.session, "xodb: symbols.image_bytes and symbols.image_total_bytes take bytes from {d} to {d}\n", .{ snapshot.min_limit, snapshot.max_limit });
         return err;
-    } else @import("preferences.zig").Preferences{};
+    } else @import("preferences.zig").Loaded{ .value = .{} };
+    const preferences = loaded_preferences.value;
+    var startup_profile: ?ProfileConfig = null;
+    if (start_profile) {
+        // Forward the whole capture config so future capture fields (including
+        // a kernel-stack policy) have one startup path for local and remote owners.
+        var config = preferences.profile.config();
+        // An explicit duration supplies the startup deadline too. Otherwise,
+        // retain attach's old deadline and let a launch span its whole run.
+        if (!loaded_preferences.profile_duration_set) config.duration_ms = if (launch.len > 0) 0 else 10_000;
+        if (profile_duration) |duration| config.duration_ms = duration;
+        if (profile_hz) |frequency| config.frequency_hz = frequency;
+        config.validate() catch |err| {
+            log.err(.session, "xodb: --start-profile settings invalid: {s}; --profile-hz takes 1 to 1000 (profile.* keys from --config are checked too)\n", .{@errorName(err)});
+            return err;
+        };
+        startup_profile = config;
+    }
     const ui_scale = ui_scale_cli orelse preferences.appearance.ui_scale;
     const ghidra_prestart = preferences.decompiler.prestart and !no_ghidra_prestart;
     // Off in either place is off.
@@ -556,8 +582,8 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
                 session.target.detach() catch {};
                 return err;
             };
-            if (start_profile) {
-                _ = try session.startProfile(.{ .frequency_hz = 99, .duration_ms = 10_000 });
+            if (startup_profile) |config| {
+                _ = try session.startProfile(config);
                 try session.continueExecution(.human);
             }
             log.info(.session, "xodb: attached pid={d} threads={d} state={s} elapsed_ms={d}\n", .{ pid, session.target.snapshot().thread_count, @tagName(session.target.snapshot().state), (linux.now() -| started) / 1_000_000 });
@@ -567,6 +593,10 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
         for (initial_breakpoints[0..initial_breakpoint_count]) |name| {
             _ = try session.breakSymbol(name);
         }
+        if (launch.len > 0) if (startup_profile) |config| {
+            _ = try session.startProfile(config);
+            try session.continueExecution(.human);
+        };
     }
     if (!async_remote_start) if (observation_recipe) |path| {
         try @import("observe/cli.zig").run(a, session, path, observation_out.?, observation_threshold, &quitting);
@@ -605,7 +635,7 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
     defer if (mcp) server.deinit();
     if (headless) {
         if (runtime_remote) {
-            var startup = RemoteStartup{ .session = session, .gdb = gdb_remote, .transport = remote_transport.items, .attach = attach, .launch = launch, .follow = follow_forks, .breakpoints = initial_breakpoints[0..initial_breakpoint_count], .observation = if (observation_recipe) |path| .{ .allocator = a, .path = path, .output = observation_out.?, .threshold = observation_threshold } else null, .report_attach = true };
+            var startup = RemoteStartup{ .session = session, .gdb = gdb_remote, .transport = remote_transport.items, .attach = attach, .launch = launch, .follow = follow_forks, .breakpoints = initial_breakpoints[0..initial_breakpoint_count], .start_profile = startup_profile, .observation = if (observation_recipe) |path| .{ .allocator = a, .path = path, .output = observation_out.?, .threshold = observation_threshold } else null, .report_attach = true };
             var shutdown = RemoteShutdown{ .tree = &tree, .session = session, .destroyed = &remote_destroyed, .capture_out = capture_out, .profile_out = profile_out, .record_path = record_path, .startup = &startup };
             const owner = try @import("model/remote_worker.zig").Worker.start(&tree, .{
                 .connection = 1,
@@ -666,7 +696,7 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
         defer for (workspaces) |entry| if (entry) |view| view.deinit();
         var last_process: u64 = 1;
         var last_tree_revision: u64 = 0;
-        workspace.show_profile = open_capture != null or open_pcap != null or open_mitmproxy != null or live_capture != null;
+        workspace.show_profile = start_profile or open_capture != null or open_pcap != null or open_mitmproxy != null or live_capture != null;
         workspace.logical_frames.open = open_frames != null;
         workspace.comparison.open = compare_capture != null;
         workspace.invocations.open = browse_observation != null;
@@ -680,7 +710,7 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
             const first_workspace = workspaces[0].?;
             var incarnation: u64 = 1;
             var protocol_server: ?*Server = if (mcp) server else null;
-            var startup = RemoteStartup{ .session = session, .gdb = gdb_remote, .transport = remote_transport.items, .attach = attach, .launch = launch, .follow = follow_forks, .breakpoints = initial_breakpoints[0..initial_breakpoint_count], .expected_start = expected_start, .start_profile = start_profile, .report_attach = native_owner };
+            var startup = RemoteStartup{ .session = session, .gdb = gdb_remote, .transport = remote_transport.items, .attach = attach, .launch = launch, .follow = follow_forks, .breakpoints = initial_breakpoints[0..initial_breakpoint_count], .expected_start = expected_start, .start_profile = startup_profile, .report_attach = native_owner };
             while (true) {
                 var shutdown = RemoteShutdown{ .tree = &tree, .session = session, .destroyed = &remote_destroyed, .capture_out = if (incarnation == 1) capture_out else null, .profile_out = if (incarnation == 1) profile_out else null, .record_path = if (incarnation == 1) record_path else null };
                 const reconnect = lifecycle: {
@@ -1079,7 +1109,7 @@ const RemoteStartup = struct {
     observation: ?struct { allocator: std.mem.Allocator, path: [:0]const u8, output: [:0]const u8, threshold: ?u64 } = null,
     report_attach: bool = false, // headless prints the same attach lines as a local attach
     expected_start: ?u64 = null,
-    start_profile: bool = false,
+    start_profile: ?ProfileConfig = null,
     completed: bool = false, // owner thread only: written here, read by RemoteShutdown
     fn run(context: *anyopaque, cancel: *@import("target/runtime.zig").c.struct_xrt_cancel) !void {
         const self: *RemoteStartup = @ptrCast(@alignCast(context));
@@ -1109,8 +1139,8 @@ const RemoteStartup = struct {
                 self.session.target.detach() catch {};
                 return err;
             };
-            if (self.start_profile) {
-                _ = try self.session.startProfile(.{ .frequency_hz = 99, .duration_ms = 10_000 });
+            if (self.start_profile) |config| {
+                _ = try self.session.startProfile(config);
                 try self.session.continueExecution(.human);
             }
             if (self.report_attach) log.info(.session, "xodb: attached pid={d} threads={d} state={s} elapsed_ms={d}\n", .{ pid, self.session.target.snapshot().thread_count, @tagName(self.session.target.snapshot().state), (linux.now() -| started) / 1_000_000 });
@@ -1120,6 +1150,10 @@ const RemoteStartup = struct {
         for (self.breakpoints) |name| {
             _ = try self.session.breakSymbol(name);
         }
+        if (self.launch.len > 0) if (self.start_profile) |config| {
+            _ = try self.session.startProfile(config);
+            try self.session.continueExecution(.human);
+        };
         self.completed = true;
     }
     fn observe(context: *anyopaque) !void {
@@ -1388,6 +1422,7 @@ fn openMitmproxy(session: *Session, path: [:0]const u8) !void {
 }
 
 test {
+    std.testing.refAllDecls(@import("model/static_view.zig"));
     std.testing.refAllDecls(@import("redot/protocol.zig"));
     std.testing.refAllDecls(@import("redact.zig"));
     std.testing.refAllDecls(@import("appearance.zig"));

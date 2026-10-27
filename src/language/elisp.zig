@@ -34,7 +34,7 @@ fn runtimeModule(session: *const Context) !Module {
     // kernel PHDR evidence. A shared-library runtime stays unavailable.
     const main_phdr = session.mainPhdr();
     if (main_phdr == 0) return error.ElispModuleIdentityUnavailable;
-    const module = session.moduleAt(main_phdr) catch return error.ElispModuleIdentityUnavailable;
+    const module = session.moduleAt(main_phdr) catch |err| return context_api.metadataFailure(err, error.ElispModuleIdentityUnavailable);
     if (module.symbols().findSymbol("emacs_version") == null or module.symbols().findSymbol("Fdebugger_trap") == null) return error.ElispStaticRuntimeUnavailable;
     return module;
 }
@@ -73,7 +73,7 @@ fn profile(session: *const Context, module: Module) !*const c.struct_xel_layout 
     if (try session.readMemory(try module.runtimeAddress(note.addr), actual[0..expected.len]) != expected.len or !std.mem.eql(u8, expected, actual[0..expected.len])) return error.ElispBuildIdMismatch;
     try constant(session, module, "emacs_version", c.XEL_VERSION);
     if (module.layouts.elisp == null) {
-        const debug = module.debugInfo() catch |err| return if (err == error.DebugMetadataPending) err else error.ElispDwarfUnavailable;
+        const debug = module.debugInfo() catch |err| return context_api.metadataFailure(err, error.ElispDwarfUnavailable);
         var layout: c.struct_xel_layout = undefined;
         if (c.xel_layout_build(debug.dwarf, id.ptr, id.len, c.XEL_VERSION, &layout)) |why| {
             inline for (.{ error.ElispDwarfMalformed, error.ElispDwarfWorkLimit, error.ElispDwarfAmbiguous, error.ElispDwarfTypesUnavailable, error.ElispDwarfConstantsUnavailable, error.ElispConstantMismatch, error.ElispRuntimeMultiple }) |err| {

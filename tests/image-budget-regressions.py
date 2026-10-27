@@ -28,6 +28,8 @@ def text(r): return '; '.join(x['text'] for x in r.get('content',[]))
 def stats(c):
     s=Path(f'/proc/{c.p.pid}/stat').read_text().rsplit(')',1)[1].split()
     return dict(cpu_ticks=int(s[11])+int(s[12]),rss_bytes=int(s[21])*os.sysconf('SC_PAGESIZE'),load=os.getloadavg(),cpus=os.cpu_count())
+def source_breakpoint(c, **args):
+    return c.prepared_tool('set_breakpoint',**args)['result']
 def close(c):
     if c.p.poll() is None:
         c.p.stdin.close()
@@ -57,7 +59,9 @@ def honest(w,a):
                 assert target.stdout.readline()=='ready\n'
                 c=client('control',None,options=['--attach',str(target.pid)],reply_seconds=60);s=c.stopped();before=stats(c)
                 if mode=='line':
-                    r=c.inspect('set_breakpoint',generation=s['generation'],file='hot.c',line=2)
+                    reply=source_breakpoint(c,generation=s['generation'],file='hot.c',line=2)
+                    assert not reply.get('isError'),reply
+                    r=reply['structuredContent']
                     assert r['ids'] and r['images_not_searched']==0,r
                 else:
                     cap=c.inspect('start_profile',generation=s['generation'],duration_ms=0,frequency_hz=499,tids=[target.pid])['capture']
@@ -87,14 +91,14 @@ def packed(w,a):
     try:
         before=stats(r.client)
         if r.client.runtime_agent:
-            reply=r.client.tool('set_breakpoint',generation=r.client.session()['generation'],file='lib.c',line=4)['result']
+            reply=source_breakpoint(r.client,generation=r.client.session()['generation'],file='lib.c',line=4)
             assert reply['isError'] and 'images not searched' in text(reply),reply
         found=r.stack(select=(lib,));notice=found['image_budget']
         wanted='302 MiB' if a.wrong_result else '301 MiB'
         assert notice and 'decompressed debug data' in notice and wanted in notice and '--image-limit 400M' in notice,found
         failures=h.load_failures(r.client)
         assert any(f['diagnostic']=='CompressedDebugBudget' and f['detail']==notice for f in failures),failures
-        reply=r.client.tool('set_breakpoint',generation=r.client.session()['generation'],file='lib.c',line=4)['result']
+        reply=source_breakpoint(r.client,generation=r.client.session()['generation'],file='lib.c',line=4)
         assert reply['isError'] and 'images not searched' in text(reply) and 'decompressed debug data' in text(reply),reply
         assert r.held()['held']<8*MIB,r.held()
         print(json.dumps({'case':'compressed','before':before,'after':stats(r.client),'notice':notice.replace(str(w),'.')}),flush=True)
@@ -127,13 +131,13 @@ def converge(w,a):
         for attempt in range(4):
             r=h.Run(w,w/'host',[lib],options=[v for pair in options.items() for v in pair])
             try:
-                found=r.stack();notice=found.get('image_budget')
+                found=r.stack(select=(lib,));notice=found.get('image_budget')
                 if notice:
                     match=advice.search(notice);assert match,notice
                     args=match.group(1).split();options.update(zip(args[::2],args[1::2]));observed.append(notice)
                     if attempt==0:assert '--image-total-limit' in args,notice
                 else:
-                    reply=r.client.tool('set_breakpoint',generation=r.client.session()['generation'],file='host.c',line=5)['result']
+                    reply=source_breakpoint(r.client,generation=r.client.session()['generation'],file='host.c',line=5)
                     assert not reply['isError'] and reply['structuredContent']['ids'],reply
                     assert reply['structuredContent']['images_not_searched']==0,reply
                     assert r.held()['sweep_limit']>0,r.held()
@@ -155,13 +159,13 @@ def stderr(w,a):
         start=time.monotonic();before=stats(r.client)
         for i in range(220):
             r.session=r.client.stopped()
-            r.client.tool('set_breakpoint',generation=r.session['generation'],file='no_file.c',line=1)
+            source_breakpoint(r.client,generation=r.session['generation'],file='no_file.c',line=1)
             found=r.stack()
             assert r.modules()['image_budget'],found
             r.client.action('continue');r.client.action('interrupt')
         # No pipe draining during the burst. Data remains available in silence.
         r.session=r.client.stopped()
-        r.client.tool('set_breakpoint',generation=r.session['generation'],file='no_file.c',line=1)
+        source_breakpoint(r.client,generation=r.session['generation'],file='no_file.c',line=1)
         r.stack();assert r.modules()['image_budget']
         assert r.modules()['image_budget']
         after=stats(r.client);err,_=r.close();count=err.count(b'module budget:')

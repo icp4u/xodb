@@ -62,6 +62,39 @@ exit/detach. Manual stops remain quiet. The demo runs for 20 seconds by default.
 A new capture replaces the previous completed capture; a failed start preserves
 it. One capture is retained until replacement or debugger shutdown.
 
+## Profile from program start
+
+Launch with the capture already armed when the program's startup work matters:
+
+```sh
+./zig-out/bin/xodb --start-profile -- ./program argument
+```
+
+xodb launches the program to its initial exec stop, opens an all-thread capture
+there, and only then resumes it. The flame view is selected immediately and
+updates while the program runs, so dynamic-loader work, constructors and early
+`main` code are retained. The completed flame graph remains selected after the
+program exits. `--headless --mcp` uses the same ordering; the first
+`get_profile` already reports the capture, and `--profile-out` or
+`--capture-out` saves that whole-run evidence.
+
+A launched startup capture defaults to 99 Hz with no wall-clock deadline. Use
+`--profile-hz N` (1–1000) and `--profile-duration MS` (0 means until stopped)
+to change those values. An explicitly loaded `--config FILE` can instead use
+the existing `profile.frequency_hz` and `profile.duration_ms` keys. Command-line
+values win. `--start-profile --attach PID` keeps its established 99 Hz / 10 s
+default when no config or command-line override is supplied.
+
+The capture covers one process image. If the program forks a child (a shell
+running a command, `system`, `popen`) the capture stops at that scope boundary
+(`thread_scope_changed`), and an `exec` in the profiled process stops it with
+`mappings_changed`. Launch the program itself rather than a wrapper script.
+
+Owned launches through `--runtime-agent` and `--runtime-ssh` use the same
+exec-stop ordering for same-architecture targets. Kernel-stack capture is not
+yet a startup option; when that capture mode is available, it belongs in the
+same startup configuration passed to both local and remote owners.
+
 Selecting a flame frame does not move the instruction pointer or change target
 registers. A blue source diamond marks browsing; the gold assembly arrow still
 marks the actual stopped PC. Locals/registers describe the stopped frame, not

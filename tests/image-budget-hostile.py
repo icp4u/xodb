@@ -151,6 +151,15 @@ class Run:
             self.session = self.client.stopped(seconds=30)
         except BaseException:
             self.kill(); raise
+    def native_baseline(self):
+        # The automatic remote stack prepares its small top-frame image.
+        # Measure it before requesting the large fixture, then allow exactly
+        # that amount in addition to the fixture's existing budget bound.
+        if not self.client.runtime_agent:
+            return 0
+        self.stack()
+        return self.holds(0, 16 * MIB)
+
     def stack(self, select=()):
         """Select only the requested fixture callers before checking full images.
 
@@ -184,7 +193,9 @@ class Run:
                         assert time.monotonic() < deadline, reply
                         time.sleep(.005)
                         selected = True
-                        continue
+                        # Finish the inner caller before selecting the next:
+                        # the one-image budget oracle depends on that order.
+                        break
                 requested.add(pc)
                 selected = True
             if selected: continue
@@ -618,10 +629,7 @@ def container(w, a, result):
                 # Neither library is read, by the pending --break or by the request.
                 held = holds(c, 0, 0)
                 texts = errors(missing)
-                if a.remote:
-                    assert texts[0] == 'ImageBudgetExceeded' and '/padded.apk' in texts[1] and 'remote image transfer is capped at 256 MiB outside the background main-image job' in texts[1], texts
-                else:
-                    assert texts[0] == 'ImageBudgetExceeded' and '/padded.apk is 300 MiB and has no symbols-only view' in texts[1] and '256 MiB each, 512 MiB per process' in texts[1], texts
+                assert texts[0] == 'ImageBudgetExceeded' and '/padded.apk is 300 MiB and has no symbols-only view' in texts[1] and '256 MiB each, 512 MiB per process' in texts[1], texts
                 assert errors(find('apk_left_tick'))[0] == 'ImageBudgetExceeded'
             else:
                 # Within the bounds both are read and searched, as before.
@@ -716,10 +724,7 @@ def definers(w, a, result):
             held = r.holds(0, 16 * MIB)
             assert set(answers) == {'PythonImageBudgetExceeded'}, answers
             refusals = [f.get('detail') or '' for f in load_failures(r.client)]
-            if a.remote:
-                assert any('.so: remote image transfer is capped at 256 MiB outside the background main-image job' in d for d in refusals), refusals
-            else:
-                assert any('.so is 300 MiB; a language view may read 256 MiB of the image it finds its runtime in' in d for d in refusals), refusals
+            assert any('.so is 300 MiB; a language view may read 256 MiB of the image it finds its runtime in' in d for d in refusals), refusals
             result['definers'] = {'images': len(libs), 'image_bytes': BIG, 'held_bytes': held, 'answer': answers[0]}
             r.close()
         finally:
@@ -1026,13 +1031,13 @@ def optin(w, a, result):
     try:
         r = Run(w, w/'host', [lib], options=OPTIN)
         try:
+            native = r.native_baseline()
             t = time.monotonic(); found = r.stack(select=(lib,)); seconds = time.monotonic() - t
             frame = named(found, 'probe_wait')
             figures = r.modules().get('image_bytes')
             assert not figures or (figures['image_limit'], figures['total_limit']) == (2 << 30, 8 << 30), figures
-            # Remotely this stays red until prepared images: the stack must load it.
             assert frame and frame['source'] and frame['diagnostic'] is None and found['image_budget'] is None, found
-            result['optin'] = {'image_bytes': size, 'held_bytes': r.holds(size, size + MIB), 'stack_seconds': round(seconds, 3)}
+            result['optin'] = {'image_bytes': size, 'native_bytes': native, 'held_bytes': r.holds(native + size, native + size + MIB), 'stack_seconds': round(seconds, 3)}
             r.close()
         finally:
             r.kill()
@@ -1072,10 +1077,10 @@ def starved(w, a, result, key, capture):
                     skipped, first = history.get('images_not_searched'), history.get('image_budget')
                 else:
                     # A file that is in no image: every image is searched for it.
-                    texts = errors(r.client.tool('run_to', generation=r.client.session()['generation'], tid=r.tid, file='no_such_file_anywhere.c', line=3)['result'])
+                    texts = errors(r.client.prepared_tool('run_to', generation=r.client.session()['generation'], tid=r.tid, file='no_such_file_anywhere.c', line=3)['result'])
                     assert texts[0] == 'NoCodeForSourceLine', texts
                     # A line that exists is found, and its reply says the search was partial too.
-                    reply = r.client.tool('set_breakpoint', generation=r.client.session()['generation'], file='host.c', line=line)['result']
+                    reply = r.client.prepared_tool('set_breakpoint', generation=r.client.session()['generation'], file='host.c', line=line)['result']
                     assert not reply.get('isError') and reply['structuredContent']['ids'], reply
                     skipped, first = reply['structuredContent'].get('images_not_searched'), reply['structuredContent'].get('image_budget')
                 # The search took its share of the total and no more.
@@ -1087,7 +1092,7 @@ def starved(w, a, result, key, capture):
                 assert frame and frame['source'] and frame['diagnostic'] is None and found['image_budget'] is None, (found, held)
                 # And the reply did not pass a partial search off as a whole one.
                 bounded = first and (re.search(r' is \d+ MiB; ', first) or
-                    (a.remote and label == 'optin' and first.endswith(': remote image transfer is capped at 256 MiB outside the background main-image job')))
+                    (capture and a.remote and label == 'optin' and first.endswith(': remote image transfer is capped at 256 MiB outside the background main-image job')))
                 assert skipped and skipped >= 1 and bounded, (skipped, first)
                 if not capture: assert len(texts) == 2 and texts[1].startswith(f'{skipped} images not searched; ') and ' MiB' in texts[1], (texts, skipped)
                 if capture: r.client.inspect('stop_profile', generation=r.client.session()['generation'], capture_id=opened['id'])
@@ -1115,7 +1120,7 @@ def linefirst(w, a, result):
             out = []
             for file, line in (('maps.c', number(MAPS, 'int marker(int n)')), ('lib.c', number(LIB, 'return (int)read(fd'))):
                 t = time.monotonic()
-                reply = c.tool('set_breakpoint', generation=c.session()['generation'], file=file, line=line)['result']
+                reply = c.prepared_tool('set_breakpoint', generation=c.session()['generation'], file=file, line=line)['result']
                 out.append((time.monotonic() - t, reply))
             return out
         finally:
@@ -1146,7 +1151,7 @@ def tabs(w, a, result):
             time.sleep(.005)
     def refusal(r, lib):
         found = [f.get('detail') or '' for f in load_failures(r.client) if f['path'] == str(lib)]
-        expected = ': remote image transfer is capped at 256 MiB outside the background main-image job' if a.remote else ' is 300 MiB; a language view may read 256 MiB of the image it finds its runtime in'
+        expected = ' is 300 MiB; a language view may read 256 MiB of the image it finds its runtime in'
         assert len(found) == 1 and expected in found[0], found
         return found[0]
     libs = []
@@ -1162,10 +1167,11 @@ def tabs(w, a, result):
             assert before['status'] == 'unavailable' and before['reason'] == 'PerlImageBudgetExceeded', before
             said = refusal(r, libs[-1])
             r.holds(0, 0)
+            native = r.native_baseline()
             frame = named(r.stack(select=(libs[-1],)), 'probe_wait')
             # Remotely this stays red until prepared images: the stack must load it.
             assert frame and frame['source'], frame  # the probe saw the stack load the image
-            r.holds(BIG, BIG + MIB)
+            r.holds(native + BIG, native + BIG + MIB)
             # The view can read the image now, so the tab is looked at again: it no longer blames the budget.
             after = tab(r, 'perl')
             assert after['reason'] != 'PerlImageBudgetExceeded', after
@@ -1185,10 +1191,7 @@ def tabs(w, a, result):
             before = tab(r, 'python')
             assert before['status'] == 'unavailable' and before['reason'] == 'PythonImageBudgetExceeded', before
             said = refusal(r, libs[-1])
-            if a.remote:
-                assert 'remote image transfer is capped at 256 MiB outside the background main-image job' in said, said
-            else:
-                assert said.endswith('; it has no debug info, so a stack does not load it either'), said
+            assert said.endswith('; it has no debug info, so a stack does not load it either'), said
             assert named(r.stack(), 'probe_wait')  # named from the symbols-only view
             if a.remote:
                 native = r.holds(0, 16 * MIB)  # libc may be held; the library is not
@@ -1213,11 +1216,11 @@ def views(w, a, result):
     libs = []
     for i in range(4): libs.append(w/f'vw{i}.so'); libs[-1].write_bytes((w/'lk_ok.so').read_bytes()); os.truncate(libs[-1], BIG)
     result['views'] = {}
-    native = None
     try:
         for label, options, expected in (('small', SMALL, 0), ('optin', OPTIN, BIG)):
             r = Run(w, program, [w/'lk_ok.so', *libs], options=options)
             try:
+                native = r.native_baseline()
                 answers = {}
                 for language in ('lua', 'ruby', 'go', 'elisp'):
                     deadline = time.monotonic() + 30
@@ -1229,18 +1232,8 @@ def views(w, a, result):
                     answers[language] = why
                 # Within the image budget the executable is read, once; over it, it is not.
                 # (A view may also look at the frames' own small library.)
-                # Remote small views may hold the native baseline. The remote
-                # opt-in label stays red: these views do not start the
-                # background main-image job, so the 300 MiB executable is not
-                # transferred. That transfer belongs to prepared-image work.
-                if a.remote and label == 'small':
-                    if native is None:
-                        native = r.holds(0, 16 * MIB)
-                        assert native != BIG
-                    held = r.holds(native, native + MIB)
-                else:
-                    held = r.holds(expected, expected + MIB)
-                result['views'][label] = {'answers': answers, 'held_bytes': held}
+                held = r.holds(native + expected, native + expected + MIB)
+                result['views'][label] = {'answers': answers, 'native_bytes': native, 'held_bytes': held}
                 r.close()
             finally:
                 r.kill()

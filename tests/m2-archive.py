@@ -164,6 +164,13 @@ o = Offline(original, trace=trace)
 try:
     state = o.inspect('get_archive_status')
     assert state['offline'] and state['artifact_sha256'] == saved_sha
+    tabs = o.inspect('get_language_tabs')['view']
+    assert tabs['complete'] and tabs['selected'] == 'native', tabs
+    runtime_tabs = [t for t in tabs['tabs'] if t['tab'] not in ('registers', 'native')]
+    assert len(runtime_tabs) == 8 and all(t['status'] == 'unavailable' and t['reason'] == 'OfflineSession'
+                                        and not t['visible'] for t in runtime_tabs), tabs
+    error(o.tool('select_language_tab', generation=o.session()['generation'], tab='ruby'), 'LanguageTabUnavailable')
+    assert o.inspect('get_language_tabs')['view']['selected'] == 'native'
     origin = state['recorded_origin']
     assert origin['pid'] == cap['pid'] and origin['capture_id'] == cap['id'] and origin['boot_id'] is not None
     assert origin['stack_registers'] == 'not_recorded'

@@ -122,6 +122,8 @@ COVERS = (
       'src/ui/flow.zig', 'src/ui/imported.zig', 'src/ui/comparison.zig', 'src/ui/allocations.zig'),
      ('m2-*', 'syscall-timing', 'frame-*', 'allocation-helper', 'comparison', 'scheduling-decode', 'gui-profile', 'gui-flame-status', 'gui-frames',
       'gui-overview-live', 'gui-capture-setup')),
+    (('src/main.zig', 'src/preferences.zig', 'tests/profile-from-start*.py', 'tests/fixtures/profile-from-start.c'),
+     ('profile-from-start*', 'gui-profile-from-start')),
     (('src/frames/*', 'src/import/*', 'src/mcp/frames.zig', 'src/ui/frames.zig', 'src/model/frame_view.zig'), ('frame-*', 'gui-frames')),
     (('src/remote/*', 'src/mcp/remote.zig', 'src/ui/remote.zig', 'src/runtime/remote*', 'src/runtime/agent*',
       'src/runtime/wire*', 'src/runtime/rpc.h', 'src/runtime/xrt_remote.h', 'src/runtime/xrt_wire.h', 'src/model/remote_*'),
@@ -191,6 +193,7 @@ NO_RETRY = {'scene3d-faults', 'vulkan-faults', 'vulkan-enumeration', 'vulkan-dev
 # of the rest. host/gui/all keep a quicker check of each area. `affected`
 # still selects one of these when a test script it runs changes.
 PERIODIC = (
+    'gdscript-stack-file-slots-*',
     'gui-overview-small-matrix*',
     'redot-time-demo-gui',
     'remote-unknown-matrix', 'remote-startup-matrix',
@@ -862,6 +865,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         for name in ('frame-host', 'frame-jvm', 'frame-archive', 'mcp', 'mcp-precision', 'mcp-modules', 'macho-mcp', 'mcp-list-pages', 'review-boundaries', 'm1-control', 'm1-source', 'm1-stepping',
                      'breakpoint-policy', 'run-control', 'command-boundary', 'memory-registers', 'memory-search-speed', 'memory-search-ranges', 'restart-pending', 'debug-discovery', 'optimized-info', 'composite-values', 'core-debugging',
                      'm2-profile', 'm2-mappings', 'm2-dynamic-threads', 'syscall-timing',
+                     'profile-from-start',
                      'm2-robustness', 'm2-sampled', 'm2-recorded-views',
                      'm2-archive', 'm2-limits', 'm2-preferences', 'inspections', 'inspection-lifecycle', 'remote-owner-batches', 'shared-sessions', 'shared-cleanup', 'shared-processes', 'static-analysis', 'ghidra-sidecar', 'ghidra-sidecar-real', 'ghidra-sidecar-lifetime', 'ghidra-static-images', 'log-levels',
                      'metadata-ready-validation', 'lsof-top', 'fdactivity', 'runtime-agent', 'runtime-host', 'source-blocks', 'stale-interrupt', 'fork-release', 'process-tree',
@@ -872,6 +876,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('allocation-helper', [sys.executable, '-B', 'tests/allocation-helper.py', './zig-out/bin/xodb-allocation-helper'], 30))
         for name in ('m2-preferences', 'inspections', 'inspection-lifecycle', 'remote-owner-batches', 'shared-sessions', 'shared-processes', 'command-boundary', 'memory-search-speed', 'memory-search-ranges', 'fork-release'):
             steps.append((name + '-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', sys.executable, '-B', f'tests/{name}.py'], 180))
+        steps.append(('profile-from-start-agent', ['env', 'XODB_TEST_RUNTIME_AGENT=./zig-out/bin/xodb-agent', sys.executable, '-B', 'tests/profile-from-start.py'], 180))
         if uprobes:
             for name in ('observations-live', 'observation-recipes', 'observation-associations'):
                 args = [sys.executable, '-B', f'tests/{name}.py', '--helper', './zig-out/bin/xodb-allocation-helper']
@@ -995,6 +1000,11 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps.append(('redot-time', [sys.executable, '-B', 'tests/redot-time.py', '--redot', redot, '--work', '.work/rdt'], 90))
             # A Godot 4 / Redot engine with DWARF: about a gigabyte read once per xodb.
             steps.append(('gdscript-stack', [sys.executable, '-B', 'tests/gdscript-stack.py', '--redot', redot, '--strace', '--work', '.work/gds'], 600))
+            for slots in (4, 2):
+                label = f'gdscript-stack-file-slots-{slots}'
+                steps.append((label, [sys.executable, '-B', 'tests/gdscript-stack.py', '--redot', redot,
+                              '--agent', 'zig-out/bin/xodb-agent', '--file-slots', str(slots),
+                              '--work', '.work/' + label], 600))
             steps.append(('gdscript-demo', [sys.executable, '-B', 'tests/gdscript-demo.py', '--redot', redot, '--work', '.work/gdd'], 600))
             steps.append(('gdscript-values', [sys.executable, '-B', 'tests/gdscript-values.py', '--redot', redot, '--strace', '--work', '.work/gdv'], 600))
             steps.append(('gdscript-demo-values', [sys.executable, '-B', 'tests/gdscript-demo.py', '--redot', redot, '--values', '--work', '.work/gddv'], 600))
@@ -1090,6 +1100,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ('gui-image-transfer', ['tests/image-transfer-gui.py', '--work', '.work/input-imtr']),
             ('gui-nodebug-message', ['tests/nodebug-message.py', '--gui', '--work', '.work/input-ndm']),
             ('gui-profile', ['scripts/gui-smoke.py', '--profile']),
+            ('gui-profile-from-start', ['tests/profile-from-start-gui.py']),
             ('gui-flame-status', ['tests/flame-status-gui.py']),
             ('gui-capture-setup', ['tests/m2-capture-setup.py']),
             ('gui-network-evidence', ['tests/network-evidence.py', '--gui', '--work', '.work/gne']),

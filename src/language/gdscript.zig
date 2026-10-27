@@ -293,7 +293,7 @@ fn moduleError(err: anyerror) error{ GDScriptImageBudgetExceeded, DebugMetadataP
 /// The engine is the main executable, found by the kernel's own record of
 /// its program headers: only the executable's thread-locals have a fixed
 /// place, and an engine's symbol tables are too large for a name scan. The
-/// image is read in full under the image budgets.
+/// Remote layout reads use a types-only section projection under image budgets.
 pub fn runtimeModule(session: *const Context) !Module {
     try session.languages.require(.gdscript);
     try session.refreshMaps();
@@ -529,7 +529,7 @@ pub fn stackWithNative(session: *const Context, a: A, tid: i32, first: usize, na
     const layout = try profile(session, module);
     var memory = Memory{ .context = @constCast(session), .readFn = sessionRead };
     const lang = try language(&memory, layout);
-    const native = native_input orelse try session.stack(a, tid, 64);
+    const native = native_input orelse try session.unwindStack(a, tid, 64);
     if (native.len == 0) return error.InvalidFrame;
     const pointer = (try session.registerValue(tid, "fs_base")) orelse return error.GDScriptThreadPointerUnavailable;
     const head_at = tls.executableAddress(layout.block, pointer, layout.call_stack, 8) catch return error.GDScriptThreadPointerUnavailable;

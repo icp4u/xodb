@@ -161,7 +161,7 @@ pub const Executor = struct {
             self.debugger_process = session.process_id;
             if (self.source) |path| self.debugger.source.load(path) catch {};
         }
-        session.language_tabs.enabled = true;
+        session.language_tabs.request(session);
         session.language_tabs.syncSelection(session.target.snapshot().generation);
     }
     pub fn captureDebugger(self: *Executor, session: *model.Session, inspection: boundary.Inspection) @import("debugger_view.zig").Presentation {

@@ -84,7 +84,7 @@ fn runtimeModule(session: *const Context) !Module {
     // modules or treating a filename as runtime identity.
     const main_phdr = session.mainPhdr();
     if (main_phdr == 0) return error.LuaModuleIdentityUnavailable;
-    const module = session.moduleAt(main_phdr) catch return error.LuaModuleIdentityUnavailable;
+    const module = session.moduleAt(main_phdr) catch |err| return context_api.metadataFailure(err, error.LuaModuleIdentityUnavailable);
     if (module.layouts.lua == null) try singleRuntime(module);
     if (module.symbols().findSymbol("lua_ident") == null) return error.LuaRuntimeUnavailable;
     if (module.symbols().findSymbol("luaV_execute") == null) return error.LuaImplementationUnsupported;
@@ -109,7 +109,7 @@ fn profile(session: *const Context, module: Module) !*const c.struct_xl_layout {
     const version: [3]u8 = if (std.mem.startsWith(u8, file[0..length], "$LuaVersion: Lua 5.4.9 ")) .{ 5, 4, 9 } else if (std.mem.startsWith(u8, file[0..length], "$LuaVersion: Lua 5.2.4 ")) .{ 5, 2, 4 } else return error.LuaVersionUnsupported;
     if (module.layouts.lua == null) {
         var layout: c.struct_xl_layout = undefined;
-        const debug = module.debugInfo() catch return error.LuaDwarfMalformed;
+        const debug = module.debugInfo() catch |err| return context_api.metadataFailure(err, error.LuaDwarfMalformed);
         if (c.xl_layout_build(debug.dwarf, id.ptr, id.len, &version, &layout)) |why| return layoutError(why);
         module.layouts.lua = layout;
     }

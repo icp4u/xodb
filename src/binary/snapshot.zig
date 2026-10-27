@@ -203,7 +203,8 @@ pub const Bytes = []align(std.heap.page_size_min) u8;
 // a capture of the same process, or every followed process that maps one
 // library. The key is the identity the reader already checks around its read;
 // the bytes are read-only once stored.
-const Stamp = struct { device: u64, inode: u64, size: i64, mtime: [2]i64, ctime: [2]i64, remote_boot: ?[36]u8 = null };
+pub const Completeness = enum { full, sections, types };
+const Stamp = struct { device: u64, inode: u64, size: i64, mtime: [2]i64, ctime: [2]i64, remote_boot: ?[36]u8 = null, completeness: Completeness = .full };
 const Shared = struct { stamp: Stamp, offset: u64, bytes: Bytes, holders: usize, sweep_bytes: usize };
 var store_lock: std.atomic.Mutex = .unlocked;
 var store: std.ArrayList(Shared) = .empty;
@@ -265,9 +266,17 @@ pub fn readSweepRange(fd: c_int, file_offset: u64, size: usize, limit: usize, ea
 /// The agent has already validated this original file version. Its transport
 /// memfd has a different inode on every open; that is not the sharing key.
 /// A boot ID separates remote filesystems and keeps local stat keys distinct.
-pub fn readRemoteRange(fd: c_int, file_offset: u64, size: usize, limit: usize, sweep: ?usize, identity: c.struct_xrt_file_identity, boot: ?[36]u8) !Bytes {
-    const key: ?Stamp = if (boot) |id| .{ .device = identity.device, .inode = identity.inode, .size = identity.size, .mtime = .{ identity.mtime_sec, identity.mtime_ns }, .ctime = .{ identity.ctime_sec, identity.ctime_ns }, .remote_boot = id } else null;
+pub fn readRemoteRange(fd: c_int, file_offset: u64, size: usize, limit: usize, sweep: ?usize, identity: c.struct_xrt_file_identity, boot: ?[36]u8, completeness: Completeness) !Bytes {
+    const key: ?Stamp = if (boot) |id| .{ .device = identity.device, .inode = identity.inode, .size = identity.size, .mtime = .{ identity.mtime_sec, identity.mtime_ns }, .ctime = .{ identity.ctime_sec, identity.ctime_ns }, .remote_boot = id, .completeness = completeness } else null;
     return readRangeFor(fd, file_offset, size, limit, null, sweep, key);
+}
+/// Preflight may not charge a second copy of an already retained version.
+pub fn holdsRemote(identity: c.struct_xrt_file_identity, boot: ?[36]u8, size: u64, completeness: Completeness) bool {
+    const key: Stamp = .{ .device = identity.device, .inode = identity.inode, .size = identity.size, .mtime = .{ identity.mtime_sec, identity.mtime_ns }, .ctime = .{ identity.ctime_sec, identity.ctime_ns }, .remote_boot = boot orelse return false, .completeness = completeness };
+    lockStore();
+    defer store_lock.unlock();
+    for (store.items) |item| if (item.offset == 0 and item.bytes.len == size and std.meta.eql(item.stamp, key)) return true;
+    return false;
 }
 fn readRangeFor(fd: c_int, file_offset: u64, size: usize, limit: usize, cancel: ?*const std.atomic.Value(bool), sweep: ?usize, original: ?Stamp) !Bytes {
     var before: c.struct_stat = undefined;
@@ -475,19 +484,23 @@ test "remote sealed images share original identity, not transport descriptors" {
     try std.testing.expectEqual(@as(c_uint, c.XRT_OK), c.xrt_file_identity(files[1], &other));
     try std.testing.expect(identity.inode != other.inode);
     const boot: [36]u8 = "11111111-1111-1111-1111-111111111111".*;
-    const first = try readRemoteRange(files[0], 0, mib, mib, null, identity, boot);
-    const second = try readRemoteRange(files[1], 0, mib, mib, null, identity, boot);
+    const first = try readRemoteRange(files[0], 0, mib, mib, null, identity, boot, .full);
+    const second = try readRemoteRange(files[1], 0, mib, mib, null, identity, boot, .full);
     try std.testing.expectEqual(first.ptr, second.ptr);
     try std.testing.expectEqual(start + mib, used());
     try std.testing.expectEqual(@as(u8, 'z'), second[0]);
+    try std.testing.expect(holdsRemote(identity, boot, mib, .full));
+    try std.testing.expect(!holdsRemote(identity, boot, mib, .sections));
+    try std.testing.expect(!holdsRemote(identity, boot, mib, .types));
     // Different files, versions, boots and local namespaces must not alias.
-    try std.testing.expectError(error.BinarySnapshotLimit, readRemoteRange(files[1], 0, mib, mib, null, other, boot));
+    try std.testing.expectError(error.BinarySnapshotLimit, readRemoteRange(files[1], 0, mib, mib, null, identity, boot, .sections));
+    try std.testing.expectError(error.BinarySnapshotLimit, readRemoteRange(files[1], 0, mib, mib, null, other, boot, .full));
     var changed = identity;
     changed.mtime_sec += 1;
-    try std.testing.expectError(error.BinarySnapshotLimit, readRemoteRange(files[1], 0, mib, mib, null, changed, boot));
-    try std.testing.expectError(error.BinarySnapshotLimit, readRemoteRange(files[1], 0, mib, mib, null, identity, "22222222-2222-2222-2222-222222222222".*));
+    try std.testing.expectError(error.BinarySnapshotLimit, readRemoteRange(files[1], 0, mib, mib, null, changed, boot, .full));
+    try std.testing.expectError(error.BinarySnapshotLimit, readRemoteRange(files[1], 0, mib, mib, null, identity, "22222222-2222-2222-2222-222222222222".*, .full));
     try std.testing.expectError(error.BinarySnapshotLimit, read(files[0], mib, null));
-    try std.testing.expectError(error.BinarySnapshotLimit, readRemoteRange(files[1], 0, mib, mib - 1, null, identity, boot));
+    try std.testing.expectError(error.BinarySnapshotLimit, readRemoteRange(files[1], 0, mib, mib - 1, null, identity, boot, .full));
     free(first);
     for (&files) |*fd| {
         _ = c.close(fd.*);

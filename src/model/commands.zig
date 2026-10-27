@@ -83,9 +83,8 @@ pub fn execute(a: A, session: anytype, connection: u64, service: ?*authority.c.s
             .run_to_source => |run| blk: {
                 if (run.tid <= 0) return error.InvalidArguments;
                 try sourceValid(.{ .path = run.path, .line = run.line });
-                const addresses = try session.sourceAddresses(a, run.path, run.line);
-                if (addresses.len == 0) return error.NoCodeForSourceLine;
-                try session.runToAs(run.tid, addresses[0], null, caller);
+                const address = try session.firstSourceAddress(a, run.path, run.line);
+                try session.runToAs(run.tid, address, null, caller);
                 break :blk "run_to";
             },
             .restart => blk: {

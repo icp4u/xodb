@@ -86,11 +86,23 @@ class Client:
         raise AssertionError('Response timeout')
     def tool(self, tool_name, **args):
         return assert_reply_exact(self.call('tools/call', {'name':tool_name,'arguments':args}))
+    def prepared_tool(self, tool_name, **args):
+        """Raw final reply after image preparation; preserve real refusals."""
+        deadline = time.monotonic() + 30
+        while True:
+            response = self.tool(tool_name, **args)
+            reply = response.get('result', {})
+            if not reply.get('isError') or reply['content'][0]['text'] not in ('DebugMetadataPending', 'SymbolDiscoveryPending'): return response
+            assert time.monotonic() < deadline, response
+            time.sleep(.005)
     def inspect(self, tool_name, **args):
         deadline = time.monotonic() + (900 if tool_name == 'get_language_stack' else 15)
         while True:
             response = self.tool(tool_name, **args)
-            if tool_name == 'get_language_stack' and 'result' in response and response['result'].get('isError') and response['result']['content'][0]['text'] == 'DebugMetadataPending':
+            # inspect requests the settled value; tool remains the raw surface
+            # for tests asserting Pending/cancellation. Generic remote source
+            # loads now share the language metadata worker lifecycle.
+            if 'result' in response and response['result'].get('isError') and response['result']['content'][0]['text'] in ('DebugMetadataPending', 'SymbolDiscoveryPending'):
                 assert time.monotonic() < deadline, response
                 time.sleep(.02)
                 continue
@@ -100,6 +112,10 @@ class Client:
                 continue
             assert 'error' not in response and not response['result']['isError'], response
             data = response['result']['structuredContent']
+            if tool_name == 'get_stack' and any(f.get('diagnostic') == 'DebugMetadataPending' for f in data['frames']):
+                assert time.monotonic() < deadline, response
+                time.sleep(.02)
+                continue
             if tool_name != 'get_flamegraph' or args.get('basis') == 'reconstructed' or not data.get('pending'): return data
             assert time.monotonic() < deadline, data
             args['view_id'] = data['view_id']

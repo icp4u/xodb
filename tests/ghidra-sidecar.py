@@ -275,7 +275,13 @@ def record(case, ok, detail=""):
 
 
 def tool(client, name, **args):
-    response = client.call("tools/call", {"name": name, "arguments": args})
+    deadline = time.monotonic() + 30
+    while True:
+        response = client.call("tools/call", {"name": name, "arguments": args})
+        result = response.get("result", {})
+        if not result.get("isError") or result["content"][0]["text"] not in ("DebugMetadataPending", "SymbolDiscoveryPending"): break
+        assert time.monotonic() < deadline, response
+        time.sleep(.01)
     if "error" in response: return {"_protocol_error": response["error"]["message"]}
     result = response["result"]
     if result.get("isError"): return {"_error": result["content"][0]["text"]}

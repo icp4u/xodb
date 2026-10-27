@@ -237,6 +237,9 @@ pub fn build(b: *std.Build) void {
     const profile = b.addExecutable(.{ .name = "xodb-profile-fixture", .root_module = b.createModule(.{ .target = target, .optimize = .ReleaseSafe, .link_libc = true }) });
     profile.root_module.addCSourceFile(.{ .file = b.path("tests/fixtures/profile.c"), .flags = &.{ "-g", "-gdwarf-4", "-O2", "-fno-omit-frame-pointer", "-mno-omit-leaf-frame-pointer", "-fno-optimize-sibling-calls", "-pthread" } });
     b.installArtifact(profile);
+    const profile_start = b.addExecutable(.{ .name = "xodb-profile-start-fixture", .root_module = b.createModule(.{ .target = target, .optimize = .ReleaseSafe, .link_libc = true }) });
+    profile_start.root_module.addCSourceFile(.{ .file = b.path("tests/fixtures/profile-from-start.c"), .flags = &.{ "-g", "-gdwarf-4", "-O2", "-fno-omit-frame-pointer", "-mno-omit-leaf-frame-pointer", "-fno-optimize-sibling-calls", "-Wall", "-Wextra", "-Werror" } });
+    b.installArtifact(profile_start);
     const lifecycle = b.addExecutable(.{ .name = "xodb-lifecycle-fixture", .root_module = b.createModule(.{ .target = target, .optimize = .Debug, .link_libc = true }) });
     lifecycle.root_module.addCSourceFile(.{ .file = b.path("tests/fixtures/lifecycle.c"), .flags = &.{ "-g", "-O0", "-pthread" } });
     b.installArtifact(lifecycle);
@@ -746,7 +749,7 @@ pub fn build(b: *std.Build) void {
         const libdir = b.option([]const u8, "android-lib-dir", "NDK library directory for the selected Android API") orelse
             @panic("Android requires -Dandroid-lib-dir pointing to the NDK API library directory");
         // Android requires PIE; permit both 4 KiB and 16 KiB page kernels.
-        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, observations, profile, lifecycle, process, fd_fixture, fdscan_tests, fdevent_tests, fdcount_tests, fdactivity_tests, cancel_tests, resolve_tests, gdb_packet_tests, gdb_link_tests, debugserver_tests, gdb_description_tests, gdb_model_tests, fdactivity_live, fdactivity_scope, fd_events, tests, remote_lifecycle_tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests, sysstat_tests, sys_services_tests, memstat_system_tests, memstat_process_tests, memstat_cells_tests, memobserver_tests, perl_tests, python_tests, lua_tests, ruby_tests, elisp_tests, go_tests, javascript_tests, javascript_layout_tests }) |artifact| {
+        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, observations, profile, profile_start, lifecycle, process, fd_fixture, fdscan_tests, fdevent_tests, fdcount_tests, fdactivity_tests, cancel_tests, resolve_tests, gdb_packet_tests, gdb_link_tests, debugserver_tests, gdb_description_tests, gdb_model_tests, fdactivity_live, fdactivity_scope, fd_events, tests, remote_lifecycle_tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests, sysstat_tests, sys_services_tests, memstat_system_tests, memstat_process_tests, memstat_cells_tests, memobserver_tests, perl_tests, python_tests, lua_tests, ruby_tests, elisp_tests, go_tests, javascript_tests, javascript_layout_tests }) |artifact| {
             artifact.root_module.addLibraryPath(.{ .cwd_relative = libdir });
             artifact.pie = true;
             artifact.link_z_max_page_size = 16384;

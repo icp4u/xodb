@@ -4,7 +4,7 @@ memory and checked against the stack the script itself printed.
 Run: python3 tests/gdscript-stack.py --redot /path/to/engine --work out/gd
 The engine must be a debug-enabled build with DWARF (an editor or a
 template_debug binary). Fast lane: about 10 s with a 1.4 GB engine."""
-import argparse, json, os, shutil, subprocess, sys, time
+import argparse, json, os, shlex, shutil, subprocess, sys, time
 from pathlib import Path
 from client import Client
 from helpers.readonly import audit
@@ -17,11 +17,19 @@ p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--redot', required=True, help='engine binary (debug-enabled, with DWARF)')
 p.add_argument('--work', type=Path, required=True)
 p.add_argument('--strace', action='store_true', help='also prove that reading the stack only reads')
+p.add_argument('--agent', type=Path, help='agent binary for the small-file-table regression')
+p.add_argument('--file-slots', type=int, choices=(2, 4), help='exercise ready/cancelled image views in a small agent table (periodic)')
 a = p.parse_args(); root = Path(__file__).resolve().parents[1]; os.chdir(root); os.umask(0o022)
+if a.file_slots and not a.agent: p.error('--file-slots needs --agent')
 w = a.work.resolve(); w.mkdir(parents=True, exist_ok=True); w.chmod(0o755)
+if a.file_slots:
+    wrapper = w/'agent-slots'
+    wrapper.write_text(f'#!/bin/sh\nexec {shlex.quote(str(a.agent.resolve()))} --file-slots {a.file_slots} "$@"\n')
+    wrapper.chmod(0o755)
+    os.environ['XODB_TEST_RUNTIME_AGENT'] = str(wrapper)
 began = time.monotonic()
 engine = Path(a.redot).resolve()
-result = {'status': 'running', 'engine_bytes': engine.stat().st_size}
+result = {'status': 'running', 'engine_bytes': engine.stat().st_size, 'file_slots': a.file_slots}
 if os.environ.get('XODB_TEST_RUNTIME_AGENT'):
     cache = w/'image-cache'; cache.mkdir(mode=0o700)
     os.environ['XDG_CACHE_HOME'] = str(cache)
@@ -30,12 +38,17 @@ if os.environ.get('XODB_TEST_RUNTIME_AGENT'):
 
 def usage(client):
     fields = Path(f'/proc/{client.p.pid}/stat').read_text().rsplit(')', 1)[1].split()
+    peak = next(int(row.split()[1])*1024 for row in Path(f'/proc/{client.p.pid}/status').read_text().splitlines() if row.startswith('VmHWM:'))
     return {'cpu_seconds': (int(fields[11]) + int(fields[12])) / os.sysconf('SC_CLK_TCK'),
-            'rss_bytes': int(Path(f'/proc/{client.p.pid}/statm').read_text().split()[1]) * os.sysconf('SC_PAGESIZE')}
+            'rss_bytes': int(Path(f'/proc/{client.p.pid}/statm').read_text().split()[1]) * os.sysconf('SC_PAGESIZE'),
+            'peak_rss_bytes': peak}
 
 def image_load(client, label, started, before):
     jobs = [j for j in client.inspect('get_debug_metadata')['jobs'] if j['kind'] == 'image' and j['image'] == str(engine)]
     check(len(jobs) == 1 and jobs[0]['state'] == 'ready', jobs)
+    # Layout discovery does not need code, line tables, location/range lists.
+    # This bound is specific to the supplied debug engine, not a time gate.
+    check(jobs[0]['image_total'] < engine.stat().st_size * 3 // 4, jobs)
     result['image_load'].append({'name': label, 'job': jobs[0], 'seconds': time.monotonic() - started,
                                  'before': before, 'after': usage(client)})
 
@@ -73,7 +86,9 @@ def language_stack(client, **args):
         reply = client.tool('get_language_stack', language='gdscript', **args)['result']
         if not reply.get('isError'): return reply['structuredContent'], None
         why = [item['text'] for item in reply['content']]
-        if why[0] not in ('SymbolDiscoveryPending', 'DebugMetadataPending'): return None, why
+        if why[0] not in ('SymbolDiscoveryPending', 'DebugMetadataPending'):
+            result['last_language_failure'] = {'reason': why, 'jobs': client.inspect('get_debug_metadata')['jobs']}
+            return None, why
         check(time.monotonic() < deadline, why); time.sleep(.005)
 def tab(client):
     deadline = time.monotonic() + 120
@@ -83,6 +98,57 @@ def tab(client):
         check(time.monotonic() < deadline, view); time.sleep(.01)
 def shown(stack):
     return [(f['name'], f['file'], f['line']) for f in stack['segments'][0]['frames']]
+def native_stack(client, **args):
+    deadline = time.monotonic() + 120
+    upgrade = None
+    if client.runtime_agent and 'upgrade' not in result:
+        if a.file_slots and 'cancel_recovery' not in result:
+            original, why = language_stack(client, **args)
+            check(original, why)
+            reply = client.tool('get_stack', **args)['result']
+            check(not reply.get('isError') and any(f['diagnostic'] == 'DebugMetadataPending' for f in reply['structuredContent']['frames']), reply)
+            jobs = client.inspect('get_debug_metadata')['jobs']
+            full = [j for j in jobs if j['kind'] == 'image' and j['image'] == str(engine)]
+            check(len(full) == 1, jobs)
+            ident = full[0]['id']
+            client.inspect('cancel_debug_metadata', id=ident)
+            restored, why = language_stack(client, **args)
+            check(restored and shown(restored) == shown(original) and restored['in_script'] == original['in_script'], (restored, why))
+            jobs = client.inspect('get_debug_metadata')['jobs']
+            cancelled = [j for j in jobs if j['id'] == ident]
+            recovered = [j for j in jobs if j['kind'] == 'image' and j['image'] == str(engine) and j['id'] != ident]
+            check(len(cancelled) == 1 and cancelled[0]['state'] == 'cancelled', jobs)
+            check(len(recovered) == 1 and recovered[0]['state'] == 'ready' and recovered[0]['source_bytes'] < 65536, jobs)
+            result['cancel_recovery'] = {'cancelled': cancelled[0], 'recovered': recovered[0], 'usage': usage(client)}
+            client.inspect('retry_debug_metadata', id=ident)
+        before = usage(client)
+        reply = client.tool('get_stack', **args)['result']
+        check(not reply.get('isError') and any(f['diagnostic'] == 'DebugMetadataPending' for f in reply['structuredContent']['frames']), reply)
+        # Observe the completed worker before the next native request adopts
+        # its image and releases the descriptor and progress entry.
+        while True:
+            jobs = client.inspect('get_debug_metadata')['jobs']
+            full = [j for j in jobs if j['kind'] == 'image' and j['image'] == str(engine) and j['image_total'] == engine.stat().st_size]
+            if full and full[0]['state'] == 'ready':
+                upgrade = {'before': before, 'job': full[0]}
+                break
+            check(time.monotonic() < deadline, jobs); time.sleep(.005)
+    while True:
+        frames = client.inspect('get_stack', **args)['frames']
+        if not any(f['diagnostic'] == 'DebugMetadataPending' for f in frames):
+            if upgrade:
+                upgrade['after'] = usage(client)
+                upgrade['held'] = client.inspect('list_modules', limit=1)['image_bytes']
+                cold = result['image_load'][0]['job']
+                size = engine.stat().st_size
+                check(cold['source_bytes'] + upgrade['job']['source_bytes'] <= size * 102 // 100, upgrade)
+                check(upgrade['job']['cached_bytes'] >= cold['image_total'] * 95 // 100, upgrade)
+                check(upgrade['held']['held'] <= size + 64*1024*1024 and upgrade['held']['peak'] <= size + 64*1024*1024, upgrade)
+                check(upgrade['after']['peak_rss_bytes'] <= result['image_load'][0]['before']['rss_bytes'] + size + 128*1024*1024, upgrade)
+                check('memfd:xodb-image-types' not in Path(f'/proc/{client.p.pid}/maps').read_text(), upgrade)
+                result['upgrade'] = upgrade
+            return frames
+        check(time.monotonic() < deadline, frames); time.sleep(.005)
 def matches(stack, truth):
     return shown(stack) == [(f['function'], f['source'], f['line']) for f in truth]
 
@@ -113,7 +179,7 @@ try:
         at_break = any(t['tid'] == pid and t['reason'] == 'breakpoint' for t in session['threads'])
         if stack['in_script'] and scripted is None and at_break:
             scripted = stack
-            native = client.inspect('get_stack', tid=pid, generation=generation)['frames']
+            native = native_stack(client, tid=pid, generation=generation)
             check(native[0]['symbol'] == DELAY, native[0])
             # The engine's own answer, taken on the line where it now sleeps.
             check(matches(stack, truth), (shown(stack), truth))
@@ -157,7 +223,7 @@ try:
             result['script'] = {'frames': shown(stack), 'native_frames': calls, 'memory_reads': stack['memory_reads'], 'memory_bytes': stack['memory_bytes'], 'other_thread_in_script': other['in_script']}
         elif not stack['in_script'] and idle is None and at_break:
             idle = stack
-            native = client.inspect('get_stack', tid=pid, generation=generation)['frames']
+            native = native_stack(client, tid=pid, generation=generation)
             # The probe saw the condition: the same native function, no script above it.
             check(native[0]['symbol'] in (DELAY, FRAME) and not any((f['symbol'] or '').startswith(CALL) for f in native), [f['symbol'] for f in native[:6]])
             check(segment['frames'] == [] and segment['depth'] == 0 and segment['call_stack_size'] == 0 and segment['anchor'] is None and segment['native_call_frames'] == 0, segment)
@@ -176,7 +242,7 @@ try:
         image_load(client, 'warm', image_started, image_before)
         cold, warm = [r['job'] for r in result['image_load']]
         check(cold['source_bytes'] > warm['source_bytes'] and warm['source_bytes'] < 65536, (cold, warm))
-        check(warm['cached_bytes'] > engine.stat().st_size // 2, warm)
+        check(warm['cached_bytes'] >= warm['image_total'] - 65536, warm)
         client.tool('detach', generation=generation); client.close(); client = None
 
     # 2. A budget the engine image does not fit: the refusal says so.

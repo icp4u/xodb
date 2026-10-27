@@ -70,7 +70,17 @@ def run_until(pid, enough, minimum, tids=None, seconds=20):
         time.sleep(.02)
 
 def perf_fds(client):
-    return [os.readlink(p) for p in Path(f'/proc/{client.collector_pid()}/fd').iterdir() if 'perf_event' in os.readlink(p)]
+    found = []
+    for path in Path(f'/proc/{client.collector_pid()}/fd').iterdir():
+        try:
+            target = os.readlink(path)
+        except FileNotFoundError:
+            # A metadata worker may close an unrelated descriptor between
+            # enumeration and readlink. A closed fd cannot be a leaked perf fd.
+            continue
+        if 'perf_event' in target:
+            found.append(target)
+    return found
 
 client = Client('control', fixture, args=['6'])
 try:

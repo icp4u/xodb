@@ -960,6 +960,7 @@ pub const Session = struct {
         self.maps_generation = self.target.snapshot().generation;
     }
     pub fn refreshMaps(self: *Session) !void {
+        defer self.metadata.bind(self);
         if (self.target.gdbRemoteInfo()) |gdb| if (gdb.libraries == .unsupported) {
             const executable = self.modules.gdb_executable orelse return error.GdbLibrariesUnavailable;
             if (self.target.snapshot().state == .stopped and self.modules.loaded.items.len == 0) {
@@ -1136,6 +1137,7 @@ pub const Session = struct {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         const frames = try self.stack(arena.allocator(), tid, frame_index + 2);
+        try language_view.requirePreparedFrames(frames);
         if (frames.len <= frame_index + 1) return error.CallerUnavailable;
         const caller_frame = frames[frame_index + 1];
         const sp = caller_frame.registers[self.target.arch().sp()] orelse return error.CallerUnavailable;
@@ -2042,6 +2044,17 @@ pub const Session = struct {
     /// sweep (see Modules.Reason): what it left unread for a budget is in
     /// `modules.skipped()` afterwards, so "no code" is never silently partial.
     pub fn sourceAddresses(self: *Session, a: std.mem.Allocator, path: []const u8, line: u32) ![]u64 {
+        return self.sourceAddressesFor(a, path, line, false);
+    }
+    /// Run-to needs one location, not a sweep through unrelated images after
+    /// the requested line has already been found. In particular, that sweep
+    /// must not turn a ready user action into a remote metadata wait.
+    pub fn firstSourceAddress(self: *Session, a: std.mem.Allocator, path: []const u8, line: u32) !u64 {
+        const addresses = try self.sourceAddressesFor(a, path, line, true);
+        if (addresses.len == 0) return error.NoCodeForSourceLine;
+        return addresses[0];
+    }
+    fn sourceAddressesFor(self: *Session, a: std.mem.Allocator, path: []const u8, line: u32, first: bool) ![]u64 {
         if (self.target.gdbRemoteInfo()) |gdb| if (gdb.os == .darwin) {
             try self.gdb_map.refreshImages(&self.target);
             const deadline = linux.now() + macho_settle_ns;
@@ -2070,6 +2083,7 @@ pub const Session = struct {
                 key[3] = region.offset;
                 if (tried.contains(key)) continue;
                 const module = self.modules.load(region, .sweep) catch |err| {
+                    if (err == error.DebugMetadataPending) return err;
                     // A budget refusal is the file's; anything else may be one entry of a container.
                     if (err == error.BinarySnapshotLimit) key[3] = whole;
                     try tried.put(a, key, {});
@@ -2102,6 +2116,7 @@ pub const Session = struct {
                 if (seen) continue;
                 if (addresses.items.len == max_line_addresses) return error.SourceLineAddressLimit;
                 try addresses.append(a, address);
+                if (first) return addresses.toOwnedSlice(a);
             }
         }
         if (addresses.items.len == 0) return error.NoCodeForSourceLine;
@@ -2233,6 +2248,9 @@ pub const Session = struct {
         return frames.toOwnedSlice(a);
     }
     pub fn stack(self: *Session, a: std.mem.Allocator, tid: i32, limit: usize) ![]Frame {
+        return self.stackDemand(a, tid, limit, false);
+    }
+    fn stackDemand(self: *Session, a: std.mem.Allocator, tid: i32, limit: usize, unwind_only: bool) ![]Frame {
         defer self.modules.reportBudget();
         if (self.target.snapshot().state != .stopped) return error.NotStopped;
         if (self.target.gdbRemoteInfo()) |gdb| if (gdb.os == .darwin and self.target.arch() == .aarch64) return self.framePointerStack(a, tid, limit, gdb.address_bits);
@@ -2264,10 +2282,11 @@ pub const Session = struct {
             sigcontext_pc = false;
             var frame = Frame{ .architecture = self.target.arch(), .tid = tid, .index = frames.items.len, .pc = pc, .lookup_pc = lookup_pc, .registers = registers };
             const remote = @import("../target/runtime.zig").c.xrt_target_is_remote(self.target.handle);
-            const remote_caller = frames.items.len != 0 and remote;
+            const remote_caller = remote and (frames.items.len != 0 or unwind_only);
             // Remote callers load a whole image only for .debug_frame without
             // usable .eh_frame. A failed classification keeps that caller bounded.
-            // The first frame of a remote target still loads, as before.
+            // Explicit native-stack queries still load the first remote frame.
+            // A language join asks only for symbols/registers/CFI, including it.
             const metadata_only = if (remote_caller)
                 self.modules.prefersUnwindMetadata(frame.lookup_pc) catch true
             else if (remote)
@@ -2406,6 +2425,10 @@ pub const Session = struct {
         return self.frameLocalsAtDepth(a, frames[frame_index], depth);
     }
     pub fn frameLocalsAtDepth(self: *Session, a: std.mem.Allocator, frame: Frame, depth: usize) ![]info.Local {
+        if (frame.diagnostic) |why| {
+            if (std.mem.eql(u8, why, "DebugMetadataPending")) return error.DebugMetadataPending;
+            if (std.mem.eql(u8, why, "DebugMetadataCancelled")) return error.DebugMetadataCancelled;
+        }
         if (depth > frame.inline_frames.len) return error.InvalidInlineDepth;
         if (self.target.snapshot().state != .stopped) return error.NotStopped;
         if (self.target.gdbRemoteInfo()) |gdb| if (gdb.os == .darwin) {
@@ -2471,6 +2494,8 @@ pub const Session = struct {
         }
         if (try @import("../language/go_values.zig").summarize(&self.languageContext(), a, v, &result)) return result;
         const elisp_preview = @import("../language/elisp.zig").preview(&self.languageContext(), a, v) catch |err| blk: {
+            if (err == error.DebugMetadataPending or err == error.DebugMetadataCancelled or
+                err == error.SymbolDiscoveryPending or err == error.SymbolDiscoveryCancelled) return err;
             result.diagnostic = @errorName(err);
             break :blk null;
         };
@@ -2481,6 +2506,8 @@ pub const Session = struct {
             return result;
         }
         const ruby_preview = @import("../language/ruby.zig").preview(&self.languageContext(), a, v) catch |err| blk: {
+            if (err == error.DebugMetadataPending or err == error.DebugMetadataCancelled or
+                err == error.SymbolDiscoveryPending or err == error.SymbolDiscoveryCancelled) return err;
             result.diagnostic = @errorName(err);
             break :blk null;
         };
@@ -2491,6 +2518,8 @@ pub const Session = struct {
             return result;
         }
         const lua_preview = @import("../language/lua.zig").preview(&self.languageContext(), a, v) catch |err| blk: {
+            if (err == error.DebugMetadataPending or err == error.DebugMetadataCancelled or
+                err == error.SymbolDiscoveryPending or err == error.SymbolDiscoveryCancelled) return err;
             result.diagnostic = @errorName(err);
             break :blk null;
         };
@@ -2501,6 +2530,8 @@ pub const Session = struct {
             return result;
         }
         const javascript_preview = @import("../language/javascript.zig").preview(&self.languageContext(), a, v) catch |err| blk: {
+            if (err == error.DebugMetadataPending or err == error.DebugMetadataCancelled or
+                err == error.SymbolDiscoveryPending or err == error.SymbolDiscoveryCancelled) return err;
             result.diagnostic = @errorName(err);
             break :blk null;
         };
@@ -2511,6 +2542,8 @@ pub const Session = struct {
             return result;
         }
         const perl_preview = @import("../language/perl.zig").preview(&self.languageContext(), a, v) catch |err| blk: {
+            if (err == error.DebugMetadataPending or err == error.DebugMetadataCancelled or
+                err == error.SymbolDiscoveryPending or err == error.SymbolDiscoveryCancelled) return err;
             result.diagnostic = @errorName(err);
             break :blk null;
         };
@@ -2522,6 +2555,8 @@ pub const Session = struct {
             return result;
         }
         const python_preview = @import("../language/python.zig").preview(&self.languageContext(), a, v) catch |err| blk: {
+            if (err == error.DebugMetadataPending or err == error.DebugMetadataCancelled or
+                err == error.SymbolDiscoveryPending or err == error.SymbolDiscoveryCancelled) return err;
             result.diagnostic = @errorName(err);
             break :blk null;
         };
@@ -2578,8 +2613,19 @@ pub const Session = struct {
     pub fn evaluateAtDepth(self: *Session, a: std.mem.Allocator, tid: i32, frame_index: usize, depth: usize, text: []const u8) !eval.Value {
         if (frame_index >= 64 or depth > 64) return error.InvalidFrame;
         const frames = try self.stack(a, tid, frame_index + 1);
+        if (frame_index != 0) try language_view.requirePreparedFrames(frames);
         if (frame_index >= frames.len) return error.InvalidFrame;
-        const values = if (depth == 0) self.frameLocals(a, frames[frame_index]) catch &.{} else try self.frameLocalsAtDepth(a, frames[frame_index], depth);
+        // Registers and constants need no DWARF. In particular, a register
+        // logpoint must not lose its value while a remote image is preparing.
+        if (depth == 0) {
+            if (self.evaluateInFrame(a, frames[frame_index], &.{}, text)) |value|
+                return value
+            else |err| if (err != error.UnknownVariable) return err;
+        }
+        const values = if (depth == 0) self.frameLocals(a, frames[frame_index]) catch |err| switch (err) {
+            error.DebugMetadataPending, error.DebugMetadataCancelled => return err,
+            else => &.{},
+        } else try self.frameLocalsAtDepth(a, frames[frame_index], depth);
         return self.evaluateInFrame(a, frames[frame_index], values, text);
     }
     /// Evaluates against a frame from `stack` and its locals (empty when
@@ -2905,10 +2951,11 @@ const LanguageAccess = struct {
         return owner(user).target.gdbRemoteInfo() != null;
     }
     fn mainPhdr(user: *anyopaque) u64 {
-        const rt = @import("../target/runtime.zig").c;
-        var loader = std.mem.zeroes(rt.struct_xrt_loader);
-        _ = rt.xrt_target_loader(owner(user).target.handle, &loader, null);
-        return loader.main_phdr;
+        const session = owner(user);
+        // AT_PHDR is fixed for this image epoch. Reuse the metadata owner's
+        // kernel-proved placement while a background image occupies a file
+        // slot; re-reading auxv can turn that Pending work into false absence.
+        return session.metadata.mainPhdr(session) catch 0;
     }
     fn expectGeneration(user: *anyopaque, generation: u64) !void {
         return owner(user).target.expectGeneration(generation);
@@ -2930,7 +2977,7 @@ const LanguageAccess = struct {
             if (address == 0 or address != mainPhdr(user)) return error.BinaryIdentityUnavailable;
             try session.refreshMaps();
             if (session.modules.cachedAt(address)) |module| return moduleView(module) else |_| {}
-            return moduleView(try session.metadata.mainImage(session, address, .frame));
+            return moduleView(try session.metadata.mainTypes(session, address));
         }
         return moduleView(try session.modules.runtimeAt(address));
     }
@@ -3015,6 +3062,14 @@ const LanguageAccess = struct {
     fn stack(user: *anyopaque, a: std.mem.Allocator, tid: i32, limit: usize) ![]language_view.Frame {
         return owner(user).stack(a, tid, limit);
     }
+    fn unwindStack(user: *anyopaque, a: std.mem.Allocator, tid: i32, limit: usize) ![]language_view.Frame {
+        const frames = try owner(user).stackDemand(a, tid, limit, true);
+        for (frames) |frame| if (frame.diagnostic) |why| {
+            if (std.mem.eql(u8, why, "DebugMetadataPending") or std.mem.eql(u8, why, "SymbolDiscoveryPending"))
+                return error.DebugMetadataPending;
+        };
+        return frames;
+    }
     fn frameLocals(user: *anyopaque, a: std.mem.Allocator, frame: language_view.Frame) ![]info.Local {
         return owner(user).frameLocals(a, frame);
     }
@@ -3048,6 +3103,7 @@ const LanguageAccess = struct {
         .runtime_retained = runtimeRetained,
         .runtime_owns = runtimeOwns,
         .stack = stack,
+        .unwind_stack = unwindStack,
         .frame_locals = frameLocals,
         .evaluate_in_frame = evaluateInFrame,
     };

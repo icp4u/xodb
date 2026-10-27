@@ -9,6 +9,8 @@ struct xrt_file_view {
     const struct xrt_target *target;
     struct xrt_file_identity identity;
     uint64_t remote_id;
+    unsigned char *request;
+    size_t request_size;
     int fd, background;
     enum xrt_file_source source;
     enum xrt_status failure;
@@ -38,6 +40,10 @@ static enum xrt_status file_view_open(const struct xrt_target *t,
         struct xrt_codec wire = xrt_codec(v->bytes, sizeof(v->bytes), false);
         xrt_wire_file_request(&wire, &copy, NULL, 0);
         if (!wire.ok) { free(v); return XRT_INVALID_ARGUMENT; }
+        v->request = malloc(wire.at);
+        if (!v->request) { free(v); return XRT_OUT_OF_MEMORY; }
+        memcpy(v->request, v->bytes, wire.at);
+        v->request_size = wire.at;
         unsigned char meta[128]; size_t size = 0;
         status = xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_FILE_OPEN,
             .args = {XRT_RPC_FILE_SYMBOLS}, .data = v->bytes, .size = wire.at,
@@ -62,6 +68,7 @@ static enum xrt_status file_view_open(const struct xrt_target *t,
     }
     if (status != XRT_OK) {
         if (v->fd >= 0) close(v->fd);
+        free(v->request);
         free(v);
         return status;
     }
@@ -99,11 +106,48 @@ static enum xrt_status file_read_call(struct xrt_file_view *v, const struct xrt_
     return v->background ? xrt_remote_background_file(v->target, call) :
         xrt_remote_call(v->target, call);
 }
+enum xrt_status xrt_file_view_release(struct xrt_file_view *v)
+{
+    if (!v || !v->target || !v->remote_id) return XRT_OK;
+    uint64_t id = v->remote_id;
+    v->remote_id = 0;
+    return remember(v, xrt_remote_call(v->target, &(struct xrt_call){
+        .op = XRT_RPC_FILE_CLOSE, .args = {id}}));
+}
+/* A finished image keeps its original identity and request, not an agent
+ * slot. Re-open only for this check and close even on an identity mismatch.
+ * The borrowed target remains guarded by remote_files until view_close. */
+static enum xrt_status validate_released(struct xrt_file_view *v)
+{
+    uint64_t id = 0;
+    unsigned char meta[128]; size_t size = 0;
+    enum xrt_status status = xrt_remote_call(v->target, &(struct xrt_call){
+        .op = XRT_RPC_FILE_OPEN, .args = {XRT_RPC_FILE_SYMBOLS},
+        .data = v->request, .size = v->request_size, .value = &id,
+        .out = meta, .capacity = sizeof(meta), .length = &size});
+    if (status != XRT_OK) return remember(v, status);
+    struct xrt_codec in = xrt_codec(meta, size, true);
+    struct xrt_file_identity identity = {0};
+    bool regular = false;
+    xrt_codec_bool(&in, &regular);
+    xrt_wire_file_identity(&in, &identity);
+    if (!in.ok || in.at != in.size || !regular || !id || id > UINT32_MAX)
+        return remember(v, xrt_remote_fail(v->target, XRT_PROTOCOL_ERROR));
+    const struct xrt_file_identity *old = &v->identity;
+    if (identity.device != old->device || identity.inode != old->inode ||
+        identity.size != old->size || identity.mtime_sec != old->mtime_sec ||
+        identity.mtime_ns != old->mtime_ns || identity.ctime_sec != old->ctime_sec ||
+        identity.ctime_ns != old->ctime_ns) status = XRT_FILE_CHANGED;
+    enum xrt_status closed = xrt_remote_call(v->target, &(struct xrt_call){
+        .op = XRT_RPC_FILE_CLOSE, .args = {id}});
+    return remember(v, status != XRT_OK ? status : closed);
+}
 enum xrt_status xrt_file_view_validate(struct xrt_file_view *v)
 {
     if (!v) return XRT_INVALID_ARGUMENT;
     if (v->failure != XRT_OK) return v->failure;
     if (!v->target) return remember(v, xrt_file_unchanged(v->fd, &v->identity));
+    if (!v->remote_id) return validate_released(v);
     size_t size = 0;
     enum xrt_status status = file_read_call(v, &(struct xrt_call){
         .op = XRT_RPC_FILE_READ, .args = {v->remote_id, 0, 0}, .length = &size});
@@ -113,6 +157,7 @@ enum xrt_status xrt_file_view_validate_foreground(struct xrt_file_view *v)
 {
     if (!v || !v->target) return xrt_file_view_validate(v);
     if (v->failure != XRT_OK) return v->failure;
+    if (!v->remote_id) return validate_released(v);
     size_t size = 0;
     return remember(v, xrt_remote_call(v->target, &(struct xrt_call){
         .op = XRT_RPC_FILE_READ, .args = {v->remote_id, 0, 0}, .length = &size}));
@@ -126,6 +171,7 @@ enum xrt_status xrt_file_view_read(struct xrt_file_view *v, uint64_t offset,
     if (v->failure != XRT_OK) return v->failure;
     enum xrt_status status;
     if (v->target) {
+        if (!v->remote_id) return XRT_INVALID_ARGUMENT;
         size_t got = 0;
         status = file_read_call(v, &(struct xrt_call){.op = XRT_RPC_FILE_READ,
             .args = {v->remote_id, offset, size}, .out = v->bytes, .capacity = size, .length = &got});
@@ -147,10 +193,10 @@ enum xrt_status xrt_file_view_close(struct xrt_file_view *v)
     if (!v) return XRT_OK;
     enum xrt_status status = XRT_OK;
     if (v->target) {
-        status = xrt_remote_call(v->target, &(struct xrt_call){
-            .op = XRT_RPC_FILE_CLOSE, .args = {v->remote_id}});
+        status = xrt_file_view_release(v);
         __atomic_sub_fetch(&((struct xrt_target *)v->target)->remote_files, 1, __ATOMIC_SEQ_CST);
     } else if (close(v->fd)) status = XRT_FILE_UNAVAILABLE;
+    free(v->request);
     free(v);
     return status;
 }

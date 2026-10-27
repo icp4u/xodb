@@ -12,6 +12,10 @@ const V = std.json.Value;
 const Allocator = std.mem.Allocator;
 pub const definitions = @embedFile("static_tools.json");
 
+test "MCP pseudo-C live values preserve metadata readiness" {
+    try pseudo_values.testMetadataReadiness(livePseudoValues);
+}
+
 pub fn handles(name: []const u8) bool {
     for ([_][]const u8{ "analyze_function", "decompile_function", "get_decomp_mapping", "slice_value", "control_dependencies", "cancel_static_analysis" }) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
     return false;
@@ -54,9 +58,13 @@ fn readSessionMemory(user: *anyopaque, address: u64, bytes: []u8) !usize {
     return session.target.readMemory(address, bytes);
 }
 
-fn livePseudoValues(a: Allocator, session: *Session, analysis: *host.Analysis, tid: i32, frame_index: usize) ![]const pseudo_values.PseudoValue {
+fn livePseudoValues(a: Allocator, session: anytype, analysis: *host.Analysis, tid: i32, frame_index: usize) ![]const pseudo_values.PseudoValue {
     const frame_count = std.math.add(usize, frame_index, 1) catch return &.{};
-    const frames = session.stack(a, tid, frame_count) catch return &.{};
+    const frames = session.stack(a, tid, frame_count) catch |err| {
+        try pseudo_values.metadataFailure(err);
+        return &.{};
+    };
+    for (frames) |frame| try pseudo_values.frameMetadata(frame);
     if (frame_index >= frames.len) return &.{};
     const frame = frames[frame_index];
     const link_pc = frame.lookup_pc -% analysis.function.bias;
@@ -64,7 +72,10 @@ fn livePseudoValues(a: Allocator, session: *Session, analysis: *host.Analysis, t
     // parameter may share a name and shadow it at depth 0, so match only the
     // concrete subprogram's DWARF, and refuse when inline scopes are unknown.
     if (frame.inline_diagnostic != null) return &.{};
-    const locals = session.frameLocalsAtDepth(a, frame, frame.inline_frames.len) catch return &.{};
+    const locals = session.frameLocalsAtDepth(a, frame, frame.inline_frames.len) catch |err| {
+        try pseudo_values.metadataFailure(err);
+        return &.{};
+    };
     // A matched CFA-relative address remains an exact current-memory fact in
     // outer frames; changes through a callee alias are part of that value.
     const memory: ?pseudo_values.LiveMemory = .{ .user = session, .read = readSessionMemory };

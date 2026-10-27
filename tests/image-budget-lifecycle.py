@@ -234,7 +234,7 @@ class T:
         print(json.dumps(r), flush=True); return r
     def line(self, process=1, label='line search'):
         s = self.settle(process); t = time.monotonic()
-        reply = self.client.tool('run_to', process_id=process, generation=s['generation'], tid=self.tid(process), file='no_such_file_anywhere.c', line=3)['result']
+        reply = self.client.prepared_tool('run_to', process_id=process, generation=s['generation'], tid=self.tid(process), file='no_such_file_anywhere.c', line=3)['result']
         return self.row(label, process, seconds=round(time.monotonic() - t, 2), reply=text(reply)[:330])
     def capture(self, process=1, stop=False):
         s = self.settle(process); t = time.monotonic()
@@ -353,7 +353,7 @@ def run(case):
             else:
                 # The search retains its own image references; the restart
                 # below clears them before replacement releases the capture.
-                reply = t.client.tool('run_to', generation=t.settle()['generation'], tid=t.tid(), file='no_such_file_anywhere.c', line=3)['result']
+                reply = t.client.prepared_tool('run_to', generation=t.settle()['generation'], tid=t.tid(), file='no_such_file_anywhere.c', line=3)['result']
                 assert reply['isError'] and 'images not searched' in text(reply) and 'release_profile' in text(reply), reply
             (w/'lib.c').write_text(LIB + 'int rebuilt_once;\n')
             new = build_lib(w, 5, 2*MIB, 'own.so.new'); os.replace(new, own)

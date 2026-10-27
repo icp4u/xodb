@@ -120,7 +120,7 @@ fn overBudget(err: anyerror) bool {
     return err == error.BinarySnapshotLimit or err == error.SymbolSnapshotLimit;
 }
 fn moduleError(comptime language: Language, err: anyerror) anyerror {
-    if (err == error.SymbolDiscoveryPending or err == error.SymbolDiscoveryCancelled or err == error.SymbolDiscoveryBudgetExceeded or err == error.RemoteCancelled or err == error.RemoteOutcomeUnknown) return err;
+    if (err == error.DebugMetadataPending or err == error.DebugMetadataCancelled or err == error.SymbolDiscoveryPending or err == error.SymbolDiscoveryCancelled or err == error.SymbolDiscoveryBudgetExceeded or err == error.RemoteCancelled or err == error.RemoteOutcomeUnknown) return err;
     return switch (language) {
         .python => if (overBudget(err)) error.PythonImageBudgetExceeded else error.PythonModuleIdentityUnavailable,
         .perl => if (overBudget(err)) error.PerlImageBudgetExceeded else error.PerlModuleIdentityUnavailable,
@@ -197,6 +197,7 @@ pub fn process(comptime language: Language, session: *model.Session) !Binding {
 }
 /// A direct stack request never borrows another thread's runtime witness.
 pub fn thread(comptime language: Language, session: *model.Session, a: A, tid: i32, native: []const model.Frame, first: usize) !Binding {
+    try @import("../language/context.zig").requirePreparedFrames(native);
     const state = &session.language_bindings;
     const scan = try state.prepare(session, language);
     const generation = state.key.?.generation;

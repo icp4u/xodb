@@ -44,9 +44,25 @@ try:
                               '--attach', str(target.pid), '--image-limit', '1G'])
     stopped = d.wait(lambda s: s['state'] == 'stopped', seconds=30)
     assert stopped, d.tail()
+    # The selected native top frame now has its own generic image job. Let
+    # that inspection settle so Esc targets the deliberate slow image below.
+    deadline = time.monotonic() + 30
+    while True:
+        stack = d.tool('get_stack', tid=target.pid)
+        if not any(f.get('diagnostic') == 'DebugMetadataPending' for f in stack['frames']): break
+        assert time.monotonic() < deadline, stack
+        time.sleep(.005)
+    deadline = time.monotonic() + 30
+    while True:
+        main = d.request('tools/call', {'name': 'find_symbol', 'arguments': {'name': 'main'}})
+        if not main.get('isError'): break
+        assert main['content'][0]['text'] == 'SymbolDiscoveryPending' and time.monotonic() < deadline, main
+        time.sleep(.005)
     def request_image():
-        reply = d.request('tools/call', {'name': 'get_language_stack',
-                          'arguments': {'tid': target.pid, 'language': 'gdscript'}})
+        # Explicit source needs the complete file; the layout-only language
+        # request deliberately no longer transfers this unrelated payload.
+        reply = d.request('tools/call', {'name': 'get_source_location',
+                          'arguments': {'address': main['structuredContent']['address']}})
         assert reply.get('isError') and reply['content'][0]['text'] == 'DebugMetadataPending', reply
     request_image()
     deadline = time.monotonic() + 30

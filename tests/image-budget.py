@@ -72,7 +72,7 @@ def stack(client, session, tid):
                        if f['inline_diagnostic'] in ('DebugMetadataNotLoaded', 'NoDebugInfo') and f['lookup_pc'] not in requested]
             for pc in missing:
                 requested.add(pc)
-                reply = client.tool('get_source_location', address=hex(pc))['result']
+                reply = client.prepared_tool('get_source_location', address=hex(pc))['result']
                 if reply.get('isError'):
                     texts = [c['text'] for c in reply['content']]
                     assert texts[0] in ('BinarySnapshotLimit', 'CompressedDebugBudget', 'NoDebugInfo', 'NoDebugInfoAtAddress', 'NoSourceAtAddress'), reply

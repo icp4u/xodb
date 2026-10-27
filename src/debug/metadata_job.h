@@ -36,6 +36,14 @@ struct xmd_job;
  * the bounded managed range cache. Not an exact original-file byte copy.
  * Successful start owns the pinned view; result fd is borrowed until destroy. */
 enum xbo_status xmd_start_image(struct xrt_file_view *, struct xmd_job **);
+/* Types-only derived ELF: missing sections are unadvertised. Never use this
+ * view for source, code, locations or native-frame metadata. */
+enum xbo_status xmd_start_types(struct xrt_file_view *, struct xmd_job **);
+/* Complete-file preparation for generic ELF/container readers. Same lifetime,
+ * cancellation and 2 GiB transport bound; interpretation happens after join. */
+enum xbo_status xmd_start_file(struct xrt_file_view *, struct xmd_job **);
+/* Full ELF upgrade through the range cache populated by a types projection. */
+enum xbo_status xmd_start_file_cached(struct xrt_file_view *, struct xmd_job **);
 enum xbo_status xmd_image_result(struct xmd_job *, int *fd);
 /* Optional range_cache_fd is borrowed and duplicated, or -1 for uncached.
  * The caller selects a private regular cache and grants a finite file quota.
