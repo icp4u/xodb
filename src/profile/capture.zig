@@ -8,6 +8,15 @@ const Arch = @import("../target/arch.zig").Arch;
 pub fn perfFile(arch: Arch) ?records.PerfFile {
     return records.perfFile(@intFromEnum(arch));
 }
+/// Syscall names and the raw_syscalls layout are the x86-64 ABI. Other
+/// architectures keep CPU sampling and refuse this option by name.
+pub fn requireSyscallTiming(arch: Arch) !void {
+    if (arch != .x86_64) return error.SyscallTimingUnsupportedArchitecture;
+}
+const x86_syscall_number_abi = "x86-64 syscall ABI; raw tracepoints do not distinguish int 0x80 compatibility calls; such names require separate ABI confirmation";
+const x86_syscall_scope = "fixed explicitly selected x86-64 threads; no inherited children; syscall arguments are discarded";
+const other_syscall_number_abi = "syscall names are not recorded on this architecture";
+const other_syscall_scope = "syscall timing is not recorded on this architecture";
 const modules = @import("../model/modules.zig");
 const info = @import("../debug/info.zig");
 const activity = @import("activity.zig");
@@ -152,6 +161,10 @@ pub const Capture = struct {
     pub fn openTarget(target: ?*const @import("../target/runtime.zig").c.struct_xrt_target, a: std.mem.Allocator, id: u64, session_id: u64, generation: u64, image_epoch: u64, pid: i32, map_tid: i32, config: Config, debugger_ids: []const u64, started_ns: u64) !Opened {
         try config.validate();
         if (config.tids.len == 0 or config.tids.len != debugger_ids.len) return error.InvalidProfileConfig;
+        const rt = @import("../target/runtime.zig");
+        const arch = std.enums.fromInt(Arch, rt.c.xrt_target_arch(target).*.machine) orelse return error.ProfilingUnsupportedArchitecture;
+        if (config.syscall_timing) try requireSyscallTiming(arch);
+        const perf_regs = perfFile(arch) orelse return error.ProfilingUnsupportedArchitecture;
         var images = modules.Modules.init(a);
         images.immutable = true;
         images.target = target;
@@ -173,9 +186,6 @@ pub const Capture = struct {
         errdefer user_state.deinit(a);
         const syscall_ring_bytes = if (config.syscall_timing) syscall_perf.ringBytes(config.tids.len) else 0;
         if (syscall_ring_bytes >= config.ring_budget_bytes) return error.SyscallRingBudget;
-        const rt = @import("../target/runtime.zig");
-        const arch = std.enums.fromInt(Arch, rt.c.xrt_target_arch(target).*.machine) orelse return error.ProfilingUnsupportedArchitecture;
-        const perf_regs = perfFile(arch) orelse return error.ProfilingUnsupportedArchitecture;
         const opened = try perf.start(a, .{ .target = @ptrCast(target), .follow_threads = config.follow_threads, .tids = config.tids, .frequency_hz = config.frequency_hz, .max_frames = 64, .mmap_data = true, .data_pages = ringPages(config.tids.len), .ring_budget_bytes = config.ring_budget_bytes - syscall_ring_bytes, .max_sides = perf.max_sides_cap, .context_switch = config.context_switch, .user_regs_mask = if (config.user_stack_bytes != 0) perf_regs.mask else 0, .user_stack_bytes = config.user_stack_bytes });
         switch (opened) {
             .failed => |failure| {
@@ -198,6 +208,7 @@ pub const Capture = struct {
                         images.deinit();
                         history.deinit(a);
                         a.destroy(self);
+                        if (std.mem.eql(u8, full.syscall, "syscalls.architecture")) return error.SyscallTimingUnsupportedArchitecture;
                         return .{ .failed = full };
                     },
                 };
@@ -336,13 +347,14 @@ pub const Capture = struct {
         finished: bool,
         unread_possible: bool,
         discarded_basis: []const u8 = "decoded spans rejected by storage; unread ring records are not counted",
-        number_abi: []const u8 = "x86-64 assumed from the supported target; raw tracepoints do not distinguish int 0x80 compatibility calls; such names require separate ABI confirmation",
-        scope: []const u8 = "fixed explicitly selected x86-64 threads; no inherited children; syscall arguments are discarded",
+        number_abi: []const u8 = other_syscall_number_abi,
+        scope: []const u8 = other_syscall_scope,
         basis: []const u8 = "entry/exit CLOCK_MONOTONIC elapsed time, including off-CPU and debugger stops; scheduling overlap is observed context, not a wait cause",
     };
     pub fn syscallSummary(self: *const Capture) SyscallSummary {
         const calls = &self.syscalls;
-        return .{ .enabled = calls.enabled, .retained = calls.items.items.len, .limit = calls.limit, .lost = calls.lost, .throttles = calls.throttles, .discarded = calls.discarded, .invalid = calls.invalid, .finished = calls.finished, .unread_possible = calls.unread_possible };
+        const x86 = self.architecture == .x86_64;
+        return .{ .enabled = calls.enabled, .retained = calls.items.items.len, .limit = calls.limit, .lost = calls.lost, .throttles = calls.throttles, .discarded = calls.discarded, .invalid = calls.invalid, .finished = calls.finished, .unread_possible = calls.unread_possible, .number_abi = if (x86) x86_syscall_number_abi else other_syscall_number_abi, .scope = if (x86) x86_syscall_scope else other_syscall_scope };
     }
     fn firstSkippedSample(self: *const Capture) ?usize {
         const entry = self.user_state.first_skipped orelse return null;

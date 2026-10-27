@@ -43,7 +43,10 @@ variants.add_argument('--companions', action='store_true')
 variants.add_argument('--large-companions', action='store_true')
 variants.add_argument('--full-dwarf', action='store_true')
 p.add_argument('--wrong-result', action='store_true')
+p.add_argument('--agent', type=Path, help='agent binary for --file-slots')
+p.add_argument('--file-slots', type=int, help='chain over an agent with this many file slots')
 a = p.parse_args()
+assert not a.file_slots or a.agent, '--file-slots needs --agent'
 root = Path(__file__).resolve().parents[1]
 os.chdir(root)
 os.umask(0o022)
@@ -92,7 +95,8 @@ elif a.mixed:
     assert eh is not None and eh > 4, eh
     assert frame not in (None, 0), frame
     assert section_size(w/'library.so', b'.debug_info') is None
-count = 66 if a.eviction else 4 if a.debug_frame or a.mixed or companions else 12
+tiny = a.file_slots is not None and a.file_slots <= 2
+count = 4 if tiny else 66 if a.eviction else 4 if a.debug_frame or a.mixed or companions else 12
 for i in range(count):
     path = w/f'lib{i:02}.so'
     shutil.copyfile(w/'library.so', path)
@@ -126,6 +130,13 @@ for i in range(count):
 fixture = w/'fixture'
 subprocess.run(['cc', *flags, '-g', '-Itests', 'tests/fixtures/module-unwind.c', '-ldl', '-o', str(fixture)], check=True, timeout=30)
 os.environ['XODB_BIN'] = str(a.binary.resolve())
+if a.file_slots:
+    # The hidden agent option shrinks its file table. The unwind budget must
+    # follow the advertised count; a fixed cap would fill the table.
+    wrapper = w/'agent-slots'
+    wrapper.write_text(f'#!/bin/sh\nexec {a.agent.resolve()} --file-slots {a.file_slots} "$@"\n')
+    wrapper.chmod(0o755)
+    os.environ['XODB_TEST_RUNTIME_AGENT'] = str(wrapper)
 
 
 def usage(pid):
@@ -147,7 +158,7 @@ def action(client, name, **arguments):
 
 
 # These variants were sized against a 256 MiB image and 512 MiB total budget.
-c = Client('control', str(fixture), args=[str(w), str(w/'oracle'), str(count), 'eviction' if a.eviction else 'chain'], options=['--image-limit', '256M', '--image-total-limit', '512M'])
+c = Client('control', str(fixture), args=[str(w), str(w/'oracle'), str(count), 'eviction' if a.eviction or tiny else 'chain'], options=['--image-limit', '256M', '--image-total-limit', '512M'])
 report = dict(status='running', baseline=a.baseline, eviction=a.eviction, budget=a.budget, debug_frame=a.debug_frame, mixed=a.mixed, companions=companions, full_dwarf=a.full_dwarf, stacks=[])
 try:
     c.stopped()
@@ -156,7 +167,7 @@ try:
     stopped = c.stopped('breakpoint')
     report['before'] = usage(c.p.pid)
     original_id = None
-    for index in range(count+2 if a.eviction else 20 if companions else 3 if a.full_dwarf else 1):
+    for index in range(count if tiny else count+2 if a.eviction else 20 if companions else 3 if a.full_dwarf else 1):
         expected = [int(pc,16) for pc in (w/'oracle').read_text().splitlines()]
         if a.wrong_result:
             expected[0] += 1
@@ -174,6 +185,15 @@ try:
             assert any(f.get('diagnostic')=='DebugMetadataBudgetLimit' for f in frames), stack
         elif a.eviction and index == count+1:
             assert any(f.get('diagnostic') in ('BinaryChangedDuringRead', 'DebugMetadataFileChanged') for f in frames), stack
+        elif tiny:
+            # The retained unwind view fills the table before the next maps
+            # read. That read may be skipped; the stack call must not fail.
+            assert frames and frames[0].get('symbol') == 'unwind_stop', stack
+        elif a.file_slots:
+            diagnostics = [f.get('diagnostic') for f in frames]
+            assert 'AgentFileSlotLimit' not in diagnostics and 'DebugMetadataJobLimit' in diagnostics, stack
+            actual = [int(f['pc'],16) if isinstance(f['pc'],str) else f['pc'] for f in frames[2:2+len(expected)]]
+            assert actual and actual == expected[:len(actual)], (index, actual, expected, stack)
         else:
             actual = [int(f['pc'],16) if isinstance(f['pc'],str) else f['pc'] for f in frames[2:2+len(expected)]]
             assert actual == expected, (index, actual, expected, stack)
@@ -185,7 +205,7 @@ try:
                 assert all(f['unwind_method']=='debug_frame' for f in frames[2:2+count]), stack
             if a.debug_frame:
                 assert not any(j['image'].endswith('lib00.so') for j in metadata), metadata
-            if index == 0 and not a.budget and not a.debug_frame and not a.mixed and not a.full_dwarf:
+            if index == 0 and not a.budget and not a.debug_frame and not a.mixed and not a.full_dwarf and not a.file_slots:
                 assert any(j['image'].endswith('lib00.so') and j['state']=='ready' for j in metadata), metadata
                 original_id = next(j['id'] for j in metadata if j['image'].endswith('lib00.so'))
             if a.eviction and index == 2:
@@ -205,7 +225,7 @@ try:
                 stat = changed.stat()
                 os.utime(changed, ns=(stat.st_atime_ns, stat.st_mtime_ns+1_000_000_000))
         report['stacks'].append(dict(index=index, expected=expected, stack=stack, jobs=metadata, usage=usage(c.p.pid)))
-        if a.eviction and index < count+1:
+        if (a.eviction and index < count+1) or (tiny and index < count-1):
             action(c, 'continue')
             stopped = c.stopped('breakpoint')
     if a.full_dwarf:

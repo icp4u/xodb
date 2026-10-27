@@ -1670,6 +1670,31 @@ test "non-x86 captures are not written as x86 archives" {
     try std.testing.expectError(error.ArchiveUnsupportedArchitecture, encode(a, source, .{}));
 }
 
+test "syscall summary names the x86-64 ABI only on x86-64" {
+    const a = std.testing.allocator;
+    const fixture = @import("archive_fixture.zig");
+    const source = try fixture.build(a, .empty, null);
+    defer source.deinit();
+    const x86 = source.syscallSummary();
+    try std.testing.expect(std.mem.indexOf(u8, x86.number_abi, "int 0x80") != null);
+    try std.testing.expect(std.mem.indexOf(u8, x86.scope, "x86-64 threads") != null);
+    try std.testing.expect(std.mem.indexOf(u8, x86.number_abi, "assumed from the supported target") == null);
+    source.architecture = .aarch64;
+    const arm = source.syscallSummary();
+    try std.testing.expect(std.mem.indexOf(u8, arm.number_abi, "x86-64") == null);
+    try std.testing.expect(std.mem.indexOf(u8, arm.scope, "x86-64") == null);
+    try std.testing.expect(std.mem.indexOf(u8, arm.number_abi, "not recorded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, arm.scope, "not recorded") != null);
+    source.architecture = .loongarch64;
+    const loong = source.syscallSummary();
+    try std.testing.expectEqualStrings(arm.number_abi, loong.number_abi);
+    try std.testing.expectEqualStrings(arm.scope, loong.scope);
+    try std.testing.expectError(error.SyscallTimingUnsupportedArchitecture, capture_model.requireSyscallTiming(.aarch64));
+    try std.testing.expectError(error.SyscallTimingUnsupportedArchitecture, capture_model.requireSyscallTiming(.loongarch64));
+    try std.testing.expectError(error.SyscallTimingUnsupportedArchitecture, capture_model.requireSyscallTiming(.riscv64));
+    try capture_model.requireSyscallTiming(.x86_64);
+}
+
 test "x86 archives reject ARM64 images even with a matching asset identity" {
     const a = std.testing.allocator;
     const fixture = @import("archive_fixture.zig");

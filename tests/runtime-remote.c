@@ -924,9 +924,139 @@ static void legacy_reads(const char *agent, const char *self)
     CHECK(cache_stats(t).rpc_reads == before.rpc_reads + 2 && cache_stats(t).hits == before.hits);
     OK(xrt_target_destroy(t));
 }
+static enum xrt_status open_boot(struct xrt_target *t, uint64_t *handle)
+{
+    struct xrt_file_request request = {.kind = XRT_FILE_BOOT_ID};
+    unsigned char encoded[128];
+    struct xrt_codec wire = xrt_codec(encoded, sizeof(encoded), false);
+    xrt_wire_file_request(&wire, &request, NULL, 0);
+    CHECK(wire.ok);
+    unsigned char meta[128];
+    return xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_FILE_OPEN, .data = encoded,
+        .size = wire.at, .value = handle, .out = meta, .capacity = sizeof(meta)});
+}
+static void close_boot(struct xrt_target *t, uint64_t handle)
+{
+    OK(xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_FILE_CLOSE, .args = {handle}}));
+}
+/* A four-slot table must refuse the fifth open. Passing while the scan still
+ * uses the compiled 32-slot constant means the hook was ignored. */
+static void small_file_slots(const char *agent)
+{
+    const char *transport[] = {agent, "--file-slots", "4", "--stdio", NULL};
+    struct xrt_target *t = NULL;
+    OK(xrt_target_remote(transport, &t));
+    CHECK(xrt_target_file_slots(t) == 4);
+    uint64_t handles[4];
+    for (unsigned i = 0; i < 4; ++i)
+        OK(open_boot(t, &handles[i]));
+    uint64_t extra = 0;
+    CHECK(open_boot(t, &extra) == XRT_FILE_SLOT_LIMIT);
+    close_boot(t, handles[0]);
+    OK(open_boot(t, &handles[0]));
+    for (unsigned i = 0; i < 4; ++i)
+        close_boot(t, handles[i]);
+    OK(xrt_target_destroy(t));
+    puts("C file slots: hidden table of 4 refuses the fifth open");
+}
+static void clamped_file_slots(const char *agent)
+{
+    const char *transport[] = {agent, "--file-slots", "100", "--stdio", NULL};
+    struct xrt_target *t = NULL;
+    OK(xrt_target_remote(transport, &t));
+    CHECK(xrt_target_file_slots(t) == XRT_AGENT_FILE_SLOTS);
+    OK(xrt_target_destroy(t));
+    puts("C file slots: a request above 32 is clamped");
+}
+static void exhausted_file_ids(const char *agent)
+{
+    const char *transport[] = {agent, "--file-slots", "4", "--next-file", "4294967295", "--stdio", NULL};
+    struct xrt_target *t = NULL;
+    OK(xrt_target_remote(transport, &t));
+    CHECK(xrt_target_file_slots(t) == 4);
+    uint64_t handle = 0;
+    CHECK(open_boot(t, &handle) == XRT_FILE_UNAVAILABLE);
+    CHECK(open_boot(t, &handle) == XRT_FILE_UNAVAILABLE);
+    OK(xrt_target_destroy(t));
+    puts("C file slots: id exhaustion reports file unavailable and keeps the link");
+}
+static int status_proxy(const char *agent, bool break_header)
+{
+    int pair[2];
+    CHECK(!socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair));
+    pid_t child = fork();
+    CHECK(child >= 0);
+    if (!child) {
+        CHECK(dup2(pair[1], STDIN_FILENO) >= 0 && dup2(pair[1], STDOUT_FILENO) >= 0);
+        close(pair[0]);
+        close(pair[1]);
+        execl(agent, agent, "--stdio", (char *)NULL);
+        _exit(127);
+    }
+    close(pair[1]);
+    int streams[] = {STDIN_FILENO, STDOUT_FILENO, pair[0]};
+    for (unsigned i = 0; i < 3; ++i) {
+        int flags = fcntl(streams[i], F_GETFL);
+        CHECK(flags >= 0 && !fcntl(streams[i], F_SETFL, flags | O_NONBLOCK));
+    }
+    unsigned char *body = malloc(XRT_WIRE_MAX_BODY);
+    CHECK(body);
+    bool once = false;
+    for (;;) {
+        struct xrt_wire_frame frame;
+        enum xrt_wire_result got = xrt_wire_read(STDIN_FILENO, &frame, body, XRT_WIRE_MAX_BODY, 10000);
+        if (got == XRT_WIRE_EOF)
+            break;
+        CHECK(got == XRT_WIRE_OK);
+        CHECK(xrt_wire_write(pair[0], &frame, body, 10000) == XRT_WIRE_OK);
+        CHECK(xrt_wire_read(pair[0], &frame, body, XRT_WIRE_MAX_BODY, 10000) == XRT_WIRE_OK);
+        if (!once && frame.op == XRT_RPC_FILE_OPEN) {
+            /* flags 0 is a request-shaped reply. The wire accepts it; the
+             * host must still close the link. flags above 1 never leave the
+             * wire reader, so they do not exercise that check. */
+            if (break_header)
+                frame.flags = 0;
+            else {
+                frame.status = 200;
+                if (frame.size)
+                    memset(body, 0xa5, frame.size);
+            }
+            once = true;
+        }
+        CHECK(xrt_wire_write(STDOUT_FILENO, &frame, body, 10000) == XRT_WIRE_OK);
+    }
+    free(body);
+    close(pair[0]);
+    int status = 0;
+    CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    return 0;
+}
+static void unknown_agent_status(const char *agent, const char *self, bool break_header)
+{
+    const char *transport[] = {self, break_header ? "--broken-header-proxy" : "--unknown-status-proxy", agent, NULL};
+    struct xrt_target *t = NULL;
+    OK(xrt_target_remote(transport, &t));
+    struct xrt_file_request request = {.kind = XRT_FILE_BOOT_ID};
+    int fd = -1;
+    enum xrt_status status = xrt_target_file(t, &request, &fd);
+    if (break_header) {
+        CHECK(status == XRT_PROTOCOL_ERROR);
+        CHECK(xrt_target_file(t, &request, &fd) == XRT_PROTOCOL_ERROR);
+        puts("C file slots: a malformed reply still closes the link");
+    } else {
+        CHECK(status == XRT_UNSUPPORTED_MODE && fd < 0);
+        OK(xrt_target_file(t, &request, &fd));
+        CHECK(fd >= 0);
+        close(fd);
+        puts("C file slots: an unknown status refuses one call and leaves the link up");
+    }
+    OK(xrt_target_destroy(t));
+}
 int main(int argc, char **argv)
 {
     if (argc == 3 && !strcmp(argv[1], "--delay-proxy")) return delayed_proxy(argv[2], false, false, false);
+    if (argc == 3 && !strcmp(argv[1], "--unknown-status-proxy")) return status_proxy(argv[2], false);
+    if (argc == 3 && !strcmp(argv[1], "--broken-header-proxy")) return status_proxy(argv[2], true);
     if (argc == 3 && !strcmp(argv[1], "--symbol-delay-proxy")) return delayed_proxy(argv[2], true, false, false);
     if (argc == 3 && !strcmp(argv[1], "--short-page-proxy")) return delayed_proxy(argv[2], false, true, false);
     if (argc == 3 && !strcmp(argv[1], "--legacy-cache-proxy")) return delayed_proxy(argv[2], false, false, true);
@@ -990,6 +1120,13 @@ int main(int argc, char **argv)
         return 0;
     }
     assert(prctl(PR_SET_CHILD_SUBREAPER, 1) == 0);
+    if (argc == 2) {
+        small_file_slots(argv[1]);
+        clamped_file_slots(argv[1]);
+        exhausted_file_ids(argv[1]);
+        unknown_agent_status(argv[1], self, false);
+        unknown_agent_status(argv[1], self, true);
+    }
     if (argc == 3 && !strncmp(argv[2], "--unstable", 10)) {
         const bool good = unstable_reads(argv[1], false, !strcmp(argv[2], "--unstable-wrong"));
         CHECK(unstable_reads(argv[1], true, false));

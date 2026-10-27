@@ -29,7 +29,13 @@ struct xrt_read_cache_stats {
 bool xrt_target_read_cache_stats(const struct xrt_target *, struct xrt_read_cache_stats *);
 const struct xrt_arch *xrt_target_arch(const struct xrt_target *);
 /* Standalone service. All ptrace work runs on this one calling OS thread.
- * Input/output must be nonblocking private streams. Stop is optional. */
+ * Input/output must be nonblocking private streams. Stop is optional.
+ * The two hooks below are for tests. The agent executable accepts them as
+ * hidden arguments and does not list them in its usage text. Call them
+ * before serve. Zero slots are rejected; a count above the compiled table
+ * is clamped. next_file may be UINT32_MAX. */
+int xrt_agent_configure_file_slots(uint32_t slots);
+void xrt_agent_configure_next_file(uint32_t next_file);
 int xrt_agent_serve(int input, int output, const volatile sig_atomic_t *stop);
 /* Fixed correlation from the shortest of four HELLO round trips. Uncertainty
  * is half that round trip; clock drift after connection is not measured. */

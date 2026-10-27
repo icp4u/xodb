@@ -400,12 +400,16 @@ static enum xrt_status invoke(const struct xrt_target *target, const struct xrt_
         (void)broken(c, status);
         return mutation ? XRT_REMOTE_OUTCOME_UNKNOWN : status;
     }
-    /* Statuses above the ambiguous-match value are host-local, except the
-     * appended file-slot refusal, which a current agent sends. */
+    /* A malformed frame still ends the connection. Statuses above the
+     * ambiguous-match value are host-local, except the appended file-slot
+     * refusal. Any other unknown agent status refuses this call only: the
+     * stream stays up, and a body this host does not know is not decoded.
+     * A mutation may have happened, so its outcome is unknown, not refused. */
     if (reply.flags != 1 || reply.request != frame.request || reply.op != frame.op ||
-        reply.target != frame.target ||
-        (reply.status > XRT_AMBIGUOUS_MATCH && reply.status != XRT_FILE_SLOT_LIMIT))
+        reply.target != frame.target)
         return invalid_reply(c, mutation);
+    if (reply.status > XRT_AMBIGUOUS_MATCH && reply.status != XRT_FILE_SLOT_LIMIT)
+        return mutation ? XRT_REMOTE_OUTCOME_UNKNOWN : XRT_UNSUPPORTED_MODE;
     struct xrt_codec in = xrt_codec(c->reply, reply.size, true);
     uint64_t value = 0;
     uint32_t size = 0, root = 0;

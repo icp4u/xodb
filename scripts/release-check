@@ -823,6 +823,12 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         for variant in ('chain', 'debug-frame', 'companions', 'mixed'):
             label = 'module-unwind-' + variant
             steps.append((label, [sys.executable, '-B', 'tests/module-unwind.py', *([] if variant == 'chain' else ['--'+variant]), '--work', '.work/'+label], 60))
+        # A 12-slot agent table: the unwind budget follows the advertised count.
+        # A 1-slot table: a full table at the maps read must not fail the stack.
+        for slots in (12, 1):
+            label = f'module-unwind-file-slots-{slots}'
+            steps.append((label, [sys.executable, '-B', 'tests/module-unwind.py', '--file-slots', str(slots),
+                          '--work', '.work/' + label, '--agent', 'zig-out/bin/xodb-agent'], 60))
         for remote in (False, True):
             label = f'jai-elf-demo-{int(remote)}'
             steps.append((label, [sys.executable, '-B', 'tests/jai-demo.py', '--writes', '--work', '.work/' + label,

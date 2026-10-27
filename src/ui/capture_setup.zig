@@ -460,6 +460,8 @@ pub fn startFailure(buffer: []u8, start_error: []const u8, failure: ?perf.Failur
         .{ "A source step is in progress", "Wait for the step to finish" }
     else if (std.mem.eql(u8, start_error, "OfflineSession"))
         .{ "Offline archive", "Live capture is unavailable; recorded evidence only" }
+    else if (std.mem.eql(u8, start_error, "SyscallTimingUnsupportedArchitecture"))
+        .{ "Syscall timing is recorded only on x86-64", "Start CPU sampling with syscall timing off" }
     else
         .{ std.fmt.bufPrint(buffer, "Capture did not start ({s})", .{start_error}) catch "", "The target is unchanged" };
     return .{ .title = title, .next = next, .severity = .failure };
@@ -627,6 +629,9 @@ test "outcomes use recorded evidence and keep the primary reason" {
     try testing.expect(std.mem.indexOf(u8, denied.next, "does not change system settings") != null);
     const limit = startFailure(&buffer, "ProfileThreadLimit", null, 2000, .{});
     try testing.expectEqualStrings("Capture needs 2000 threads; the limit is 1024", limit.title);
+    const syscall_arch = startFailure(&buffer, "SyscallTimingUnsupportedArchitecture", null, 1, .{});
+    try testing.expectEqualStrings("Syscall timing is recorded only on x86-64", syscall_arch.title);
+    try testing.expectEqualStrings("Start CPU sampling with syscall timing off", syscall_arch.next);
 }
 
 test "capture summary uses the recorded sample ceiling" {

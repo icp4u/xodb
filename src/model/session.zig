@@ -723,6 +723,7 @@ pub const Session = struct {
         if (self.archiveBusy()) return error.ArchiveBusy;
         try request.validate();
         if (request.syscall_timing and request.tids.len == 0) return error.SyscallRequiresExplicitThreads;
+        if (request.syscall_timing) try profile.requireSyscallTiming(self.target.arch());
         if (self.profile != null and self.profile.?.collector != null) return error.ProfileAlreadyRunning;
         if (self.target.snapshot().state != .stopped) return error.NotStopped;
         if (self.source_step != null) return error.StepInProgress;
@@ -988,7 +989,16 @@ pub const Session = struct {
             self.modules.target = self.target.handle;
             self.modules.owner_target = self.target.handle;
             self.modules.beginStop(self.target.snapshot().generation);
-            try self.modules.refresh(try self.target.stoppedTid());
+            const tid = try self.target.stoppedTid();
+            // Finished unwind jobs keep their agent file views. When the
+            // agent table is full, close idle ones so the maps read can run.
+            while (true) {
+                self.modules.refresh(tid) catch |err| {
+                    if (err == error.AgentFileSlotLimit and self.metadata.releaseIdleUnwind()) continue;
+                    return err;
+                };
+                break;
+            }
             self.maps_generation = self.target.snapshot().generation;
         }
     }
@@ -2226,7 +2236,12 @@ pub const Session = struct {
         defer self.modules.reportBudget();
         if (self.target.snapshot().state != .stopped) return error.NotStopped;
         if (self.target.gdbRemoteInfo()) |gdb| if (gdb.os == .darwin and self.target.arch() == .aarch64) return self.framePointerStack(a, tid, limit, gdb.address_bits);
-        try self.refreshMaps();
+        // An over-advertised file table can refuse this maps read. Keep the
+        // registers and walk; every other refresh failure still fails the stack.
+        self.refreshMaps() catch |err| switch (err) {
+            error.AgentFileSlotLimit => {},
+            else => return err,
+        };
         const raw_registers = try self.target.registers(tid);
         var registers = loc.registers(raw_registers);
         var frames: std.ArrayList(Frame) = .empty;

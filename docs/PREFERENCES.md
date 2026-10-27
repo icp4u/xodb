@@ -40,7 +40,7 @@ and pass its path. This keeps location, merging and persistence choices open.
 | profile.duration_ms | 60000 | Wall-clock deadline in milliseconds; 0 means until stopped |
 | profile.frequency_hz | 99 | Requested user CPU sample rate per selected thread, 1–1000 Hz |
 | profile.sample_limit | 16384 | Maximum retained samples, 1–65536; the independent 32 MiB sample store may fill earlier |
-| profile.syscall_timing | false | Record syscall durations; requires 1–32 explicitly chosen threads |
+| profile.syscall_timing | false | Record syscall durations on x86-64; requires 1–32 explicitly chosen threads |
 | profile.syscall_limit | 16384 | Retained syscall spans, 1–65536; reaching the limit stops the capture |
 | profile.context_switch | false | Include per-thread scheduling transitions |
 | profile.follow_threads | true | Enroll new same-process threads for all-thread captures; explicit TID selections remain fixed |

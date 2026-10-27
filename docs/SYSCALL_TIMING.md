@@ -61,9 +61,13 @@ ring suffix after a limit or error.
 - Unknown entry/exit boundaries, loss, mismatches and interrupted collection
   never produce a fabricated duration. A terminal `exit_group` commonly has
   an entry and no return. Kernel restart codes are labeled separately from errno.
-- Names assume the x86-64 syscall ABI. Raw tracepoints do not identify every
+- Names use the x86-64 syscall ABI. Raw tracepoints do not identify every
   compatibility call (for example `int 0x80` from a 64-bit image); confirm that
   ABI separately before interpreting those names. Unknown numbers stay numeric.
+  On any other architecture `start_profile` with `syscall_timing` returns
+  `SyscallTimingUnsupportedArchitecture` before a collector opens. A CPU
+  capture on that architecture reports that syscall names are not recorded.
+  CPU sampling on AArch64 and LoongArch is unchanged.
 - The kernel writes argument words into its raw ring; xodb discards them during
   decoding. Retained spans/MCP/archive contain no argument words, paths or buffers.
 - This traces every observed call. Short CPU fixtures and responsive status

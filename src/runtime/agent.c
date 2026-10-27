@@ -31,7 +31,7 @@ struct agent {
     uint64_t negotiated;
     struct xrt_agent_perf *collectors;
     struct entry entries[XRT_RPC_TARGETS];
-    uint32_t next_id, next_file;
+    uint32_t next_id, next_file, file_slots;
     struct xrt_source_budget source_budget;
     struct agent_file files[XRT_AGENT_FILE_SLOTS];
     char file_path[8192];
@@ -98,7 +98,7 @@ static enum xrt_status dispatch(struct agent *a, struct xrt_wire_frame *frame, u
             uint64_t caps = XRT_RPC_CAP_SOURCE | XRT_RPC_CAP_LARGE_IMAGES | a->negotiated;
             xrt_codec_u64(&extra, &caps);
             if (a->negotiated & XRT_RPC_CAP_FILE_SLOTS) {
-                uint64_t slots = XRT_AGENT_FILE_SLOTS;
+                uint64_t slots = a->file_slots;
                 xrt_codec_u64(&extra, &slots);
             }
         }
@@ -336,12 +336,12 @@ static enum xrt_status dispatch(struct agent *a, struct xrt_wire_frame *frame, u
     case XRT_RPC_SOURCE_OPEN: {
         struct xrt_source_file meta = {.reason=XRT_SOURCE_INVALID_REQUEST};
         unsigned slot = 0;
-        while (slot < XRT_AGENT_FILE_SLOTS && a->files[slot].id) ++slot;
+        while (slot < a->file_slots && a->files[slot].id) ++slot;
         status = XRT_INVALID_ARGUMENT;
         struct xrt_file_request request = {0};
         struct xrt_codec file = xrt_codec(data, size, true);
         xrt_wire_file_request(&file, &request, a->file_path, sizeof a->file_path);
-        if (slot == XRT_AGENT_FILE_SLOTS || a->next_file == UINT32_MAX) {
+        if (slot == a->file_slots || a->next_file == UINT32_MAX) {
             meta.reason=XRT_SOURCE_COUNT_LIMIT; status=XRT_FILE_LIMIT;
         } else if (file.ok && file.at < file.size && file.size-file.at <= 4096 &&
             data[file.size-1] == 0 && !memchr(data+file.at,0,file.size-file.at-1) &&
@@ -373,9 +373,13 @@ static enum xrt_status dispatch(struct agent *a, struct xrt_wire_frame *frame, u
         *snapshot = NULL;
         if (args[0] > XRT_RPC_FILE_SYMBOLS) return XRT_INVALID_ARGUMENT;
         unsigned slot = 0;
-        while (slot < XRT_AGENT_FILE_SLOTS && a->files[slot].id)
+        while (slot < a->file_slots && a->files[slot].id)
             ++slot;
-        if (slot == XRT_AGENT_FILE_SLOTS || a->next_file == UINT32_MAX)
+        /* Id exhaustion is not a full table. Report it as file unavailable
+         * even when the host negotiated the slot-limit status. */
+        if (a->next_file == UINT32_MAX)
+            return XRT_FILE_UNAVAILABLE;
+        if (slot == a->file_slots)
             return a->negotiated & XRT_RPC_CAP_FILE_SLOTS ? XRT_FILE_SLOT_LIMIT : XRT_FILE_UNAVAILABLE;
         struct xrt_file_request request = {0};
         struct xrt_codec file = xrt_codec(data, size, true);
@@ -415,10 +419,10 @@ static enum xrt_status dispatch(struct agent *a, struct xrt_wire_frame *frame, u
     case XRT_RPC_FILE_CLOSE: {
         *snapshot = NULL;
         unsigned slot = 0;
-        while (slot < XRT_AGENT_FILE_SLOTS &&
+        while (slot < a->file_slots &&
                (a->files[slot].id != args[0] || a->files[slot].target != frame->target))
             ++slot;
-        if (slot == XRT_AGENT_FILE_SLOTS || !args[0])
+        if (slot == a->file_slots || !args[0])
             return XRT_INVALID_ARGUMENT;
         struct agent_file *file = &a->files[slot];
         status = file->regular ? xrt_file_unchanged(file->fd, &file->identity) : XRT_OK;
@@ -466,11 +470,28 @@ static enum xrt_status dispatch(struct agent *a, struct xrt_wire_frame *frame, u
         return XRT_INVALID_ARGUMENT;
     }
 }
+static uint32_t configured_file_slots = XRT_AGENT_FILE_SLOTS;
+static uint32_t configured_next_file;
+int xrt_agent_configure_file_slots(uint32_t slots)
+{
+    if (!slots)
+        return -1;
+    if (slots > XRT_AGENT_FILE_SLOTS)
+        slots = XRT_AGENT_FILE_SLOTS;
+    configured_file_slots = slots;
+    return 0;
+}
+void xrt_agent_configure_next_file(uint32_t next_file)
+{
+    configured_next_file = next_file;
+}
 int xrt_agent_serve(int input, int output, const volatile sig_atomic_t *stop)
 {
     struct agent *a = calloc(1, sizeof(*a));
     if (!a)
         return 1;
+    a->file_slots = configured_file_slots;
+    a->next_file = configured_next_file;
     a->request = malloc(XRT_WIRE_MAX_BODY);
     a->reply = malloc(XRT_WIRE_MAX_BODY);
     a->extra = malloc(XRT_RPC_DATA_MAX);
@@ -550,7 +571,7 @@ int xrt_agent_serve(int input, int output, const volatile sig_atomic_t *stop)
 done:
     xrt_log(XRT_LOG_DEBUG, XRT_LOG_AGENT, "agent stopping: %s; closing owned targets\n", ended);
     xrt_agent_perf_destroy(a->collectors);
-    for (unsigned i = 0; i < XRT_AGENT_FILE_SLOTS; ++i)
+    for (unsigned i = 0; i < a->file_slots; ++i)
         if (a->files[i].id)
             close(a->files[i].fd);
     /* Keep every handle alive until family cleanup has visited all members. */

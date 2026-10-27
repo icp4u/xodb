@@ -229,8 +229,13 @@ The source-fetch capability is negotiated with an optional HELLO suffix, so
 agents predating that operation keep their original handshake.
 A host that asks also receives the agent's open-file slot count. An older
 agent omits it, and the host keeps its existing per-feature caps. Unwind
-uses half of an advertised count. A full table returns a distinct file-slot
-status; an older agent still reports that case as file unavailable.
+leaves eight slots free for image, JavaScript, symbol, temporary, and maps
+reads; a table of 16 slots or fewer gives unwind half of it instead. A
+missing count keeps the historical cap of sixteen. A full table returns a
+distinct file-slot status; an older agent still reports that case as file
+unavailable. Running out of file ids reports file unavailable even when the
+slot status was negotiated. A status this host does not know refuses that
+call (a mutation reports an unknown outcome) and leaves the connection up.
 The 32-byte big-endian header contains `XRT1`, u16 version/opcode, u64 request ID,
 and u32 target/status/body length/flags. Requests use flags 0; replies use flags 1.
 IDs must increase by one. Frames have a 1 MiB ceiling and a 10-second deadline;
