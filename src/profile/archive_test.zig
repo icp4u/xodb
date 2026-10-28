@@ -432,3 +432,53 @@ test "evidence context (ECTX) is optional, ignorable and round trips" {
     try std.testing.expectEqual(@as(usize, 1), extended.tables[0].usb_fds.len);
     try std.testing.expectEqual(@as(u16, 3), extended.tables[0].usb_fds[0].device);
 }
+
+test "kernel stack section names frames and a redacted archive keeps raw kernel addresses" {
+    const capture = try fixture.build(a, .empty, null);
+    defer capture.deinit();
+    const text =
+        \\ffffffff81000100 T vfs_read
+        \\ffffffff81000200 T sys_read
+        \\
+    ;
+    capture.kallsyms = try @import("kallsyms.zig").parse(a, text);
+    capture.kallsyms_owned = true;
+    capture.kernel_stacks_requested = true;
+    capture.kernel_stacks_granted = true;
+    capture.kernel_symbolizable = true;
+    var sample = @import("records.zig").Sample{ .ip = 0x400100, .ip_present = true, .pid = 4100, .tid = 4100, .tid_present = true, .time_ns = fixture.base_ns + 1000, .time_present = true, .cpu_mode = .user, .callchain = .complete, .frame_count = 2 };
+    sample.frames[0] = .{ .context = .user, .address = 0x400100 };
+    sample.frames[1] = .{ .context = .kernel, .address = 0xffffffff81000180 };
+    try capture.samples.append(a, sample);
+    const bytes = try archive.encode(a, capture, .{});
+    defer a.free(bytes);
+    try std.testing.expectEqual(@as(u16, 11), std.mem.readInt(u16, bytes[10..12], .little));
+    var needle: [8]u8 = undefined;
+    std.mem.writeInt(u64, &needle, 0xffffffff81000180, .little);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &needle) != null);
+    var opened = try archive.decode(a, bytes, .{ .local_id = 11 });
+    defer opened.deinit();
+    try std.testing.expect(opened.capture.kernel_symbolizable);
+    var named = false;
+    const graph = opened.capture.offline_graph.?;
+    for (graph.nodes.items) |node| {
+        if (node.frame.kind == .kernel and std.mem.eql(u8, node.frame.name, "vfs_read")) named = true;
+    }
+    try std.testing.expect(named);
+
+    var policy = @import("../redact.zig").Policy.init(@splat(7));
+    const redacted = try archive.encode(a, capture, .{ .redact = &policy });
+    defer a.free(redacted);
+    std.mem.writeInt(u64, &needle, 0xffffffff81000180, .little);
+    try std.testing.expect(std.mem.indexOf(u8, redacted, &needle) != null);
+    std.mem.writeInt(u64, &needle, 0xffffffff81000100, .little);
+    try std.testing.expect(std.mem.indexOf(u8, redacted, &needle) != null);
+    try std.testing.expect(std.mem.indexOf(u8, redacted, "vfs_read") != null);
+    var hidden = try archive.decode(a, redacted, .{ .local_id = 12 });
+    defer hidden.deinit();
+    var still_named = false;
+    for (hidden.capture.offline_graph.?.nodes.items) |node| {
+        if (node.frame.kind == .kernel and std.mem.eql(u8, node.frame.name, "vfs_read")) still_named = true;
+    }
+    try std.testing.expect(still_named);
+}

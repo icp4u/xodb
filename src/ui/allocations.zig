@@ -314,6 +314,7 @@ pub const Panel = struct {
             const fill = switch (node.kind) {
                 .root, .thread => theme.flame_root,
                 .incomplete, .unknown, .unverified => theme.flame_unknown,
+                .kernel => theme.warm,
                 .code => style.mix(theme.flame_low, theme.flame_high, @as(f32, @floatFromInt(node.color)) / 100),
             };
             try r.rect(rect, fill);

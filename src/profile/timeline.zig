@@ -50,6 +50,9 @@ pub const Filter = struct {
     tids: ThreadSet = .{},
     from_ns: u64 = 0,
     to_ns: u64 = std.math.maxInt(u64),
+    /// Omit kernel frames from a recorded flame. The sample weight stays on
+    /// the user leaf, or on the thread when the sample has no user frame.
+    hide_kernel: bool = false,
     pub fn validate(self: *const Filter) !void {
         if (self.tids.len > ThreadSet.capacity or self.tids.len == 1 or (self.tid != null and self.tids.len != 0)) return error.InvalidProfileFilter;
         var previous: u32 = 0;

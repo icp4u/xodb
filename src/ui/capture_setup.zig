@@ -443,6 +443,14 @@ pub fn failureLine(buffer: []u8, failure: perf.Failure) []const u8 {
 }
 /// Readable text for a failed start. These are not capture-stop diagnostics.
 pub fn startFailure(buffer: []u8, start_error: []const u8, failure: ?perf.Failure, requested_threads: usize, limits: Limits) Reason {
+    if (std.mem.eql(u8, start_error, "KernelStacksDenied"))
+        return .{ .title = "Kernel stacks were refused", .next = "perf_event_paranoid must be 1 or less for this process, or run as root. xodb does not change that setting.", .severity = .failure };
+    if (std.mem.eql(u8, start_error, "OffCpuDenied"))
+        return .{ .title = "Off-CPU stacks were refused", .next = "perf_event_paranoid must be -1 (raw tracepoint data), or run as root, and the sched_switch tracepoint must be readable. xodb does not change that setting.", .severity = .failure };
+    if (std.mem.eql(u8, start_error, "OffCpuRemoteUnsupported"))
+        return .{ .title = "Off-CPU stacks are local only", .next = "A remote target is not opened against this host's tracefs.", .severity = .failure };
+    if (std.mem.eql(u8, start_error, "OffCpuThreadLimit"))
+        return .{ .title = "Off-CPU stacks cover at most 64 threads", .next = "Select a smaller thread set.", .severity = .failure };
     if (failure) |f| {
         const next = switch (f.kind) {
             .permission => "xodb does not change system settings. Grant perf_event_open access for this process (see PROFILING.md)",
@@ -633,6 +641,12 @@ test "outcomes use recorded evidence and keep the primary reason" {
     inline for (@typeInfo(profile.Stop).@"enum".fields) |field| try testing.expect(reason(@enumFromInt(field.value)).title.len > 0);
     const denied = startFailure(&buffer, "PerfOpenFailed", .{ .kind = .permission, .syscall = "perf_event_open", .errno = 13 }, 4, .{});
     try testing.expect(std.mem.indexOf(u8, denied.title, "permission") != null);
+    const kernel = startFailure(&buffer, "KernelStacksDenied", .{ .kind = .permission, .syscall = "perf_event_open", .errno = 1 }, 1, .{});
+    try testing.expect(std.mem.indexOf(u8, kernel.title, "Kernel stacks were refused") != null);
+    try testing.expect(std.mem.indexOf(u8, kernel.next, "perf_event_paranoid") != null);
+    const off_cpu = startFailure(&buffer, "OffCpuDenied", null, 1, .{});
+    try testing.expect(std.mem.indexOf(u8, off_cpu.title, "Off-CPU stacks were refused") != null);
+    try testing.expect(std.mem.indexOf(u8, off_cpu.next, "sched_switch") != null);
     try testing.expect(std.mem.indexOf(u8, denied.next, "does not change system settings") != null);
     const limit = startFailure(&buffer, "ProfileThreadLimit", null, 2000, .{});
     try testing.expectEqualStrings("Capture needs 2000 threads; the limit is 1024", limit.title);

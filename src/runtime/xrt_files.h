@@ -1,6 +1,7 @@
 #ifndef XODB_RUNTIME_FILES_H
 #define XODB_RUNTIME_FILES_H
 #include "xrt.h"
+#include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <signal.h>
@@ -32,7 +33,8 @@ enum xrt_file_kind {
     XRT_FILE_THREAD_STAT,
     XRT_FILE_BOOT_ID,
     XRT_FILE_THREAD_COMM,
-    XRT_FILE_AUXV
+    XRT_FILE_AUXV,
+    XRT_FILE_KALLSYMS
 };
 struct xrt_file_request {
     enum xrt_file_kind kind;
@@ -55,6 +57,9 @@ enum xrt_status xrt_target_file_open(const struct xrt_target *, const struct xrt
                                      int *, struct xrt_file_identity *);
 enum xrt_status xrt_target_file(const struct xrt_target *, const struct xrt_file_request *,
                                 int *fd);
+/* A local or null target can read kallsyms. A remote target can only when
+ * its HELLO reply included XRT_RPC_CAP_KALLSYMS. */
+bool xrt_target_kallsyms_capable(const struct xrt_target *);
 enum xrt_status xrt_process_file(int32_t pid, const struct xrt_file_request *, int *fd);
 /* Optional source output is set only on success. Identity checks and lookup
  * order are identical to the ordinary open calls. On a remote target the

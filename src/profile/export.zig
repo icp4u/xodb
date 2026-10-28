@@ -101,7 +101,7 @@ pub fn savePrepared(capture: *capture_model.Capture, path: [:0]const u8, filter:
             .schema_version = @as(u32, 1),
             .redacted = policy != null,
             .capture = capture.summary(),
-            .filter = .{ .tid = filter.tid, .tids = filter.tids.optional(), .from_ns = filter.from_ns, .to_ns = if (filter.to_ns == std.math.maxInt(u64)) null else @as(?u64, filter.to_ns) },
+            .filter = .{ .tid = filter.tid, .tids = filter.tids.optional(), .from_ns = filter.from_ns, .to_ns = if (filter.to_ns == std.math.maxInt(u64)) null else @as(?u64, filter.to_ns), .hide_kernel = filter.hide_kernel },
             .range = range,
             .ordering = ordering,
             .samples = data.count,

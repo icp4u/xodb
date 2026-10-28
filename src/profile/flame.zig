@@ -3,7 +3,7 @@
 //! never collapse into a flat function histogram.
 const std = @import("std");
 pub const max_nodes = 8192;
-pub const Kind = enum { root, thread, code, unknown, unverified, incomplete };
+pub const Kind = enum { root, thread, code, unknown, unverified, incomplete, kernel };
 pub const Frame = struct {
     kind: Kind,
     module_id: u64 = 0,
@@ -31,6 +31,8 @@ pub const Graph = struct {
     nodes: std.ArrayList(Node) = .empty,
     index: std.AutoHashMapUnmanaged(Key, u32) = .empty,
     rejected: u64 = 0,
+    /// Weight of the rejected paths (samples, or blocked ns on that flame).
+    rejected_weight: u64 = 0,
     partial_samples: u64 = 0,
     unverified_samples: u64 = 0,
     limit: usize = max_nodes,
@@ -42,7 +44,7 @@ pub const Graph = struct {
         return graph;
     }
     pub fn clone(self: *const Graph, a: std.mem.Allocator) !Graph {
-        var out = Graph{ .allocator = a, .rejected = self.rejected, .partial_samples = self.partial_samples, .unverified_samples = self.unverified_samples, .limit = self.limit };
+        var out = Graph{ .allocator = a, .rejected = self.rejected, .rejected_weight = self.rejected_weight, .partial_samples = self.partial_samples, .unverified_samples = self.unverified_samples, .limit = self.limit };
         errdefer out.deinit();
         try out.nodes.appendSlice(a, self.nodes.items);
         out.index = try self.index.clone(a);
@@ -93,6 +95,7 @@ pub const Graph = struct {
         }
         if (self.nodes.items.len + missing > self.limit) {
             self.rejected += 1;
+            self.rejected_weight +|= weight;
             return;
         }
         try self.nodes.ensureUnusedCapacity(self.allocator, missing);

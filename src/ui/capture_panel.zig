@@ -24,6 +24,8 @@ pub const Action = union(enum) {
     set_frequency: u32,
     toggle_scheduling,
     toggle_syscalls,
+    toggle_kernel_stacks,
+    toggle_off_cpu,
     set_stack_bytes: u32,
     set_stack_budget: u32,
     select_all,
@@ -229,6 +231,14 @@ pub const Panel = struct {
                 self.editor.open = false;
             },
             .toggle_scheduling => defaults.context_switch = !defaults.context_switch,
+            .toggle_kernel_stacks => {
+                defaults.kernel_stacks = !defaults.kernel_stacks;
+                self.message = if (defaults.kernel_stacks) "Kernel stacks on for the next capture" else "Kernel stacks off for the next capture";
+            },
+            .toggle_off_cpu => {
+                defaults.off_cpu = !defaults.off_cpu;
+                self.message = if (defaults.off_cpu) "Off-CPU blocked time on for the next capture" else "Off-CPU blocked time off for the next capture";
+            },
             .toggle_syscalls => {
                 defaults.syscall_timing = !defaults.syscall_timing;
                 self.message = if (defaults.syscall_timing) "Syscalls: choose 1..32 threads; X opens recorded detail" else "Syscall recording off for the next capture";
@@ -467,6 +477,14 @@ pub const Panel = struct {
         const calls = gpu.Rect{ .x = sched.x + half + 6, .y = y, .w = half, .h = 24 };
         try chip(r, font, calls, if (d.syscall_timing) "Syscalls on (Y)" else "Syscalls off (Y)", d.syscall_timing, theme.text);
         self.addHit(calls, .toggle_syscalls);
+        y += if (compact) 28 else 32;
+        try r.textFit(font, area.x, y + 4, 90, "Kernel", theme.weak);
+        const kernel = gpu.Rect{ .x = area.x + 90, .y = y, .w = half, .h = 24 };
+        try chip(r, font, kernel, if (d.kernel_stacks) "Kernel stacks on" else "Kernel stacks off", d.kernel_stacks, theme.text);
+        self.addHit(kernel, .toggle_kernel_stacks);
+        const blocked = gpu.Rect{ .x = kernel.x + half + 6, .y = y, .w = half, .h = 24 };
+        try chip(r, font, blocked, if (d.off_cpu) "Off-CPU on" else "Off-CPU off", d.off_cpu, theme.text);
+        self.addHit(blocked, .toggle_off_cpu);
         y += if (compact) 28 else 32;
         // Sampled user stacks (T10): size per sample, then the total budget.
         try r.textFit(font, area.x, y + 4, 90, "Stacks", theme.weak);

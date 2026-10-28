@@ -225,6 +225,7 @@ pub const Profile = struct {
         std.mem.writeInt(u64, fields[12..20], filter.to_ns, .little);
         hash.update(&fields);
         filter.tids.hashInto(&hash);
+        if (filter.hide_kernel) hash.update("hide_kernel");
         return std.fmt.bytesToHex(hash.finalResult(), .lower);
     }
 };

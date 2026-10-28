@@ -48,6 +48,10 @@ pub fn readThreads(args: Value, filter: *profile.Filter) !void {
 pub fn readFilter(args: Value) !profile.Filter {
     var filter = profile.Filter{ .from_ns = try number(args, "from_ns", 0), .to_ns = try number(args, "to_ns", std.math.maxInt(u64)) };
     try readThreads(args, &filter);
+    if (args == .object) if (args.object.get("hide_kernel")) |given| switch (given) {
+        .bool => filter.hide_kernel = given.bool,
+        else => return error.InvalidArguments,
+    };
     filter.validate() catch return error.InvalidArguments;
     return filter;
 }
@@ -100,7 +104,7 @@ fn derivedFlamegraph(a: Allocator, session: *Session, capture: *profile.Capture,
         .algorithm = @import("../profile/unwind.zig").algorithmFor(capture.architecture),
         .aggregate = derived.version,
         .units = "samples",
-        .filter = .{ .tid = filter.tid, .tids = filter.tids.optional(), .from_ns = filter.from_ns, .to_ns = if (filter.to_ns == std.math.maxInt(u64)) null else @as(?u64, filter.to_ns) },
+        .filter = .{ .tid = filter.tid, .tids = filter.tids.optional(), .from_ns = filter.from_ns, .to_ns = if (filter.to_ns == std.math.maxInt(u64)) null else @as(?u64, filter.to_ns), .hide_kernel = filter.hide_kernel },
         .denominator = view.counts.filtered,
         .buckets = .{ .complete = view.counts.complete, .partial = view.counts.partial, .leaf_only = view.counts.leaf_only, .unavailable = view.counts.unavailable, .excluded_by_node_limit = view.counts.excluded },
         .bucket_meaning = derived.bucket_meaning,
@@ -134,7 +138,7 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: Value) !Val
         return value(a, .{ .capture_id = capture.id, .revision = capture.revision, .artifact_sha256 = if (session.artifact) |*artifact| try a.dupe(u8, &std.fmt.bytesToHex(artifact.source.archive_sha256, .lower)) else null, .samples = rows.items, .total = capture.samples.len(), .next = if (end < capture.samples.len()) @as(?usize, end) else null });
     }
     if (std.mem.eql(u8, name, "export_profile")) {
-        try fields(args, &.{ "generation", "capture_id", "revision", "path", "tid", "tids", "from_ns", "to_ns" });
+        try fields(args, &.{ "generation", "capture_id", "revision", "path", "tid", "tids", "from_ns", "to_ns", "hide_kernel" });
         try session.authorize(.agent, .execution, try number(args, "generation", null));
         const capture = session.profile orelse return error.NoProfile;
         if (try number(args, "capture_id", null) != capture.id) return error.StaleCapture;
@@ -199,7 +203,7 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: Value) !Val
         return value(a, .{ .capture_id = capture.id, .revision = capture.revision, .range = filter.clipped(extent), .total = total, .start = start, .next = if (start < total and rows.items.len < total - start) @as(?u64, start + rows.items.len) else null, .intervals = rows.items, .provenance = app.provenance, .selection = "overlap with half-open range; returned endpoints retain original imported times; global intervals match every TID" });
     }
     if (std.mem.eql(u8, name, "start_profile")) {
-        try fields(args, &.{ "generation", "tids", "sample_limit", "frequency_hz", "duration_ms", "context_switch", "syscall_timing", "syscall_limit", "follow_threads", "ring_budget_bytes", "user_stack_bytes", "user_stack_budget_bytes" });
+        try fields(args, &.{ "generation", "tids", "sample_limit", "frequency_hz", "duration_ms", "context_switch", "kernel_stacks", "off_cpu", "syscall_timing", "syscall_limit", "follow_threads", "ring_budget_bytes", "user_stack_bytes", "user_stack_budget_bytes" });
         try session.authorize(.agent, .execution, try number(args, "generation", null));
         const sample_limit = try number(args, "sample_limit", session.profile_defaults.sample_limit);
         if (sample_limit == 0 or sample_limit > @import("../profile/capture.zig").max_sample_limit) return error.InvalidArguments;
@@ -213,6 +217,14 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: Value) !Val
             .bool => v.bool,
             else => return error.InvalidArguments,
         } else session.profile_defaults.context_switch;
+        const kernel_stacks = if (args.object.get("kernel_stacks")) |v| switch (v) {
+            .bool => v.bool,
+            else => return error.InvalidArguments,
+        } else session.profile_defaults.kernel_stacks;
+        const off_cpu = if (args.object.get("off_cpu")) |v| switch (v) {
+            .bool => v.bool,
+            else => return error.InvalidArguments,
+        } else session.profile_defaults.off_cpu;
         const syscall_timing = if (args.object.get("syscall_timing")) |v| switch (v) {
             .bool => v.bool,
             else => return error.InvalidArguments,
@@ -235,7 +247,7 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: Value) !Val
                 count += 1;
             }
         }
-        _ = try session.startProfile(.{ .sample_limit = @intCast(sample_limit), .follow_threads = follow_threads, .ring_budget_bytes = @intCast(ring_budget), .frequency_hz = @intCast(hz), .duration_ms = @intCast(duration), .context_switch = context_switch, .syscall_timing = syscall_timing, .syscall_limit = @intCast(syscall_limit), .user_stack_bytes = @intCast(stack_bytes), .user_stack_budget_bytes = @intCast(stack_budget), .tids = tids[0..count] });
+        _ = try session.startProfile(.{ .sample_limit = @intCast(sample_limit), .follow_threads = follow_threads, .ring_budget_bytes = @intCast(ring_budget), .frequency_hz = @intCast(hz), .duration_ms = @intCast(duration), .context_switch = context_switch, .kernel_stacks = kernel_stacks, .off_cpu = off_cpu, .syscall_timing = syscall_timing, .syscall_limit = @intCast(syscall_limit), .user_stack_bytes = @intCast(stack_bytes), .user_stack_budget_bytes = @intCast(stack_budget), .tids = tids[0..count] });
         session.record(.agent, "start_profile");
         return value(a, .{ .capture = session.profile.?.summary(), .session = session.snapshot() });
     }
@@ -245,7 +257,7 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: Value) !Val
             const capture = session.profile orelse return error.NoProfile;
             if (try number(args, "capture_id", null) != capture.id) return error.StaleCapture;
         }
-        return value(a, .{ .defaults = .{ .sample_limit = session.profile_defaults.sample_limit, .follow_threads = session.profile_defaults.follow_threads, .ring_budget_bytes = session.profile_defaults.ring_budget_bytes, .frequency_hz = session.profile_defaults.frequency_hz, .duration_ms = session.profile_defaults.duration_ms, .context_switch = session.profile_defaults.context_switch, .syscall_timing = session.profile_defaults.syscall_timing, .syscall_limit = session.profile_defaults.syscall_limit, .user_stack_bytes = session.profile_defaults.user_stack_bytes, .user_stack_budget_bytes = session.profile_defaults.user_stack_budget_bytes }, .offline = session.offline, .archive_job = if (session.archive_job) |job| job.status() else null, .recorded_view_job = if (session.recorded_views.job) |job| .{ .id = job.id, .capture_id = job.key.capture_id, .revision = job.key.revision, .sample_count = job.sample_count, .done = job.done.load(.acquire), .cancelled = job.cancel.load(.acquire) } else null, .capture = if (session.profile) |capture| capture.summary() else null, .displayed_view = if (session.profile_view) |view| .{ .visible = session.profile_view_visible, .basis = view.basis, .capture_id = view.capture_id, .revision = view.revision, .view_id = if (view.view_id) |id| @as(?[]const u8, &id) else null, .sample_count = view.sample_count, .filter = .{ .tid = view.filter.tid, .tids = view.filter.tids.optional(), .from_ns = view.filter.from_ns, .to_ns = if (view.filter.to_ns == std.math.maxInt(u64)) null else @as(?u64, view.filter.to_ns) } } else null, .last_open_failure = session.profile_failure, .last_start_error = session.profile_error, .requested_threads = session.profile_requested_threads, .thread_limit = @import("../profile/linux_perf.zig").max_threads });
+        return value(a, .{ .defaults = .{ .sample_limit = session.profile_defaults.sample_limit, .follow_threads = session.profile_defaults.follow_threads, .ring_budget_bytes = session.profile_defaults.ring_budget_bytes, .frequency_hz = session.profile_defaults.frequency_hz, .duration_ms = session.profile_defaults.duration_ms, .context_switch = session.profile_defaults.context_switch, .kernel_stacks = session.profile_defaults.kernel_stacks, .off_cpu = session.profile_defaults.off_cpu, .syscall_timing = session.profile_defaults.syscall_timing, .syscall_limit = session.profile_defaults.syscall_limit, .user_stack_bytes = session.profile_defaults.user_stack_bytes, .user_stack_budget_bytes = session.profile_defaults.user_stack_budget_bytes }, .offline = session.offline, .archive_job = if (session.archive_job) |job| job.status() else null, .recorded_view_job = if (session.recorded_views.job) |job| .{ .id = job.id, .capture_id = job.key.capture_id, .revision = job.key.revision, .sample_count = job.sample_count, .done = job.done.load(.acquire), .cancelled = job.cancel.load(.acquire) } else null, .capture = if (session.profile) |capture| capture.summary() else null, .displayed_view = if (session.profile_view) |view| .{ .visible = session.profile_view_visible, .basis = view.basis, .capture_id = view.capture_id, .revision = view.revision, .view_id = if (view.view_id) |id| @as(?[]const u8, &id) else null, .sample_count = view.sample_count, .filter = .{ .tid = view.filter.tid, .tids = view.filter.tids.optional(), .from_ns = view.filter.from_ns, .to_ns = if (view.filter.to_ns == std.math.maxInt(u64)) null else @as(?u64, view.filter.to_ns), .hide_kernel = view.filter.hide_kernel } } else null, .last_open_failure = session.profile_failure, .last_start_error = session.profile_error, .requested_threads = session.profile_requested_threads, .thread_limit = @import("../profile/linux_perf.zig").max_threads });
     }
     if (std.mem.eql(u8, name, "release_profile")) {
         try fields(args, &.{ "generation", "capture_id", "revision" });
@@ -353,7 +365,7 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: Value) !Val
         });
     }
     const detail = std.mem.eql(u8, name, "get_profile_frame");
-    try fields(args, if (detail) &.{ "capture_id", "revision", "tid", "tids", "from_ns", "to_ns", "node", "view_id" } else &.{ "capture_id", "revision", "tid", "tids", "from_ns", "to_ns", "start", "limit", "view_id", "retry", "basis" });
+    try fields(args, if (detail) &.{ "capture_id", "revision", "tid", "tids", "from_ns", "to_ns", "hide_kernel", "node", "view_id" } else &.{ "capture_id", "revision", "tid", "tids", "from_ns", "to_ns", "hide_kernel", "start", "limit", "view_id", "retry", "basis" });
     const capture = session.profile orelse return error.NoProfile;
     if (try number(args, "capture_id", null) != capture.id) return error.StaleCapture;
     const revision = try number(args, "revision", if (capture.offline or detail or try number(args, "start", 0) > 0 or args.object.get("view_id") != null) null else capture.revision);
@@ -362,6 +374,7 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: Value) !Val
     // Reconstructed node IDs belong to a separate completed-capture view.
     if (!detail) if (args.object.get("basis")) |basis| {
         if (basis != .string) return error.InvalidArguments;
+        if (std.mem.eql(u8, basis.string, "blocked_ns")) return blockedFlamegraph(a, capture, filter, args);
         if (std.mem.eql(u8, basis.string, "reconstructed")) {
             if (capture.collector != null) return error.ArchiveStillCollecting;
             if (revision != capture.revision) return error.StaleProfile;
@@ -439,5 +452,23 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: Value) !Val
         const frame = node.frame;
         try rows.append(a, .{ .id = node.id, .parent = node.parent, .name = frame.name, .kind = frame.kind, .module_id = frame.module_id, .mapping_id = frame.mapping_id, .mapping_note = frame.mapping_note, .module = frame.module[0..@min(512, frame.module.len)], .address = try std.fmt.allocPrint(a, "0x{x}", .{frame.address}), .lookup_address = try std.fmt.allocPrint(a, "0x{x}", .{frame.lookup_address}), .inclusive = node.inclusive, .self = node.self, .depth = node.depth, .x = node.x });
     }
-    return value(a, .{ .capture_id = capture.id, .revision = revision, .current_revision = capture.revision, .view_id = view_id, .basis = "recorded", .pending = false, .snapshot_samples = snapshot_samples, .worker = if (!capture.offline) .{ .algorithm = @import("../profile/recorded_view.zig").algorithm, .snapshot_ns = snapshot_ns, .build_ns = build_ns, .peak_bytes = peak_bytes, .limit_bytes = @import("../profile/recorded_view.zig").memory_limit } else null, .analysis_version = @import("../profile/archive.zig").analysis_version, .units = "samples", .mapping_coverage = @import("../profile/mappings.zig").coverage, .filter = .{ .tid = filter.tid, .tids = filter.tids.optional(), .from_ns = filter.from_ns, .to_ns = if (filter.to_ns == std.math.maxInt(u64)) null else @as(?u64, filter.to_ns) }, .samples = graph.nodes.items[0].inclusive, .excluded_by_node_limit = graph.rejected, .partial_callchain_samples = graph.partial_samples, .unverified_mapping_samples = graph.unverified_samples, .total_nodes = graph.nodes.items.len, .nodes = rows.items, .next = if (end < graph.nodes.items.len) @as(?usize, end) else null });
+    return value(a, .{ .capture_id = capture.id, .revision = revision, .current_revision = capture.revision, .view_id = view_id, .basis = "recorded", .pending = false, .snapshot_samples = snapshot_samples, .worker = if (!capture.offline) .{ .algorithm = @import("../profile/recorded_view.zig").algorithm, .snapshot_ns = snapshot_ns, .build_ns = build_ns, .peak_bytes = peak_bytes, .limit_bytes = @import("../profile/recorded_view.zig").memory_limit } else null, .analysis_version = @import("../profile/archive.zig").analysis_version, .units = "samples", .mapping_coverage = @import("../profile/mappings.zig").coverage, .filter = .{ .tid = filter.tid, .tids = filter.tids.optional(), .from_ns = filter.from_ns, .to_ns = if (filter.to_ns == std.math.maxInt(u64)) null else @as(?u64, filter.to_ns), .hide_kernel = filter.hide_kernel }, .samples = graph.nodes.items[0].inclusive, .excluded_by_node_limit = graph.rejected, .partial_callchain_samples = graph.partial_samples, .unverified_mapping_samples = graph.unverified_samples, .total_nodes = graph.nodes.items.len, .nodes = rows.items, .next = if (end < graph.nodes.items.len) @as(?usize, end) else null });
+}
+fn blockedFlamegraph(a: Allocator, capture: *profile.Capture, filter: profile.Filter, args: Value) !Value {
+    if (!capture.config.off_cpu) return error.OffCpuNotRequested;
+    if (capture.offcpu_collector) |collector| _ = collector.drain() catch {};
+    var graph = try capture.blockedGraph(a, filter);
+    defer graph.deinit();
+    const summary = capture.offCpuSummary();
+    const start = try number(args, "start", 0);
+    const limit = try number(args, "limit", 64);
+    if (limit == 0 or limit > 64 or start >= graph.nodes.items.len) return error.InvalidArguments;
+    const end = @min(graph.nodes.items.len, start + limit);
+    const Row = struct { id: u32, parent: ?u32, name: []const u8, kind: @import("../profile/flame.zig").Kind, module_id: u64, mapping_id: u32, mapping_note: []const u8, module: []const u8, address: []const u8, lookup_address: []const u8, inclusive: u64, self: u64, depth: u16, x: u64 };
+    var rows: std.ArrayList(Row) = .empty;
+    for (graph.nodes.items[start..end]) |node| {
+        const frame = node.frame;
+        try rows.append(a, .{ .id = node.id, .parent = node.parent, .name = frame.name, .kind = frame.kind, .module_id = frame.module_id, .mapping_id = frame.mapping_id, .mapping_note = frame.mapping_note, .module = frame.module[0..@min(512, frame.module.len)], .address = try std.fmt.allocPrint(a, "0x{x}", .{frame.address}), .lookup_address = try std.fmt.allocPrint(a, "0x{x}", .{frame.lookup_address}), .inclusive = node.inclusive, .self = node.self, .depth = node.depth, .x = node.x });
+    }
+    return value(a, .{ .capture_id = capture.id, .revision = capture.revision, .current_revision = capture.revision, .view_id = null, .basis = "blocked_ns", .pending = false, .label = "Blocked time", .units = "blocked_ns", .provisional = capture.collector != null, .filter = .{ .tid = filter.tid, .tids = filter.tids.optional(), .from_ns = filter.from_ns, .to_ns = if (filter.to_ns == std.math.maxInt(u64)) null else @as(?u64, filter.to_ns), .hide_kernel = filter.hide_kernel }, .samples = graph.nodes.items[0].inclusive, .blocked_ns = graph.nodes.items[0].inclusive, .intervals = summary.intervals, .truncated = summary.truncated, .dropped = summary.dropped, .open_intervals = summary.open, .runqueue_ns = summary.runqueue_ns, .excluded_by_node_limit = graph.rejected, .excluded_ns = graph.rejected_weight, .weight = summary.weight, .total_nodes = graph.nodes.items.len, .nodes = rows.items, .next = if (end < graph.nodes.items.len) @as(?usize, end) else null });
 }

@@ -26,7 +26,10 @@ const timeline = @import("timeline.zig");
 const scheduling = @import("scheduling.zig");
 const syscall_model = @import("syscalls.zig");
 const syscall_perf = @import("linux_syscalls.zig");
+const offcpu = @import("offcpu.zig");
+const offcpu_live = @import("offcpu_live.zig");
 const intervals = @import("intervals.zig");
+const kallsyms = @import("kallsyms.zig");
 pub const sample_state = @import("sample_state.zig");
 pub const sample_store = @import("sample_store.zig");
 /// Default and legacy archive sample ceiling.
@@ -48,6 +51,13 @@ pub const Config = struct {
     /// A positive value starts when collection is enabled, then includes time stopped.
     duration_ms: u32 = 60000,
     context_switch: bool = false,
+    /// Ask perf for kernel instruction pointers and the kernel part of the
+    /// callchain. Off leaves the capture user-only. A refusal is an error;
+    /// the open does not retry with the kernel excluded.
+    kernel_stacks: bool = false,
+    /// Separate sched_switch capture. Weights are blocked nanoseconds on their
+    /// own flame. A refusal does not continue as an on-CPU-only capture.
+    off_cpu: bool = false,
     syscall_timing: bool = false,
     syscall_limit: u32 = syscall_model.default_limit,
     /// Effective only for an all-thread selection. Explicit TID lists stay fixed.
@@ -66,6 +76,30 @@ pub const Config = struct {
         if (self.frequency_hz == 0 or self.frequency_hz > 1000 or self.tids.len > perf.max_threads) return error.InvalidProfileConfig;
     }
 };
+/// A kernel-stack request that the kernel refuses is not a user-only capture.
+pub fn startError(kernel_stacks: bool, kind: perf.FailureKind) error{ KernelStacksDenied, PerfOpenFailed } {
+    if (kernel_stacks and kind == .permission) return error.KernelStacksDenied;
+    return error.PerfOpenFailed;
+}
+/// Tracefs and the tracepoint permission use the same refusal as a denied open.
+/// A CPU-sampler failure does not match this, so kernel-stack denial stays distinct.
+pub fn offCpuFailure(failure: perf.Failure) bool {
+    if (std.mem.startsWith(u8, failure.syscall, "offcpu.tracefs") or std.mem.eql(u8, failure.syscall, "offcpu.format")) return true;
+    return std.mem.indexOf(u8, failure.detail, "off-CPU stacks") != null;
+}
+test "a refused kernel-stack open is not turned into a user-only capture" {
+    try std.testing.expectEqual(error.KernelStacksDenied, startError(true, .permission));
+    try std.testing.expectEqual(error.PerfOpenFailed, startError(false, .permission));
+    try std.testing.expectEqual(error.PerfOpenFailed, startError(true, .configuration));
+    try std.testing.expectEqual(error.PerfOpenFailed, startError(true, .unavailable));
+    try std.testing.expect(offCpuFailure(.{ .kind = .permission, .syscall = "perf_event_open", .detail = "off-CPU stacks need perf_event_paranoid -1 (raw tracepoint data), or root, and a readable sched_switch tracepoint; this program does not change that setting" }));
+    try std.testing.expect(offCpuFailure(.{ .kind = .unavailable, .syscall = "offcpu.tracefs", .detail = "tracefs" }));
+    try std.testing.expect(!offCpuFailure(.{ .kind = .permission, .syscall = "perf_event_open", .detail = "kernel stacks need perf_event_paranoid at most 1, or root; this program does not change that setting" }));
+}
+test "off-CPU refuses a remote connection and treats a null target as local" {
+    const rt = @import("../target/runtime.zig").c;
+    try std.testing.expect(!rt.xrt_target_is_remote(null));
+}
 pub const ScopeChange = struct { pid: u32, tid: u32, parent_pid: u32, parent_tid: u32, time_ns: ?u64 };
 pub const Thread = struct {
     debugger_id: u64,
@@ -79,6 +113,21 @@ pub const annotations = @import("annotations.zig");
 pub const CacheKey = annotations.Key;
 pub const Stop = enum { collecting, manual, duration, capacity, mapping_limit, mappings_changed, metadata_lost, thread_scope_changed, decode_error, target_ended, image_changed, drain_limit, collector_error, scheduling_limit, scheduling_error, syscall_limit, syscall_error };
 pub const Opened = union(enum) { capture: *Capture, failed: perf.Failure };
+const kallsyms_cache_slots = 4;
+/// Boot id plus a hash of the loaded modules. Reloading a driver module in
+/// the same boot moves its symbols, so it must not reuse the cached table.
+const KallsymsKey = [44]u8;
+const KallsymsCacheSlot = struct {
+    boot: KallsymsKey = undefined,
+    table: kallsyms.Table = .{},
+    used: bool = false,
+};
+var kallsyms_cache_lock: std.atomic.Mutex = .unlocked;
+var kallsyms_cache: [kallsyms_cache_slots]KallsymsCacheSlot = .{ .{}, .{}, .{}, .{} };
+fn lockKallsymsCache() void {
+    while (!kallsyms_cache_lock.tryLock()) std.atomic.spinLoopHint();
+}
+
 pub const Capture = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -122,6 +171,10 @@ pub const Capture = struct {
     thread_count: usize,
     collector: ?*perf.Collector,
     syscall_collector: ?*syscall_perf.Collector = null,
+    offcpu_collector: ?*offcpu_live.Collector = null,
+    /// Intervals kept after the ring closes. Weights are blocked nanoseconds.
+    offcpu_view: ?offcpu.Tracker = null,
+    off_cpu_granted: bool = false,
     syscalls: syscall_model.Store = .{},
     thread_names: [perf.max_threads][32]u8 = undefined,
     cpu_before: [perf.max_threads]?activity.Ticks = @splat(null),
@@ -146,6 +199,17 @@ pub const Capture = struct {
     stop_reason_count: usize = 0,
     failure: ?perf.Failure = null,
     diagnostic: []const u8 = "",
+    /// Set when this capture asked for kernel stacks. Granted means the open
+    /// kept the kernel in the sample. Symbolizable is true only when kallsyms
+    /// supplied at least one real address.
+    kernel_stacks_requested: bool = false,
+    kernel_stacks_granted: bool = false,
+    kernel_symbolizable: bool = false,
+    /// Why kernel frames could not be named. Empty when they could.
+    kernel_symbol_reason: []const u8 = "",
+    /// Borrowed by a recorded-view snapshot. Freed only when owned.
+    kallsyms: kallsyms.Table = .{},
+    kallsyms_owned: bool = false,
     lost_records: u64 = 0,
     lost_samples: u64 = 0,
     throttles: u64 = 0,
@@ -173,6 +237,10 @@ pub const Capture = struct {
         try config.validate();
         if (config.tids.len == 0 or config.tids.len != debugger_ids.len) return error.InvalidProfileConfig;
         const rt = @import("../target/runtime.zig");
+        // A local session also owns an xrt_target. Only a connected remote
+        // target is refused, and that happens before any host tracefs read.
+        if (config.off_cpu and rt.c.xrt_target_is_remote(target)) return error.OffCpuRemoteUnsupported;
+        if (config.off_cpu and config.tids.len > 64) return error.OffCpuThreadLimit;
         const arch = std.enums.fromInt(Arch, rt.c.xrt_target_arch(target).*.machine) orelse return error.ProfilingUnsupportedArchitecture;
         if (config.syscall_timing) try requireSyscallTiming(arch);
         const perf_regs = perfFile(arch) orelse return error.ProfilingUnsupportedArchitecture;
@@ -197,7 +265,9 @@ pub const Capture = struct {
         errdefer user_state.deinit(a);
         const syscall_ring_bytes = if (config.syscall_timing) syscall_perf.ringBytes(config.tids.len) else 0;
         if (syscall_ring_bytes >= config.ring_budget_bytes) return error.SyscallRingBudget;
-        const opened = try perf.start(a, .{ .target = @ptrCast(target), .follow_threads = config.follow_threads, .tids = config.tids, .frequency_hz = config.frequency_hz, .max_frames = 64, .mmap_data = true, .data_pages = ringPages(config.tids.len), .ring_budget_bytes = config.ring_budget_bytes - syscall_ring_bytes, .max_sides = perf.max_sides_cap, .context_switch = config.context_switch, .user_regs_mask = if (config.user_stack_bytes != 0) perf_regs.mask else 0, .user_stack_bytes = config.user_stack_bytes });
+        const offcpu_ring_bytes = if (config.off_cpu) offcpu_live.ringBytes(config.tids.len) else 0;
+        if (offcpu_ring_bytes != 0 and syscall_ring_bytes + offcpu_ring_bytes >= config.ring_budget_bytes) return error.OffCpuRingBudget;
+        const opened = try perf.start(a, .{ .target = @ptrCast(target), .follow_threads = config.follow_threads, .tids = config.tids, .frequency_hz = config.frequency_hz, .max_frames = 64, .mmap_data = true, .data_pages = ringPages(config.tids.len), .ring_budget_bytes = config.ring_budget_bytes - syscall_ring_bytes - offcpu_ring_bytes, .max_sides = perf.max_sides_cap, .exclude_kernel = !config.kernel_stacks, .context_switch = config.context_switch, .user_regs_mask = if (config.user_stack_bytes != 0) perf_regs.mask else 0, .user_stack_bytes = config.user_stack_bytes });
         switch (opened) {
             .failed => |failure| {
                 user_state.deinit(a);
@@ -223,7 +293,22 @@ pub const Capture = struct {
                         return .{ .failed = full };
                     },
                 };
-                self.* = .{ .allocator = a, .arena = std.heap.ArenaAllocator.init(a), .id = id, .session_id = session_id, .generation = generation, .image_epoch = image_epoch, .pid = pid, .architecture = arch, .boot_id = @import("../binary/snapshot.zig").bootId(), .producer = @import("producer.zig").describe(target), .started_ns = started_ns, .config = .{ .sample_limit = config.sample_limit, .follow_threads = config.follow_threads, .ring_budget_bytes = config.ring_budget_bytes, .frequency_hz = config.frequency_hz, .duration_ms = config.duration_ms, .context_switch = config.context_switch, .syscall_timing = config.syscall_timing, .syscall_limit = config.syscall_limit, .user_stack_bytes = config.user_stack_bytes, .user_stack_budget_bytes = if (config.user_stack_bytes == 0) 0 else config.user_stack_budget_bytes }, .samples = .{ .max_samples = config.sample_limit }, .user_state = user_state, .accepted = collector.acceptance(), .thread_count = config.tids.len, .collector = collector, .syscall_collector = syscall_collector, .syscalls = .{ .enabled = config.syscall_timing, .limit = config.syscall_limit }, .images = images, .history = history, .missing_images = missing };
+                errdefer if (syscall_collector) |opened_syscalls| opened_syscalls.close();
+                var offcpu_collector: ?*offcpu_live.Collector = null;
+                errdefer if (offcpu_collector) |opened_off| opened_off.close();
+                if (config.off_cpu) switch (try offcpu_live.start(a, config.tids, offcpu_ring_bytes)) {
+                    .collector => |opened_off| offcpu_collector = opened_off,
+                    .failed => |failure| {
+                        if (syscall_collector) |opened_syscalls| opened_syscalls.close();
+                        collector.close();
+                        user_state.deinit(a);
+                        images.deinit();
+                        history.deinit(a);
+                        a.destroy(self);
+                        return .{ .failed = failure };
+                    },
+                };
+                self.* = .{ .allocator = a, .arena = std.heap.ArenaAllocator.init(a), .id = id, .session_id = session_id, .generation = generation, .image_epoch = image_epoch, .pid = pid, .architecture = arch, .boot_id = @import("../binary/snapshot.zig").bootId(), .producer = @import("producer.zig").describe(target), .started_ns = started_ns, .config = .{ .sample_limit = config.sample_limit, .follow_threads = config.follow_threads, .ring_budget_bytes = config.ring_budget_bytes, .frequency_hz = config.frequency_hz, .duration_ms = config.duration_ms, .context_switch = config.context_switch, .kernel_stacks = config.kernel_stacks, .off_cpu = config.off_cpu, .syscall_timing = config.syscall_timing, .syscall_limit = config.syscall_limit, .user_stack_bytes = config.user_stack_bytes, .user_stack_budget_bytes = if (config.user_stack_bytes == 0) 0 else config.user_stack_budget_bytes }, .samples = .{ .max_samples = config.sample_limit }, .user_state = user_state, .accepted = collector.acceptance(), .kernel_stacks_requested = config.kernel_stacks, .kernel_stacks_granted = config.kernel_stacks and !collector.exclude_kernel, .off_cpu_granted = offcpu_collector != null, .thread_count = config.tids.len, .collector = collector, .syscall_collector = syscall_collector, .offcpu_collector = offcpu_collector, .syscalls = .{ .enabled = config.syscall_timing, .limit = config.syscall_limit }, .images = images, .history = history, .missing_images = missing };
                 for (debugger_ids, 0..) |debugger_id, i| {
                     self.threads[i] = .{ .debugger_id = debugger_id, .perf = collector.thread(i).? };
                     self.cpu_before[i] = activity.readTarget(@ptrCast(target), pid, config.tids[i]);
@@ -233,6 +318,7 @@ pub const Capture = struct {
                 // recorder still gives the archive a well-formed ECTX.
                 const net_context = @import("net_context.zig").Recorder;
                 self.net = if (self.producer == null) net_context.begin(a, pid, started_ns) else net_context.beginRemote(a, pid, started_ns);
+                self.loadKallsyms();
                 return .{ .capture = self };
             },
         }
@@ -265,6 +351,7 @@ pub const Capture = struct {
         if (!self.config.follow_threads or self.status != .collecting) return;
         // Release drained retired rings before applying the admission budget.
         self.drainSyscalls(4);
+        self.drainOffCpu(4);
         self.drain(4);
         if (self.status != .collecting) {
             self.stop(self.status, now);
@@ -310,6 +397,8 @@ pub const Capture = struct {
         self.clearOfflineGraph();
         if (self.collector) |collector| collector.close();
         if (self.syscall_collector) |collector| collector.close();
+        if (self.offcpu_collector) |collector| collector.close();
+        if (self.offcpu_view) |*view| view.deinit();
         self.syscalls.deinit(self.allocator);
         self.samples.deinit(self.allocator);
         self.user_state.deinit(self.allocator);
@@ -321,6 +410,7 @@ pub const Capture = struct {
         self.history.deinit(self.allocator);
         self.pe_assets.deinit(self.allocator);
         self.images.deinit();
+        if (self.kallsyms_owned) self.kallsyms.deinit();
         if (self.net) |*net| net.deinit();
         self.arena.deinit();
         self.allocator.destroy(self);
@@ -373,7 +463,7 @@ pub const Capture = struct {
         return null;
     }
     pub fn summary(self: *const Capture) Summary {
-        return .{ .producer = self.producer, .follow_threads = self.config.follow_threads, .ring_budget_bytes = if (self.config.ring_budget_bytes == 0) null else self.config.ring_budget_bytes, .ring_allocated_bytes = (if (self.collector) |collector| collector.allocatedRingBytes() else 0) + (if (self.syscall_collector != null) syscall_perf.ringBytes(self.thread_count) else 0), .opening_threads = self.openingThreads(), .scope = if (self.config.follow_threads) "all threads in this process, including held newborns; user CPU only; child processes remain outside scope" else "fixed selected threads, user CPU only; new tasks stop collection; a subset leaves mappings unverified", .id = self.id, .session_id = self.session_id, .opening_generation = self.generation, .image_epoch = self.image_epoch, .pid = self.pid, .revision = self.revision, .status = self.status, .stop_reasons = self.stop_reasons[0..self.stop_reason_count], .started_ns = self.started_ns, .collection_enabled_ns = self.collection_enabled_ns, .ended_ns = self.ended_ns, .duration_ms = self.config.duration_ms, .accepted = self.accepted, .threads = self.threads[0..self.thread_count], .sampled_state = .{ .requested_bytes = self.config.user_stack_bytes, .budget_bytes = self.config.user_stack_budget_bytes, .retained_bytes = self.user_state.used, .records = self.user_state.count, .skipped_stacks = self.user_state.skipped, .first_skipped_sample = self.firstSkippedSample(), .allocated_bytes = self.user_state.allocationBytes() }, .stored_samples = self.samples.len(), .sample_limit = self.config.sample_limit, .discarded_samples = self.discarded_samples, .lost_records = self.lost_records, .lost_samples = self.lost_samples, .throttles = self.throttles, .unthrottles = self.unthrottles, .mapping_events = self.mapping_events, .exec_events = self.exec_events, .exit_events = self.exit_events, .fork_events = self.fork_events, .scope_change = self.scope_change, .unknown_records = self.unknown_records, .unselected_threads = self.unselected_threads, .missing_images = self.missing_images, .trusted_before_ns = if (self.trusted_before_ns == std.math.maxInt(u64)) null else self.trusted_before_ns, .failure = self.failure, .diagnostic = self.diagnostic, .cpu_activity = self.cpu_activity, .scheduling = self.schedulingSummary(), .syscalls = self.syscallSummary(), .application_intervals = self.application_intervals.items.items.len, .mapping_revision = self.mapping_revision, .mapping_history = .{ .per_image_bytes_limit = @import("../binary/snapshot.zig").per_image_limit, .total_image_bytes_limit = @import("../binary/snapshot.zig").total_limit, .opening_regions = self.history.opening_count, .recorded_changes = self.history.changes.items.len, .unresolved_executable_mappings = self.unresolvedMappings(), .opened_images = self.images.loaded.items.len + self.pe_assets.entries.items.len, .pe_images = self.pe_assets.entries.items.len, .pe_metadata_bytes = self.pe_assets.metadata_bytes, .pe_failed = self.pe_assets_failed, .pe_pending = self.pe_assets_pending, .snapshot_bytes = self.images.snapshot_bytes, .images_not_searched = self.images.skipped().count, .image_budget = self.images.skipped().first } };
+        return .{ .producer = self.producer, .follow_threads = self.config.follow_threads, .ring_budget_bytes = if (self.config.ring_budget_bytes == 0) null else self.config.ring_budget_bytes, .ring_allocated_bytes = (if (self.collector) |collector| collector.allocatedRingBytes() else 0) + (if (self.syscall_collector != null) syscall_perf.ringBytes(self.thread_count) else 0) + (if (self.offcpu_collector != null) offcpu_live.ringBytes(self.thread_count) else 0), .opening_threads = self.openingThreads(), .scope = if (self.config.follow_threads and self.kernel_stacks_granted) "all threads in this process, including held newborns; user and kernel CPU; child processes remain outside scope" else if (self.config.follow_threads) "all threads in this process, including held newborns; user CPU only; child processes remain outside scope" else if (self.kernel_stacks_granted) "fixed selected threads, user and kernel CPU; new tasks stop collection; a subset leaves mappings unverified" else "fixed selected threads, user CPU only; new tasks stop collection; a subset leaves mappings unverified", .id = self.id, .session_id = self.session_id, .opening_generation = self.generation, .image_epoch = self.image_epoch, .pid = self.pid, .revision = self.revision, .status = self.status, .stop_reasons = self.stop_reasons[0..self.stop_reason_count], .started_ns = self.started_ns, .collection_enabled_ns = self.collection_enabled_ns, .ended_ns = self.ended_ns, .duration_ms = self.config.duration_ms, .accepted = self.accepted, .threads = self.threads[0..self.thread_count], .sampled_state = .{ .requested_bytes = self.config.user_stack_bytes, .budget_bytes = self.config.user_stack_budget_bytes, .retained_bytes = self.user_state.used, .records = self.user_state.count, .skipped_stacks = self.user_state.skipped, .first_skipped_sample = self.firstSkippedSample(), .allocated_bytes = self.user_state.allocationBytes() }, .stored_samples = self.samples.len(), .sample_limit = self.config.sample_limit, .discarded_samples = self.discarded_samples, .lost_records = self.lost_records, .lost_samples = self.lost_samples, .throttles = self.throttles, .unthrottles = self.unthrottles, .mapping_events = self.mapping_events, .exec_events = self.exec_events, .exit_events = self.exit_events, .fork_events = self.fork_events, .scope_change = self.scope_change, .unknown_records = self.unknown_records, .unselected_threads = self.unselected_threads, .missing_images = self.missing_images, .trusted_before_ns = if (self.trusted_before_ns == std.math.maxInt(u64)) null else self.trusted_before_ns, .failure = self.failure, .diagnostic = self.diagnostic, .kernel_stacks_requested = self.kernel_stacks_requested, .kernel_stacks_granted = self.kernel_stacks_granted, .kernel_symbolizable = self.kernel_symbolizable, .kernel_symbol_reason = self.kernel_symbol_reason, .off_cpu = self.offCpuSummary(), .cpu_activity = self.cpu_activity, .scheduling = self.schedulingSummary(), .syscalls = self.syscallSummary(), .application_intervals = self.application_intervals.items.items.len, .mapping_revision = self.mapping_revision, .mapping_history = .{ .per_image_bytes_limit = @import("../binary/snapshot.zig").per_image_limit, .total_image_bytes_limit = @import("../binary/snapshot.zig").total_limit, .opening_regions = self.history.opening_count, .recorded_changes = self.history.changes.items.len, .unresolved_executable_mappings = self.unresolvedMappings(), .opened_images = self.images.loaded.items.len + self.pe_assets.entries.items.len, .pe_images = self.pe_assets.entries.items.len, .pe_metadata_bytes = self.pe_assets.metadata_bytes, .pe_failed = self.pe_assets_failed, .pe_pending = self.pe_assets_pending, .snapshot_bytes = self.images.snapshot_bytes, .images_not_searched = self.images.skipped().count, .image_budget = self.images.skipped().first } };
     }
     pub fn poll(self: *Capture, now: u64) void {
         if (self.collector == null) return;
@@ -382,6 +472,7 @@ pub const Capture = struct {
             self.revision += 1;
         }
         self.drainSyscalls(4);
+        self.drainOffCpu(4);
         self.drain(4);
         if (self.status != .collecting) {
             self.stop(self.status, now);
@@ -409,6 +500,17 @@ pub const Capture = struct {
             self.syscalls.finish(self.allocator, if (trace.image_changed) .exec else if (self.hasStop(.syscall_error)) .decode_error else if (self.hasStop(.syscall_limit)) .truncated else .missing_exit) catch |err| self.noteStop(.syscall_limit, @errorName(err));
             trace.close();
             self.syscall_collector = null;
+        }
+        if (self.offcpu_collector) |trace| {
+            if (trace.stop()) |failure| {
+                self.failure = failure;
+                self.noteStop(.collector_error, failure.detail);
+            }
+            self.drainOffCpu(128);
+            trace.finish(now) catch |err| self.noteStop(.collector_error, @errorName(err));
+            self.offcpu_view = trace.takeTracker();
+            trace.close();
+            self.offcpu_collector = null;
         }
         if (collector.stop()) |failure| {
             self.failure = failure;
@@ -542,7 +644,10 @@ pub const Capture = struct {
             },
             .throttle => self.throttles += 1,
             .unthrottle => self.unthrottles += 1,
-            .exit => self.exit_events += 1,
+            .exit => {
+                self.exit_events += 1;
+                if (event.tid != 0 and event.tid <= std.math.maxInt(i32)) self.truncateOffCpu(@intCast(event.tid), if (event.time_present) event.time_ns else self.started_ns);
+            },
             .fork => {
                 self.fork_events += 1;
                 if (self.outlive_child_processes and event.pid != self.pid) return;
@@ -975,13 +1080,15 @@ pub const Capture = struct {
             if (!filter.contains(core.tid, offset)) continue;
             const sample = self.samples.get(sample_index);
             try cursor.advance(sample.time_ns);
-            var path: [records.max_frames + 4]flame.Frame = undefined;
+            var path: [records.max_frames * 2 + 8]flame.Frame = undefined;
             var count: usize = 0;
             // Labels are interned with the capture, not allocated per sample.
             const thread = self.threads[thread_index];
             path[count] = .{ .kind = .thread, .address = sample.tid, .module_id = thread.debugger_id, .name = std.mem.sliceTo(&self.thread_names[thread_index], 0) };
             count += 1;
             var chain = userChain(sample);
+            const kernel = kernelChain(sample);
+            const show_kernel = kernel.count > 0 and !filter.hide_kernel;
             const trusted = sample.time_ns < self.trusted_before_ns;
             var unverified = !trusted;
             // Kernel frame-pointer walking can run into libc/entry code that
@@ -996,7 +1103,10 @@ pub const Capture = struct {
                     break;
                 }
             };
-            if (sample.callchain != .complete or chain.count <= 1 or chain.omitted_context or unmapped_caller) {
+            // A complete kernel stack with no user frame is the sample, not a
+            // missing user callchain. Hypervisor and guest context still count.
+            const kernel_only = chain.count == 0 and kernel.count > 0 and sample.callchain == .complete and !chain.omitted_context and !unmapped_caller;
+            if (!kernel_only and (sample.callchain != .complete or chain.count <= 1 or chain.omitted_context or unmapped_caller)) {
                 result.partial_samples += 1;
                 path[count] = .{ .kind = .incomplete, .address = if (unmapped_caller) 4 else @as(u64, @intFromEnum(sample.callchain)) + 1, .name = if (unmapped_caller) "[unmapped caller / partial]" else if (sample.callchain == .truncated) "[truncated callers]" else "[callers unavailable / partial]" };
                 count += 1;
@@ -1008,12 +1118,316 @@ pub const Capture = struct {
                 if (path[count].kind == .unverified) unverified = true;
                 count += 1;
             }
-            if (chain.count == 0) {
+            if (chain.count == 0 and show_kernel) {
+                path[count] = .{ .kind = .kernel, .name = "[kernel]" };
+                count += 1;
+            } else if (chain.count == 0 and !(filter.hide_kernel and kernel.count > 0)) {
                 path[count] = .{ .kind = .unknown, .name = "[user IP unavailable]" };
                 count += 1;
             }
+            if (show_kernel) {
+                if (kernelCallersPartial(self.architecture, kernel.count)) {
+                    const user_partial = !kernel_only and (sample.callchain != .complete or chain.count <= 1 or chain.omitted_context or unmapped_caller);
+                    if (!user_partial) result.partial_samples += 1;
+                    path[count] = .{ .kind = .incomplete, .address = 5, .name = kernel_callers_unavailable };
+                    count += 1;
+                }
+                var kernel_index = kernel.count;
+                while (kernel_index > 0) {
+                    kernel_index -= 1;
+                    path[count] = try self.kernelFrame(kernel.addresses[kernel_index]);
+                    count += 1;
+                }
+            }
             if (unverified) result.unverified_samples += 1;
             try result.add(path[0..count]);
+        }
+        try result.layout();
+        return result;
+    }
+    fn kallsymsBoot(self: *const Capture, testing_file: bool) ?KallsymsKey {
+    if (testing_file) return null;
+    const rt = @import("../target/runtime.zig").c;
+    const boot: ?[36]u8 = if (self.images.target) |target| @import("../binary/snapshot.zig").bootIdTarget(target) else self.boot_id orelse @import("../binary/snapshot.zig").bootId();
+    const id = boot orelse return null;
+    var key: KallsymsKey = undefined;
+    @memcpy(key[0..36], &id);
+    // A remote target's module list is not read here; its key is the boot id.
+    const module_hash: u64 = if (rt.xrt_target_is_remote(self.images.target)) 0 else localModulesHash() orelse return null;
+    std.mem.writeInt(u64, key[36..44], module_hash, .little);
+    return key;
+}
+/// Name, size and load address of each loaded module. Use counts are left
+/// out: opening a device changes them without moving any symbol.
+fn localModulesHash() ?u64 {
+    const fd = std.c.open("/proc/modules", .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    if (fd < 0) return 0;
+    defer _ = std.c.close(fd);
+    var h = std.hash.Wyhash.init(0);
+    var buf: [65536]u8 = undefined;
+    var carry: usize = 0;
+    while (true) {
+        const n = std.c.read(fd, buf[carry..].ptr, buf.len - carry);
+        if (n < 0) return null;
+        const filled = carry + @as(usize, @intCast(n));
+        var start: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, buf[0..filled], start, '\n')) |nl| {
+            var fields = std.mem.tokenizeScalar(u8, buf[start..nl], ' ');
+            var i: usize = 0;
+            while (fields.next()) |field| : (i += 1) {
+                if (i == 0 or i == 1 or i == 5) {
+                    h.update(field);
+                    h.update(" ");
+                }
+            }
+            h.update("\n");
+            start = nl + 1;
+        }
+        if (n == 0) return h.final();
+        if (start == 0 and filled == buf.len) return null;
+        std.mem.copyForwards(u8, buf[0 .. filled - start], buf[start..filled]);
+        carry = filled - start;
+    }
+}
+fn borrowKallsyms(self: *Capture, boot: KallsymsKey) bool {
+    lockKallsymsCache();
+    defer kallsyms_cache_lock.unlock();
+    for (&kallsyms_cache) |*slot| {
+        if (!slot.used or !std.mem.eql(u8, &slot.boot, &boot)) continue;
+        self.kallsyms = slot.table;
+        self.kallsyms_owned = false;
+        if (slot.table.addresses_hidden) self.kernel_symbol_reason = "kallsyms addresses are hidden; kernel frames stay [kernel] 0x…";
+        self.kernel_symbolizable = self.kernel_stacks_granted and !slot.table.addresses_hidden;
+        return true;
+    }
+    return false;
+}
+/// Same-boot racers drop the duplicate parse. A published table is never
+/// freed: another capture may still be borrowing it. A full cache leaves the
+/// new table owned by this capture.
+fn storeKallsyms(boot: KallsymsKey, incoming: kallsyms.Table) struct { table: kallsyms.Table, owned: bool } {
+    lockKallsymsCache();
+    defer kallsyms_cache_lock.unlock();
+    for (&kallsyms_cache) |*slot| {
+        if (!slot.used or !std.mem.eql(u8, &slot.boot, &boot)) continue;
+        var loser = incoming;
+        loser.deinit();
+        return .{ .table = slot.table, .owned = false };
+    }
+    for (&kallsyms_cache) |*slot| {
+        if (slot.used) continue;
+        slot.* = .{ .boot = boot, .table = incoming, .used = true };
+        return .{ .table = slot.table, .owned = false };
+    }
+    return .{ .table = incoming, .owned = true };
+}
+fn adoptKallsyms(self: *Capture, table: kallsyms.Table, owned: bool) void {
+    self.kallsyms = table;
+    self.kallsyms_owned = owned;
+    if (table.addresses_hidden) self.kernel_symbol_reason = "kallsyms addresses are hidden; kernel frames stay [kernel] 0x…";
+    self.kernel_symbolizable = self.kernel_stacks_granted and !table.addresses_hidden;
+}
+/// Names kernel frames from the target's kallsyms. A failure here does not
+/// fail the capture: frames stay in the graph and the reason says why they
+/// have no symbol. A successful parse is cached by the boot id of the machine
+/// whose file was read. `XODB_TEST_KALLSYMS` and `XODB_TEST_KPTR_RESTRICT=hide`
+/// skip that cache, so a forced hide cannot publish or reuse a real table.
+fn loadKallsyms(self: *Capture) void {
+    if (!self.kernel_stacks_granted and !self.off_cpu_granted) return;
+    const rt = @import("../target/runtime.zig").c;
+    if (self.images.target) |t| if (!rt.xrt_target_kallsyms_capable(t)) {
+        self.kernel_symbol_reason = "remote agent does not provide kernel symbols";
+        return;
+    };
+    const testing_file = std.c.getenv("XODB_TEST_KALLSYMS") != null;
+    const forced_hide = if (std.c.getenv("XODB_TEST_KPTR_RESTRICT")) |raw| std.mem.eql(u8, std.mem.span(raw), "hide") else false;
+    const boot = if (forced_hide) null else self.kallsymsBoot(testing_file);
+    if (boot) |id| if (self.borrowKallsyms(id)) return;
+    const allocator = if (boot != null) std.heap.page_allocator else self.allocator;
+    const fd = self.openKallsymsFd() catch {
+        self.kernel_symbol_reason = "kallsyms unreadable";
+        return;
+    };
+    defer _ = std.c.close(fd);
+    const bytes = readAllFd(allocator, fd) catch |err| {
+        self.kernel_symbol_reason = if (err == error.KallsymsTruncated) "kallsyms read was truncated; kernel frames stay unnamed" else "kallsyms unreadable";
+        return;
+    };
+    var table = kallsyms.parseOwned(allocator, bytes) catch {
+        self.kernel_symbol_reason = "kallsyms parse failed";
+        return;
+    };
+    if (forced_hide) table.addresses_hidden = true;
+    if (table.symbols.len == 0) {
+        table.deinit();
+        self.kernel_symbol_reason = "kallsyms empty";
+        return;
+    }
+    if (boot) |id| {
+        const stored = storeKallsyms(id, table);
+        self.adoptKallsyms(stored.table, stored.owned);
+    } else self.adoptKallsyms(table, true);
+}
+    fn openKallsymsFd(self: *Capture) !c_int {
+        if (std.c.getenv("XODB_TEST_KALLSYMS")) |raw| {
+            if (raw[0] == 0) return error.KallsymsUnreadable;
+            const fd = std.c.open(raw, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+            if (fd < 0) return error.KallsymsUnreadable;
+            return fd;
+        }
+        const rt = @import("../target/runtime.zig").c;
+        const request = std.mem.zeroInit(rt.struct_xrt_file_request, .{ .kind = rt.XRT_FILE_KALLSYMS });
+        var fd: c_int = -1;
+        const target = self.images.target;
+        const status = if (target) |t| rt.xrt_target_file(t, &request, &fd) else rt.xrt_process_file(0, &request, &fd);
+        if (status != rt.XRT_OK) return error.KallsymsUnreadable;
+        return fd;
+    }
+    /// Kernel chain, leaf first. The sampled IP is exact. Callers are stored
+    /// as the return address minus one, and the first copy of that IP is dropped.
+    fn kernelFrame(self: *Capture, address: u64) !flame.Frame {
+        if (self.kallsyms.lookup(address)) |symbol| {
+            const name = if (symbol.module.len == 0) symbol.name else try std.fmt.allocPrint(self.arena.allocator(), "{s}:{s}", .{ symbol.module, symbol.name });
+            return .{ .kind = .kernel, .address = symbol.address, .lookup_address = address, .name = name, .module = symbol.module };
+        }
+        if (address == 0) return .{ .kind = .kernel, .address = address, .lookup_address = address, .name = "[kernel]" };
+        const name = try std.fmt.allocPrint(self.arena.allocator(), "[kernel] 0x{x}", .{address});
+        return .{ .kind = .kernel, .address = address, .lookup_address = address, .name = name };
+    }
+    fn offCpuTracker(self: *const Capture) ?*const offcpu.Tracker {
+        if (self.offcpu_view) |*view| return view;
+        if (self.offcpu_collector) |collector| return &collector.tracker;
+        return null;
+    }
+    fn offCpuTrackerMut(self: *Capture) ?*offcpu.Tracker {
+        if (self.offcpu_view) |*view| return view;
+        if (self.offcpu_collector) |collector| return &collector.tracker;
+        return null;
+    }
+    fn truncateOffCpu(self: *Capture, tid: i32, time_ns: u64) void {
+        const tracker = self.offCpuTrackerMut() orelse return;
+        tracker.truncateTid(tid, time_ns) catch |err| self.noteStop(.collector_error, @errorName(err));
+    }
+    fn drainOffCpu(self: *Capture, passes: usize) void {
+        const collector = self.offcpu_collector orelse return;
+        const before = collector.tracker.closed;
+        defer if (self.offcpu_collector) |live| if (live.tracker.closed != before) {
+            self.revision += 1;
+        };
+        for (0..passes) |_| {
+            const more = collector.drain() catch |err| {
+                self.noteStop(.collector_error, @errorName(err));
+                self.revision += 1;
+                return;
+            };
+            if (!more) return;
+        }
+        if (passes == 128) self.noteStop(.collector_error, "off-CPU final drain limit reached");
+    }
+    pub fn offCpuSummary(self: *const Capture) OffCpuSummary {
+        const tracker = self.offCpuTracker();
+        var closed: usize = 0;
+        var truncated: usize = 0;
+        var blocked: u64 = 0;
+        var open_count: usize = 0;
+        var dropped: u64 = 0;
+        var runqueue: u64 = 0;
+        if (tracker) |live| {
+            closed = @intCast(@min(live.closed, std.math.maxInt(usize)));
+            truncated = @intCast(@min(live.truncated_closes, std.math.maxInt(usize)));
+            blocked = live.blocked_total;
+            dropped = live.dropped;
+            runqueue = live.runqueue_ns;
+            for (live.open) |slot| if (slot != null) {
+                open_count += 1;
+            };
+        }
+        return .{ .requested = self.config.off_cpu, .granted = self.off_cpu_granted, .intervals = closed, .truncated = truncated, .blocked_ns = blocked, .dropped = dropped, .open = open_count, .runqueue_ns = runqueue };
+    }
+    /// Full-range weight is the stored nanoseconds. A clipped window scales by
+    /// the overlap of the merged span, which is approximate once gaps were folded.
+    fn blockedOverlapWeight(self: *const Capture, interval: offcpu.Interval, filter: Filter) u64 {
+        if (interval.tid <= 0 or !filter.matchesThread(@intCast(interval.tid))) return 0;
+        if (filter.from_ns == 0 and filter.to_ns == std.math.maxInt(u64)) return interval.blocked_ns;
+        const span = interval.end_ns -| interval.start_ns;
+        if (span == 0 or interval.blocked_ns == 0) return 0;
+        const win_from = self.started_ns +| filter.from_ns;
+        const win_to = if (filter.to_ns >= std.math.maxInt(u64) - self.started_ns) std.math.maxInt(u64) else self.started_ns + filter.to_ns;
+        const end = if (interval.end_ns > interval.start_ns) interval.end_ns else interval.start_ns;
+        const lo = @max(interval.start_ns, win_from);
+        const hi = @min(end, win_to);
+        if (hi <= lo) return 0;
+        const scaled = @as(u128, interval.blocked_ns) * (hi - lo) / span;
+        return @intCast(@min(scaled, @as(u128, interval.blocked_ns)));
+    }
+    /// Blocked-time flame. Sample weight never enters this tree.
+    pub fn blockedGraph(self: *Capture, a: std.mem.Allocator, filter: Filter) !flame.Graph {
+        try self.validateFilter(filter);
+        const tracker = self.offCpuTracker() orelse return error.OffCpuNotRequested;
+        var result = try flame.Graph.init(a);
+        errdefer result.deinit();
+        result.nodes.items[0].frame.name = "Blocked time";
+        var cursor = try mappings.Cursor.init(a, &self.history);
+        defer cursor.deinit();
+        // Intervals are stored as they close, interleaved across threads. The
+        // mapping cursor only moves forward, so visit them by start time.
+        const order = try a.alloc(u32, tracker.intervals.items.len);
+        defer a.free(order);
+        for (order, 0..) |*index, i| index.* = @intCast(i);
+        std.mem.sort(u32, order, tracker.intervals.items, struct {
+            fn less(items: []const offcpu.Interval, l: u32, r: u32) bool {
+                if (items[l].start_ns != items[r].start_ns) return items[l].start_ns < items[r].start_ns;
+                return l < r;
+            }
+        }.less);
+        for (order) |interval_index| {
+            const interval = tracker.intervals.items[interval_index];
+            const weight = self.blockedOverlapWeight(interval, filter);
+            if (weight == 0) continue;
+            const tid_u: u32 = @intCast(interval.tid);
+            try cursor.advance(interval.start_ns);
+            const trusted = interval.start_ns < self.trusted_before_ns;
+            var user_buf: [offcpu.max_frames]u64 = undefined;
+            var kernel_buf: [offcpu.max_frames]u64 = undefined;
+            const parts = offcpu.splitChain(interval.frames, &user_buf, &kernel_buf);
+            var path: [offcpu.max_frames * 2 + 6]flame.Frame = undefined;
+            var count: usize = 0;
+            const thread_index = self.threadIndex(interval.tid);
+            path[count] = .{ .kind = .thread, .address = tid_u, .module_id = if (thread_index) |index| self.threads[index].debugger_id else 0, .name = if (thread_index) |index| std.mem.sliceTo(&self.thread_names[index], 0) else "thread" };
+            count += 1;
+            if (interval.wait == .runqueue) {
+                path[count] = .{ .kind = .incomplete, .address = 6, .name = offcpu.run_queue_name };
+                count += 1;
+            }
+            var user_index = parts.user;
+            while (user_index > 0) {
+                user_index -= 1;
+                const address = if (user_index == 0) user_buf[user_index] else user_buf[user_index] -| 1;
+                path[count] = try self.frame(address, trusted, if (trusted) cursor.at(address) else null);
+                count += 1;
+            }
+            const show_kernel = parts.kernel > 0 and !filter.hide_kernel;
+            if (parts.user == 0 and show_kernel) {
+                path[count] = .{ .kind = .kernel, .name = "[kernel]" };
+                count += 1;
+            } else if (parts.user == 0 and parts.kernel == 0) {
+                path[count] = .{ .kind = .unknown, .name = "[blocked stack unavailable]" };
+                count += 1;
+            }
+            if (show_kernel and kernelCallersPartial(self.architecture, parts.kernel)) {
+                path[count] = .{ .kind = .incomplete, .address = 5, .name = kernel_callers_unavailable };
+                count += 1;
+            }
+            if (show_kernel) {
+                var kernel_index = parts.kernel;
+                while (kernel_index > 0) {
+                    kernel_index -= 1;
+                    const address = if (kernel_index == 0) kernel_buf[kernel_index] else kernel_buf[kernel_index] -| 1;
+                    path[count] = try self.kernelFrame(address);
+                    count += 1;
+                }
+            }
+            try result.addWeighted(path[0..count], weight);
         }
         try result.layout();
         return result;
@@ -1052,6 +1466,11 @@ pub const Summary = struct {
     trusted_before_ns: ?u64,
     failure: ?perf.Failure,
     diagnostic: []const u8,
+    kernel_stacks_requested: bool = false,
+    kernel_stacks_granted: bool = false,
+    kernel_symbolizable: bool = false,
+    kernel_symbol_reason: []const u8 = "",
+    off_cpu: OffCpuSummary = .{ .requested = false, .granted = false, .intervals = 0, .truncated = 0, .blocked_ns = 0, .dropped = 0, .open = 0 },
     cpu_activity: ?activity.Summary,
     scheduling: Capture.SchedulingSummary,
     syscalls: Capture.SyscallSummary,
@@ -1070,6 +1489,18 @@ pub const Summary = struct {
     sampled_state: struct { requested_bytes: u32, budget_bytes: u32, retained_bytes: usize, records: usize, skipped_stacks: usize, first_skipped_sample: ?usize, allocated_bytes: usize },
     sample_limit: usize = max_samples,
 };
+pub const OffCpuSummary = struct {
+    requested: bool,
+    granted: bool,
+    intervals: usize,
+    truncated: usize,
+    blocked_ns: u64,
+    dropped: u64,
+    open: usize,
+    /// Nanoseconds that were a run-queue wait after preemption, already included in `blocked_ns`.
+    runqueue_ns: u64 = 0,
+    weight: []const u8 = "blocked nanoseconds on a separate flame; sample flames stay sample-weighted; repeated stacks are summed; a run-queue wait after preemption is labeled separately",
+};
 pub const Chain = struct { addresses: [records.max_frames + 1]u64 = undefined, count: usize = 0, omitted_context: bool = false };
 pub fn userChain(sample: records.Sample) Chain {
     var chain = Chain{};
@@ -1080,8 +1511,10 @@ pub fn userChain(sample: records.Sample) Chain {
     var first_user = true;
     for (sample.frames[0..sample.frame_count]) |item| {
         if (item.marker) continue;
+        // Kernel context is a separate chain. Hypervisor and guest context
+        // still mean the user chain is partial.
         if (item.context != .user) {
-            chain.omitted_context = true;
+            if (item.context != .kernel) chain.omitted_context = true;
             continue;
         }
         if (item.address == 0 or records.isContextMarker(item.address)) continue;
@@ -1097,6 +1530,58 @@ pub fn userChain(sample: records.Sample) Chain {
     }
     return chain;
 }
+pub const kernel_callers_unavailable = "[kernel callers unavailable]";
+/// LoongArch frame-pointer walks often stop at the leaf. One kernel frame is
+/// not a complete chain there. Other architectures keep the recorded chain.
+pub fn kernelCallersPartial(architecture: Arch, kernel_frames: usize) bool {
+    return architecture == .loongarch64 and kernel_frames == 1;
+}
+pub fn kernelChain(sample: records.Sample) Chain {
+    var chain = Chain{};
+    if (sample.ip_present and sample.ip != 0 and sample.cpu_mode == .kernel and !records.isContextMarker(sample.ip)) {
+        chain.addresses[0] = sample.ip;
+        chain.count = 1;
+    }
+    var skipped_leaf = false;
+    for (sample.frames[0..sample.frame_count]) |item| {
+        if (item.marker) continue;
+        if (item.context != .kernel) continue;
+        if (item.address == 0 or records.isContextMarker(item.address)) continue;
+        // Same rule as the user chain: drop only the first copy of the sampled IP.
+        if (!skipped_leaf and sample.cpu_mode == .kernel and sample.ip_present and item.address == sample.ip) {
+            skipped_leaf = true;
+            continue;
+        }
+        skipped_leaf = true;
+        chain.addresses[chain.count] = item.address -| 1;
+        chain.count += 1;
+    }
+    return chain;
+}
+fn readAllFd(allocator: std.mem.Allocator, fd: c_int) ![]u8 {
+    const c = @import("../c.zig").api;
+    const cap: usize = 32 * 1024 * 1024;
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var tmp: [65536]u8 = undefined;
+    while (buf.items.len < cap) {
+        const room = cap - buf.items.len;
+        const n = std.c.read(fd, &tmp, @min(tmp.len, room));
+        if (n < 0) {
+            if (std.c._errno().* == c.EINTR) continue;
+            return error.KallsymsUnreadable;
+        }
+        if (n == 0) return buf.toOwnedSlice(allocator);
+        try buf.appendSlice(allocator, tmp[0..@intCast(n)]);
+    }
+    var extra: [1]u8 = undefined;
+    while (true) {
+        const n = std.c.read(fd, &extra, 1);
+        if (n < 0 and std.c._errno().* == c.EINTR) continue;
+        if (n > 0) return error.KallsymsTruncated;
+        return buf.toOwnedSlice(allocator);
+    }
+}
 
 test "sample IP is exact lookup, callers use return minus one, markers and recursion survive" {
     var sample = records.Sample{ .ip = 100, .ip_present = true, .cpu_mode = .user, .frame_count = 6 };
@@ -1108,7 +1593,223 @@ test "sample IP is exact lookup, callers use return minus one, markers and recur
     sample.frames[5] = .{ .context = .user, .address = 0 };
     const chain = userChain(sample);
     try std.testing.expectEqualSlices(u64, &.{ 100, 99, 199 }, chain.addresses[0..chain.count]);
-    try std.testing.expect(chain.omitted_context);
+    try std.testing.expect(!chain.omitted_context);
+    const kernel = kernelChain(sample);
+    try std.testing.expectEqualSlices(u64, &.{499}, kernel.addresses[0..kernel.count]);
+}
+
+fn plantCapture(a: std.mem.Allocator, tid: i32) !*Capture {
+    const capture = try a.create(Capture);
+    capture.* = .{ .allocator = a, .arena = std.heap.ArenaAllocator.init(a), .id = 1, .session_id = 1, .generation = 0, .image_epoch = 0, .pid = 1, .started_ns = 1000, .config = .{}, .accepted = std.mem.zeroes(perf.Acceptance), .thread_count = 1, .collector = null, .images = modules.Modules.init(a), .trusted_before_ns = 0 };
+    capture.threads[0] = .{ .debugger_id = 1, .perf = .{ .tid = tid, .event_id = 1, .start_time_ticks = 1, .start_time_known = true } };
+    _ = try std.fmt.bufPrintZ(&capture.thread_names[0], "Thread {d}", .{tid});
+    return capture;
+}
+
+test "kernel frames sit under the user frame that entered the kernel" {
+    const a = std.testing.allocator;
+    const capture = try plantCapture(a, 7);
+    defer capture.deinit();
+    const text =
+        \\ffffffff81000100 T vfs_read
+        \\ffffffff81000200 T sys_read
+        \\ffffffffa0100100 t drm_ioctl [drm]
+        \\
+    ;
+    capture.kallsyms = try kallsyms.parse(a, text);
+    capture.kallsyms_owned = true;
+    var sample = records.Sample{ .ip = 0x400100, .ip_present = true, .pid = 1, .tid = 7, .tid_present = true, .time_ns = 2000, .time_present = true, .cpu_mode = .user, .callchain = .complete, .frame_count = 3 };
+    sample.frames[0] = .{ .context = .user, .address = 0x400100 };
+    sample.frames[1] = .{ .context = .user, .address = 0x400200 };
+    sample.frames[2] = .{ .context = .kernel, .address = 0xffffffff81000180 };
+    try capture.samples.append(a, sample);
+    var graph_ = try capture.graph(a, .{});
+    defer graph_.deinit();
+    var kernel_node: ?flame.Node = null;
+    for (graph_.nodes.items) |node| {
+        if (node.frame.kind == .kernel and std.mem.eql(u8, node.frame.name, "vfs_read")) kernel_node = node;
+    }
+    try std.testing.expect(kernel_node != null);
+    const found = kernel_node.?;
+    try std.testing.expectEqual(@as(u64, 0xffffffff81000100), found.frame.address);
+    const parent = graph_.nodes.items[found.parent.?];
+    try std.testing.expect(parent.frame.kind != .kernel and parent.frame.kind != .thread);
+    try std.testing.expectEqual(@as(u64, 0x400100), parent.frame.lookup_address);
+    try std.testing.expectEqual(@as(u64, 1), graph_.nodes.items[0].inclusive);
+    var hidden = try capture.graph(a, .{ .hide_kernel = true });
+    defer hidden.deinit();
+    for (hidden.nodes.items) |node| try std.testing.expect(node.frame.kind != .kernel);
+    try std.testing.expectEqual(@as(u64, 1), hidden.nodes.items[0].inclusive);
+
+    const only = try plantCapture(a, 7);
+    defer only.deinit();
+    only.kallsyms = try kallsyms.parse(a, text);
+    only.kallsyms_owned = true;
+    var kernel_sample = records.Sample{ .ip = 0xffffffff81000180, .ip_present = true, .pid = 1, .tid = 7, .tid_present = true, .time_ns = 2000, .time_present = true, .cpu_mode = .kernel, .callchain = .complete, .frame_count = 1 };
+    kernel_sample.frames[0] = .{ .context = .kernel, .address = 0xffffffff81000180 };
+    try only.samples.append(a, kernel_sample);
+    var kernel_graph = try only.graph(a, .{});
+    defer kernel_graph.deinit();
+    try std.testing.expectEqual(@as(u64, 0), kernel_graph.partial_samples);
+    var saw_root = false;
+    var saw_fn = false;
+    for (kernel_graph.nodes.items) |node| {
+        if (node.frame.kind == .kernel and std.mem.eql(u8, node.frame.name, "[kernel]")) saw_root = true;
+        if (node.frame.kind == .kernel and std.mem.eql(u8, node.frame.name, "vfs_read")) saw_fn = true;
+    }
+    try std.testing.expect(saw_root and saw_fn);
+    var kernel_hidden = try only.graph(a, .{ .hide_kernel = true });
+    defer kernel_hidden.deinit();
+    try std.testing.expectEqual(@as(usize, 2), kernel_hidden.nodes.items.len);
+    try std.testing.expectEqual(flame.Kind.thread, kernel_hidden.nodes.items[1].frame.kind);
+}
+
+test "blocked time from two threads that close out of start order still builds" {
+    const a = std.testing.allocator;
+    const capture = try plantCapture(a, 7);
+    defer capture.deinit();
+    capture.config.off_cpu = true;
+    capture.off_cpu_granted = true;
+    var tracker = try offcpu.Tracker.init(a, &.{ 7, 8 });
+    try tracker.switched(7, 1, 1000, &.{ records.context_user, 0x400100 });
+    try tracker.switched(8, 1, 1500, &.{ records.context_user, 0x400200 });
+    try tracker.resumed(8, 1600);
+    try tracker.resumed(7, 2000);
+    capture.offcpu_view = tracker;
+    var blocked = try capture.blockedGraph(a, .{});
+    defer blocked.deinit();
+    try std.testing.expectEqual(@as(u64, 1100), blocked.nodes.items[0].inclusive);
+}
+
+test "blocked time stays on its own flame and keeps its weight when kernel frames are hidden" {
+    const a = std.testing.allocator;
+    const capture = try plantCapture(a, 7);
+    defer capture.deinit();
+    capture.config.off_cpu = true;
+    capture.off_cpu_granted = true;
+    capture.trusted_before_ns = std.math.maxInt(u64);
+    const text = "ffffffff81000100 T vfs_read\nffffffff81000200 T sys_read\n";
+    capture.kallsyms = try kallsyms.parse(a, text);
+    capture.kallsyms_owned = true;
+    var tracker = try offcpu.Tracker.init(a, &.{7});
+    const frames = [_]u64{ records.context_kernel, 0xffffffff81000180, records.context_user, 0x400100 };
+    try tracker.switched(7, 1, 1100, &frames);
+    try tracker.finish(1100 + 250_000_000);
+    try tracker.switched(7, 1, 2000, &.{});
+    try tracker.finish(2000);
+    capture.offcpu_view = tracker;
+    var blocked = try capture.blockedGraph(a, .{});
+    defer blocked.deinit();
+    try std.testing.expectEqualStrings("Blocked time", blocked.nodes.items[0].frame.name);
+    try std.testing.expectEqual(@as(u64, 250_000_000), blocked.nodes.items[0].inclusive);
+    var kernel_node: ?flame.Node = null;
+    for (blocked.nodes.items) |node| {
+        if (node.frame.kind == .kernel and std.mem.eql(u8, node.frame.name, "vfs_read")) kernel_node = node;
+    }
+    try std.testing.expect(kernel_node != null);
+    const parent = blocked.nodes.items[kernel_node.?.parent.?];
+    try std.testing.expect(parent.frame.kind != .kernel and parent.frame.kind != .thread);
+    try std.testing.expectEqual(@as(u64, 0x400100), parent.frame.lookup_address);
+    var hidden = try capture.blockedGraph(a, .{ .hide_kernel = true });
+    defer hidden.deinit();
+    for (hidden.nodes.items) |node| try std.testing.expect(node.frame.kind != .kernel);
+    try std.testing.expectEqual(@as(u64, 250_000_000), hidden.nodes.items[0].inclusive);
+    var samples = try capture.graph(a, .{});
+    defer samples.deinit();
+    try std.testing.expectEqualStrings("All samples", samples.nodes.items[0].frame.name);
+    try std.testing.expectEqual(@as(u64, 0), samples.nodes.items[0].inclusive);
+}
+
+test "a loongarch leaf-only kernel chain is marked partial and an x86 chain is not" {
+    const a = std.testing.allocator;
+    const capture = try plantCapture(a, 7);
+    defer capture.deinit();
+    capture.architecture = .loongarch64;
+    const text = "ffffffff81000100 T __clear_user_fast\nffffffff81000200 T sys_read\n";
+    capture.kallsyms = try kallsyms.parse(a, text);
+    capture.kallsyms_owned = true;
+    var sample = records.Sample{ .ip = 0x400100, .ip_present = true, .pid = 1, .tid = 7, .tid_present = true, .time_ns = 2000, .time_present = true, .cpu_mode = .user, .callchain = .complete, .frame_count = 3 };
+    sample.frames[0] = .{ .context = .user, .address = 0x400100 };
+    sample.frames[1] = .{ .context = .user, .address = 0x400200 };
+    sample.frames[2] = .{ .context = .kernel, .address = 0xffffffff81000180 };
+    try capture.samples.append(a, sample);
+    var graph_ = try capture.graph(a, .{});
+    defer graph_.deinit();
+    try std.testing.expectEqual(@as(u64, 1), graph_.partial_samples);
+    var marked = false;
+    for (graph_.nodes.items) |node| {
+        if (node.frame.kind == .incomplete and std.mem.eql(u8, node.frame.name, kernel_callers_unavailable)) marked = true;
+    }
+    try std.testing.expect(marked);
+    capture.architecture = .x86_64;
+    var x86 = try capture.graph(a, .{});
+    defer x86.deinit();
+    try std.testing.expectEqual(@as(u64, 0), x86.partial_samples);
+    for (x86.nodes.items) |node| try std.testing.expect(!std.mem.eql(u8, node.frame.name, kernel_callers_unavailable));
+
+    const only = try plantCapture(a, 7);
+    defer only.deinit();
+    only.architecture = .loongarch64;
+    only.kallsyms = try kallsyms.parse(a, text);
+    only.kallsyms_owned = true;
+    var kernel_sample = records.Sample{ .ip = 0xffffffff81000180, .ip_present = true, .pid = 1, .tid = 7, .tid_present = true, .time_ns = 2000, .time_present = true, .cpu_mode = .kernel, .callchain = .complete, .frame_count = 1 };
+    kernel_sample.frames[0] = .{ .context = .kernel, .address = 0xffffffff81000180 };
+    try only.samples.append(a, kernel_sample);
+    var kernel_graph = try only.graph(a, .{});
+    defer kernel_graph.deinit();
+    try std.testing.expectEqual(@as(u64, 1), kernel_graph.partial_samples);
+}
+
+test "a run-queue wait is its own node and a clipped range scales the merged span" {
+    const a = std.testing.allocator;
+    const capture = try plantCapture(a, 7);
+    defer capture.deinit();
+    capture.config.off_cpu = true;
+    capture.off_cpu_granted = true;
+    var tracker = try offcpu.Tracker.init(a, &.{7});
+    try tracker.switchedWait(7, 1, 1000, &.{ records.context_user, 0x400100 }, .runqueue);
+    try tracker.resumed(7, 2000);
+    try tracker.switchedWait(7, 1, 3000, &.{ records.context_user, 0x400100 }, .blocking);
+    try tracker.resumed(7, 4000);
+    capture.offcpu_view = tracker;
+    var blocked = try capture.blockedGraph(a, .{});
+    defer blocked.deinit();
+    try std.testing.expectEqual(@as(u64, 2000), blocked.nodes.items[0].inclusive);
+    var saw_queue = false;
+    for (blocked.nodes.items) |node| {
+        if (std.mem.eql(u8, node.frame.name, offcpu.run_queue_name)) saw_queue = true;
+    }
+    try std.testing.expect(saw_queue);
+    try std.testing.expect(blocked.nodes.items.len >= 4);
+    var clipped = try capture.blockedGraph(a, .{ .from_ns = 500, .to_ns = 1000 });
+    defer clipped.deinit();
+    try std.testing.expectEqual(@as(u64, 500), clipped.nodes.items[0].inclusive);
+}
+
+test "hidden kallsyms labels kernel frames without failing the capture" {
+    const a = std.testing.allocator;
+    var name_buf: [96]u8 = undefined;
+    const name = std.fmt.bufPrintZ(&name_buf, ".zig-cache/kallsyms-{d}", .{std.c.getpid()}) catch unreachable;
+    const text = "ffffffff81000100 T vfs_read\n";
+    const fd = std.c.open(name.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, @as(std.c.mode_t, 0o644));
+    try std.testing.expect(fd >= 0);
+    try std.testing.expectEqual(@as(isize, text.len), std.c.write(fd, text, text.len));
+    _ = std.c.close(fd);
+    defer _ = std.c.unlink(name.ptr);
+    const c = @import("../c.zig").api;
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv("XODB_TEST_KALLSYMS", name.ptr, 1));
+    defer _ = c.unsetenv("XODB_TEST_KALLSYMS");
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv("XODB_TEST_KPTR_RESTRICT", "hide", 1));
+    defer _ = c.unsetenv("XODB_TEST_KPTR_RESTRICT");
+    const capture = try plantCapture(a, 7);
+    defer capture.deinit();
+    capture.kernel_stacks_granted = true;
+    capture.loadKallsyms();
+    try std.testing.expect(!capture.kernel_symbolizable);
+    try std.testing.expect(std.mem.indexOf(u8, capture.kernel_symbol_reason, "hidden") != null);
+    const frame = try capture.kernelFrame(0xffffffff81000180);
+    try std.testing.expect(std.mem.startsWith(u8, frame.name, "[kernel] 0x"));
+    try std.testing.expect(std.mem.indexOf(u8, frame.name, "vfs_read") == null);
 }
 
 test "duration is measured from collection enable, not from the earlier request clock" {

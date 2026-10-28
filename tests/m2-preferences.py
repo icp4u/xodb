@@ -38,7 +38,7 @@ def close(c, name):
 
 c=Client('control',fixture)
 try:
-    assert c.inspect('get_profile')['defaults']==dict(sample_limit=16384,frequency_hz=99,duration_ms=60000,context_switch=False,syscall_timing=False,syscall_limit=16384,user_stack_bytes=0,user_stack_budget_bytes=33554432,follow_threads=True,ring_budget_bytes=67108864)
+    assert c.inspect('get_profile')['defaults']==dict(sample_limit=16384,frequency_hz=99,duration_ms=60000,context_switch=False,kernel_stacks=False,off_cpu=False,syscall_timing=False,syscall_limit=16384,user_stack_bytes=0,user_stack_budget_bytes=33554432,follow_threads=True,ring_budget_bytes=67108864)
     cap=c.action('start_profile')['capture']
     assert cap['duration_ms']==60000
     c.action('stop_profile',capture_id=cap['id'])

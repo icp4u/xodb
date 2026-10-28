@@ -44,9 +44,11 @@ pub const FlameView = struct {
     hits: [512]Hit = undefined,
     hit_count: usize = 0,
     duration_button: gpu.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    kernel_button: gpu.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    blocked_button: gpu.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     scheduling_button: gpu.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     viewport: gpu.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
-    /// Recorded kernel callchains, or the reconstructed view (B).
+    /// Recorded callchains (B toggles reconstructed), or blocked time (Shift+B).
     basis: Basis = .recorded,
     derived_identity: [64]u8 = @splat(0),
     derived_failed_identity: ?[64]u8 = null,
@@ -154,6 +156,38 @@ pub const FlameView = struct {
     pub fn durationHit(self: *const FlameView, x: f32, y: f32) bool {
         return inside(self.duration_button, x, y);
     }
+    pub fn kernelHit(self: *const FlameView, x: f32, y: f32) bool {
+        return inside(self.kernel_button, x, y);
+    }
+    pub fn blockedHit(self: *const FlameView, x: f32, y: f32) bool {
+        return inside(self.blocked_button, x, y);
+    }
+    pub const HeaderPlace = struct {
+        kernel: gpu.Rect,
+        blocked: gpu.Rect,
+        scheduling: gpu.Rect,
+        duration: gpu.Rect,
+    };
+    /// Wide windows keep the kernel chip on the top row. Narrow windows put
+    /// kernel and blocked time on the second row, inside the flame bounds.
+    pub fn placeHeader(bounds: gpu.Rect) HeaderPlace {
+        var kernel: gpu.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+        var scheduling: gpu.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+        if (bounds.w >= 1329) {
+            kernel = .{ .x = bounds.x + 975, .y = bounds.y + 5, .w = 150, .h = 28 };
+            scheduling = .{ .x = bounds.x + 1135, .y = bounds.y + 5, .w = @max(0, bounds.w - 1149), .h = 28 };
+        } else {
+            scheduling = .{ .x = bounds.x + 975, .y = bounds.y + 5, .w = @max(0, bounds.w - 989), .h = 28 };
+            // Second row, right after Blocked time: the duration button owns
+            // the right end of that row.
+            kernel = .{ .x = bounds.x + 14 + 180 + 8, .y = bounds.y + 36, .w = 180, .h = 24 };
+        }
+        const blocked: gpu.Rect = .{ .x = bounds.x + 14, .y = bounds.y + 36, .w = 180, .h = 24 };
+        const duration: gpu.Rect = .{ .x = bounds.x + 975, .y = bounds.y + 37, .w = @max(0, bounds.w - 989), .h = 24 };
+        if (kernel.y >= bounds.y + 30 and duration.w > 0 and kernel.x + kernel.w + 8 > duration.x) kernel = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+        if (kernel.w > 0 and (kernel.x < bounds.x or kernel.x + kernel.w > bounds.x + bounds.w)) kernel = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+        return .{ .kernel = kernel, .blocked = blocked, .scheduling = scheduling, .duration = duration };
+    }
     fn durationText(buffer: []u8, ms: u32) []const u8 {
         if (ms == 0) return "until stopped";
         if (ms > 60000 and ms % 60000 == 0) return std.fmt.bufPrint(buffer, "{d} min", .{ms / 60000}) catch "";
@@ -181,6 +215,7 @@ pub const FlameView = struct {
     /// The timeline selection the graph was built with, for the status line.
     fn scopeText(buffer: []u8, filter: profile.Filter) []const u8 {
         if (std.meta.eql(filter, profile.Filter{})) return "";
+        if (filter.hide_kernel and filter.tid == null and filter.tids.len == 0 and filter.from_ns == 0 and filter.to_ns == std.math.maxInt(u64)) return "  /  graph: kernel frames hidden";
         var thread: [24]u8 = undefined;
         const tid = if (filter.tid) |t| std.fmt.bufPrint(&thread, "  TID {d}", .{t}) catch "" else if (filter.tids.len > 0) std.fmt.bufPrint(&thread, "  {d} threads", .{filter.tids.len}) catch "" else "";
         if (filter.from_ns == 0 and filter.to_ns == std.math.maxInt(u64)) return std.fmt.bufPrint(buffer, "  /  graph:{s}", .{tid}) catch "";
@@ -234,18 +269,32 @@ pub const FlameView = struct {
         self.hit_count = 0;
         r.clip = bounds;
         try style.box(r, bounds, theme.surface, theme.border, @splat(8));
-        try r.textFit(font, bounds.x + 14, bounds.y + 9, 175, "FLAMES / B: basis", theme.text);
+        var title_buf: [64]u8 = undefined;
+        const basis_name = switch (self.basis) {
+            .recorded => "recorded",
+            .reconstructed => "reconstructed",
+            .blocked => "blocked",
+        };
+        const title = std.fmt.bufPrint(&title_buf, "FLAMES / {s}", .{basis_name}) catch "FLAMES";
+        try r.textFit(font, bounds.x + 14, bounds.y + 9, 175, title, theme.text);
         const offline = if (self.view.facts) |facts| facts.offline else false;
         const active = if (self.view.facts) |facts| facts.collecting else false;
         try style.button(r, font, .{ .x = bounds.x + 205, .y = bounds.y + 5, .w = 170, .h = 28 }, if (offline) "Offline" else if (active) "Stop capture" else "New capture", if (offline) "" else "P", if (active) theme.warm else theme.good, 0, 0);
         try style.button(r, font, .{ .x = bounds.x + 390, .y = bounds.y + 5, .w = 140, .h = 28 }, "Zoom", "Z", theme.text, 0, 0);
         try style.button(r, font, .{ .x = bounds.x + 545, .y = bounds.y + 5, .w = 160, .h = 28 }, "Parent", "BKSP", theme.text, 0, 0);
         try style.button(r, font, .{ .x = bounds.x + 720, .y = bounds.y + 5, .w = 240, .h = 28 }, if (offline) "Location" else "Browse source", "ENTER", theme.text, 0, 0);
-        self.scheduling_button = .{ .x = bounds.x + 975, .y = bounds.y + 5, .w = @max(0, bounds.w - 989), .h = 28 };
+        // Capture, zoom, parent and browse stay on the top row. Kernel moves
+        // to the second row only when the window is too narrow for it there.
+        const placed = placeHeader(bounds);
+        self.kernel_button = placed.kernel;
+        self.blocked_button = placed.blocked;
+        self.scheduling_button = placed.scheduling;
+        if (self.kernel_button.w > 0) try style.button(r, font, self.kernel_button, if (self.selection.filter.hide_kernel) "Kernel hidden" else "Kernel shown", "⇧K", theme.text, 0, 0);
+        if (self.blocked_button.w > 0) try style.button(r, font, self.blocked_button, if (self.basis == .blocked) "Blocked on" else "Blocked time", "⇧B", theme.text, 0, 0);
         if (self.scheduling_button.w >= 180) {
             try style.button(r, font, self.scheduling_button, if (offline) "Capture details" else if (next.context_switch) "Setup / sched on" else "Setup / sched off", "S", theme.text, 0, 0);
         } else self.scheduling_button.w = 0;
-        self.duration_button = .{ .x = bounds.x + 975, .y = bounds.y + 37, .w = @max(0, bounds.w - 989), .h = 24 };
+        self.duration_button = placed.duration;
         var duration_buffer: [32]u8 = undefined;
         const next_duration = durationText(&duration_buffer, next.duration_ms);
         if (!offline and self.duration_button.w >= 180) {
@@ -253,21 +302,26 @@ pub const FlameView = struct {
             const text = try std.fmt.bufPrint(&text_buffer, "Next: {s}", .{next_duration});
             try style.button(r, font, self.duration_button, text, "T", theme.text, 0, 0);
         } else self.duration_button.w = 0;
-        const status_width = if (self.duration_button.w > 0) @min(bounds.w - 28, 947) else bounds.w - 28;
+        var status_x = bounds.x + 14;
+        var status_right = bounds.x + bounds.w - 14;
+        if (self.blocked_button.w > 0 and @abs(self.blocked_button.y - (bounds.y + 36)) < 2) status_x = self.blocked_button.x + self.blocked_button.w + 8;
+        if (self.kernel_button.w > 0 and self.kernel_button.y >= bounds.y + 30) status_x = @max(status_x, self.kernel_button.x + self.kernel_button.w + 8);
+        if (self.duration_button.w > 0) status_right = @min(status_right, self.duration_button.x - 8);
+        const status_width = @max(@as(f32, 0), status_right - status_x);
         if (start_error) |message| {
             // A failed start is not a capture outcome; any earlier capture is unchanged.
             var buffer: [256]u8 = undefined;
             const failed = capture_setup.startFailure(&buffer, message, failure, requested_threads, .{});
-            try label(r, font, bounds.x + 14, bounds.y + 38, status_width, theme.warm, "Did not start: {s}. {s}. S shows details.", .{ failed.title, failed.next });
+            try label(r, font, status_x, bounds.y + 38, status_width, theme.warm, "Did not start: {s}. {s}. S shows details.", .{ failed.title, failed.next });
         } else if (self.view.facts) |facts| {
             var scope: [96]u8 = undefined;
             var line: [512]u8 = undefined;
             const filtered = !std.meta.eql(self.built_filter, profile.Filter{});
             const why = capture_setup.reason(facts.status);
             const color = if (filtered or why.severity != .normal) theme.warm else theme.weak;
-            try label(r, font, bounds.x + 14, bounds.y + 38, status_width, color, "{s}{s}", .{ capture_panel.headerLine(&line, facts, .{}, .{ .now_ns = now() }), scopeText(&scope, self.built_filter) });
+            try label(r, font, status_x, bounds.y + 38, status_width, color, "{s}{s}", .{ capture_panel.headerLine(&line, facts, .{}, .{ .now_ns = now() }), scopeText(&scope, self.built_filter) });
         } else {
-            try r.textFit(font, bounds.x + 14, bounds.y + 48, status_width, "Pause after program initialization, press P, then Space to run. P stops collection; F returns to source.", theme.weak);
+            try r.textFit(font, status_x, bounds.y + 48, status_width, "Pause after program initialization, press P, then Space to run. P stops collection; F returns to source.", theme.weak);
             try label(r, font, bounds.x + 14, bounds.y + 79, bounds.w - 28, theme.weak, "Next: {d} Hz / {s}. S sets duration, rate, scheduling and threads (up to {d}); T cycles duration.", .{ next.frequency_hz, next_duration, perf.max_threads });
             return;
         }
@@ -284,12 +338,16 @@ pub const FlameView = struct {
                 }
             } else try r.textFit(font, bounds.x + 14, bounds.y + 62, bounds.w - 28, waiting.?, theme.warm);
             if (waiting != null) return;
+        } else if (self.basis == .blocked) {
+            if (waiting) |message| {
+                try r.textFit(font, bounds.x + 14, bounds.y + 62, bounds.w - 28, message, theme.warm);
+            } else try r.textFit(font, bounds.x + 14, bounds.y + 62, bounds.w - 28, "Blocked nanoseconds. [run queue] is a wait after preemption, separate from sleep and I/O. Repeated stacks are summed. A selected time range is approximate.", theme.weak);
         } else if (self.view.cpu_activity) |cpu| {
             const facts = self.view.facts.?;
             if (cpu.user_ms != null and cpu.kernel_ms != null) {
-                try label(r, font, bounds.x + 14, bounds.y + 62, bounds.w - 28, theme.weak, "CPU totals: user {d} ms / kernel {d} ms / wall {d} ms / {d}/{d} threads accounted. Graph samples user CPU only.", .{ cpu.user_ms.?, cpu.kernel_ms.?, (facts.ended_ns.? -| facts.started_ns) / 1_000_000, cpu.available_threads, facts.selected_threads });
-            } else try r.textFit(font, bounds.x + 14, bounds.y + 62, bounds.w - 28, "CPU totals unavailable (tasks exited or counters inaccessible). Graph samples user CPU only; excludes kernel and I/O waits.", theme.weak);
-        } else try r.textFit(font, bounds.x + 14, bounds.y + 62, bounds.w - 28, "Samples cover user CPU only. Kernel work and I/O waits are absent. Click selects; Z zooms; wheel scrolls depth.", theme.weak);
+                try label(r, font, bounds.x + 14, bounds.y + 62, bounds.w - 28, theme.weak, "CPU totals: user {d} ms / kernel {d} ms / wall {d} ms / {d}/{d} threads accounted. Kernel frames, when collected, sit under the user frame that entered the kernel.", .{ cpu.user_ms.?, cpu.kernel_ms.?, (facts.ended_ns.? -| facts.started_ns) / 1_000_000, cpu.available_threads, facts.selected_threads });
+            } else try r.textFit(font, bounds.x + 14, bounds.y + 62, bounds.w - 28, "CPU totals unavailable (tasks exited or counters inaccessible). Kernel frames are present only when this capture collected them. I/O waits are not shown.", theme.weak);
+        } else try r.textFit(font, bounds.x + 14, bounds.y + 62, bounds.w - 28, "Kernel frames, when collected, sit under the user frame that entered the kernel. I/O waits are not shown. Click selects; Z zooms; wheel scrolls depth.", theme.weak);
         if (self.basis == .recorded and self.view.facts != null) {
             if (!offline) {
                 // Routine snapshot refreshes are progress, so keep their color
@@ -309,7 +367,7 @@ pub const FlameView = struct {
         self.scrollBy(0);
         const view = self.viewport;
         r.clip = view;
-        if (root.inclusive == 0) try r.textFit(font, view.x + 10, view.y + 12, view.w - 20, "No user CPU samples. Resume a stopped target; kernel-heavy copying or I/O waits can also leave this view empty.", theme.weak);
+        if (root.inclusive == 0) try r.textFit(font, view.x + 10, view.y + 12, view.w - 20, if (self.basis == .blocked) "No blocked time in this selection." else "No samples in this selection. Resume a stopped target. I/O waits are not in this view.", theme.weak);
         for (graph.nodes.items) |node| {
             if (node.depth < root.depth or node.x < root.x or node.x + node.inclusive > root.x + root.inclusive or root.inclusive == 0) continue;
             // Interval containment alone also admits a zero-width neighbor;
@@ -328,6 +386,7 @@ pub const FlameView = struct {
             const color: gpu.Color = switch (node.frame.kind) {
                 .code => style.mix(theme.flame_low, theme.flame_high, tone),
                 .root, .thread => theme.flame_root,
+                .kernel => theme.warm,
                 else => theme.flame_unknown,
             };
             try r.rect(.{ .x = x + 0.5, .y = y, .w = @max(0, width - 1), .h = 23 }, color);
@@ -339,7 +398,9 @@ pub const FlameView = struct {
         try r.rect(.{ .x = bounds.x + 10, .y = y, .w = bounds.w - 20, .h = 1 }, theme.border);
         const node = graph.nodes.items[self.selected];
         const total: f64 = @floatFromInt(@max(1, graph.nodes.items[0].inclusive));
-        if (self.basis == .reconstructed) {
+        if (self.basis == .blocked) {
+            try label(r, font, bounds.x + 14, y + 7, bounds.w - 28, theme.warm, "{s} / blocked {d} ns ({d:.1}%) / self {d} ns / {d} stacks ({d} ns) over node limit", .{ node.frame.name, node.inclusive, @as(f64, @floatFromInt(node.inclusive)) * 100 / total, node.self, graph.rejected, graph.rejected_weight });
+        } else if (self.basis == .reconstructed) {
             try label(r, font, bounds.x + 14, y + 7, bounds.w - 28, theme.warm, "{s} / inclusive {d} ({d:.1}%) / self {d} / reconstructed", .{ node.frame.name, node.inclusive, @as(f64, @floatFromInt(node.inclusive)) * 100 / total, node.self });
         } else try label(r, font, bounds.x + 14, y + 7, bounds.w - 28, theme.warm, "{s}  /  inclusive {d} ({d:.1}%)  /  self {d}  /  partial {d} / unverified {d} / excluded {d}", .{ node.frame.name, node.inclusive, @as(f64, @floatFromInt(node.inclusive)) * 100 / total, node.self, graph.partial_samples, graph.unverified_samples, graph.rejected });
         if (compact) return; // Leave visible graph rows at small window heights.
@@ -358,6 +419,31 @@ pub const FlameView = struct {
         } else try r.textFit(font, bounds.x + 14, bounds.y + bounds.h - 23, bounds.w - 28, if (offline) "Recorded labels/locations; assembly needs verified ELF assets. Historical source text is not bundled." else "Assembly: retained ELF bytes. Enter browses the live stopped image when its identity matches; execution and registers stay unchanged.", theme.weak);
     }
 };
+
+test "kernel and blocked buttons stay inside a narrow flame header" {
+    const narrow = FlameView.placeHeader(.{ .x = 0, .y = 0, .w = 900, .h = 400 });
+    try std.testing.expect(narrow.kernel.w > 0);
+    try std.testing.expect(narrow.kernel.x >= 0);
+    try std.testing.expect(narrow.kernel.x + narrow.kernel.w <= 900);
+    try std.testing.expect(narrow.blocked.w > 0);
+    try std.testing.expect(narrow.blocked.x + narrow.blocked.w <= narrow.kernel.x);
+    const fitted = FlameView.placeHeader(.{ .x = 8, .y = 4, .w = 866, .h = 588 });
+    try std.testing.expect(fitted.kernel.w > 0);
+    try std.testing.expect(fitted.kernel.x >= fitted.blocked.x + fitted.blocked.w);
+    try std.testing.expect(fitted.kernel.x + fitted.kernel.w <= 8 + 866);
+    try std.testing.expect(fitted.blocked.x >= 8);
+    // The default 1280x800 window: the kernel chip is drawn and the duration
+    // button, drawn after it on the same row, does not cover it.
+    const default = FlameView.placeHeader(.{ .x = 8, .y = 92, .w = 1264, .h = 420 });
+    try std.testing.expect(default.kernel.w > 0);
+    try std.testing.expect(default.kernel.x >= default.blocked.x + default.blocked.w);
+    try std.testing.expect(default.duration.w == 0 or default.kernel.x + default.kernel.w <= default.duration.x);
+    const wide = FlameView.placeHeader(.{ .x = 0, .y = 0, .w = 1400, .h = 800 });
+    try std.testing.expectEqual(@as(f32, 975), wide.kernel.x);
+    try std.testing.expectEqual(@as(f32, 5), wide.kernel.y);
+    try std.testing.expect(wide.blocked.w > 0);
+    try std.testing.expect(wide.blocked.y > wide.kernel.y);
+}
 
 test "capture duration presets include a manual deadline and preserve other settings" {
     var next = profile.Config{ .frequency_hz = 199, .context_switch = true };

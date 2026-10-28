@@ -9,6 +9,8 @@ pub const Profile = struct {
     frequency_hz: u32 = (Config{}).frequency_hz,
     duration_ms: u32 = (Config{}).duration_ms,
     context_switch: bool = false,
+    kernel_stacks: bool = false,
+    off_cpu: bool = false,
     syscall_timing: bool = false,
     syscall_limit: u32 = (Config{}).syscall_limit,
     follow_threads: bool = true,
@@ -16,7 +18,7 @@ pub const Profile = struct {
     user_stack_bytes: u32 = 0,
     user_stack_budget_bytes: u32 = (Config{}).user_stack_budget_bytes,
     pub fn config(self: Profile) Config {
-        return .{ .sample_limit = self.sample_limit, .follow_threads = self.follow_threads, .ring_budget_bytes = self.ring_budget_bytes, .frequency_hz = self.frequency_hz, .duration_ms = self.duration_ms, .context_switch = self.context_switch, .syscall_timing = self.syscall_timing, .syscall_limit = self.syscall_limit, .user_stack_bytes = self.user_stack_bytes, .user_stack_budget_bytes = self.user_stack_budget_bytes };
+        return .{ .sample_limit = self.sample_limit, .follow_threads = self.follow_threads, .ring_budget_bytes = self.ring_budget_bytes, .frequency_hz = self.frequency_hz, .duration_ms = self.duration_ms, .context_switch = self.context_switch, .kernel_stacks = self.kernel_stacks, .off_cpu = self.off_cpu, .syscall_timing = self.syscall_timing, .syscall_limit = self.syscall_limit, .user_stack_bytes = self.user_stack_bytes, .user_stack_budget_bytes = self.user_stack_budget_bytes };
     }
 };
 /// `image_bytes` and `image_total_bytes` bound full ELF images read for code,
@@ -218,6 +220,14 @@ test "preferences partial defaults, custom and unlimited durations, typo and typ
     try std.testing.expectEqual(@as(u32, 99), prefs.profile.frequency_hz);
     try std.testing.expectEqual(@as(u32, 0), prefs.profile.duration_ms);
     try std.testing.expect(prefs.profile.context_switch);
+    try std.testing.expect(!prefs.profile.kernel_stacks);
+    const kernel = try parse(a, "{\"profile\":{\"kernel_stacks\":true}}");
+    try std.testing.expect(kernel.profile.kernel_stacks);
+    try std.testing.expect(kernel.profile.config().kernel_stacks);
+    try std.testing.expect(!kernel.profile.off_cpu);
+    const blocked = try parse(a, "{\"profile\":{\"off_cpu\":true}}");
+    try std.testing.expect(blocked.profile.off_cpu);
+    try std.testing.expect(blocked.profile.config().off_cpu);
     _ = try parse(a, "{\"profile\":{\"duration_ms\":300000}}");
     _ = try parse(a, "{\"profile\":{\"duration_ms\":4294967295}}");
     try std.testing.expectError(error.UnknownField, parse(a, "{\"profile\":{\"duraton_ms\":1}}"));

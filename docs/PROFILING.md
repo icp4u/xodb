@@ -199,10 +199,12 @@ churn, child processes and resource cleanup.
 
 ### Few or no samples
 
-The graph samples **user CPU only**. Frequent system calls can spend nearly all
-CPU time inside the kernel, so file copying can produce very few samples even
-when it is busy. A task blocked waiting for I/O also produces no CPU samples.
-A low sample count alone cannot tell these cases apart.
+The default graph samples **user CPU only**. A capture that asked for kernel
+stacks also shows those frames under the user frame that entered the kernel.
+Frequent system calls can spend nearly all CPU time inside the kernel, so file
+copying can produce very few user samples even when it is busy. A task blocked
+waiting for I/O also produces no CPU samples. A low sample count alone cannot
+tell these cases apart.
 
 After collection stops, the view and `get_profile` report separate approximate
 **user and kernel CPU totals** for the selected threads, alongside wall time.
@@ -215,7 +217,51 @@ coverage is explicit. A capture that ends after process exit may lack totals.
 
 High kernel CPU explains sparse user samples. Low total CPU can mean sleeping,
 I/O waits, or other scheduling delays; it does not identify the wait cause.
-Kernel stacks, syscall timings, and off-CPU attribution remain future work.
+Kernel stacks are off unless the capture asks for them (`kernel_stacks` on
+`start_profile`, or the Kernel stacks chip). The kernel must allow them:
+`perf_event_paranoid` at most 1 for this user's own processes, or the process
+runs as root. xodb does not change that setting. A refusal is reported and
+the capture does not continue as user-only. When the open is granted, samples
+keep kernel instruction pointers. The target's kallsyms names them, including
+`module:function` for a module. A table whose addresses are hidden labels
+those frames `[kernel] 0x…` and records why. A remote agent that does not
+offer kallsyms still captures; those frames stay unnamed. In the flame graph,
+kernel frames sit under the user frame that entered the kernel. A sample with
+no user frame hangs under `[kernel]`. Hiding kernel frames keeps each sample's
+weight on the user frame, or on the thread when there is no user frame. The
+reconstructed flame keeps those kernel frames under the CFI stack unless
+kernel frames are hidden. On LoongArch a one-frame kernel chain is marked
+partial: the callers above that leaf were not recovered. An archive stores
+the kernel symbols the graph used and keeps the raw kernel addresses. A
+redacted archive still keeps those addresses. Kernel symbol text is cached
+for the boot id of the machine whose kallsyms was read.
+Syscall timings are a separate x86-64 capture, not part of this kernel-stack view.
+
+Off-CPU attribution is a separate capture (`off_cpu` on `start_profile`, or the
+Off-CPU chip). It samples `sched:sched_switch` once per switch on each selected
+thread and keeps the outgoing callchain. Blocked time runs until the matching
+switch-in, taken from the thread's PERF_RECORD_SWITCH (a per-thread tracepoint
+never sees the switch that brings its thread back). A thread that exits while
+blocked, or a capture that stops mid-block,
+keeps that interval and marks it truncated. Repeated closes of the same
+thread, wait kind and frames sum into one stack. Distinct stacks are capped;
+further stacks increment the drop count and are omitted from the flame, so
+the unfiltered flame matches the summed nanoseconds. The ring size also
+bounds the volume, and lost records increment that same drop count. A
+`sched_switch` whose `prev_state` is still runnable (including a preemption)
+is a run-queue wait and is labeled `[run queue]`, separate from sleep and
+I/O. The blocked-time flame is weighted by blocked nanoseconds
+(`get_flamegraph` basis `blocked_ns`, and the flame view's Blocked time
+button or Shift+B; root label `Blocked time`). A selected time range scales
+a merged span and is approximate. The sample flame stays sample-weighted.
+The two are never added into one tree. The tracepoint id is read from
+tracefs. A refusal is
+`OffCpuDenied` and names tracefs, `perf_event_paranoid` -1 (raw tracepoint data), or root.
+xodb does not change that setting, and it does not continue as an on-CPU-only
+capture. This host path does not open a remote target's tracefs. Newborns
+enrolled after the open are outside the off-CPU set. A saved archive
+does not store these intervals, so reopening it does not rebuild the
+blocked-time flame.
 
 ## Capture identity and evidence
 
@@ -226,8 +272,9 @@ Kernel stacks, syscall timings, and off-CPU attribution remain future work.
   threads). Kernel perf inheritance stays off. `follow_threads`, `opening_threads`,
   `ring_budget_bytes` and current `ring_allocated_bytes` describe effective scope
   and resource use. Legacy archives report an unknown ring budget as null.
-- Collection uses `PERF_COUNT_SW_TASK_CLOCK`, excludes kernel/hypervisor stacks,
-  and uses `CLOCK_MONOTONIC`. Accepted kernel parameters, ring size, frequency,
+- Collection uses `PERF_COUNT_SW_TASK_CLOCK` and `CLOCK_MONOTONIC`. Kernel
+  stacks are included only when requested and the open was granted. Accepted
+  kernel parameters, ring size, frequency,
   loss, throttle/unthrottle, mapping, exec and fork/exit counts are exposed.
 - A capture has its own ID and revision. Appending samples never advances the
   debugger's stop generation. An agent's start/stop action still enters the

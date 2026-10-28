@@ -24,6 +24,7 @@ xstate.c
 perf.c
 perf_cpu.c
 perf_syscalls.c
+perf_offcpu.c
 perf_allocations.c
 wire.c
 wire_target.c

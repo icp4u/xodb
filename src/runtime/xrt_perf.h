@@ -129,6 +129,16 @@ bool xrt_syscall_format(const char *, size_t size, uint32_t id, bool enter);
 struct xrt_perf *xrt_syscalls_start(int32_t pid, const int32_t *tids, size_t count,
                                     uint16_t *enter_type, uint16_t *exit_type,
                                     struct xrt_perf_failure *);
+/* sched_switch layout read from tracefs. Offsets are bytes from the start of
+ * the trace event inside PERF_SAMPLE_RAW. */
+struct xrt_offcpu_layout {
+    uint16_t id, prev_pid_off, next_pid_off, prev_state_off;
+    uint8_t prev_state_size;
+};
+bool xrt_offcpu_format(const char *text, size_t size, uint32_t id, struct xrt_offcpu_layout *out);
+struct xrt_perf *xrt_offcpu_start(const int32_t *tids, size_t count, uint8_t data_pages,
+                                  uint64_t ring_budget, struct xrt_offcpu_layout *layout,
+                                  struct xrt_perf_failure *);
 /* Like xrt_syscalls_start, requesting per-FD loss counters where supported.
  * xrt_perf_read_lost reports whether those counters are actually available. */
 struct xrt_perf *xrt_syscalls_start_loss(int32_t pid, const int32_t *tids, size_t count,

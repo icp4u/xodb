@@ -360,3 +360,36 @@ test "sample inspector never substitutes an out-of-filter sample for an empty se
     ordinal = sample_view.choose(capture, .{ .tid = 4101 }, ordinal);
     try std.testing.expect(sample_view.matches(capture, .{ .tid = 4101 }, ordinal));
 }
+
+test "reconstructed flames keep kernel frames and do not change the CFI bucket" {
+    const capture = try fixture.build(a, .empty, null);
+    defer capture.deinit();
+    capture.architecture = .loongarch64;
+    capture.kallsyms = try @import("kallsyms.zig").parse(a,
+        \\ffffffff81000100 T __clear_user_fast
+        \\ffffffff81000200 T sys_read
+        \\
+    );
+    capture.kallsyms_owned = true;
+    var sample = records.Sample{ .ip = 0x400100, .ip_present = true, .pid = 4100, .tid = 4100, .tid_present = true, .time_ns = fixture.base_ns + 1000, .time_present = true, .cpu_mode = .user, .callchain = .complete, .frame_count = 2 };
+    sample.frames[0] = .{ .context = .user, .address = 0x400100 };
+    sample.frames[1] = .{ .context = .kernel, .address = 0xffffffff81000180 };
+    try capture.samples.append(a, sample);
+    var view = try derived.buildWithLimit(a, capture, .{}, null, null, 64);
+    defer view.deinit();
+    try std.testing.expectEqual(@as(u64, 1), view.counts.filtered);
+    try std.testing.expectEqual(@as(u64, 1), view.counts.unavailable);
+    try std.testing.expectEqual(@as(u64, 0), view.counts.complete);
+    var named = false;
+    var marked = false;
+    for (view.graph.nodes.items) |node| {
+        if (node.frame.kind == .kernel and std.mem.eql(u8, node.frame.name, "__clear_user_fast")) named = true;
+        if (node.frame.kind == .incomplete and node.frame.address == 5) marked = true;
+    }
+    try std.testing.expect(named and marked);
+    var hidden = try derived.buildWithLimit(a, capture, .{ .hide_kernel = true }, null, null, 64);
+    defer hidden.deinit();
+    for (hidden.graph.nodes.items) |node| try std.testing.expect(node.frame.kind != .kernel);
+    try std.testing.expectEqual(view.counts.unavailable, hidden.counts.unavailable);
+    try std.testing.expectEqual(view.counts.complete, hidden.counts.complete);
+}

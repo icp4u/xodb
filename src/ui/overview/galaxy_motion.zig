@@ -17,6 +17,8 @@ pub const Motion = struct {
     camera_active: bool = false,
     signature: u64 = 0,
     layout_until: u64 = 0,
+    /// 0 idle, 1 this publication's first layout, 2 waiting for the landing layout.
+    layout_presents: u8 = 0,
     focus: ?u64 = null,
     pointer: [2]f32 = .{ -1, -1 },
 
@@ -59,11 +61,24 @@ pub const Motion = struct {
         self.last = now;
         self.active = false;
         if (s.signature != self.signature) {
+            const startup = self.star_count == 0;
+            // One finite transition per publication. A redraw while that
+            // transition is open keeps the same deadline instead of starting
+            // another tail. Startup is already settled.
+            if (startup or self.layout_presents == 0 or now >= self.layout_until) {
+                self.layout_until = if (startup) now else now + 100_000_000;
+                self.layout_presents = if (startup) 0 else 1;
+            }
             self.signature = s.signature;
-            // One finite transition per publication, never an exponential tail
-            // restarted by each rendered frame. Startup is already settled.
-            self.layout_until = if (self.star_count == 0) now else now + 100_000_000;
         }
+        // The second layout of a publication lands. Every publication draws a
+        // follow-up frame a few milliseconds after its first moving frame, and
+        // any further wake inside the 100 ms deadline would be one more moving
+        // frame; landing on the second layout keeps one moving frame each.
+        if (self.layout_presents >= 2 or (self.layout_presents != 0 and now >= self.layout_until)) {
+            self.layout_presents = 0;
+            self.layout_until = now;
+        } else if (self.layout_presents == 1) self.layout_presents = 2;
         const step: f32 = if (now >= self.layout_until) 1 else @min(1, @as(f32, @floatFromInt(now -| previous)) / @as(f32, @floatFromInt(@max(1, self.layout_until -| previous))));
         var minimum = [2]f32{ std.math.inf(f32), std.math.inf(f32) };
         var maximum = [2]f32{ -std.math.inf(f32), -std.math.inf(f32) };
@@ -179,4 +194,32 @@ test "camera-hidden layout movement lands without waking the view" {
     _ = motion.layout(scene, body, 30_000_001, .{});
     try std.testing.expect(!motion.active);
     try std.testing.expectEqual(@as(f32, 700), scene.stars[0].at[0]);
+}
+
+test "the second layout of one publication lands, including a republish" {
+    const scene = try std.testing.allocator.create(model.Scene);
+    defer std.testing.allocator.destroy(scene);
+    scene.* = .{};
+    scene.stars[0] = .{ .seed = 1, .at = .{ 100, 100 }, .r = 10 };
+    scene.star_count = 1;
+    scene.signature = 1;
+    const body = draw.Rect{ .x = 0, .y = 0, .w = 800, .h = 600 };
+    var motion = Motion{};
+    _ = motion.layout(scene, body, 1_000_000, .{});
+    try std.testing.expect(!motion.layout_active);
+    scene.stars[0].at = .{ 400, 100 };
+    scene.signature = 2;
+    _ = motion.layout(scene, body, 500_000_000, .{});
+    try std.testing.expect(motion.layout_active);
+    const mid = scene.stars[0].at[0];
+    try std.testing.expect(mid > 100 and mid < 400);
+    // A present retry, and a publication that arrives on that retry, both land.
+    scene.stars[0].at[0] = 500;
+    scene.signature = 3;
+    _ = motion.layout(scene, body, 506_000_000, .{});
+    try std.testing.expect(!motion.layout_active);
+    try std.testing.expectEqual(@as(f32, 500), scene.stars[0].at[0]);
+    _ = motion.layout(scene, body, 520_000_000, .{});
+    try std.testing.expect(!motion.layout_active);
+    try std.testing.expectEqual(@as(f32, 500), scene.stars[0].at[0]);
 }

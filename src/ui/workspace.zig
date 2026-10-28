@@ -262,9 +262,9 @@ pub const Workspace = struct {
             0xff0d => 28, // Return
             0xff08 => 14, // BackSpace
             'j' => 36,
-            'k' => 37,
+            'k' => if (event.mods.shift) 38 else 37,
             'q' => if (event.mods.shift) 16 else 0,
-            'b' => 48,
+            'b' => if (event.mods.shift) 39 else 48,
             'm' => 50,
             'y' => 21,
             'r' => 19,
@@ -893,6 +893,25 @@ pub const Workspace = struct {
             w.dirty = true;
             if (self.setup.press(w.pointer_x, w.pointer_y, w.input.mods().shift)) |action| return self.applySetup(w, context, action);
             if (!self.setup.containsPoint(w.pointer_x, w.pointer_y)) self.setup.open = false;
+        }
+        if (self.show_profile and (key == 38 or (click and self.flame.kernelHit(w.pointer_x, w.pointer_y)))) {
+            self.flame.selection.filter.hide_kernel = !self.flame.selection.filter.hide_kernel;
+            self.status = if (self.flame.selection.filter.hide_kernel) "Kernel frames hidden" else "Kernel frames shown";
+            w.dirty = true;
+            if (key == 38) return;
+            click = false;
+        }
+        if (self.show_profile and (key == 39 or (click and self.flame.blockedHit(w.pointer_x, w.pointer_y)))) {
+            if (self.flame.basis == .blocked) {
+                self.flame.setBasis(.recorded);
+                self.status = "Recorded kernel callchains";
+            } else {
+                self.flame.setBasis(.blocked);
+                self.status = "Blocked time; B returns to recorded callchains";
+            }
+            w.dirty = true;
+            if (key == 39) return;
+            click = false;
         }
         if (self.show_profile and (key == 31 or (click and self.flame.setupHit(w.pointer_x, w.pointer_y)))) {
             self.setup.open = !self.setup.open;
@@ -1637,7 +1656,7 @@ pub const Workspace = struct {
             };
             if (effect == .start_requested) self.step(w, session, false, 25);
             switch (action) {
-                .set_duration, .set_frequency, .toggle_scheduling, .toggle_syscalls => self.status = "Next capture settings changed; a running capture keeps its own",
+                .set_duration, .set_frequency, .toggle_scheduling, .toggle_syscalls, .toggle_kernel_stacks, .toggle_off_cpu => self.status = "Next capture settings changed; a running capture keeps its own",
                 else => {},
             }
         }

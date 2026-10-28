@@ -818,9 +818,7 @@ enum xrt_status xrt_target_remote_cancel(const char *const argv[], struct xrt_ta
         size_t meta_size = 0;
         const uint64_t before = xrt_now();
         status = xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_HELLO,
-                                                       .args = {XRT_RPC_HELLO_CAPABILITIES,
-                                                                XRT_RPC_CAP_ADDRESS_SPACE | XRT_RPC_CAP_FILE_SLOTS |
-                                                                    XRT_RPC_CAP_PAC_MASK},
+                                                       .args = {XRT_RPC_HELLO_CAPABILITIES, XRT_RPC_CAP_NEGOTIATED},
                                                        .value = &machine,
                                                        .out = meta,
                                                        .capacity = sizeof(meta),
@@ -891,6 +889,11 @@ enum xrt_status xrt_target_remote_cancel(const char *const argv[], struct xrt_ta
 bool xrt_target_source_capable(const struct xrt_target *t)
 {
     return t && t->connection && (t->connection->capabilities & XRT_RPC_CAP_SOURCE) != 0;
+}
+bool xrt_target_kallsyms_capable(const struct xrt_target *t)
+{
+    if (!t || !t->connection) return true;
+    return (t->connection->capabilities & XRT_RPC_CAP_KALLSYMS) != 0;
 }
 uint64_t xrt_target_remote_image_limit(const struct xrt_target *t)
 {

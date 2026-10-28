@@ -19,6 +19,7 @@ const capture_model = @import("capture.zig");
 const flame = @import("flame.zig");
 const unwind = @import("unwind.zig");
 const sample_store = @import("sample_store.zig");
+const records = @import("records.zig");
 const Capture = capture_model.Capture;
 
 pub const version = "xodb-derived-flame-v1";
@@ -112,6 +113,15 @@ fn sampleThread(capture: *const Capture, sample: *const sample_store.Core) ?usiz
     for (capture.threads[0..capture.thread_count], 0..) |thread, i| if (thread.perf.tid == sample.tid) return i;
     return null;
 }
+fn kernelFrame(capture: *const Capture, address: u64, buf: []u8) flame.Frame {
+    if (capture.kallsyms.lookup(address)) |symbol| {
+        const name = if (symbol.module.len == 0) symbol.name else std.fmt.bufPrint(buf, "{s}:{s}", .{ symbol.module, symbol.name }) catch symbol.name;
+        return .{ .kind = .kernel, .address = symbol.address, .lookup_address = address, .name = name, .module = symbol.module };
+    }
+    if (address == 0) return .{ .kind = .kernel, .address = address, .lookup_address = address, .name = "[kernel]" };
+    const name = std.fmt.bufPrint(buf, "[kernel] 0x{x}", .{address}) catch "[kernel]";
+    return .{ .kind = .kernel, .address = address, .lookup_address = address, .name = name };
+}
 fn bucketOf(result: *const unwind.Result) Bucket {
     if (result.reason == .complete and result.count > 0) return .complete;
     if (result.count >= 2) return .partial;
@@ -142,6 +152,8 @@ pub fn buildWithLimit(a: std.mem.Allocator, capture: *const Capture, filter: cap
     std.mem.writeInt(u32, filter_bytes[16..20], filter.tid orelse 0, .little);
     identity.update(&filter_bytes);
     filter.tids.hashInto(&identity);
+    // Hashed only when set, so views without the toggle keep their old ids.
+    if (filter.hide_kernel) identity.update("hide_kernel");
     // The same time order (ties by ordinal) the recorded graph uses.
     const order = try a.alloc(u32, capture.samples.len());
     defer a.free(order);
@@ -178,9 +190,10 @@ pub fn buildWithLimit(a: std.mem.Allocator, capture: *const Capture, filter: cap
             view.reason_examples[slot][view.reason_example_count[slot]] = ordinal;
             view.reason_example_count[slot] += 1;
         }
-        var path: [unwind.max_frames + 2]flame.Frame = undefined;
+        var path: [unwind.max_frames + records.max_frames + 4]flame.Frame = undefined;
         var marker_label: [160]u8 = undefined;
         var address_labels: [unwind.max_frames][32]u8 = undefined;
+        var kernel_labels: [records.max_frames + 1][96]u8 = undefined;
         var count: usize = 0;
         const thread = capture.threads[thread_index];
         path[count] = .{ .kind = .thread, .address = sample.tid, .module_id = thread.debugger_id, .name = std.mem.sliceTo(&capture.thread_names[thread_index], 0) };
@@ -210,6 +223,24 @@ pub fn buildWithLimit(a: std.mem.Allocator, capture: *const Capture, filter: cap
                 .name = if (named) result.frames[index].name[0..frame.name_len] else try std.fmt.bufPrint(&address_labels[index], "0x{x}", .{frame.lookup_pc}),
             };
             count += 1;
+        }
+        // Kernel frames hang under the CFI result. A leaf-only kernel chain
+        // adds a marker and does not move the sample into another CFI bucket.
+        if (!filter.hide_kernel) {
+            const kernel = capture_model.kernelChain(capture.samples.get(ordinal));
+            if (kernel.count > 0) {
+                if (capture_model.kernelCallersPartial(capture.architecture, kernel.count)) {
+                    path[count] = .{ .kind = .incomplete, .address = 5, .name = capture_model.kernel_callers_unavailable };
+                    count += 1;
+                }
+                var kernel_index = kernel.count;
+                while (kernel_index > 0) {
+                    kernel_index -= 1;
+                    const address = kernel.addresses[kernel_index];
+                    path[count] = kernelFrame(capture, address, &kernel_labels[kernel_index]);
+                    count += 1;
+                }
+            }
         }
         const before = view.graph.rejected;
         const old_nodes = view.graph.nodes.items.len;

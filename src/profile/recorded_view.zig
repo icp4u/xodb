@@ -28,6 +28,7 @@ pub const Key = struct {
             hash.update(&bytes);
         }
         self.filter.tids.hashInto(&hash);
+        if (self.filter.hide_kernel) hash.update("hide_kernel");
         return std.fmt.bytesToHex(hash.finalResult(), .lower);
     }
     pub fn eql(self: Key, other: Key) bool {
@@ -148,7 +149,7 @@ fn frameCopy(allocator: std.mem.Allocator, frame: flame.Frame) !flame.Frame {
 /// handles. The caller must pin source until snapshot destruction.
 pub fn snapshot(allocator: std.mem.Allocator, source: *const Capture) !*Capture {
     const copy = try allocator.create(Capture);
-    copy.* = .{ .allocator = allocator, .arena = std.heap.ArenaAllocator.init(allocator), .id = source.id, .session_id = source.session_id, .generation = source.generation, .image_epoch = source.image_epoch, .pid = source.pid, .started_ns = source.started_ns, .ended_ns = source.ended_ns, .observed_until_ns = source.observed_until_ns, .config = source.config, .accepted = source.accepted, .thread_count = source.thread_count, .collector = null, .images = modules.Modules.init(allocator), .offline = source.offline, .revision = source.revision, .mapping_revision = source.mapping_revision, .trusted_before_ns = source.trusted_before_ns };
+    copy.* = .{ .allocator = allocator, .arena = std.heap.ArenaAllocator.init(allocator), .id = source.id, .session_id = source.session_id, .generation = source.generation, .image_epoch = source.image_epoch, .pid = source.pid, .architecture = source.architecture, .started_ns = source.started_ns, .ended_ns = source.ended_ns, .observed_until_ns = source.observed_until_ns, .config = source.config, .accepted = source.accepted, .thread_count = source.thread_count, .collector = null, .images = modules.Modules.init(allocator), .offline = source.offline, .revision = source.revision, .mapping_revision = source.mapping_revision, .trusted_before_ns = source.trusted_before_ns };
     errdefer copy.deinit();
     copy.config.tids = &.{};
     @memcpy(copy.threads[0..source.thread_count], source.threads[0..source.thread_count]);
@@ -175,6 +176,12 @@ pub fn snapshot(allocator: std.mem.Allocator, source: *const Capture) !*Capture 
     copy.pe_assets.metadata_bytes = source.pe_assets.metadata_bytes;
     copy.pe_assets_failed = source.pe_assets_failed;
     copy.pe_assets_pending = source.pe_assets_pending;
+    copy.kallsyms = source.kallsyms;
+    copy.kallsyms_owned = false;
+    copy.kernel_stacks_requested = source.kernel_stacks_requested;
+    copy.kernel_stacks_granted = source.kernel_stacks_granted;
+    copy.kernel_symbolizable = source.kernel_symbolizable;
+    copy.kernel_symbol_reason = source.kernel_symbol_reason;
     var records = source.recorded.iterator();
     while (records.next()) |entry| try copy.recorded.put(allocator, entry.key_ptr.*, .{ .frame = try frameCopy(strings, entry.value_ptr.frame) });
     return copy;
@@ -280,3 +287,14 @@ pub const State = struct {
         capture.deinit();
     }
 };
+
+test "a snapshot keeps the capture architecture" {
+    const alloc = std.testing.allocator;
+    const perf = @import("linux_perf.zig");
+    const source = try alloc.create(Capture);
+    source.* = .{ .allocator = alloc, .arena = std.heap.ArenaAllocator.init(alloc), .id = 1, .session_id = 1, .generation = 0, .image_epoch = 0, .pid = 1, .architecture = .loongarch64, .started_ns = 1000, .config = .{}, .accepted = std.mem.zeroes(perf.Acceptance), .thread_count = 0, .collector = null, .images = modules.Modules.init(alloc), .trusted_before_ns = 0 };
+    defer source.deinit();
+    const copy = try snapshot(alloc, source);
+    defer copy.deinit();
+    try std.testing.expectEqual(source.architecture, copy.architecture);
+}

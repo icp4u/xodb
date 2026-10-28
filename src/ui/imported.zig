@@ -243,6 +243,7 @@ pub const View = struct {
             const color: gpu.Color = switch (node.frame.kind) {
                 .code => style.mix(theme.flame_low, theme.flame_high, tone),
                 .root, .thread => theme.flame_root,
+                .kernel => theme.warm,
                 else => theme.flame_import_unknown,
             };
             try r.rect(.{ .x = x + 0.5, .y = y, .w = @max(0, width - 1), .h = 23 }, color);

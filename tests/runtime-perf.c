@@ -197,8 +197,65 @@ static void loss_counter_reads(void)
     close(first[1]); close(second[1]); xrt_perf_destroy(p);
 }
 
+static void kernel_stack_denial(void)
+{
+    int32_t tid = (int32_t)gettid();
+    struct xrt_cpu_config cfg = {
+        .tids = &tid, .thread_count = 1, .frequency_hz = 99, .max_frames = 8, .data_pages = 1,
+        .ring_budget_bytes = 4096, .exclude_kernel = false, .callchain = true,
+    };
+    struct xrt_cpu_acceptance accepted;
+    struct xrt_perf_failure failure = {0};
+    assert(!setenv("XODB_TEST_KERNEL_STACKS", "deny", 1));
+    assert(!xrt_cpu_start(&cfg, &accepted, &failure));
+    assert(failure.kind == XRT_PERF_PERMISSION && failure.error == EPERM);
+    assert(failure.opened_then_closed == 0);
+    assert(failure.detail && strstr(failure.detail, "perf_event_paranoid"));
+    /* User-only still opens while the hook is set. A swallowed refusal would
+     * fail this open with the kernel-stack detail. */
+    cfg.exclude_kernel = true;
+    failure = (struct xrt_perf_failure){0};
+    struct xrt_perf *opened = xrt_cpu_start(&cfg, &accepted, &failure);
+    assert(opened);
+    xrt_perf_destroy(opened);
+    unsetenv("XODB_TEST_KERNEL_STACKS");
+}
+
+static void offcpu_format(void)
+{
+    const char *text =
+        "name: sched_switch\n"
+        "ID: 317\n"
+        "format:\n"
+        "\tfield:unsigned short common_type;\toffset:0;\tsize:2;\tsigned:0;\n"
+        "\tfield:pid_t prev_pid;\toffset:24;\tsize:4;\tsigned:1;\n"
+        "\tfield:long prev_state;\toffset:32;\tsize:8;\tsigned:1;\n"
+        "\tfield:pid_t next_pid;\toffset:56;\tsize:4;\tsigned:1;\n";
+    struct xrt_offcpu_layout layout = {0};
+    assert(xrt_offcpu_format(text, strlen(text), 317, &layout));
+    assert(layout.id == 317);
+    assert(layout.prev_pid_off == 24 && layout.next_pid_off == 56);
+    assert(layout.prev_state_off == 32 && layout.prev_state_size == 8);
+    assert(!xrt_offcpu_format(text, strlen(text), 1, &layout));
+}
+static void offcpu_denial(void)
+{
+    int32_t tid = (int32_t)gettid();
+    struct xrt_offcpu_layout layout = {0};
+    struct xrt_perf_failure failure = {0};
+    assert(!setenv("XODB_TEST_OFF_CPU", "deny", 1));
+    assert(!xrt_offcpu_start(&tid, 1, 4, 65536, &layout, &failure));
+    assert(failure.kind == XRT_PERF_PERMISSION && failure.error == EPERM);
+    assert(failure.opened_then_closed == 0);
+    assert(failure.detail && strstr(failure.detail, "perf_event_paranoid"));
+    assert(failure.detail && strstr(failure.detail, "tracepoint"));
+    unsetenv("XODB_TEST_OFF_CPU");
+}
 int main(void)
 {
+    offcpu_format();
+    offcpu_denial();
+    kernel_stack_denial();
     loss_counter_reads();
     asynchronous_failure();
     rings();

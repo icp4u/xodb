@@ -878,6 +878,19 @@ fn processes(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !vo
     const body = Rect{ .x = table.x, .y = table.y + 34, .w = table.w, .h = table.h - 38 };
     v.visible_rows = @max(1, @as(usize, @intFromFloat(@max(0, (body.h - 22) / row_h))));
     const top = &v.scroll[@intFromEnum(vw.Panel.processes)];
+    // A numeric search keeps ancestors, which can fill the pane and hide the
+    // match. Keep that pid on screen without moving the selection.
+    if (v.search_len > 0) {
+        if (std.fmt.parseInt(i32, v.searchText(), 10)) |query_pid| {
+            for (v.rows.items, 0..) |row, i| {
+                if (s.processes[row.index].pid == query_pid) {
+                    if (i < top.*) top.* = i;
+                    if (i >= top.* + v.visible_rows) top.* = i + 1 - v.visible_rows;
+                    break;
+                }
+            }
+        } else |_| {}
+    }
     top.* = @min(top.*, v.rows.items.len -| v.visible_rows);
     if (v.rows.items.len == 0) {
         try missing(v, ctx, body.x + 12, body.y + 8, body.w - 24, if (s.group(.processes).status != .ok) s.group(.processes).reason else if (q.len > 0) "no process matches the search" else "no processes");

@@ -43,6 +43,7 @@ and pass its path. This keeps location, merging and persistence choices open.
 | profile.syscall_timing | false | Record syscall durations on x86-64; requires 1–32 explicitly chosen threads |
 | profile.syscall_limit | 16384 | Retained syscall spans, 1–65536; reaching the limit stops the capture |
 | profile.context_switch | false | Include per-thread scheduling transitions |
+| profile.off_cpu | false | Separate blocked-time flame from sched_switch on 1–64 threads; a refusal is OffCpuDenied |
 | profile.follow_threads | true | Enroll new same-process threads for all-thread captures; explicit TID selections remain fixed |
 | profile.ring_budget_bytes | 67108864 | Total live perf data rings, 4096–268435456 bytes; one extra metadata page per event |
 | profile.user_stack_bytes | 0 | Disable stack capture, or request 64–8192 bytes/sample, multiple of 8 |

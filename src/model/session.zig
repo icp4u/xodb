@@ -213,7 +213,7 @@ pub const Session = struct {
     profile_error: ?[]const u8 = null,
     profile_requested_threads: usize = 0,
     next_profile_id: u64 = 1,
-    profile_view: ?struct { capture_id: u64, revision: u64, filter: profile.Filter, view_id: ?[64]u8 = null, sample_count: usize = 0, basis: enum { recorded, reconstructed } = .recorded } = null,
+    profile_view: ?struct { capture_id: u64, revision: u64, filter: profile.Filter, view_id: ?[64]u8 = null, sample_count: usize = 0, basis: enum { recorded, reconstructed, blocked } = .recorded } = null,
     profile_view_visible: bool = false,
     investigation_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
     investigations: std.ArrayList(Investigation) = .empty,
@@ -764,6 +764,7 @@ pub const Session = struct {
         var config = request;
         config.follow_threads = request.follow_threads and request.tids.len == 0;
         config.tids = tids[0..count];
+        if (config.off_cpu and count > 64) return error.OffCpuThreadLimit;
         try self.refreshMaps();
         // A replacement must not compete with the stopped capture's images.
         // Validate the request and target first; a later open failure is
@@ -774,7 +775,8 @@ pub const Session = struct {
         switch (opened) {
             .failed => |failure| {
                 self.profile_failure = failure;
-                return error.PerfOpenFailed;
+                if (profile.offCpuFailure(failure)) return error.OffCpuDenied;
+                return profile.startError(request.kernel_stacks, failure.kind);
             },
             .capture => |capture| {
                 errdefer capture.deinit();

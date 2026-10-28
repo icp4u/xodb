@@ -5,6 +5,7 @@
 #include "xrt_remote.h"
 #include <errno.h>
 #include <linux/perf_event.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 static uint32_t sysctl(const char *path)
@@ -83,6 +84,9 @@ struct xrt_perf *xrt_cpu_start(const struct xrt_cpu_config *c, struct xrt_cpu_ac
                   (UINT64_C(1) << 25);
     if (c->mmap_data)
         attr->flags |= UINT64_C(1) << 17;
+    /* Bit 5 drops kernel instruction pointers. Bit 21 drops the kernel part
+     * of PERF_SAMPLE_CALLCHAIN. A kernel-stack capture leaves both clear.
+     * There is no second open that turns them back on. */
     if (c->exclude_kernel)
         attr->flags |= (UINT64_C(1) << 5) | (UINT64_C(1) << 21);
     if (c->context_switch)
@@ -95,14 +99,25 @@ struct xrt_perf *xrt_cpu_start(const struct xrt_cpu_config *c, struct xrt_cpu_ac
     attr->config = c->event == 2   ? PERF_COUNT_HW_CPU_CYCLES
                    : c->event == 1 ? PERF_COUNT_SW_CPU_CLOCK
                                    : PERF_COUNT_SW_TASK_CLOCK;
+    if (!c->exclude_kernel) {
+        const char *hook = getenv("XODB_TEST_KERNEL_STACKS");
+        if (hook && !strcmp(hook, "deny")) {
+            xrt_perf_fail(f, "perf_event_open", EPERM, -1,
+                          "kernel stacks need perf_event_paranoid at most 1, or root; this program does not change that setting");
+            return NULL;
+        }
+    }
     struct xrt_perf *p = xrt_perf_create(c->data_pages, XRT_PERF_MAX_THREADS, c->ring_budget_bytes);
     if (!p) {
         xrt_perf_fail(f, "alloc", errno, -1, "collector allocation");
         return NULL;
     }
     for (size_t i = 0; i < c->thread_count; ++i)
-        if (!xrt_perf_add(p, c->tids[i], attr, 1, NULL, NULL, f))
+        if (!xrt_perf_add(p, c->tids[i], attr, 1, NULL, NULL, f)) {
+            if (!c->exclude_kernel && f && (f->error == EPERM || f->error == EACCES))
+                f->detail = "kernel stacks need perf_event_paranoid at most 1, or root; this program does not change that setting";
             goto fail;
+        }
     if (!xrt_perf_enable(p, f))
         goto fail;
     return p;

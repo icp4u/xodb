@@ -176,9 +176,8 @@ static enum xrt_status dispatch(struct agent *a, struct xrt_wire_frame *frame, u
              * so the reply bit and the agreed reply shape cannot disagree. */
             /* The file-slot count and the PAC triple are sent only to a host
              * that asked, since an older host drops an unknown suffix. */
-            a->negotiated = args[1] & (XRT_RPC_CAP_ADDRESS_SPACE | XRT_RPC_CAP_FILE_SLOTS |
-                                       XRT_RPC_CAP_PAC_MASK);
-            uint64_t caps = XRT_RPC_CAP_SOURCE | XRT_RPC_CAP_LARGE_IMAGES | a->negotiated;
+            a->negotiated = args[1] & XRT_RPC_CAP_NEGOTIATED;
+            uint64_t caps = XRT_RPC_CAP_ALWAYS | a->negotiated;
             xrt_codec_u64(&extra, &caps);
             if (a->negotiated & XRT_RPC_CAP_FILE_SLOTS) {
                 uint64_t slots = a->file_slots;

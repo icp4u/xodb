@@ -90,6 +90,9 @@ static enum xrt_status process_file(int32_t pid, const struct xrt_file_request *
     case XRT_FILE_BOOT_ID:
         strcpy(path, "/proc/sys/kernel/random/boot_id");
         break;
+    case XRT_FILE_KALLSYMS:
+        strcpy(path, "/proc/kallsyms");
+        break;
     case XRT_FILE_MAPPED:
         return XRT_INVALID_ARGUMENT;
     default:

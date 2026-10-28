@@ -9,7 +9,7 @@ const info = @import("../debug/info.zig");
 const disasm = @import("disassembly.zig");
 const derived = @import("../profile/derived.zig");
 const now = @import("../target/linux.zig").now;
-pub const Basis = enum { recorded, reconstructed };
+pub const Basis = enum { recorded, reconstructed, blocked };
 pub const ViewStatus = union(enum) {
     ready,
     building,
@@ -54,7 +54,7 @@ pub const State = struct {
     source: ?info.Site = null,
     instructions: []disasm.Instruction = &.{},
     diagnostic: ?[]const u8 = null,
-    /// Recorded kernel callchains, or the reconstructed view (B).
+    /// Recorded callchains, the reconstructed view (B), or blocked time (Shift+B).
     basis: Basis = .recorded,
     derived_identity: [64]u8 = @splat(0),
     derived_failed_identity: ?[64]u8 = null,
@@ -277,6 +277,35 @@ pub const State = struct {
         self.zoom = zoom_path.restore(&self.graph.?);
         self.select(capture, @min(self.selected, @as(u32, @intCast(self.graph.?.nodes.items.len - 1))));
     }
+    fn refreshBlocked(self: *State, capture: *profile.Capture) void {
+        self.selection.bind(capture.id, capture.extentNs());
+        const filter_changed = capture.id != self.capture_id or !std.meta.eql(self.selection.filter, self.built_filter);
+        if (self.graph != null and !filter_changed and capture.revision == self.revision) return;
+        const selected_path = SavedPath.save(self.graph, self.selected);
+        const zoom_path = SavedPath.save(self.graph, self.zoom);
+        _ = self.arena.reset(.retain_capacity);
+        self.graph = null;
+        self.built_filter = self.selection.filter;
+        self.graph = capture.blockedGraph(self.arena.allocator(), self.built_filter) catch |err| {
+            self.diagnostic = @errorName(err);
+            self.view_status = .{ .failed = @errorName(err) };
+            self.revision = 0;
+            return;
+        };
+        self.view_status = .ready;
+        self.diagnostic = null;
+        self.capture_id = capture.id;
+        self.revision = capture.revision;
+        self.mapping_revision = capture.mapping_revision;
+        self.trusted_before_ns = capture.trusted_before_ns;
+        self.sample_count = 0;
+        self.view_id = null;
+        self.selected = if (filter_changed) 0 else selected_path.restore(&self.graph.?);
+        self.zoom = if (filter_changed) 0 else zoom_path.restore(&self.graph.?);
+        if (filter_changed) self.scroll = 0;
+        const last: u32 = @intCast(self.graph.?.nodes.items.len -| 1);
+        self.select(capture, @min(self.selected, last));
+    }
 };
 
 /// Array-list-shaped const storage keeps traversal independent of the owner's
@@ -285,10 +314,11 @@ pub const Graph = struct {
     nodes: struct { items: []const tree.Node },
     colors: []const u8 = &.{},
     rejected: u64,
+    rejected_weight: u64 = 0,
     partial_samples: u64,
     unverified_samples: u64,
     pub fn borrow(graph: *const tree.Graph) Graph {
-        return .{ .nodes = .{ .items = graph.nodes.items }, .rejected = graph.rejected, .partial_samples = graph.partial_samples, .unverified_samples = graph.unverified_samples };
+        return .{ .nodes = .{ .items = graph.nodes.items }, .rejected = graph.rejected, .rejected_weight = graph.rejected_weight, .partial_samples = graph.partial_samples, .unverified_samples = graph.unverified_samples };
     }
     pub fn findChild(self: *const Graph, parent: u32, frame: tree.Frame) ?u32 {
         if (parent >= self.nodes.items.len) return null;
@@ -513,6 +543,13 @@ pub const Capture = struct {
             if (capture.offline) session.ensureArchiveView(request.filter) catch {};
             self.state.refresh(capture, &session.recorded_views);
             self.pending = self.state.view_status == .building or self.state.view_status == .waiting or (capture.offline and self.state.revision == 0);
+        } else if (request.basis == .blocked) {
+            if (!capture.config.off_cpu) {
+                value.waiting = "Off-CPU was not requested for this capture. The Off-CPU chip applies to the next capture.";
+            } else {
+                self.state.refreshBlocked(capture);
+                if (self.state.view_status == .failed) value.waiting = self.state.diagnostic orelse "Blocked-time view failed";
+            }
         } else switch (session.requestDerivedOwned(request.filter, .gui)) {
             .ready => |view| self.state.adoptDerived(capture, view),
             .pending => |progress| {
@@ -568,7 +605,7 @@ fn copyGraph(a: std.mem.Allocator, graph: *const tree.Graph) !Graph {
         node.frame.module = "";
         node.frame.mapping_note = "";
     }
-    return .{ .nodes = .{ .items = nodes }, .colors = colors, .rejected = graph.rejected, .partial_samples = graph.partial_samples, .unverified_samples = graph.unverified_samples };
+    return .{ .nodes = .{ .items = nodes }, .colors = colors, .rejected = graph.rejected, .rejected_weight = graph.rejected_weight, .partial_samples = graph.partial_samples, .unverified_samples = graph.unverified_samples };
 }
 fn displayName(a: std.mem.Allocator, text: []const u8) ![]const u8 {
     if (text.len <= 384) return a.dupe(u8, text);

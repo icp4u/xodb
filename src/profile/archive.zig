@@ -20,6 +20,7 @@ const Budget = @import("archive_budget.zig").Budget;
 const progress = @import("archive_progress.zig");
 const snapshot = @import("../binary/snapshot.zig");
 const flame = @import("flame.zig");
+const kallsyms = @import("kallsyms.zig");
 const info = @import("../debug/info.zig");
 const redact = @import("../redact.zig");
 pub const max_memory_bytes = 512 * 1024 * 1024;
@@ -89,10 +90,14 @@ pub const Tag = enum(u32) {
     user_state = 0x41545355, // "USTA", required when feature bit 2 is set
     evidence_context = 0x58544345, // "ECTX", optional collector context for external evidence (2.9)
     usb_evidence_context = 0x42535545, // "EUSB", optional USB fd rows (2.10)
+    kernel_stacks = 0x4b54534b, // "KSTK", optional kernel symbols the graph used (2.11)
 };
 /// Lowest minor that writes ECTX; captures without it keep their previous minor.
 const evidence_context_minor: u16 = 9;
 const usb_evidence_context_minor: u16 = 10;
+/// Written only when a capture asked for kernel stacks or has kernel frames.
+const kernel_stacks_minor: u16 = 11;
+const kernel_symbol_cap = 8192;
 /// Required sections, in this order. A future minor version may append
 /// sections whose table flag marks them ignorable (bit 0).
 const section_order = [_]Tag{ .meta, .threads, .images, .mappings, .samples, .scheduling, .markers, .intervals, .annotations };
@@ -204,7 +209,7 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
     if (capture.config.sample_limit == 0 or capture.config.sample_limit > capture_model.max_sample_limit) return error.ArchiveLimit;
     try validateUserState(capture);
     try validateThreadScope(capture);
-    var selected_storage: [section_order.len + 7]Tag = undefined;
+    var selected_storage: [section_order.len + 8]Tag = undefined;
     @memcpy(selected_storage[0..section_order.len], &section_order);
     var selected_count: usize = section_order.len;
     if (sampled) {
@@ -233,14 +238,21 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
             selected_count += 1;
         }
     }
-    const selected = selected_storage[0..selected_count];
     // One key per archive, never stored: tags are stable within this file only.
     const archive_policy: ?redact.Policy = if (env.redact) |p| p.rekeyed(redact.randomKey()) else null;
     const policy: ?*const redact.Policy = if (archive_policy) |*p| p else null;
+    var kernel_plan = try KernelPlan.collect(a, capture);
+    defer kernel_plan.deinit();
+    const write_kernel = capture.kernel_stacks_requested or kernel_plan.slots.items.len != 0;
+    if (write_kernel) {
+        selected_storage[selected_count] = .kernel_stacks;
+        selected_count += 1;
+    }
+    const selected = selected_storage[0..selected_count];
     if (capture.thread_count > perf.max_threads or capture.samples.len() > capture.config.sample_limit or capture.images.loaded.items.len + capture.pe_assets.entries.items.len > max_images) return error.ArchiveLimit;
     // Lanes beyond the recorded threads are never written by the collector.
     for (capture.switches.lanes[capture.thread_count..]) |lane| if (lane.events.items.len != 0 or lane.cutoff_ns != null or lane.contradictory) return error.ArchiveInconsistent;
-    var bodies: [section_order.len + 7]std.ArrayList(u8) = @splat(.empty);
+    var bodies: [section_order.len + 8]std.ArrayList(u8) = @splat(.empty);
     defer for (&bodies) |*body| body.deinit(a);
     for (selected, bodies[0..selected.len], 0..) |tag, *body, section_index| {
         try progress.step(env.progress, .encoding, section_index);
@@ -270,6 +282,7 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
                 defer a.free(payload);
                 try w.out.appendSlice(a, payload);
             },
+            .kernel_stacks => try encodeKernel(w, capture, &kernel_plan),
         }
     }
     var total: usize = header_bytes + entry_bytes * selected.len;
@@ -280,7 +293,8 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
     @memset(out[0..header_bytes], 0);
     @memcpy(out[0..8], magic);
     std.mem.writeInt(u16, out[8..10], format_major, .little);
-    std.mem.writeInt(u16, out[10..12], if (capture.net) |net| (if (net.hasUsb()) usb_evidence_context_minor else evidence_context_minor) else if (typed_images) @as(u16, 8) else if (capture.producer != null) 6 else if (capture.syscalls.enabled) 5 else if (custom_limit) 4 else 3, .little);
+    const minor: u16 = if (write_kernel) kernel_stacks_minor else if (capture.net) |net| (if (net.hasUsb()) usb_evidence_context_minor else evidence_context_minor) else if (typed_images) @as(u16, 8) else if (capture.producer != null) 6 else if (capture.syscalls.enabled) 5 else if (custom_limit) 4 else 3;
+    std.mem.writeInt(u16, out[10..12], minor, .little);
     std.mem.writeInt(u32, out[12..16], header_bytes, .little);
     std.mem.writeInt(u64, out[16..24], total, .little);
     std.mem.writeInt(u32, out[24..28], @intCast(selected.len), .little);
@@ -295,7 +309,7 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
     for (selected, bodies[0..selected.len], 0..) |tag, body, i| {
         const entry = out[header_bytes + i * entry_bytes ..][0..entry_bytes];
         std.mem.writeInt(u32, entry[0..4], @intFromEnum(tag), .little);
-        std.mem.writeInt(u32, entry[4..8], if (tag == .producer or tag == .evidence_context or tag == .usb_evidence_context) flag_ignorable else 0, .little);
+        std.mem.writeInt(u32, entry[4..8], if (tag == .producer or tag == .evidence_context or tag == .usb_evidence_context or tag == .kernel_stacks) flag_ignorable else 0, .little);
         std.mem.writeInt(u64, entry[8..16], offset, .little);
         std.mem.writeInt(u32, entry[16..20], @intCast(body.items.len), .little);
         std.mem.writeInt(u32, entry[20..24], std.hash.Crc32.hash(body.items), .little);
@@ -530,6 +544,60 @@ fn encodeMappings(w: Writer, capture: *const Capture) !void {
         try w.int(u32, change.id);
     }
 }
+const KernelSlot = struct {
+    address: u64,
+    limit: u64,
+    name: []const u8,
+    module: []const u8,
+};
+/// Named kernel symbols the chain actually used. Raw kernel addresses stay in
+/// the sample records. A redacted archive does not substitute ids for them.
+const KernelPlan = struct {
+    a: Allocator,
+    slots: std.ArrayList(KernelSlot) = .empty,
+    fn deinit(self: *KernelPlan) void {
+        self.slots.deinit(self.a);
+    }
+    fn collect(a: Allocator, capture: *const Capture) !KernelPlan {
+        var plan = KernelPlan{ .a = a };
+        errdefer plan.deinit();
+        for (0..capture.samples.len()) |ordinal| {
+            const sample = capture.samples.get(ordinal);
+            if (sample.cpu_mode == .kernel and sample.ip_present and sample.ip != 0 and !records.isContextMarker(sample.ip)) try plan.note(capture, sample.ip);
+            var skipped_leaf = false;
+            for (sample.frames[0..sample.frame_count]) |item| {
+                if (item.marker or item.context != .kernel) continue;
+                if (item.address == 0 or records.isContextMarker(item.address)) continue;
+                if (!skipped_leaf and sample.cpu_mode == .kernel and sample.ip_present and item.address == sample.ip) {
+                    skipped_leaf = true;
+                    continue;
+                }
+                skipped_leaf = true;
+                try plan.note(capture, item.address -| 1);
+            }
+        }
+        return plan;
+    }
+    fn note(self: *KernelPlan, capture: *const Capture, key: u64) !void {
+        const symbol = capture.kallsyms.lookup(key) orelse return;
+        for (self.slots.items) |slot| if (slot.address == symbol.address) return;
+        if (self.slots.items.len >= kernel_symbol_cap) return error.ArchiveLimit;
+        try self.slots.append(self.a, .{ .address = symbol.address, .limit = symbol.limit, .name = symbol.name[0..@min(symbol.name.len, max_text)], .module = symbol.module[0..@min(symbol.module.len, max_text)] });
+    }
+};
+fn encodeKernel(w: Writer, capture: *const Capture, plan: *const KernelPlan) !void {
+    try w.code(1);
+    const flags: u8 = @as(u8, @intFromBool(capture.kernel_stacks_requested)) | @as(u8, @intFromBool(capture.kernel_stacks_granted)) << 1 | @as(u8, @intFromBool(capture.kernel_symbolizable)) << 2 | @as(u8, @intFromBool(capture.kallsyms.addresses_hidden)) << 3;
+    try w.code(flags);
+    try w.text(capture.kernel_symbol_reason, max_text);
+    try w.count(plan.slots.items.len);
+    for (plan.slots.items) |slot| {
+        try w.int(u64, slot.address);
+        try w.int(u64, slot.limit);
+        try w.text(slot.name, max_text);
+        try w.text(slot.module, max_text);
+    }
+}
 fn encodeSamples(w: Writer, capture: *const Capture) !void {
     try w.count(capture.samples.len());
     for (0..capture.samples.len()) |ordinal| {
@@ -730,11 +798,12 @@ pub const Opened = struct {
         std.mem.writeInt(u64, fields[12..20], filter.to_ns, .little);
         hash.update(&fields);
         filter.tids.hashInto(&hash);
+        if (filter.hide_kernel) hash.update("hide_kernel");
         return std.fmt.bytesToHex(hash.finalResult(), .lower);
     }
 };
 
-const Header = struct { evidence_context: ?[]const u8 = null, usb_evidence_context: ?[]const u8 = null, frames: ?[]const u8 = null, producer: ?[]const u8 = null, syscalls: ?[]const u8 = null, limits: ?[]const u8 = null, thread_scope: ?[]const u8 = null, user_state: ?[]const u8 = null, minor: u16, sections: [section_order.len][]const u8, ignored: usize, required_features: u64, optional_features: u64 };
+const Header = struct { evidence_context: ?[]const u8 = null, usb_evidence_context: ?[]const u8 = null, kernel_stacks: ?[]const u8 = null, frames: ?[]const u8 = null, producer: ?[]const u8 = null, syscalls: ?[]const u8 = null, limits: ?[]const u8 = null, thread_scope: ?[]const u8 = null, user_state: ?[]const u8 = null, minor: u16, sections: [section_order.len][]const u8, ignored: usize, required_features: u64, optional_features: u64 };
 fn readHeader(bytes: []const u8, limit: usize) Error!Header {
     if (bytes.len > limit) return error.ArchiveTooLarge;
     if (bytes.len < header_bytes) return error.ArchiveTruncated;
@@ -794,6 +863,9 @@ fn readHeader(bytes: []const u8, limit: usize) Error!Header {
         } else if (tag == @intFromEnum(Tag.usb_evidence_context)) {
             if (flags != flag_ignorable or required != section_order.len or result.usb_evidence_context != null or result.evidence_context == null or minor < usb_evidence_context_minor) return error.ArchiveSectionLayout;
             result.usb_evidence_context = body;
+        } else if (tag == @intFromEnum(Tag.kernel_stacks)) {
+            if (flags != flag_ignorable or required != section_order.len or result.kernel_stacks != null or minor < kernel_stacks_minor) return error.ArchiveSectionLayout;
+            result.kernel_stacks = body;
         } else if (tag == frames_tag) {
             if (flags != flag_ignorable or required != section_order.len or result.frames != null) return error.ArchiveSectionLayout;
             result.frames = body;
@@ -918,6 +990,10 @@ fn decodeInner(budget: *Budget, bytes: []const u8, options: Options) !Opened {
         resolution.update(@tagName(report.status));
     }
     try progress.step(options.progress, .annotations, source.annotation_count);
+    if (header.kernel_stacks) |body| {
+        r = .{ .bytes = body, .cancel = if (options.progress) |p| &p.cancel else null };
+        try decodeKernel(&r, self);
+    }
     self.work_cancel = if (options.progress) |p| &p.cancel else null;
     self.offline_graph = try self.graphDirect(a, .{});
     self.work_cancel = null;
@@ -1376,7 +1452,52 @@ pub fn readFile(a: Allocator, path: [:0]const u8, limit: usize, state: ?*progres
     return bytes;
 }
 
-const FrameCode = Codes(flame.Kind, &.{ "root", "thread", "code", "unknown", "unverified", "incomplete" });
+fn decodeKernel(r: *Reader, self: *Capture) !void {
+    if (try r.code() != 1) return error.ArchiveFeatureUnsupported;
+    const flags = try r.code();
+    if (flags & ~@as(u8, 15) != 0) return error.ArchiveInvalidValue;
+    const reason = try r.text(max_text);
+    const n = try r.count(kernel_symbol_cap, 18);
+    const symbols = try self.allocator.alloc(kallsyms.Symbol, n);
+    errdefer self.allocator.free(symbols);
+    const Span = struct { name_at: usize, name_len: usize, module_at: usize, module_len: usize };
+    const spans = try self.allocator.alloc(Span, n);
+    defer self.allocator.free(spans);
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(self.allocator);
+    for (symbols, spans) |*symbol, *span| {
+        const address = try r.int(u64);
+        const limit = try r.int(u64);
+        if (limit <= address) return error.ArchiveInvalidValue;
+        const name = try r.text(max_text);
+        const module = try r.text(max_text);
+        if (name.len == 0) return error.ArchiveInvalidValue;
+        span.* = .{ .name_at = text.items.len, .name_len = name.len, .module_at = 0, .module_len = module.len };
+        try text.appendSlice(self.allocator, name);
+        span.module_at = text.items.len;
+        try text.appendSlice(self.allocator, module);
+        symbol.* = .{ .address = address, .name = "", .module = "", .limit = limit };
+    }
+    try r.end();
+    const owned = try text.toOwnedSlice(self.allocator);
+    errdefer self.allocator.free(owned);
+    for (symbols, spans) |*symbol, span| {
+        symbol.name = owned[span.name_at..][0..span.name_len];
+        symbol.module = owned[span.module_at..][0..span.module_len];
+    }
+    std.mem.sort(kallsyms.Symbol, symbols, {}, struct {
+        fn less(_: void, left: kallsyms.Symbol, right: kallsyms.Symbol) bool {
+            return left.address < right.address;
+        }
+    }.less);
+    self.kernel_symbol_reason = try self.arena.allocator().dupe(u8, reason);
+    self.kernel_stacks_requested = flags & 1 != 0;
+    self.kernel_stacks_granted = flags & 2 != 0;
+    self.kernel_symbolizable = flags & 4 != 0;
+    self.kallsyms = .{ .symbols = symbols, .text = owned, .addresses_hidden = false, .allocator = self.allocator };
+    self.kallsyms_owned = true;
+}
+const FrameCode = Codes(flame.Kind, &.{ "root", "thread", "code", "unknown", "unverified", "incomplete", "kernel" });
 fn encodeAnnotations(w: Writer, original: *const Capture, state: ?*progress.Progress) !void {
     // Borrow immutable evidence/ELF bytes. Every mutable cache and libdw handle
     // belongs to this private analysis copy. The job pins the original lifetime.
