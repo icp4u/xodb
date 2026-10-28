@@ -38,10 +38,10 @@
  * Old agents drop the bit. A host that does not see it still captures and
  * leaves kernel frames unnamed. */
 #define XRT_RPC_CAP_KALLSYMS UINT64_C(32)
-/* One registry of the HELLO capability word. A new bit is added to one row
- * list below, not as a second mask at a call site. Always-on bits are
- * advertised on every capable HELLO. Negotiated bits are asked and returned
- * only when the host sets them. */
+/* One registry of the HELLO capability word. A new bit is added to
+ * XRT_RPC_CAP_DEFINED and to one row list below, not as a second mask at a
+ * call site. Always-on bits are advertised on every capable HELLO.
+ * Negotiated bits are asked and returned only when the host sets them. */
 #define XRT_RPC_CAP_ALWAYS_ROWS(X) \
     X(XRT_RPC_CAP_SOURCE) \
     X(XRT_RPC_CAP_LARGE_IMAGES)
@@ -53,11 +53,20 @@
 #define XRT_RPC_CAP_ALL_ROWS(X) \
     XRT_RPC_CAP_ALWAYS_ROWS(X) \
     XRT_RPC_CAP_NEGOTIATED_ROWS(X)
+/* Every XRT_RPC_CAP_* value macro. The row lists must name the same bits. */
+#define XRT_RPC_CAP_DEFINED(X) \
+    X(XRT_RPC_CAP_SOURCE) \
+    X(XRT_RPC_CAP_ADDRESS_SPACE) \
+    X(XRT_RPC_CAP_LARGE_IMAGES) \
+    X(XRT_RPC_CAP_FILE_SLOTS) \
+    X(XRT_RPC_CAP_PAC_MASK) \
+    X(XRT_RPC_CAP_KALLSYMS)
 #define XRT_RPC_CAP_OR_BIT(bit) |(bit)
 #define XRT_RPC_CAP_ADD_BIT(bit) +(bit)
 #define XRT_RPC_CAP_ONE_BIT(bit) && ((bit) > 0) && (((bit) & ((bit) - 1)) == 0)
 #define XRT_RPC_CAP_ALWAYS (0 XRT_RPC_CAP_ALWAYS_ROWS(XRT_RPC_CAP_OR_BIT))
 #define XRT_RPC_CAP_NEGOTIATED (0 XRT_RPC_CAP_NEGOTIATED_ROWS(XRT_RPC_CAP_OR_BIT))
+_Static_assert((0 XRT_RPC_CAP_DEFINED(XRT_RPC_CAP_OR_BIT)) == (XRT_RPC_CAP_ALWAYS | XRT_RPC_CAP_NEGOTIATED), "HELLO capability defined but left out of the row lists");
 _Static_assert((0 XRT_RPC_CAP_ALL_ROWS(XRT_RPC_CAP_ADD_BIT)) == (0 XRT_RPC_CAP_ALL_ROWS(XRT_RPC_CAP_OR_BIT)), "HELLO capability bits overlap");
 _Static_assert((1 XRT_RPC_CAP_ALL_ROWS(XRT_RPC_CAP_ONE_BIT)), "HELLO capability is not one bit");
 _Static_assert(XRT_RPC_CAP_PAC_MASK == UINT64_C(16), "PAC mask bit stays 16");

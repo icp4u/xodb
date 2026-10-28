@@ -29,6 +29,27 @@ fn addRuntimeSources(b: *std.Build, module: *std.Build.Module, sources: []const 
 // dependency; the macos-seam step and `test` compile it for aarch64-macos.
 const macos_seam_sources = [_][]const u8{ "cancel.c", "gdb_packet.c", "gdb_link.c", "log.c", "gdb_description.c", "gdb_lldb.c", "gdbremote.c", "target_state.c", "file_identity.c", "arch.c", "loongarch_step.c", "riscv_step.c", "wire.c", "wire_target.c", "agent.c", "agent_main.c", "remote.c", "file_view.c", "perf_wire.c", "agent_perf.c", "remote_perf.c", "fdinherit.c", "fdgraph.c", "fdgraph_layout.c", "fdtreemap.c", "fdevent_decode.c", "fdevent_count.c", "fdflow_decode.c", "fdflow_count.c", "fdflow_graph.c" };
 
+/// C cannot list its own macros, so the rpc.h static asserts only see bits
+/// named in XRT_RPC_CAP_DEFINED. Every `#define XRT_RPC_CAP_<name> UINT64_C(`
+/// must be named there too, or the build stops.
+fn checkCapRegistry(b: *std.Build) void {
+    const text = b.build_root.handle.readFileAlloc(b.graph.io, "src/runtime/rpc.h", b.allocator, .limited(1024 * 1024)) catch
+        @panic("src/runtime/rpc.h");
+    const start = std.mem.indexOf(u8, text, "#define XRT_RPC_CAP_DEFINED(X)") orelse @panic("rpc.h has no XRT_RPC_CAP_DEFINED");
+    const end = std.mem.indexOfPos(u8, text, start, "\n#") orelse text.len;
+    const defined = text[start..end];
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        const prefix = "#define XRT_RPC_CAP_";
+        if (!std.mem.startsWith(u8, line, prefix) or std.mem.indexOf(u8, line, " UINT64_C(") == null) continue;
+        const name = line["#define ".len..std.mem.indexOfScalarPos(u8, line, "#define ".len, ' ').?];
+        if (std.mem.indexOf(u8, defined, b.fmt("X({s})", .{name})) == null) {
+            std.debug.print("src/runtime/rpc.h: {s} is not in XRT_RPC_CAP_DEFINED and a row list\n", .{name});
+            std.process.exit(1);
+        }
+    }
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -40,6 +61,7 @@ pub fn build(b: *std.Build) void {
     abi_lint.dependOn(&b.addSystemCommand(&.{ "python3", "-B", "scripts/abi-lint" }).step);
     if (target.result.os.tag == .macos) return @import("build_macos.zig").build(b, target, optimize);
     const runtime_sources = loadRuntimeSources(b);
+    checkCapRegistry(b);
     const perf_regs_gen = b.addExecutable(.{
         .name = "perf-regs-gen",
         .root_module = b.createModule(.{

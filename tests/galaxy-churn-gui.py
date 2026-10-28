@@ -121,7 +121,14 @@ try:
     # A changed publication adds a moving and a settled frame; one more each
     # covers the poll phase shifting against the quiet estimate.
     check('churn has bounded frames beyond quiet polling', report['busy']['frames'] <= ordinary + len(observed) * 3 + 4)
-    check('at most two moving frames per changed publication', sum(f['moving'] == '1' for f in rows('frame')[start[2]:]) <= len(observed) * 2)
+    moving = sum(f['moving'] == '1' for f in rows('frame')[start[2]:])
+    allowance = len(observed) * 2
+    report['moving_frames'] = moving
+    report['moving_allowance'] = allowance
+    print(f'moving frames {moving} / allowance {allowance}', flush=True)
+    if moving + 2 >= allowance:
+        print(f'WARN moving frames {moving} / allowance {allowance} are near the limit', flush=True)
+    check('at most two moving frames per changed publication', moving <= allowance)
     check('cloud rebuilds are bounded by publications, not eased frames', report['busy']['builds'] <= len(observed) + 2)
     check('no unmeasured traffic impulses', all(f['impulses'] == '0' for f in rows('frame')))
     check('application remains healthy', d.alive() and 'panic' not in text() and 'frame failed' not in text())
