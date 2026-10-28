@@ -156,6 +156,7 @@ for mode in ('duration','mappings','exit'):
     try:
         checkpoint(client)
         opened=client.action('start_profile',duration_ms=250 if mode=='duration' else 5000,frequency_hz=199)['capture']
+        assert opened['collection_enabled_ns'] is not None and opened['collection_enabled_ns'] >= opened['started_ns'], opened
         client.action('continue')
         deadline=time.monotonic()+5
         while True:

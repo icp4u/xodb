@@ -53,6 +53,7 @@ COVERS = (
     (('src/debug/macho*', 'tests/macos-debug*', 'tests/macos-dwarf*', 'tests/macos-object*', 'tests/macos-unwind*', 'src/model/image_label.zig'), ('macos-debug*', 'macos-dwarf*', 'macos-unwind*', 'macos-names*', 'gui-macos-debug', 'proton-metadata*', 'pe-*', 'pdb-*')),
     (('src/model/remote_worker.zig', 'tests/helpers/agent_proxy.py', 'src/runtime/remote_perf.c'), ('remote-exit-export*', 'remote-broken-exit', 'remote-startup*')),
     (('src/target/runtime.zig', 'src/runtime/remote.c', 'tests/helpers/agent_proxy.py'), ('remote-unknown', 'remote-broken-exit', 'remote-startup*')),
+    (('tests/helpers/listen.py',), ('remote', 'remote-startup*', 'private-network-evidence', 'live-network-evidence*', 'log-levels', 'gui-themes')),
     (('src/runtime/remote.c', 'src/runtime/xrt_remote.h', 'tests/runtime-remote.c'), ('remote-read-cache',)),
     (('src/runtime/remote.c', 'src/runtime/agent.c', 'src/runtime/family.c', 'src/runtime/rpc.h', 'src/runtime/target_internal.h', 'src/runtime/xrt_target.h', 'tests/runtime-remote.c'), ('remote-unstable-cache',)),
     (("src/language/runtime_binding.zig", "tests/runtime-binding.py", "tests/fixtures/pe/runtime-binding.c"), ("runtime-binding*", "gui-runtime-binding*", "python-*", "perl-*", *LANGUAGE_PANES)),
@@ -139,7 +140,10 @@ COVERS = (
       'gui-symbol-discovery', 'gui-debug', 'm2-recovery', 'unwind-realigned*', 'unwind-return-address*', 'module-unwind*')),
     (('src/binary/*', 'src/model/modules.zig'),
      ('mapping-identity', 'cache-pool', 'object-cache', 'symbol-query', 'module-*', 'source-paths*', 'apk-symbols', 'core-debugging', 'local-large-symbols', 'symbol-discovery*',
-      'mcp-modules', 'm2-mappings', 'demo-binary', 'gui-symbol-discovery', 'python-image-budget', 'image-budget', 'image-budget-hostile', 'gui-image-budget')),
+      'mcp-modules', 'm2-mappings', 'demo-binary', 'gui-symbol-discovery', 'python-image-budget', 'image-budget', 'image-budget-hostile', 'image-budget-held', 'gui-image-budget')),
+    (('src/binary/snapshot.zig', 'src/model/modules.zig', 'src/runtime/remote.c', 'src/runtime/xrt_files.h',
+      'tests/image-budget-held.py', 'tests/fixtures/file-read-count.py'),
+     ('image-budget-held',)),
     (('src/target/*', 'src/runtime/target*', 'src/runtime/process.c', 'src/runtime/watchpoints.c', 'src/runtime/arch.c',
       'src/runtime/events.c', 'src/runtime/xstate.c', 'src/runtime/loader.c', 'src/runtime/xrt_target.h', 'src/runtime/xrt_process.h',
       'tests/runtime-target.c',
@@ -568,7 +572,7 @@ def agent_source(path):
         'tests/shared-sessions.py')
 
 
-def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=(), python=None, padwalker=None, ruby=None, node_refusal=None, go=None, wine=None, emacs=None, moved=False, redot=None, macos_ssh=None, arm64_sidecar=None, macos=None, riscv64_guest=None):
+def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=(), python=None, padwalker=None, ruby=None, node_refusal=None, go=None, wine=None, emacs=None, moved=False, redot=None, macos_ssh=None, arm64_sidecar=None, macos=None, riscv64_guest=None, aarch64_pac=None):
     # moved: return the PERIODIC steps of this tier's host and gui lanes instead of the others.
     runtimes = (headless, optimize, uprobes, perl, node, node_include, lua, python, padwalker, ruby, node_refusal, go, wine, emacs)
     live = tier in ('host', 'all')
@@ -779,6 +783,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 if variant.name not in present:
                     steps.append(variant)
                     present.add(variant.name)
+        if tier == 'periodic' and aarch64_pac:
+            steps.append(('aarch64-pac', ['sh', 'tests/aarch64-pac.sh', aarch64_pac], 3600, dict(kind='live')))
         return steps
     if live:
         steps.append(('remote-queued-drop', [sys.executable, '-B', 'tests/remote-queued-drop.py', '--work', '.work/remote-queued-drop'], 60))
@@ -910,6 +916,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('local-large-symbols', [sys.executable, '-B', 'tests/local-large-symbols.py', '--work', '.work/ls', *storage], 120))
         steps.append(('image-budget', [sys.executable, '-B', 'tests/image-budget.py', '--work', '.work/ib'], 60))
         steps.append(('image-budget-hostile', [sys.executable, '-B', 'tests/image-budget-hostile.py', '--work', '.work/ibh'], 60))
+        steps.append(('image-budget-held', [sys.executable, '-B', 'tests/image-budget-held.py', '--work', '.work/ibhd', '--runtime-agent', 'zig-out/bin/xodb-agent'], 180))
         for name, work in (('image-budget-lifecycle', 'ibl'), ('image-budget-regressions', 'ibr')):
             for remote in (False, True):
                 steps.append((name + ('-agent' if remote else ''), [sys.executable, '-B', 'tests/' + name + '.py', '--work', '.work/' + work + str(int(remote)), *(['--agent', 'zig-out/bin/xodb-agent'] if remote else []), *(['--only', 'honest,packed,stderr'] if remote and name == 'image-budget-regressions' else [])], 300))
@@ -1228,6 +1235,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 steps.append(('gui-owner-' + suffix,
                               ['env', 'XODB_TEST_RUNTIME_AGENT=zig-out/bin/xodb-agent', *step.argv],
                               step.timeout, dict(work=step.work, serial=step.serial)))
+    if tier == 'all' and aarch64_pac:
+        steps.append(('aarch64-pac', ['sh', 'tests/aarch64-pac.sh', aarch64_pac], 3600, dict(kind='live')))
     return Steps(step for step in steps if periodic(step.name) == moved)
 
 
@@ -1759,6 +1768,7 @@ def main(argv=None):
     parser.add_argument('--macos', metavar='HOST', help='Opt-in native macOS build, Cocoa contract, bundle and offscreen presentation checks over SSH (gui/all/periodic; no on-screen windows)')
     parser.add_argument('--arm64-sidecar', nargs=3, metavar=('SSH', 'AGENT', 'FIXTURE'), help='Include the live arm64 Ghidra-sidecar test using an SSH destination and owned remote agent/fixture paths (periodic tier)')
     parser.add_argument('--riscv64-guest', nargs=3, metavar=('SSH', 'AGENT', 'FIXTURE'), help='Include the riscv64 software-step driver (periodic tier). AGENT and FIXTURE are remote executables; a path that is not executable makes the step build a fresh guest tree. Holds XODB_GUEST_LEASE and uses ssh from PATH.')
+    parser.add_argument('--aarch64-pac', metavar='SSH', help='Opt-in: build and run the PAC unwind proof on this Linux aarch64 machine (all and periodic; no default destination)')
     parser.add_argument('--node-refusal', help='Also require completed metadata and an exact frame-proof refusal from this separately selected Node build (gui/all)')
     parser.add_argument('--lua', action='append', nargs=3, default=[], metavar=('EXECUTABLE', 'SOURCE', 'LIBRARY'), help='Include Lua live/component checks; repeat for each debug runtime and matching internal headers/static library')
     parser.add_argument('--node-include', default='/usr/include/node', help='Matching Node development header directory')
@@ -1816,6 +1826,8 @@ def main(argv=None):
         parser.error('--arm64-sidecar requires the periodic tier')
     if args.riscv64_guest and args.tier != 'periodic':
         parser.error('--riscv64-guest requires the periodic tier')
+    if args.aarch64_pac and args.tier not in ('all', 'periodic'):
+        parser.error('--aarch64-pac requires the all or periodic tier')
     if args.node and args.tier in ('portable', 'perf'):
         parser.error('--node is not for the portable or perf tier')
     if args.node_refusal and args.tier not in ('gui', 'all', 'periodic', 'periodic-gui'):
@@ -1825,7 +1837,7 @@ def main(argv=None):
     if args.agent_lane and args.tier == 'affected':
         parser.error('--agent-lane selects a tier; affected adds the variants when a runtime or agent file changes')
     runtimes = (args.headless, args.optimize, args.uprobes, args.perl, args.node, args.node_include, args.lua, args.python, args.padwalker, args.ruby, args.node_refusal, args.go, args.wine, args.emacs)
-    steps = plan(args.tier, *runtimes, redot=args.redot, macos_ssh=args.macos_ssh, arm64_sidecar=args.arm64_sidecar, macos=args.macos, riscv64_guest=args.riscv64_guest)
+    steps = plan(args.tier, *runtimes, redot=args.redot, macos_ssh=args.macos_ssh, arm64_sidecar=args.arm64_sidecar, macos=args.macos, riscv64_guest=args.riscv64_guest, aarch64_pac=args.aarch64_pac)
     decisions, missing = [], []
     if tier == 'affected':
         base = args.base or 'HEAD'
@@ -1928,7 +1940,8 @@ def main(argv=None):
                     (['Node.js frame-proof refusal (use --node-refusal PATH)'] if args.tier in ('gui', 'all') and not args.node_refusal else []) +
                     (['Lua live checks (use --lua EXECUTABLE SOURCE LIBRARY)'] if args.tier not in ('portable', 'perf') and not args.lua else []) +
                     (['Perl named-local oracle checks (use --perl PATH --padwalker BUILT_TREE)'] if args.tier not in ('portable', 'perf') and not args.padwalker else []) +
-                    (['riscv64 software-step guest (use periodic --riscv64-guest SSH AGENT FIXTURE)'] if not args.riscv64_guest else []))
+                    (['riscv64 software-step guest (use periodic --riscv64-guest SSH AGENT FIXTURE)'] if not args.riscv64_guest else []) +
+                    (['aarch64 PAC unwind proof (use all or periodic --aarch64-pac SSH)'] if args.tier in ('all', 'periodic') and not args.aarch64_pac else []))
     print(f'Release evidence: {run}', flush=True)
     began = time.monotonic()
     # periodic runs the live steps that host leaves out, unless it is headless.

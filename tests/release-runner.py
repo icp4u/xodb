@@ -31,6 +31,7 @@ UNREGISTERED = {
         ('needs an ARM64 host', ('arm64-demo.py', 'arm64-native.py', 'arm64-watchpoints.py', 'remote-ssh-gui.py',)),
         ('needs gdbserver and QEMU targets', ('gdb-remote.py',)),
         ('run on a riscv64 guest by tests/riscv64-guest.sh (periodic --riscv64-guest)', ('runtime-riscv64.py',)),
+        ('run on a Linux aarch64 machine by tests/aarch64-pac.sh (all or periodic --aarch64-pac)', ('aarch64-pac.py',)),
         ('run on Darwin by macos-native.py --local (release-check --macos)', ('macos-local.py',)),
         ('needs a device profile', ('simpleperf-import.py', 'simpleperf-import-gui.py',)),
         ('needs sudo: the privileged allocation helper, or a configured host', ('allocations-live.py', 'm2-syscall-configured.py',)),
@@ -394,12 +395,12 @@ class RunnerTests(unittest.TestCase):
 
     RUNTIMES = (['--perl', 'P', '--padwalker', 'W'], ['--python', 'Y'], ['--emacs', 'E'], ['--ruby', 'R'], ['--node', 'N'],
                 ['--node', 'N', '--node-refusal', 'NR'], ['--go', 'G'], ['--redot', 'RD'], ['--macos-ssh', 'MAC'], ['--macos', 'MAC'],
-                ['--arm64-sidecar', 'SSH', 'AGENT', 'FIXTURE'], ['--riscv64-guest', 'SSH', 'AGENT', 'FIXTURE'], ['--wine', 'WINE'], ['--uprobes'], ['--headless'],
+                ['--arm64-sidecar', 'SSH', 'AGENT', 'FIXTURE'], ['--riscv64-guest', 'SSH', 'AGENT', 'FIXTURE'], ['--aarch64-pac', 'SSH'], ['--wine', 'WINE'], ['--uprobes'], ['--headless'],
                 ['--lua', 'l', 's', 'b', '--lua', 'l2', 's2', 'b2'])
     EVERYTHING = dict(uprobes=True, perl='P', node='N', lua=[('l', 's', 'b'), ('l2', 's2', 'b2')], python='Y', padwalker='W',
                       ruby='R', node_refusal='NR', go='G', wine='WINE', emacs='E', redot='RD', macos_ssh='MAC',
                       arm64_sidecar=('SSH', 'AGENT', 'FIXTURE'), macos='MAC',
-                      riscv64_guest=('SSH', 'AGENT', 'FIXTURE'))
+                      riscv64_guest=('SSH', 'AGENT', 'FIXTURE'), aarch64_pac='SSH')
     TIERS = ('portable', 'host', 'gui', 'all', 'periodic', 'periodic-gui', 'perf')
 
     def listed(self, *argv):
@@ -584,6 +585,11 @@ class RunnerTests(unittest.TestCase):
             names, lines = chosen(helper)
             self.assertIn('not mapped, so every planned step', lines[0])
             self.assertEqual(names, [step.name for step in steps], helper)
+        names, lines = chosen('tests/helpers/listen.py')
+        self.assertEqual(names, ['headless-app', 'build-tests', 'release-runner', 'remote-startup', 'log-levels',
+                                 'private-network-evidence', 'live-network-evidence', 'remote', 'gui-themes'])
+        self.assertIn('tests/helpers/listen.py: 6 steps', lines[0])
+        self.assertNotIn('not mapped', lines[0])
         # The runner's own file selects the steps whose registration changed, or else the gui tier.
         names, lines = chosen('scripts/release-check')
         self.assertIn('no registration changed, so the full gui tier', lines[0])

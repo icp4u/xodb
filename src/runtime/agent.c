@@ -15,6 +15,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <signal.h>
+#include <sys/ptrace.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
+#endif
 struct entry {
     uint32_t id;
     struct xrt_target *target;
@@ -60,6 +66,82 @@ static uint64_t mutation_flags(const struct xrt_target *t)
 {
     return (uint64_t)t->last_mutation.issued | ((uint64_t)t->last_mutation.confirmed << 8);
 }
+/* Own child, stopped once. Not a user process. A transient failure is not a
+ * mask: the caller retries and does not remember the miss as zero. The macOS
+ * seam compiles this file and has no ptrace headers, so the read stays Linux. */
+#if defined(__linux__)
+static enum xrt_status agent_read_pac(uint64_t *data, uint64_t *insn)
+{
+    pid_t child = fork();
+    if (child < 0)
+        return XRT_FORK_FAILED;
+    if (child == 0) {
+        if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0)
+            _exit(127);
+        raise(SIGSTOP);
+        _exit(0);
+    }
+    int status = 0;
+    pid_t got;
+    do
+        got = waitpid(child, &status, 0);
+    while (got < 0 && errno == EINTR);
+    enum xrt_status result = XRT_PTRACE_FAILED;
+    if (got == child && WIFSTOPPED(status))
+        result = xrt_pac_masks_of_tid((int32_t)child, data, insn);
+    else if (got < 0)
+        result = XRT_PROCESS_GONE;
+    kill(child, SIGKILL);
+    do
+        got = waitpid(child, &status, 0);
+    while (got < 0 && errno == EINTR);
+    return result;
+}
+#endif
+static enum xrt_status agent_pac_suffix(uint64_t *insn, uint64_t *data, uint64_t *va)
+{
+    *insn = 0;
+    *data = 0;
+    *va = 0;
+#if !defined(__linux__)
+    return XRT_OK;
+#else
+    static struct {
+        bool ready;
+        uint64_t data, insn, va;
+    } cached;
+    const struct xrt_arch *native = xrt_arch_native();
+    if (!native || native->machine != XRT_AARCH64)
+        return XRT_OK;
+    if (!cached.ready) {
+        uint64_t read_data = 0, read_insn = 0;
+        enum xrt_status status = XRT_PTRACE_FAILED;
+        for (unsigned attempt = 0; attempt < 4; ++attempt) {
+            read_data = 0;
+            read_insn = 0;
+            status = agent_read_pac(&read_data, &read_insn);
+            if (status == XRT_OK || status == XRT_UNSUPPORTED_ARCHITECTURE ||
+                status == XRT_PERMISSION_DENIED || status == XRT_UNEXPECTED_REGISTER_SIZE)
+                break;
+        }
+        if (status != XRT_OK && status != XRT_UNSUPPORTED_ARCHITECTURE &&
+            status != XRT_PERMISSION_DENIED && status != XRT_UNEXPECTED_REGISTER_SIZE)
+            return status;
+        if (status != XRT_OK) {
+            read_data = 0;
+            read_insn = 0;
+        }
+        cached.data = read_data;
+        cached.insn = read_insn;
+        cached.va = read_insn == 0 ? 0 : (uint64_t)__builtin_ctzll(read_insn);
+        cached.ready = true;
+    }
+    *insn = cached.insn;
+    *data = cached.data;
+    *va = cached.va;
+    return XRT_OK;
+#endif
+}
 static enum xrt_status dispatch(struct agent *a, struct xrt_wire_frame *frame, uint64_t *value,
                                 size_t *extra_size, struct xrt_target **snapshot)
 {
@@ -92,14 +174,24 @@ static enum xrt_status dispatch(struct agent *a, struct xrt_wire_frame *frame, u
         if (args[0] == XRT_RPC_HELLO_CAPABILITIES) {
             /* Advertise the snapshot suffix only to a host that asked for it,
              * so the reply bit and the agreed reply shape cannot disagree. */
-            /* The file-slot status is sent only to a host that asked, since
-             * an older host drops the connection on an unknown status. */
-            a->negotiated = args[1] & (XRT_RPC_CAP_ADDRESS_SPACE | XRT_RPC_CAP_FILE_SLOTS);
+            /* The file-slot count and the PAC triple are sent only to a host
+             * that asked, since an older host drops an unknown suffix. */
+            a->negotiated = args[1] & (XRT_RPC_CAP_ADDRESS_SPACE | XRT_RPC_CAP_FILE_SLOTS |
+                                       XRT_RPC_CAP_PAC_MASK);
             uint64_t caps = XRT_RPC_CAP_SOURCE | XRT_RPC_CAP_LARGE_IMAGES | a->negotiated;
             xrt_codec_u64(&extra, &caps);
             if (a->negotiated & XRT_RPC_CAP_FILE_SLOTS) {
                 uint64_t slots = a->file_slots;
                 xrt_codec_u64(&extra, &slots);
+            }
+            if (a->negotiated & XRT_RPC_CAP_PAC_MASK) {
+                uint64_t insn = 0, data = 0, va = 0;
+                enum xrt_status pac = agent_pac_suffix(&insn, &data, &va);
+                if (pac != XRT_OK)
+                    return pac;
+                xrt_codec_u64(&extra, &insn);
+                xrt_codec_u64(&extra, &data);
+                xrt_codec_u64(&extra, &va);
             }
         }
         *extra_size = extra.at;

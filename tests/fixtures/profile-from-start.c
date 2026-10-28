@@ -1,7 +1,10 @@
 #define _GNU_SOURCE
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/prctl.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -42,6 +45,9 @@ int main(int argc, char **argv) {
     const char *stop = argc > 1 ? argv[1] : NULL;
     const char *ready = argc > 2 ? argv[2] : NULL;
     if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0) != 0) return 2;
+    /* "system" runs a short shell command after the constructor, as programs
+       that popen or system during startup do. */
+    if (argc > 3 && strcmp(argv[3], "system") == 0 && system("exit 0") != 0) return 4;
     if (ready) {
         /* The ready file carries the constructor's CLOCK_MONOTONIC entry time,
            renamed into place so a reader never sees it partly written. */

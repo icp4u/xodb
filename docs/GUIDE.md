@@ -504,6 +504,7 @@ every mode: the debugger window, `--headless --mcp`, `--open-capture`,
 | MCP replies | Every string value of every reply (object keys and the request id stay). |
 | Log lines | Every level, before the line reaches stderr or `--log-file`. |
 | Saved capture archive | Written redacted, with header bit "redacted" (optional feature bit 0). Texts are rewritten, socket addresses become tags, stack copies have names overwritten with `x`, and imported frame sources are not attached. The originals are not in the file, so it cannot be un-redacted. |
+| Speedscope profile export | Every JSON string value is rewritten under a fresh export key. Function names and numeric evidence such as user/kernel addresses, PIDs and timestamps remain intact. The xodb extension records `redacted: true`. |
 | Copy of an opened archive | Allowed only when that archive was itself written redacted (`ArchiveNotRedacted` otherwise). |
 | Allocation archive | Refused (`AllocationArchiveNotRedacted`): it has no redacting writer yet. |
 | `query_stream include_raw` | Refused (`RawPayloadRedacted`): payload bytes are withheld, not rewritten. |
@@ -512,7 +513,7 @@ every mode: the debugger window, `--headless --mcp`, `--open-capture`,
 | Private | Shown as |
 |---|---|
 | `/home/NAME/...`, your `$HOME` | `~/...` |
-| your user names, host name | `user`, `host` (any case, as a token: between non-letters such as `/`, `@`, `.`, `_`, `-` or digits, or at a camelCase step; names of 8+ characters also inside longer words, so a short name does not rewrite `stream`) |
+| your user names, host name, distribution names from os-release | `user`, `host`, `system` (any case, as a token: between non-letters such as `/`, `@`, `.`, `_`, `-` or digits, or at a camelCase step; names of 8+ characters also inside longer words, so a short name does not rewrite `stream`) |
 | IPv4/IPv6 outside loopback, unspecified, broadcast and documentation ranges | `ip-` and 8 hex digits |
 | MAC addresses | `mac-` and 8 hex digits |
 
@@ -521,9 +522,10 @@ never written down. Within one run (or one archive) the same peer always gets
 the same tag, so flows still group by peer; two runs or two archives give
 different tags, so they cannot be linked. A redacted archive's socket table
 therefore matches loopback and documentation tuples in a pcap, never tagged
-ones. Not covered yet: speedscope and investigation exports, `.xoi`/`.xof`
-files, the remote GUI wire protocol, raw memory reads, and binary (non-text)
-addresses inside stack copies.
+ones. Not covered yet: investigation exports, `.xoi`/`.xof` files, the remote
+GUI wire protocol, raw memory reads, and binary (non-text) addresses inside
+stack copies. Numeric addresses in a profile export are evidence rather than
+long-lived identity and are deliberately retained.
 
 ## HiDPI and UI scale
 

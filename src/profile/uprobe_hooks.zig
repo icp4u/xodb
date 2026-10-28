@@ -48,7 +48,7 @@ fn cancelled(cancel: ?*const std.atomic.Value(bool)) !void {
 }
 /// Exact defined function names only. Duplicate table entries at one address
 /// are fine; different definitions, IFUNC resolvers and data labels are not.
-pub fn resolve(image: *const elf.Image, region: modules.Region, name: []const u8, cancel: ?*const std.atomic.Value(bool)) !Location {
+pub fn resolve(image: *const elf.Image, region: modules.Region, name: []const u8, page: u64, cancel: ?*const std.atomic.Value(bool)) !Location {
     try cancelled(cancel);
     if (image.header.machine != .x86_64) return error.UnsupportedAllocationArchitecture;
     if (region.start >= region.end or region.permissions[2] != 'x') return error.AllocationMappingNotExecutable;
@@ -81,7 +81,7 @@ pub fn resolve(image: *const elf.Image, region: modules.Region, name: []const u8
         }
     }
     const link = found orelse return error.AllocationSymbolNotFound;
-    const bias = try modules.Modules.observedBias(image, region);
+    const bias = try modules.Modules.observedBias(image, region, page);
     const runtime = try std.math.add(u64, bias, link);
     if (runtime < region.start or runtime >= region.end) return error.AllocationSymbolOutsideMapping;
     var offset: ?u64 = null;
@@ -112,8 +112,10 @@ pub fn prepareTarget(target: ?*const rt.struct_xrt_target, pid: i32, region: mod
     const bytes = snapshot.read(result.fd, limit, cancel) catch |err| return if (err == error.ArchiveCancelled) error.AllocationPreparationCancelled else err;
     defer snapshot.free(bytes);
     const image = try elf.Image.parse(bytes);
+    const page = rt.xrt_target_page_size(target);
+    if (page == 0) return error.BadMapping;
     for (requests, 0..) |request, i| {
-        const location = try resolve(&image, region, request.name, cancel);
+        const location = try resolve(&image, region, request.name, page, cancel);
         for (result.sources[0..i]) |old| if (old.id == request.id or old.offset == location.offset) return error.DuplicateAllocationHook;
         result.sources[i] = .{ .id = request.id, .fd = result.fd, .offset = location.offset, .identity = target_identity };
         result.locations[i] = location;

@@ -176,6 +176,45 @@ static void files(struct xrt_target *t, const char *self, bool latency)
             .args = {XRT_RPC_HELLO_CAPABILITIES, XRT_RPC_CAP_ADDRESS_SPACE | XRT_RPC_CAP_FILE_SLOTS},
             .value = &machine, .out = hello, .capacity = sizeof(hello), .length = &hello_size}));
         assert(hello_size == 32);
+        /* The startup HELLO already asked for the PAC triple. On this host the
+         * agent sends zeros when the note does not exist, and the size is 56. */
+        unsigned char hello_pac[64];
+        size_t pac_size = 0;
+        OK(xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_HELLO,
+            .args = {XRT_RPC_HELLO_CAPABILITIES,
+                     XRT_RPC_CAP_ADDRESS_SPACE | XRT_RPC_CAP_FILE_SLOTS | XRT_RPC_CAP_PAC_MASK},
+            .value = &machine, .out = hello_pac, .capacity = sizeof(hello_pac), .length = &pac_size}));
+        assert(pac_size == 56);
+        uint64_t caps = 0, insn = 1, data = 1, va = 1;
+        struct xrt_codec caps_in = xrt_codec(hello_pac + 16, 8, true);
+        xrt_codec_u64(&caps_in, &caps);
+        struct xrt_codec pac = xrt_codec(hello_pac + 32, 24, true);
+        xrt_codec_u64(&pac, &insn);
+        xrt_codec_u64(&pac, &data);
+        xrt_codec_u64(&pac, &va);
+        assert(caps_in.ok && pac.ok && pac.at == 24);
+        assert((caps & XRT_RPC_CAP_PAC_MASK) && (caps & XRT_RPC_CAP_FILE_SLOTS));
+        uint64_t stored_data = 7, stored_insn = 7, stored_va = 7;
+        assert(xrt_target_remote_pac(t, &stored_data, &stored_insn, &stored_va));
+        assert(stored_insn == insn && stored_data == data && stored_va == va);
+#if defined(__aarch64__)
+        if (insn != 0) {
+            assert(va == (uint64_t)__builtin_ctzll(insn));
+            assert(va >= 32 && va <= 52);
+        } else {
+            assert(va == 0);
+        }
+#else
+        assert(insn == 0 && data == 0 && va == 0);
+#endif
+        stored_data = 7;
+        stored_insn = 7;
+        stored_va = 7;
+        assert(!xrt_target_remote_pac(NULL, &stored_data, &stored_insn, &stored_va));
+        assert(stored_data == 0 && stored_insn == 0 && stored_va == 0);
+        stored_insn = 7;
+        assert(!xrt_target_remote_pac(t, NULL, &stored_insn, &stored_va));
+        assert(stored_insn == 7);
         t->remote_id = remote_id;
         assert(xrt_remote_call(t, &open) == XRT_FILE_SLOT_LIMIT);
         for (unsigned i = 0; i < 32; ++i)

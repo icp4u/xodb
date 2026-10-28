@@ -161,6 +161,11 @@ pub const Session = struct {
     probe_resume_actor: Actor = .human,
     probe_resume_lease: ?@import("../service/lease.zig").Lease = null,
     profile: ?*profile.Capture = null,
+    /// `--start-profile` follows internal exec and an explicitly followed
+    /// process birth. Ordinary GUI/MCP captures leave this null.
+    startup_profile: ?profile.Config = null,
+    startup_profile_process_boundary: bool = false,
+    startup_profile_resume: bool = false,
     /// Session defaults for future GUI captures and omitted MCP arguments.
     profile_defaults: profile.Config = .{},
     /// Language views the user left on. Every language adapter asks here
@@ -703,6 +708,18 @@ pub const Session = struct {
         if (job.publication) |result| if (result.state != .published) return error.ArchiveSaveFailed;
     }
     pub fn startProfile(self: *Session, request: profile.Config) !u64 {
+        self.cancelStartupProfile();
+        return self.startProfileRequest(request);
+    }
+    /// Arm the launch-owned capture policy. Its all-thread request is reused
+    /// at a held exec or followed-child boundary before that target resumes.
+    pub fn startStartupProfile(self: *Session, request: profile.Config) !u64 {
+        const id = try self.startProfileRequest(request);
+        self.startup_profile = request;
+        if (self.profile) |capture| capture.outlive_child_processes = true;
+        return id;
+    }
+    fn startProfileRequest(self: *Session, request: profile.Config) !u64 {
         if (self.target.core != null) return error.ReadOnlyCore;
         if (profile.perfFile(self.target.arch()) == null) return error.ProfilingUnsupportedArchitecture;
         self.profile_failure = null;
@@ -751,7 +768,8 @@ pub const Session = struct {
         // A replacement must not compete with the stopped capture's images.
         // Validate the request and target first; a later open failure is
         // reported normally, with the previous capture already released.
-        if (self.profile != null) try self.releaseProfile();
+        if (self.profile != null) try self.releaseProfileCapture();
+        const insn_pac_mask = self.target.pacInsnMask();
         const opened = try profile.Capture.openTarget(self.target.handle, std.heap.page_allocator, self.next_profile_id, self.id, self.target.snapshot().generation, self.target.snapshot().image_epoch, self.target.snapshot().pid, try self.target.stoppedTid(), config, identities[0..count], linux.now());
         switch (opened) {
             .failed => |failure| {
@@ -761,8 +779,12 @@ pub const Session = struct {
             .capture => |capture| {
                 errdefer capture.deinit();
                 try capture.retainPe(&self.modules);
+                // Setup before this stamp, including map refresh and the perf
+                // open, is not part of the requested duration.
+                capture.collection_enabled_ns = linux.now();
                 self.dropDerived();
                 if (self.profile) |old| self.recorded_views.retire(old);
+                capture.insn_pac_mask = insn_pac_mask;
                 self.profile = capture;
                 self.profile_view = null;
                 capture.debugger_sequence = self.target.snapshot().sequence;
@@ -781,12 +803,17 @@ pub const Session = struct {
     pub fn stopProfile(self: *Session) !void {
         const capture = self.profile orelse return error.NoProfile;
         if (capture.collector == null) return error.ProfileNotRunning;
+        self.cancelStartupProfile();
         self.profileMarkers(capture);
         capture.stop(.manual, linux.now());
     }
     /// Drop a completed live capture and its image references. A worker that
     /// borrows it is cancelled first; the caller retries after it has finished.
     pub fn releaseProfile(self: *Session) !void {
+        self.cancelStartupProfile();
+        try self.releaseProfileCapture();
+    }
+    fn releaseProfileCapture(self: *Session) !void {
         if (self.offline or self.artifact != null) return error.OfflineSession;
         const capture = self.profile orelse return error.NoProfile;
         if (capture.collector != null) return error.ProfileStillCollecting;
@@ -802,6 +829,21 @@ pub const Session = struct {
         self.profile_view_visible = false;
         self.profile = null;
         self.recorded_views.retire(capture);
+    }
+    fn cancelStartupProfile(self: *Session) void {
+        self.startup_profile = null;
+        self.startup_profile_process_boundary = false;
+        self.startup_profile_resume = false;
+    }
+    pub fn startupProfileConfig(self: *const Session) ?profile.Config {
+        return self.startup_profile;
+    }
+    pub fn noteStartupProcessBoundary(self: *Session) void {
+        if (self.startup_profile != null) self.startup_profile_process_boundary = true;
+    }
+    pub fn startFollowedStartupProfile(self: *Session, request: profile.Config) !void {
+        _ = try self.startStartupProfile(request);
+        self.startup_profile_resume = true;
     }
     fn retireProfileThreads(self: *Session, capture: *profile.Capture) void {
         const now = linux.now();
@@ -862,6 +904,42 @@ pub const Session = struct {
                 }
             }
         }
+    }
+    fn followStartupProfile(self: *Session) void {
+        const request = self.startup_profile orelse return;
+        const capture = self.profile orelse return;
+        const stopped = self.target.snapshot();
+        if (stopped.state != .stopped or stopped.birth_count != 0 or self.target.sharedVm()) return;
+        if (capture.collector != null) {
+            // The capture outlives a followed child; release only the parent
+            // held at that fork stop.
+            if (self.startup_profile_process_boundary) {
+                self.startup_profile_process_boundary = false;
+                self.startup_profile_resume = true;
+            }
+            return;
+        }
+        const followed_exec = stopped.image_epoch != capture.image_epoch and
+            (capture.hasStop(.mappings_changed) or capture.hasStop(.image_changed));
+        const followed_process = self.startup_profile_process_boundary and capture.hasStop(.thread_scope_changed);
+        if (!followed_exec and !followed_process) return;
+        _ = self.startProfileRequest(request) catch return;
+        self.startup_profile = request;
+        if (self.profile) |replacement| replacement.outlive_child_processes = true;
+        self.startup_profile_process_boundary = false;
+        self.startup_profile_resume = true;
+    }
+    fn resumeStartupProfile(self: *Session) !bool {
+        if (!self.startup_profile_resume or self.target.snapshot().state != .stopped) return false;
+        self.startup_profile_resume = false;
+        self.continueExecution(.human) catch |err| {
+            if (err == error.VforkParentBlocked) {
+                self.startup_profile_resume = true;
+                return true;
+            }
+            return err;
+        };
+        return true;
     }
     fn profileMarkers(self: *Session, capture: *profile.Capture) void {
         if (self.target.snapshot().sequence == capture.debugger_sequence) return;
@@ -1655,6 +1733,7 @@ pub const Session = struct {
         };
         self.memory.poll(self);
         self.pollProfile();
+        self.followStartupProfile();
         self.recorded_views.poll(self.profile);
         try self.captureInvestigations();
         if (self.pending_continue) |*pending| pending.generation = self.target.snapshot().generation;
@@ -1677,6 +1756,7 @@ pub const Session = struct {
         const internal_id = if (self.run_to) |run| (if (run.owns_probe) run.probe else null) else null;
         const filtered = try self.probes.poll(self, internal_id);
         try self.pollRunTo(filtered);
+        if (try self.resumeStartupProfile()) return;
         // A hidden loader rendezvous may interrupt an instruction/source step-over.
         // Preserve its temporary return probe; explicit pause cancels the operation.
         if (filtered and self.target.onlyInternalStops() and (self.source_step != null or self.stepping_over) and self.run_to == null) {
@@ -2369,7 +2449,7 @@ pub const Session = struct {
                     if (inlined.decl_path) |path| inlined.decl_path = try self.sourceMaps().forward(a, path);
                 }
                 frame.inline_frames = inline_frames;
-                break :step debug.unwind(a, try module.linkAddress(frame.lookup_pc), .{ .registers = registers, .load_bias = module.bias, .user = self, .read = readTarget }) catch |err| {
+                break :step debug.unwind(a, try module.linkAddress(frame.lookup_pc), .{ .registers = registers, .load_bias = module.bias, .insn_pac_mask = self.target.pacInsnMask(), .user = self, .read = readTarget }) catch |err| {
                     frame.diagnostic = @errorName(err);
                     try frames.append(a, frame);
                     break :stack_walk;

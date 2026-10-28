@@ -7,7 +7,7 @@ JSON schema; requires test-only jsonschema in the invoking Python environment.
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-import argparse,json,os,stat,time
+import argparse,json,os,pwd,re,shlex,socket,stat,time
 from client import Client
 parser=argparse.ArgumentParser();parser.add_argument('--schema',type=Path);args=parser.parse_args()
 schema=json.loads(args.schema.read_text()) if args.schema else None
@@ -127,5 +127,69 @@ try:
  error(c.tool('export_profile',generation=c.session()['generation'],capture_id=1,revision=1,path=str(run/'denied.json')),'AgentScopeDenied')
  assert not (run/'denied.json').exists()
 finally:c.close()
+
+def distro_name():
+ for candidate in (Path('/etc/os-release'),Path('/usr/lib/os-release')):
+  try: lines=candidate.read_text().splitlines()
+  except OSError: continue
+  fields={}
+  for line in lines:
+   if '=' not in line:continue
+   key,value=line.split('=',1)
+   if key not in ('PRETTY_NAME','NAME'):continue
+   try: parsed=shlex.split(value)
+   except ValueError:continue
+   if len(parsed)==1:fields[key]=parsed[0]
+  if fields:return fields.get('PRETTY_NAME') or fields.get('NAME')
+ raise AssertionError('distro name unavailable')
+
+pw=pwd.getpwuid(os.getuid())
+private={'account':pw.pw_name,'host':socket.gethostname(),'home':pw.pw_dir.rstrip('/'),'distro':distro_name()}
+assert all(private.values()),'private export probe inputs unavailable'
+payload=' | '.join(f'{kind}:{value}' for kind,value in private.items())
+assert len(payload.encode())<=256,'private export probe exceeds interval text limit'
+
+def privacy_export(path,redacted):
+ c=Client('control',fixture,args=['2','threads'],options=['--redact'] if redacted else [])
+ try:
+  checkpoint(c)
+  cap=c.action('start_profile',frequency_hz=199)['capture']
+  c.action('continue');time.sleep(.25)
+  cap=c.action('stop_profile',capture_id=cap['id'])['capture']
+  c.action('interrupt');c.stopped()
+  c.action('add_profile_intervals',capture_id=cap['id'],revision=cap['revision'],source='redaction probe',intervals=[dict(from_ns=0,to_ns=1,kind='custom',label=payload)])
+  cap=c.inspect('get_profile')['capture']
+  c.action('export_profile',capture_id=cap['id'],revision=cap['revision'],path=str(path))
+  return path.read_text()
+ finally:
+  c.close()
+  c.p.stderr.read()
+
+def private_match(text,name):
+ if name.startswith('/'):return name.casefold() in text.casefold()
+ if len(name)==2:return re.search(r'(?<![a-z0-9_])'+re.escape(name)+r'(?![a-z0-9_])',text,re.I) is not None
+ if len(name)>=8:return name.casefold() in text.casefold()
+ for match in re.finditer(re.escape(name),text,re.I):
+  at,end=match.span();letter=lambda ch:ch.isascii() and ch.isalpha()
+  left=at==0 or not letter(text[at-1]) or (text[at-1].islower() and text[at].isupper())
+  right=end==len(text) or not letter(text[end]) or (text[end-1].islower() and text[end].isupper())
+  if left and right:return True
+ return False
+
+control_path=run/'privacy-control.json'
+try:control_text=privacy_export(control_path,False)
+finally:
+ if control_path.exists():control_path.unlink()
+for kind,needle in private.items():assert private_match(control_text,needle),f'control export did not exercise {kind}'
+redacted_path=run/'privacy-redacted.json';redacted_text=privacy_export(redacted_path,True)
+for kind,needle in private.items():assert not private_match(redacted_text,needle),f'redacted export leaked {kind}'
+assert '/home/' not in redacted_text and '/Users/' not in redacted_text,'redacted export retained a home path'
+redacted_data=json.loads(redacted_text)
+assert redacted_data['xodb']['redacted'] is True
+assert redacted_data['xodb']['capture']['pid']>0 and redacted_data['xodb']['capture']['started_ns']>0
+assert any(frame['address'] for frame in redacted_data['xodb']['frame_identities']),'redaction removed frame addresses'
+assert any(frame['name'] for frame in redacted_data['xodb']['frame_identities']),'redaction removed frame names'
+
 print('export: full/filtered/empty stack and count conservation, scheduling, imported intervals, recursion, audit/scope/stale guards, atomic no-overwrite/symlink protection, post-exit and active-close CLI output passed')
-print('schema validation:',bool(schema));print(run)
+print('redacted export: account, host, home and distro absent; numeric provenance and frame names retained')
+print('schema validation:',bool(schema));print(run.relative_to(root))

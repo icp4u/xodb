@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 #include "perf_internal.h"
+#include "perf_regs.h"
 #include "perf_remote.h"
 #include "xrt_remote.h"
 #include <errno.h>
@@ -30,31 +31,14 @@ struct xrt_perf *xrt_cpu_start(const struct xrt_cpu_config *c, struct xrt_cpu_ac
         detail = "data_pages must be a power of two up to 64";
     else if (c->callchain && (!c->max_frames || c->max_frames > 64))
         detail = "max_frames out of range";
-#if defined(__aarch64__)
-    else if (c->user_regs_mask >> 33)
+    else if (c->user_regs_mask >> XODB_PERF_USER_REGS_LIMIT)
         detail = "user register mask includes an unsupported bit";
-#elif defined(__loongarch__)
-    else if (c->user_regs_mask >> 32)
-        detail = "user register mask includes an unsupported bit";
-#else
-    else if (c->user_regs_mask >> 24)
-        detail = "user register mask includes an unsupported bit";
-#endif
     else if (c->user_stack_bytes &&
              (c->user_stack_bytes < 64 || c->user_stack_bytes > 8192 || c->user_stack_bytes % 8))
         detail = "user_stack_bytes must be a multiple of 8 from 64 to 8192";
-#if defined(__aarch64__)
     else if (c->user_stack_bytes &&
-             (c->user_regs_mask & ((1ULL << 31) | (1ULL << 32))) != ((1ULL << 31) | (1ULL << 32)))
+             (c->user_regs_mask & XODB_PERF_USER_REGS_REQUIRED) != XODB_PERF_USER_REGS_REQUIRED)
         detail = "user stack capture requires the stack pointer and instruction pointer";
-#elif defined(__loongarch__)
-    else if (c->user_stack_bytes &&
-             (c->user_regs_mask & ((1ULL << 0) | (1ULL << 3))) != ((1ULL << 0) | (1ULL << 3)))
-        detail = "user stack capture requires the stack pointer and instruction pointer";
-#else
-    else if (c->user_stack_bytes && (c->user_regs_mask & 384) != 384)
-        detail = "user stack capture requires the stack pointer and instruction pointer";
-#endif
     if (detail) {
         xrt_perf_fail(f, "config", 0, -1, detail);
         return NULL;

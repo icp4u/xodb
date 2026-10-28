@@ -33,13 +33,15 @@ try:
         assert len(body) == size
         # Compatibility replay: the previous agent has no 2 GiB image
         # capability. Its unchanged bounded range API still works.
-        # HELLO extra is 24 bytes with capabilities, or 32 when the host also
-        # asked for the open-file slot count. The capability word stays at the
-        # same offset; only the large-image bit is cleared.
+        # HELLO extra is 24 bytes with capabilities, 32 when the host also
+        # asked for the open-file slot count, or 56 when it also asked for
+        # the PAC triple. The capability word stays at the same offset; only
+        # the large-image bit is cleared. The slot count and the PAC triple
+        # stay in the tail.
         if os.environ.get('XODB_METADATA_LEGACY_IMAGES') and op == 1 and status == 0:
             extra = struct.unpack_from('>I', body, 8)[0]
             # A new HELLO shape must fail here, not silently skip the replay.
-            assert extra in (24, 32), f'HELLO extra {extra}: update the legacy replay'
+            assert extra in (24, 32, 56), f'HELLO extra {extra}: update the legacy replay'
             caps = struct.unpack_from('>Q', body, 28)[0]
             body = body[:28] + struct.pack('>Q', caps & ~4) + body[36:]
         if op == 37 and status == 0:  # VIEW, never LAUNCH

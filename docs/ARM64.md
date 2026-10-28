@@ -72,16 +72,20 @@ separate from this headless result.
 | Unwinding | CFI uses ARM LR column 30, SP 31 and PC 32; separate breakpoint and caller-PC rules |
 | Optimized fixture | GCC O2 without frame pointers unwinds; `next=12`; `amount` is explicitly unavailable (`EntryValueUnavailable`), also unavailable in installed GDB |
 | Hardware watches | Up to four aligned 1/2/4/8-byte write/read-write watches; MCP investigations and remote GUI controls; native lifecycle/completion tests pass ([semantics/evidence](research/arm64-watchpoints/integration.md)); hardware execution breakpoints remain unsupported |
-| Profiling | Native CPU sampling on a PAC-capable ARM64 machine: sampled stacks of a frame-pointer fixture unwind through the C library to `_start`, matching the breakpoint stack. In a `pac-ret` build the saved return addresses are signed. Live and sampled walks name the leaf and the first signing function, then stop with `PointerAuthenticationUnsupported` instead of reporting a signed address as a caller. Syscall and allocation sampling stay x86-64; captures are not saved (`ArchiveUnsupportedArchitecture`) |
+| Profiling | Native CPU sampling on a PAC-capable ARM64 machine: sampled stacks of a frame-pointer fixture unwind through the C library to `_start`, matching the breakpoint stack. In a `pac-ret` build the saved return addresses are signed. The insn mask is read once per target with `PTRACE_GETREGSET` `NT_ARM_PAC_MASK` and stored on each capture. A remote agent sends that mask and the virtual-address width in HELLO. Live and sampled walks strip return addresses with that mask. A leftover bit at or above bit 48 still stops the walk with `PointerAuthenticationUnsupported` instead of naming a signed address as a caller. Syscall and allocation sampling stay x86-64; captures are not saved (`ArchiveUnsupportedArchitecture`) |
 | Archives | Existing x86 format retained; incompatible ELF assets are rejected even if their content hash matches |
 | GUI / remote protocol | Workstation GUI controls native ARM64 over SSH or TCP ([demo](REMOTE_DEBUGGING.md)); GUI rendering on Jetty remains pending |
 
 Jetty's libdw predates `dwarf_get_units`; its adapter uses `dwarf_next_unit` for
 DWARF 4 and explicitly rejects newer unit versions. Newer libdw keeps the
-existing DWARF 4/5 path. Pointer authentication: unwinding does not strip PAC bits
-yet. A return address with bits above 47 stops the walk. Stripping needs the
-insn mask from `PTRACE_GETREGSET` `NT_ARM_PAC_MASK` (recorded with each capture
-for sampled stacks), or `xpaclri` when the debugger runs on the target.
+existing DWARF 4/5 path. Pointer authentication: `Image.unwind` strips a saved
+return address with the insn mask recorded for that target. The mask is read
+once, with `PTRACE_GETREGSET` `NT_ARM_PAC_MASK`, and copied onto each capture.
+A return address that still has a bit at or above bit 48 stops the walk.
+`xpaclri` is not used. A remote agent reads the same note and sends the insn
+mask, the data mask, and the virtual-address width in HELLO. Live and sampled
+walks use that insn mask. An agent that does not send it keeps mask 0, so a
+signed return still stops the walk.
 Signal-frame unwinding, tag handling, SIMD/SVE state,
 32-bit compatibility targets and general optimized entry-value reconstruction
 are outside this first native slice. Native target and ELF ISA checks prevent

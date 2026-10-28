@@ -3,7 +3,9 @@
 memory and checked against the stack the script itself printed.
 Run: python3 tests/gdscript-stack.py --redot /path/to/engine --work out/gd
 The engine must be a debug-enabled build with DWARF (an editor or a
-template_debug binary). Fast lane: about 10 s with a 1.4 GB engine."""
+template_debug binary). Fast lane: about 10 s with a 1.4 GB engine.
+The two-slot variant detects retained ready/cancelled views. Four slots cover
+cancel recovery too, but have enough room to hide a missing view release."""
 import argparse, json, os, shlex, shutil, subprocess, sys, time
 from pathlib import Path
 from client import Client

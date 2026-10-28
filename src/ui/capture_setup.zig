@@ -292,6 +292,8 @@ pub const Facts = struct {
     status: profile.Stop,
     stop_reasons: []const profile.Stop,
     started_ns: u64,
+    /// The deadline origin; null keeps the request clock (archives, tests).
+    collection_enabled_ns: ?u64 = null,
     ended_ns: ?u64,
     duration_ms: u32,
     frequency_hz: u32,
@@ -354,7 +356,7 @@ pub fn stackLine(buffer: []u8, facts: Facts) []const u8 {
     return std.fmt.bufPrint(buffer, "Stacks {s}/{s}: {d}/{d} kept, {d} over budget{s}, {d} no stack, {d} no regs", .{ sizeText(&a, facts.stack_bytes), sizeText(&b, facts.stack_budget), s.retained, s.samples, s.budget_gaps, first, s.kernel_absent, (s.samples - s.registers) }) catch "";
 }
 pub fn factsFrom(capture: *const profile.Capture) Facts {
-    return .{ .follow_threads = capture.config.follow_threads, .stack_bytes = capture.config.user_stack_bytes, .stack_budget = capture.config.user_stack_budget_bytes, .stacks = stackCounts(capture), .id = capture.id, .offline = capture.offline, .collecting = capture.collector != null, .status = capture.status, .stop_reasons = capture.stop_reasons[0..capture.stop_reason_count], .started_ns = capture.started_ns, .ended_ns = capture.ended_ns, .duration_ms = capture.config.duration_ms, .frequency_hz = capture.config.frequency_hz, .context_switch = capture.config.context_switch, .samples = capture.samples.len(), .sample_limit = capture.config.sample_limit, .discarded_samples = capture.discarded_samples, .lost_samples = capture.lost_samples, .lost_records = capture.lost_records, .selected_threads = capture.thread_count, .unselected_threads = capture.unselected_threads, .scope_change = capture.scope_change, .failure = capture.failure, .pid = capture.pid };
+    return .{ .follow_threads = capture.config.follow_threads, .stack_bytes = capture.config.user_stack_bytes, .stack_budget = capture.config.user_stack_budget_bytes, .stacks = stackCounts(capture), .id = capture.id, .offline = capture.offline, .collecting = capture.collector != null, .status = capture.status, .stop_reasons = capture.stop_reasons[0..capture.stop_reason_count], .started_ns = capture.started_ns, .collection_enabled_ns = capture.collection_enabled_ns, .ended_ns = capture.ended_ns, .duration_ms = capture.config.duration_ms, .frequency_hz = capture.config.frequency_hz, .context_switch = capture.config.context_switch, .samples = capture.samples.len(), .sample_limit = capture.config.sample_limit, .discarded_samples = capture.discarded_samples, .lost_samples = capture.lost_samples, .lost_records = capture.lost_records, .selected_threads = capture.thread_count, .unselected_threads = capture.unselected_threads, .scope_change = capture.scope_change, .failure = capture.failure, .pid = capture.pid };
 }
 pub const Severity = enum { normal, warning, failure };
 /// A readable stop reason: what happened, and a next step today's behavior supports.
@@ -401,7 +403,8 @@ pub fn elapsedText(buffer: []u8, ns: u64) []const u8 {
 /// Time left before the recorded deadline, from the clock, not the sample rate.
 pub fn remainingNs(facts: Facts, clock: Clock) ?u64 {
     if (!facts.collecting or facts.duration_ms == 0) return null;
-    return (facts.started_ns + @as(u64, facts.duration_ms) * 1_000_000) -| clock.now_ns;
+    const origin = facts.collection_enabled_ns orelse facts.started_ns;
+    return (origin + @as(u64, facts.duration_ms) * 1_000_000) -| clock.now_ns;
 }
 /// Loss and discards in words, or "" when there were none.
 pub fn lossLine(buffer: []u8, facts: Facts) []const u8 {
@@ -420,7 +423,7 @@ pub fn lossLine(buffer: []u8, facts: Facts) []const u8 {
 pub fn detailLine(buffer: []u8, facts: Facts, _: Limits) []const u8 {
     var a: [32]u8 = undefined;
     return switch (facts.status) {
-        .duration => std.fmt.bufPrint(buffer, "The limit was {s}, measured on the wall clock including time paused in the debugger", .{durationText(&a, facts.duration_ms)}) catch "",
+        .duration => std.fmt.bufPrint(buffer, "The limit was {s}, measured on the wall clock from when collection was enabled, including time paused in the debugger", .{durationText(&a, facts.duration_ms)}) catch "",
         .capacity => std.fmt.bufPrint(buffer, "{d} of {d} samples stored; {d} further samples were not kept", .{ facts.samples, facts.sample_limit, facts.discarded_samples }) catch "",
         .thread_scope_changed => if (facts.scope_change) |change| std.fmt.bufPrint(buffer, "New {s}: PID {d} / TID {d}, created by TID {d}. Task outside capture scope", .{ if (change.pid == @as(u32, @bitCast(facts.pid))) "thread" else "child process", change.pid, change.tid, change.parent_tid }) catch "" else "New task outside capture scope",
         .collector_error, .decode_error, .drain_limit => if (facts.failure) |f| failureLine(buffer, f) else "",
@@ -619,6 +622,10 @@ test "outcomes use recorded evidence and keep the primary reason" {
     facts.collecting = true;
     facts.ended_ns = null;
     try testing.expectEqual(@as(?u64, 57_500_000_000), remainingNs(facts, .{ .now_ns = 3_500_000_000 }));
+    // Setup before collection was enabled does not use up the window.
+    facts.collection_enabled_ns = 2_000_000_000;
+    try testing.expectEqual(@as(?u64, 58_500_000_000), remainingNs(facts, .{ .now_ns = 3_500_000_000 }));
+    facts.collection_enabled_ns = null;
     facts.duration_ms = 0;
     try testing.expectEqual(@as(?u64, null), remainingNs(facts, .{ .now_ns = 3_500_000_000 }));
     try testing.expectEqualStrings("#3 capturing  2.5 s, no time limit  /  412 of 16384 samples  /  2 threads (others not sampled)", summaryLine(&buffer, facts, .{}, .{ .now_ns = 3_500_000_000 }));

@@ -27,6 +27,12 @@
  * Old hosts omit the bit and keep the 24-byte reply. Old agents ignore the
  * bit and omit the count; the host then keeps today's per-feature caps. */
 #define XRT_RPC_CAP_FILE_SLOTS UINT64_C(8)
+/* HELLO arg[1] asks for three more u64s after the slot count: insn mask,
+ * data mask, then virtual-address width. Width is zero when the insn mask
+ * is zero. Old hosts omit the bit. Old agents ignore it and keep a 16, 24,
+ * or 32 byte reply. A new agent appends the triple whenever the bit is asked,
+ * including zeros off aarch64, so the size does not depend on the machine. */
+#define XRT_RPC_CAP_PAC_MASK UINT64_C(16)
 enum xrt_rpc_op {
     XRT_RPC_HELLO = 1,
     XRT_RPC_CREATE,

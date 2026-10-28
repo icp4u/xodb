@@ -2,12 +2,14 @@
 //! machine and how it is shown. A leaf: std only, no session, UI or MCP.
 //!
 //! Private: paths under home directories, the user's names, the host's names,
+//! the distribution's names,
 //! IPv4/IPv6 addresses outside loopback, unspecified, broadcast and the
 //! documentation ranges, and MAC addresses. Shown as:
 //!   /home/NAME/...            ~/...
 //!   user name, host name      user, host (any case; as a token: between
 //!                             non-letters or at a camelCase step; names of
 //!                             8+ characters anywhere, even inside a word)
+//!   distribution name        system
 //!   address                   ip-XXXXXXXX, mac-XXXXXXXX: the first 4 bytes of
 //!                             HMAC-SHA256(key, address), so one peer keeps one
 //!                             name within a session (or archive) and the key,
@@ -17,7 +19,7 @@
 //! serial numbers are not read by any mode yet.
 const std = @import("std");
 
-pub const Kind = enum(u8) { home, user, host };
+pub const Kind = enum(u8) { home, user, host, distro };
 
 pub const Policy = struct {
     /// Never written anywhere; per session, or per saved archive (`rekeyed`).
@@ -27,7 +29,7 @@ pub const Policy = struct {
     storage: [1024]u8 = undefined,
     used: u16 = 0,
 
-    const max_words = 12;
+    const max_words = 16;
     const Word = struct { at: u16, len: u16, kind: Kind };
 
     pub fn init(key: [32]u8) Policy {
@@ -50,7 +52,24 @@ pub const Policy = struct {
         const node = std.mem.sliceTo(&uts.nodename, 0);
         p.add(.host, node);
         p.add(.host, node[0 .. std.mem.indexOfScalar(u8, node, '.') orelse node.len]);
+        p.addDistroNames();
         return p;
+    }
+    fn addDistroNames(self: *Policy) void {
+        var buffer: [4096]u8 = undefined;
+        const text = readFile("/etc/os-release", &buffer) orelse readFile("/usr/lib/os-release", &buffer) orelse return;
+        self.addDistroText(text);
+    }
+    fn addDistroText(self: *Policy, text: []const u8) void {
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            const equal = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+            const key = line[0..equal];
+            if (!std.mem.eql(u8, key, "PRETTY_NAME") and !std.mem.eql(u8, key, "NAME")) continue;
+            var value = std.mem.trim(u8, line[equal + 1 ..], " \t\r");
+            if (value.len >= 2 and ((value[0] == '"' and value[value.len - 1] == '"') or (value[0] == '\'' and value[value.len - 1] == '\''))) value = value[1 .. value.len - 1];
+            self.add(.distro, value);
+        }
     }
     /// The same names under another key (one per saved archive).
     pub fn rekeyed(self: *const Policy, key: [32]u8) Policy {
@@ -92,6 +111,7 @@ pub const Policy = struct {
                 .home => try w.writeAll("~"),
                 .user => try w.writeAll("user"),
                 .host => try w.writeAll("host"),
+                .distro => try w.writeAll("system"),
                 .ip => try w.print("ip-{s}", .{&self.tag("ip", &m.bytes)}),
                 .mac => try w.print("mac-{s}", .{&self.tag("mac", m.bytes[0..6])}),
             }
@@ -165,7 +185,7 @@ pub const Policy = struct {
         }
     }
 
-    const Match = struct { len: usize, what: enum { home, user, host, ip, mac }, bytes: [16]u8 = @splat(0) };
+    const Match = struct { len: usize, what: enum { home, user, host, distro, ip, mac }, bytes: [16]u8 = @splat(0) };
     fn match(self: *const Policy, t: []const u8, i: usize) ?Match {
         for ([_][]const u8{ "/home/", "/Users/" }) |prefix| if (std.mem.startsWith(u8, t[i..], prefix)) {
             var end = i + prefix.len;
@@ -183,7 +203,12 @@ pub const Policy = struct {
             }
             if (!std.ascii.eqlIgnoreCase(here, text)) continue;
             if (text.len < substring_len and !(startsToken(t, i, text.len) and endsToken(t, i + text.len, text.len))) continue;
-            return .{ .len = text.len, .what = if (w.kind == .user) .user else .host };
+            return .{ .len = text.len, .what = switch (w.kind) {
+                .user => .user,
+                .host => .host,
+                .distro => .distro,
+                .home => unreachable,
+            } };
         }
         if (i > 0 and (std.ascii.isAlphanumeric(t[i - 1]) or t[i - 1] == '.' or t[i - 1] == ':')) return null;
         if (!std.ascii.isHex(t[i]) and t[i] != ':') return null;
@@ -216,6 +241,18 @@ pub const Policy = struct {
 fn env(name: [*:0]const u8) ?[]const u8 {
     const v = std.c.getenv(name) orelse return null;
     return std.mem.span(v);
+}
+fn readFile(path: []const u8, buffer: []u8) ?[]const u8 {
+    if (@import("builtin").os.tag == .windows) return null;
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch return null;
+    defer _ = std.c.close(fd);
+    var used: usize = 0;
+    while (used < buffer.len) {
+        const got = std.posix.read(fd, buffer[used..]) catch return null;
+        if (got == 0) break;
+        used += got;
+    }
+    return buffer[0..used];
 }
 /// Names this long are distinctive: hidden anywhere, even inside a word.
 /// Shorter ones only as a token, so a 3-letter name does not eat "stream".
@@ -371,6 +408,13 @@ fn testPolicy() Policy {
     p.add(.host, "quarkbox.example.org");
     p.add(.host, "quarkbox");
     return p;
+}
+
+test "os-release names are private text" {
+    var p = Policy.init(@splat(4));
+    p.addDistroText("PRETTY_NAME=\"Example Workstation 42\"\nNAME='Example Linux'\nID=example\n");
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("system and system; example stays", p.scrubInto(&buffer, "Example Workstation 42 and Example Linux; example stays"));
 }
 
 test "scrub hides homes, names and private addresses, keeps loopback and documentation" {

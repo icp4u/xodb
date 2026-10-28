@@ -2,6 +2,7 @@
 #include "target_internal.h"
 #include <sys/ptrace.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include "wire_target.h"
 #include <dirent.h>
 #include <stdio.h>
@@ -18,6 +19,52 @@ enum xrt_status xrt_trace(unsigned request, int32_t tid, uintptr_t address, uint
         return XRT_PROCESS_GONE;
     return XRT_PTRACE_FAILED;
 }
+
+/* NT_ARM_PAC_MASK. The kernel writes user_pac_mask: data mask, then insn mask.
+ * EINVAL means this kernel has no note. ESRCH and EIO stay distinguishable
+ * from that, so a caller can retry those and cache only a permanent answer. */
+enum xrt_status xrt_pac_masks_of_tid(int32_t tid, uint64_t *data_mask, uint64_t *insn_mask)
+{
+    if (!data_mask || !insn_mask)
+        return XRT_INVALID_ARGUMENT;
+    *data_mask = 0;
+    *insn_mask = 0;
+    if (tid <= 0)
+        return XRT_INVALID_ARGUMENT;
+    struct {
+        uint64_t data_mask;
+        uint64_t insn_mask;
+    } masks;
+    struct iovec io = {.iov_base = &masks, .iov_len = sizeof masks};
+    if (ptrace(PTRACE_GETREGSET, tid, (void *)(uintptr_t)0x406, &io) == -1) {
+        if (errno == EINVAL)
+            return XRT_UNSUPPORTED_ARCHITECTURE;
+        if (errno == EPERM || errno == EACCES)
+            return XRT_PERMISSION_DENIED;
+        if (errno == ESRCH)
+            return XRT_PROCESS_GONE;
+        return XRT_PTRACE_FAILED;
+    }
+    if (io.iov_len != sizeof masks)
+        return XRT_UNEXPECTED_REGISTER_SIZE;
+    *data_mask = masks.data_mask;
+    *insn_mask = masks.insn_mask;
+    return XRT_OK;
+}
+
+/* One stopped thread is enough; the caller caches the pair for the target. */
+enum xrt_status xrt_target_pac_mask(const struct xrt_target *t, int32_t tid,
+                                    uint64_t *data_mask, uint64_t *insn_mask)
+{
+    if (!data_mask || !insn_mask)
+        return XRT_INVALID_ARGUMENT;
+    *data_mask = 0;
+    *insn_mask = 0;
+    if (!t || !t->arch || t->connection || t->arch->machine != XRT_AARCH64)
+        return XRT_UNSUPPORTED_ARCHITECTURE;
+    return xrt_pac_masks_of_tid(tid, data_mask, insn_mask);
+}
+
 enum xrt_status xrt_target_destroy(struct xrt_target *t)
 {
     if (t && t->connection)

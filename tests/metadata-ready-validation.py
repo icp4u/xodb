@@ -4,10 +4,13 @@ import argparse, json, os, pathlib, subprocess, time
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--work',type=pathlib.Path,default=pathlib.Path('.work/metadata-ready'))
 p.add_argument('--metadata-source',type=pathlib.Path)
+p.add_argument('--file-view-source',type=pathlib.Path)
 a=p.parse_args();os.umask(0o022);a.work.mkdir(parents=True,exist_ok=True,mode=0o755)
 start=time.monotonic();exe=a.work.resolve()/'check'
 subprocess.run(['cc','-std=c11','-O2','-g','-ffunction-sections','-fdata-sections','-Wall','-Wextra','-Werror',
+    '-I','src/runtime',
     *(['-DXODB_METADATA_SOURCE="'+str(a.metadata_source.resolve())+'"'] if a.metadata_source else []),
+    *(['-DXODB_FILE_VIEW_SOURCE="'+str(a.file_view_source.resolve())+'"'] if a.file_view_source else []),
     'tests/metadata-ready-validation.c','src/runtime/wire.c','src/runtime/wire_target.c',
     '-Wl,--gc-sections','-pthread','-o',str(exe)],check=True,timeout=30)
 r=subprocess.run([str(exe)],capture_output=True,text=True,timeout=10)

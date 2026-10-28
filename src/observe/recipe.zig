@@ -166,6 +166,7 @@ fn functionMapping(session: *Session, recipe: *const Recipe, start_address: ?u64
     session.modules.beginSweep();
     // Say so when the functions were looked for in fewer images than are mapped.
     defer if (session.modules.skipped().first) |first| log.warn(.session, "xodb: observation recipe: {d} images not searched; {s}\n", .{ session.modules.skipped().count, first });
+    const page = try session.modules.pageSize();
     for (session.modules.regions.items) |region| {
         if (region.permissions[2] != 'x' or region.inode == 0 or region.path.len == 0 or region.path[0] != '/') continue;
         const module = session.modules.load(region, .sweep) catch |err| {
@@ -175,7 +176,7 @@ fn functionMapping(session: *Session, recipe: *const Recipe, start_address: ?u64
         var all = true;
         var first: u64 = 0;
         for (recipe.functions, 0..) |name, i| {
-            const location = hooks.resolve(&module.image, region, name, null) catch {
+            const location = hooks.resolve(&module.image, region, name, page, null) catch {
                 all = false;
                 break;
             };

@@ -200,6 +200,11 @@ pub const Tree = struct {
         self.entries[self.count] = .{ .id = child.process_id, .parent = parent.process_id, .session = child, .kind = event.kind };
         self.count += 1;
         self.revision += 1;
+        if (parent.startupProfileConfig()) |config| {
+            parent.noteStartupProcessBoundary();
+            child.startFollowedStartupProfile(config) catch |err|
+                log.err(.profile, "xodb: process #{d} startup profile follow failed: {s}\n", .{ child.process_id, @errorName(err) });
+        }
         log.info(.session, "xodb: process #{d} pid={d} {s} from #{d}; stopped for inspection\n", .{ child.process_id, child.target.snapshot().pid, @tagName(event.kind), parent.process_id });
     }
     /// A cancelled remote family has no native vfork links. Each session must

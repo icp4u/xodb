@@ -840,7 +840,7 @@ pub const Modules = struct {
             return err;
         };
     }
-    fn pageSize(self: *const Modules) !u64 {
+    pub fn pageSize(self: *const Modules) !u64 {
         const result = rt.xrt_target_page_size(self.target);
         if (result <= 0) return error.BadMapping;
         return @intCast(result);
@@ -958,7 +958,7 @@ pub const Modules = struct {
         if (region.offset < file_offset) return error.BadMapping;
         var relative = region;
         relative.offset -= file_offset;
-        if (observed) return .{ .first = region, .end = region.end, .bias = try observedBias(image, relative) };
+        if (observed) return .{ .first = region, .end = region.end, .bias = try observedBias(image, relative, try self.pageSize()) };
         const page = try self.pageSize();
         const memo = try self.placedIn(image, file_offset, region, page);
         // The bias is one a header mapping gives and this mapping fits. For a
@@ -1020,7 +1020,11 @@ pub const Modules = struct {
             return error.BinarySnapshotLimit;
         };
         const generic: ?c_int = if (prepared == null and !self.immutable and self.core_source == null and rt.xrt_target_is_remote(self.target))
-            if (self.image_jobs) |jobs| try jobs.prepare(jobs.context, self, region, why) else null
+            if (self.image_jobs) |jobs| (jobs.prepare(jobs.context, self, region, why) catch |err| switch (err) {
+                // A held version: the synchronous open below takes the held bytes.
+                error.RemoteImageHeld => null,
+                else => return err,
+            }) else null
         else
             null;
         defer if (generic != null) if (self.image_jobs) |jobs| jobs.release(jobs.context, region);
@@ -1032,6 +1036,13 @@ pub const Modules = struct {
         errdefer self.allocator.free(path);
         // Only read the inode actually mapped by the target. map_files can need
         // privileges unavailable to run-as, so exe/path retain inode checks.
+        const remote_sync = ready_fd == null and self.core_source == null and rt.xrt_target_is_remote(self.target);
+        if (remote_sync and !self.remote_boot_checked) {
+            self.remote_boot = snapshot.bootIdTarget(self.target);
+            self.remote_boot_checked = true;
+        }
+        if (remote_sync) snapshot.beginRemoteHold(self.remote_boot);
+        defer if (remote_sync) snapshot.endRemoteHold();
         var source: mapped_file.Source = if (ready_fd != null) .remote_snapshot else if (self.core_source != null) .core_path else .unopened;
         var opened = std.mem.zeroes(rt.struct_xrt_file_identity);
         const fd = if (ready_fd) |ready| c.fcntl(ready, c.F_DUPFD_CLOEXEC, @as(c_int, 3)) else if (self.core_source != null) c.open(path, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK) else mapped_file.openResolved(self.target, self.pid, region, &opened, &source) catch |err| {
@@ -1042,17 +1053,27 @@ pub const Modules = struct {
             }
             return err;
         };
+        // Only that one open may be answered from held bytes.
+        if (remote_sync) snapshot.disarmRemoteHold();
         if (fd < 0) return error.BinaryIdentityUnavailable;
         defer _ = c.close(fd);
         // A prepared remote image was checked when its file view opened.
         if (ready_fd == null and self.core_source == null and rt.xrt_target_is_remote(self.target)) try self.rememberMetadataIdentity(region, opened);
         try self.verifySymbolIdentity(region, fd);
+        var held_image = if (remote_sync) snapshot.claimRemoteHold() else null;
+        errdefer if (held_image) |bytes| snapshot.free(bytes);
         var stat: c.struct_stat = undefined;
         if (c.fstat(fd, &stat) != 0 or stat.st_size <= 0 or stat.st_mode & c.S_IFMT != c.S_IFREG) return error.BinaryUnavailable;
         var signature: [4]u8 = undefined;
-        if (c.pread(fd, &signature, signature.len, 0) != signature.len) return error.NotElf;
-        const file_size = std.math.cast(usize, stat.st_size) orelse return error.BinarySnapshotLimit;
-        const entry: apk.Entry = if (std.mem.eql(u8, &signature, "\x7fELF")) .{ .offset = 0, .size = file_size } else try apk.find(self.allocator, fd, file_size, region.offset);
+        const file_size = if (held_image) |bytes| blk: {
+            if (bytes.len < 4) return error.NotElf;
+            signature = bytes[0..4].*;
+            break :blk bytes.len;
+        } else blk: {
+            if (c.pread(fd, &signature, signature.len, 0) != signature.len) return error.NotElf;
+            break :blk std.math.cast(usize, stat.st_size) orelse return error.BinarySnapshotLimit;
+        };
+        const entry: apk.Entry = if (held_image != null) .{ .offset = 0, .size = file_size } else if (std.mem.eql(u8, &signature, "\x7fELF")) .{ .offset = 0, .size = file_size } else try apk.find(self.allocator, fd, file_size, region.offset);
         if (entry.offset % try self.pageSize() != 0) return error.ApkEntryNotPageAligned;
         // Some readers keep fixed bounds whatever the image budgets are.
         const bound: ?Bound = if (prepared != null and why == .sweep)
@@ -1084,7 +1105,15 @@ pub const Modules = struct {
             const index = self.identityIndex(region) orelse return error.BinaryIdentityUnavailable;
             break :identity self.identities.items[index].identity orelse return error.BinaryIdentityUnavailable;
         } else null;
-        const mapped = (if (remote)
+        if (held_image) |bytes| {
+            if (bytes.len > snapshot.per_image_limit) {
+                self.refusal = snapshot.refusal(bytes.len);
+                return error.BinarySnapshotLimit;
+            }
+        }
+        const claimed = held_image;
+        held_image = null;
+        const mapped = if (claimed) |bytes| bytes else ((if (remote)
             snapshot.readRemoteRange(fd, entry.offset, entry.size, snapshot.per_image_limit, if (why == .sweep) @intCast(bound.?.each) else null, @bitCast(original.?), self.remote_boot, coverage)
         else if (why == .sweep)
             snapshot.readSweepRange(fd, entry.offset, entry.size, snapshot.per_image_limit, @intCast(bound.?.each))
@@ -1101,7 +1130,7 @@ pub const Modules = struct {
                 };
             }
             return err;
-        };
+        });
         errdefer snapshot.free(mapped);
         // The source may change between the pre-read identity check and the
         // snapshot reader's own initial stat. Recheck the retained version too.
@@ -1162,10 +1191,10 @@ pub const Modules = struct {
     }
     /// A later executable mapping need not be the ELF's first PT_LOAD. Accept
     /// only a unique bias from executable segments covering its file pages.
-    pub fn observedBias(image: *const elf.Image, region: Region) !u64 {
-        const page_result = c.sysconf(c._SC_PAGESIZE);
-        if (page_result <= 0 or region.start >= region.end) return error.BadMapping;
-        const page: u64 = @intCast(page_result);
+    /// `page` is the target page size. A host page smaller than the target's
+    /// rounds the file end short of the mapped VMA and refuses the image.
+    pub fn observedBias(image: *const elf.Image, region: Region, page: u64) !u64 {
+        if (page == 0 or region.start >= region.end) return error.BadMapping;
         var found: ?u64 = null;
         var i: u32 = 0;
         while (i < image.header.segment_count) : (i += 1) {
@@ -2315,6 +2344,38 @@ pub const Modules = struct {
         return found;
     }
 };
+
+test "observed bias follows the given page, so a target page covers a short file" {
+    var bytes: [64 + 56]u8 = @splat(0);
+    @memcpy(bytes[0..4], "\x7fELF");
+    bytes[4] = 2;
+    bytes[5] = 1;
+    bytes[6] = 1;
+    const wr = struct {
+        fn put(b: []u8, comptime T: type, at: usize, v: T) void {
+            std.mem.writeInt(T, b[at..][0..@sizeOf(T)], v, .little);
+        }
+    }.put;
+    wr(&bytes, u16, 16, 3);
+    wr(&bytes, u16, 18, 62);
+    wr(&bytes, u32, 20, 1);
+    wr(&bytes, u64, 32, 64);
+    wr(&bytes, u16, 52, 64);
+    wr(&bytes, u16, 54, 56);
+    wr(&bytes, u16, 56, 1);
+    wr(&bytes, u32, 64, 1);
+    wr(&bytes, u32, 68, 1);
+    wr(&bytes, u64, 64 + 16, 0x400000);
+    wr(&bytes, u64, 64 + 32, 5000);
+    wr(&bytes, u64, 64 + 40, 5000);
+    const image = try elf.Image.parse(&bytes);
+    const start: u64 = 0x555555554000;
+    const wide = Region{ .start = start, .end = start + 16384, .offset = 0, .inode = 1, .device_major = 8, .device_minor = 1, .permissions = "r-xp".*, .path = "/fixture" };
+    const want = start - 0x400000;
+    try std.testing.expectError(error.BadMapping, Modules.observedBias(&image, wide, 4096));
+    try std.testing.expectEqual(want, try Modules.observedBias(&image, wide, 16384));
+    try std.testing.expectError(error.BadMapping, Modules.observedBias(&image, wide, 0));
+}
 
 test "APK placement keeps two entries and repeated load instances separate" {
     var bytes: [64 + 56 * 2]u8 = @splat(0);

@@ -33,6 +33,9 @@ pub const Context = struct {
     allow_stack_prefix: bool = false,
     frame_base: ?u64 = null,
     load_bias: u64 = 0,
+    /// AArch64 instruction-pointer PAC mask from NT_ARM_PAC_MASK. Zero keeps a
+    /// signed return address as PointerAuthenticationUnsupported.
+    insn_pac_mask: u64 = 0,
     /// Object-file DWARF may need a verified per-symbol mapping instead of
     /// one load bias. Applies only to DW_OP_addr, never register/stack values.
     image_address: ?*const fn (*const anyopaque, u64) anyerror!u64 = null,

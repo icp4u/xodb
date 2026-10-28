@@ -65,6 +65,32 @@ test "Mach exception names cover the kernel's exception types" {
     const unknown = MachException{ .kind = 99, .count = 0, .codes = @splat(0) };
     try std.testing.expectEqualStrings("Mach exception", unknown.name());
 }
+test "pac mask read refuses a null target and clears both outputs" {
+    var data: u64 = 7;
+    var insn: u64 = 9;
+    try std.testing.expect(rt.xrt_target_pac_mask(null, 1, &data, &insn) == rt.XRT_UNSUPPORTED_ARCHITECTURE);
+    try std.testing.expectEqual(@as(u64, 0), data);
+    try std.testing.expectEqual(@as(u64, 0), insn);
+    data = 7;
+    insn = 9;
+    try std.testing.expect(rt.xrt_target_pac_mask(null, 1, null, &insn) == rt.XRT_INVALID_ARGUMENT);
+    try std.testing.expectEqual(@as(u64, 9), insn);
+}
+test "remote pac suffix is absent without a connection" {
+    var data: u64 = 7;
+    var insn: u64 = 9;
+    var va: u64 = 3;
+    try std.testing.expect(!rt.xrt_target_remote_pac(null, &data, &insn, &va));
+    try std.testing.expectEqual(@as(u64, 0), data);
+    try std.testing.expectEqual(@as(u64, 0), insn);
+    try std.testing.expectEqual(@as(u64, 0), va);
+    data = 7;
+    insn = 9;
+    va = 3;
+    try std.testing.expect(!rt.xrt_target_remote_pac(null, null, &insn, &va));
+    try std.testing.expectEqual(@as(u64, 9), insn);
+    try std.testing.expectEqual(@as(u64, 3), va);
+}
 pub fn signalName(number: i32) []const u8 {
     return switch (number) {
         0 => "none",
@@ -260,6 +286,14 @@ fn gdbAvailability(info: rt.struct_xrt_gdb_info, bit: u64) GdbAvailability {
 }
 pub const Target = struct {
     handle: ?*rt.struct_xrt_target = null,
+    /// NT_ARM_PAC_MASK, read once for this target. A later launch, attach, or
+    /// reset clears it. Zero means unsigned, or the read was not available.
+    pac_mask_ready: bool = false,
+    pac_data_mask: u64 = 0,
+    pac_insn_mask: u64 = 0,
+    /// Virtual-address width from a remote HELLO. Zero means the agent did not
+    /// send one. A local read leaves this zero; the walk still stops at bit 48.
+    pac_va_bits: u64 = 0,
     core: ?@import("../binary/core.zig").Core = null,
     gdb_cache: rt.struct_xrt_gdb_info = std.mem.zeroes(rt.struct_xrt_gdb_info),
     thread_cache: [1024]Thread = undefined,
@@ -290,6 +324,7 @@ pub const Target = struct {
         return self.connectRemoteCancel(argv, null);
     }
     pub fn connectRemoteCancel(self: *Target, argv: []const [:0]const u8, cancel: ?*rt.struct_xrt_cancel) !void {
+        self.forgetPacMask();
         if (self.handle != null or self.core != null) return error.ConflictingTargets;
         if (argv.len == 0 or argv.len > 255) return error.TooManyArguments;
         var raw: [256]?[*:0]const u8 = @splat(null);
@@ -302,6 +337,7 @@ pub const Target = struct {
         return self.connectGdbRemoteCancel(endpoint, null);
     }
     pub fn connectGdbRemoteCancel(self: *Target, endpoint: [:0]const u8, cancel: ?*rt.struct_xrt_cancel) !void {
+        self.forgetPacMask();
         if (self.handle != null or self.core != null) return error.ConflictingTargets;
         try runtime.check(rt.xrt_target_gdb_remote_cancel(endpoint.ptr, &self.handle, cancel));
     }
@@ -419,7 +455,47 @@ pub const Target = struct {
     pub fn event(self: *Target, kind: @FieldType(Event, "kind"), tid: i32, detail: i64) !void {
         try runtime.check(rt.xrt_target_event(try self.get(), @intFromEnum(kind), tid, detail));
     }
+    pub fn forgetPacMask(self: *Target) void {
+        self.pac_mask_ready = false;
+        self.pac_data_mask = 0;
+        self.pac_insn_mask = 0;
+        self.pac_va_bits = 0;
+    }
+    /// One NT_ARM_PAC_MASK read for a stopped local aarch64 target. Later calls
+    /// return the stored insn mask. A target that is not stopped yet is not cached.
+    /// A remote aarch64 target uses the triple its agent sent in HELLO.
+    pub fn pacInsnMask(self: *Target) u64 {
+        if (self.pac_mask_ready) return self.pac_insn_mask;
+        if (self.core != null or self.arch() != .aarch64) {
+            self.pac_mask_ready = true;
+            return 0;
+        }
+        if (self.isRemote()) {
+            var data: u64 = 0;
+            var insn: u64 = 0;
+            var va: u64 = 0;
+            self.pac_mask_ready = true;
+            if (!rt.xrt_target_remote_pac(self.handle, &data, &insn, &va)) return 0;
+            self.pac_data_mask = data;
+            self.pac_insn_mask = insn;
+            self.pac_va_bits = va;
+            return insn;
+        }
+        const tid = self.stoppedTid() catch return 0;
+        var data: u64 = 0;
+        var insn: u64 = 0;
+        const status = rt.xrt_target_pac_mask(self.handle, tid, &data, &insn);
+        // A thread that vanished or a failed ptrace is not an answer: read again
+        // on the next walk. Only success or a permanent refusal is cached.
+        if (status == rt.XRT_PROCESS_GONE or status == rt.XRT_PTRACE_FAILED) return 0;
+        self.pac_mask_ready = true;
+        if (status != rt.XRT_OK) return 0;
+        self.pac_data_mask = data;
+        self.pac_insn_mask = insn;
+        return insn;
+    }
     pub fn launch(self: *Target, argv: []const [:0]const u8) !void {
+        self.forgetPacMask();
         if (argv.len == 0) return error.InvalidState;
         var args: [256:null]?[*:0]const u8 = @splat(null);
         if (argv.len >= args.len) return error.TooManyArguments;
@@ -431,6 +507,7 @@ pub const Target = struct {
         try runtime.check(status);
     }
     pub fn attach(self: *Target, pid: i32) !void {
+        self.forgetPacMask();
         const status = rt.xrt_target_attach(try self.get(), pid);
         if (status == rt.XRT_UNSUPPORTED_ARCHITECTURE) return error.UnsupportedTargetArchitecture;
         try runtime.check(status);
@@ -463,6 +540,7 @@ pub const Target = struct {
         try runtime.check(status);
     }
     pub fn reset(self: *Target) !void {
+        self.forgetPacMask();
         if (self.handle) |handle| try runtime.check(rt.xrt_target_reset(handle));
     }
     pub fn deinit(self: *Target) void {

@@ -3,11 +3,12 @@
 import importlib.util
 import json
 import os
-import re
 from pathlib import Path
 import subprocess
 import time
 from PIL import Image
+
+from helpers.listen import listen_and_report
 
 root = Path(__file__).resolve().parents[1]
 os.chdir(root)
@@ -116,8 +117,7 @@ try:
     with server_log.open('wb') as log:
         server = subprocess.Popen([str(root / 'zig-out/bin/xodb'), '--headless', '--mcp', '--listen', '127.0.0.1:0', '--', str(root / 'zig-out/bin/xodb-m1-fixture'), 'w'], env=d.env, stdout=log, stderr=log)
     d.procs.append(server)
-    wait_for(lambda: 'listening on' in server_log.read_text())
-    port = int(re.search(r'^xodb: listening on 127\.0\.0\.1:([0-9]+); ', server_log.read_text(), re.M).group(1))
+    port, _ = listen_and_report(server, server_log, timeout=8)
     remote_log = work / 'remote.log'
     with remote_log.open('wb') as log:
         remote = subprocess.Popen([str(root / 'zig-out/bin/xodb'), '--connect', f'127.0.0.1:{port}', '--theme', str(path)], env=d.env, stdout=log, stderr=log)

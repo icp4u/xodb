@@ -6,6 +6,7 @@ const capture_model = @import("capture.zig");
 const flame = @import("flame.zig");
 const scheduling = @import("scheduling.zig");
 const intervals = @import("intervals.zig");
+const redact = @import("../redact.zig");
 const now = @import("../target/linux.zig").now;
 pub const max_file_bytes = 64 * 1024 * 1024;
 pub const ordering = "aggregated CPU sample counts; stack order is synthetic, not a timeline; use xodb CPU bins and scheduling totals for time evidence";
@@ -87,7 +88,9 @@ pub fn savePrepared(capture: *capture_model.Capture, path: [:0]const u8, filter:
     var app: std.ArrayList(intervals.Interval) = .empty;
     for (capture.application_intervals.items.items) |item| if (item.matches(filter, extent)) try app.append(a, item);
     const profile = .{ .type = "sampled", .name = try std.fmt.allocPrint(a, "xodb #{d}: aggregate CPU sample counts (synthetic order)", .{capture.id}), .unit = "none", .startValue = @as(u64, 0), .endValue = data.count, .samples = data.samples, .weights = data.weights };
-    const bytes = try std.json.Stringify.valueAlloc(a, .{
+    const export_policy: ?redact.Policy = if (redact.active()) |policy| policy.rekeyed(redact.randomKey()) else null;
+    const policy: ?*const redact.Policy = if (export_policy) |*p| p else null;
+    const plain = try std.json.Stringify.valueAlloc(a, .{
         .@"$schema" = "https://www.speedscope.app/file-format-schema.json",
         .name = profile.name,
         .exporter = "xodb",
@@ -96,6 +99,7 @@ pub fn savePrepared(capture: *capture_model.Capture, path: [:0]const u8, filter:
         .profiles = .{profile},
         .xodb = .{
             .schema_version = @as(u32, 1),
+            .redacted = policy != null,
             .capture = capture.summary(),
             .filter = .{ .tid = filter.tid, .tids = filter.tids.optional(), .from_ns = filter.from_ns, .to_ns = if (filter.to_ns == std.math.maxInt(u64)) null else @as(?u64, filter.to_ns) },
             .range = range,
@@ -120,6 +124,7 @@ pub fn savePrepared(capture: *capture_model.Capture, path: [:0]const u8, filter:
             .limitations = "portable selected aggregate, not a reopenable native capture; raw samples, per-switch history, ELF/source files and target state are not included; recorded mapping limitations still apply",
         },
     }, .{});
+    const bytes = if (policy) |p| try p.scrubJson(a, plain, null) else plain;
     try writeNew(a, path, bytes);
     return .{ .bytes = bytes.len, .samples = data.count, .excluded_by_node_limit = graph.rejected };
 }

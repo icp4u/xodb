@@ -23,6 +23,11 @@
 static _Thread_local bool remote_io_forbidden;
 static _Thread_local bool remote_io_strict;
 static _Thread_local uint32_t remote_io_violations;
+static _Thread_local int (*held_image)(const struct xrt_file_identity *);
+void xrt_remote_set_held_image(int (*fn)(const struct xrt_file_identity *))
+{
+    held_image = fn;
+}
 void xrt_remote_io_guard(bool forbidden) { remote_io_forbidden = forbidden; }
 void xrt_remote_io_guard_strict(bool strict) { remote_io_strict = strict; }
 uint32_t xrt_remote_io_violation_count(void) { return remote_io_violations; }
@@ -60,6 +65,8 @@ struct xrt_connection {
     uint64_t request, producer_ns, host_ns, uncertainty_ns;
     uint64_t capabilities;
     uint32_t file_slots; /* HELLO count; zero when the agent did not advertise */
+    uint64_t pac_data_mask, pac_insn_mask, pac_va_bits;
+    bool pac_advertised;
     uint32_t tick_hz, page_size;
     uint16_t machine; /* HELLO: the row a newly created agent target starts on */
     enum xrt_status failed;
@@ -671,6 +678,17 @@ static enum xrt_status create_remote(struct xrt_connection *c, struct xrt_target
     c->targets[slot] = t;
     return XRT_OK;
 }
+/* A zero insn mask carries width 0 (unknown). The kernel's mask is
+ * GENMASK(54, va_bits), so a nonzero mask's lowest set bit is the address
+ * width, which is 32 through 52. */
+static bool pac_suffix_ok(uint64_t insn, uint64_t va)
+{
+    if (insn == 0)
+        return va == 0;
+    if (va < 32 || va > 52)
+        return false;
+    return va == (uint64_t)__builtin_ctzll(insn);
+}
 enum xrt_status xrt_target_remote(const char *const argv[], struct xrt_target **out)
 {
     return xrt_target_remote_cancel(argv, out, NULL);
@@ -796,12 +814,13 @@ enum xrt_status xrt_target_remote_cancel(const char *const argv[], struct xrt_ta
     /* Repeat after transport startup. Pick the shortest round trip so SSH
      * authentication/startup delay does not dominate the clock estimate. */
     for (unsigned probe = 0; probe < 4 && status == XRT_OK; ++probe) {
-        uint8_t meta[32];
+        uint8_t meta[64];
         size_t meta_size = 0;
         const uint64_t before = xrt_now();
         status = xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_HELLO,
                                                        .args = {XRT_RPC_HELLO_CAPABILITIES,
-                                                                XRT_RPC_CAP_ADDRESS_SPACE | XRT_RPC_CAP_FILE_SLOTS},
+                                                                XRT_RPC_CAP_ADDRESS_SPACE | XRT_RPC_CAP_FILE_SLOTS |
+                                                                    XRT_RPC_CAP_PAC_MASK},
                                                        .value = &machine,
                                                        .out = meta,
                                                        .capacity = sizeof(meta),
@@ -815,21 +834,36 @@ enum xrt_status xrt_target_remote_cancel(const char *const argv[], struct xrt_ta
         xrt_codec_u64(&in, &producer);
         xrt_codec_u32(&in, &hz);
         xrt_codec_u32(&in, &page);
-        uint64_t capabilities = 0, slots = 0;
-        if (in.size == 24 || in.size == 32) xrt_codec_u64(&in, &capabilities);
-        if (in.size == 32) xrt_codec_u64(&in, &slots);
-        const bool advertised = (capabilities & XRT_RPC_CAP_FILE_SLOTS) != 0;
+        uint64_t capabilities = 0, slots = 0, pac_insn = 0, pac_data = 0, pac_va = 0;
+        if (in.size != 16)
+            xrt_codec_u64(&in, &capabilities);
+        const bool slots_on = (capabilities & XRT_RPC_CAP_FILE_SLOTS) != 0;
+        const bool pac_on = (capabilities & XRT_RPC_CAP_PAC_MASK) != 0;
+        if (slots_on)
+            xrt_codec_u64(&in, &slots);
+        if (pac_on) {
+            xrt_codec_u64(&in, &pac_insn);
+            xrt_codec_u64(&in, &pac_data);
+            xrt_codec_u64(&in, &pac_va);
+        }
         if (!in.ok || in.at != in.size || !hz || !page || (page & (page - 1)) || after < before ||
-            advertised != (in.size == 32) || (advertised && (slots == 0 || slots > UINT32_MAX))) {
+            (slots_on && (slots == 0 || slots > UINT32_MAX)) ||
+            (pac_on && !pac_suffix_ok(pac_insn, pac_va))) {
             status = XRT_PROTOCOL_ERROR;
             break;
         }
-        if (probe && (c->capabilities != capabilities || c->file_slots != (uint32_t)slots)) {
-            status=XRT_PROTOCOL_ERROR;
+        if (probe && (c->capabilities != capabilities || c->file_slots != (uint32_t)slots ||
+                      c->pac_advertised != pac_on || c->pac_insn_mask != pac_insn ||
+                      c->pac_data_mask != pac_data || c->pac_va_bits != pac_va)) {
+            status = XRT_PROTOCOL_ERROR;
             break;
         }
-        c->capabilities=capabilities;
-        c->file_slots=(uint32_t)slots;
+        c->capabilities = capabilities;
+        c->file_slots = (uint32_t)slots;
+        c->pac_advertised = pac_on;
+        c->pac_insn_mask = pac_insn;
+        c->pac_data_mask = pac_data;
+        c->pac_va_bits = pac_va;
         if (after - before < shortest) {
             shortest = after - before;
             c->producer_ns = producer;
@@ -866,6 +900,21 @@ uint64_t xrt_target_remote_image_limit(const struct xrt_target *t)
 uint32_t xrt_target_file_slots(const struct xrt_target *t)
 {
     return t && t->connection ? t->connection->file_slots : 0;
+}
+bool xrt_target_remote_pac(const struct xrt_target *t, uint64_t *data_mask, uint64_t *insn_mask,
+                           uint64_t *va_bits)
+{
+    if (!data_mask || !insn_mask || !va_bits)
+        return false;
+    *data_mask = 0;
+    *insn_mask = 0;
+    *va_bits = 0;
+    if (!t || !t->connection || t->connection->gdb || !t->connection->pac_advertised)
+        return false;
+    *data_mask = t->connection->pac_data_mask;
+    *insn_mask = t->connection->pac_insn_mask;
+    *va_bits = t->connection->pac_va_bits;
+    return true;
 }
 enum xrt_status xrt_remote_destroy(struct xrt_target *t)
 {
@@ -1268,6 +1317,23 @@ enum xrt_status xrt_remote_file(const struct xrt_target *t, const struct xrt_fil
                 goto done;
             }
         }
+    }
+    /* The retained image is the file. A size-matched sealed descriptor stands
+     * in for it; its bytes are not transferred and are not charged. */
+    if (regular && held_image && held_image(&identity)) {
+        fd = xrt_host_sealed_file("xodb-target-file");
+        if (fd < 0) {
+            status = XRT_FILE_UNAVAILABLE;
+            goto done;
+        }
+        if (ftruncate(fd, identity.size) != 0 || xrt_host_seal(fd) < 0 || lseek(fd, 0, SEEK_SET) < 0) {
+            status = XRT_FILE_UNAVAILABLE;
+            goto done;
+        }
+        goto done;
+    }
+    if (budget && regular) {
+        struct xrt_connection *connection = t->connection;
         size_t prefix_size = 0;
         status = xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_FILE_READ,
                         .args = {id, 0, 4}, .out = bytes, .capacity = 4, .length = &prefix_size});

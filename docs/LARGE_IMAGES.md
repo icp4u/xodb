@@ -608,6 +608,12 @@ traffic, index size and candidate CU count. A controller can call
 discards that job; the next stack/value request starts it again. Stopped-register
 and process-generation checks still apply to all returned language values.
 
+Each job also reports its creating `session_id` and `image_epoch`. Together
+with `id`, these identify the job across process sessions and executable
+changes. They are creation stamps, not the identity of whichever session is
+currently selected. A followed child's own metadata job is valid; a job stamped
+with its parent's session is not inherited work the child may use.
+
 
 ## Local symbols and startup breakpoints
 

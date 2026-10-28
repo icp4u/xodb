@@ -32,6 +32,12 @@ $(BUILD)/dwarf_cursor.o: $(ROOT)/src/debug/dwarf_cursor.c | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 $(BUILD)/source_paths.o: $(ROOT)/src/debug/source_paths.c | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
+# perf_cpu.c checks come from records.perfFile. This is the one object that
+# runs the generator; the rest of the runtime still builds without it.
+$(BUILD)/perf_regs.h: $(ROOT)/src/profile/perf_regs_gen.zig $(ROOT)/src/profile/records.zig | $(BUILD)
+	zig run $(ROOT)/src/profile/perf_regs_gen.zig -- $@
+$(BUILD)/perf_cpu.o: perf_cpu.c $(BUILD)/perf_regs.h | $(BUILD)
+	$(CC) $(CPPFLAGS) -I$(BUILD) $(CFLAGS) -MMD -MP -c $< -o $@
 $(BUILD)/%.o: %.c | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 $(BUILD)/libxrt.a: $(OBJECTS)

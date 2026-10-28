@@ -3,7 +3,10 @@
 /* Exercise the joined-result boundary with a transport that is busy for
  * background work. No scheduler timing or real process is involved. */
 #include "check.h"
-#include "../src/runtime/file_view.c"
+#ifndef XODB_FILE_VIEW_SOURCE
+#define XODB_FILE_VIEW_SOURCE "../src/runtime/file_view.c"
+#endif
+#include XODB_FILE_VIEW_SOURCE
 #ifndef XODB_METADATA_SOURCE
 #define XODB_METADATA_SOURCE "../src/debug/metadata_job.c"
 #endif
@@ -17,6 +20,7 @@ void xbo_destroy(struct xbo_object *value) { CHECK(!value); ++parser_releases; }
 void xbc_destroy(struct xbc_cache *value) { CHECK(!value); ++cache_releases; }
 void xcp_release(struct xcp_entry *value) { CHECK(!value); ++lease_releases; }
 static enum xrt_status answer = XRT_OK;
+static enum xrt_status close_answer = XRT_OK;
 uint64_t xbo_now_ns(void) { return 1; }
 enum xrt_status xrt_remote_background_file(const struct xrt_target *target,
         const struct xrt_call *call) {
@@ -30,7 +34,7 @@ enum xrt_status xrt_remote_call(const struct xrt_target *target,
     if (call->op == XRT_RPC_FILE_CLOSE) {
         CHECK(call->args[0]);
         ++closes;
-        return XRT_OK;
+        return close_answer;
     }
     if (call->op == XRT_RPC_FILE_OPEN) {
         CHECK(call->args[0] == XRT_RPC_FILE_SYMBOLS);
@@ -118,6 +122,19 @@ int main(int argc, char **argv) {
     --reopened_identity.ctime_ns;
     CHECK(xrt_file_view_validate_foreground(&view) == XRT_FILE_CHANGED);
     CHECK(opens == 2 && closes == 3); /* never resurrect the changed image */
+    view.failure = XRT_OK;
+    view.remote_id = 3;
+    close_answer = XRT_REMOTE_IO_FORBIDDEN;
+    CHECK(xrt_file_view_release(&view) == XRT_REMOTE_IO_FORBIDDEN);
+    CHECK(view.remote_id == 3 && closes == 4); /* nothing sent; still owned */
+    close_answer = XRT_OK;
+    CHECK(xrt_file_view_release(&view) == XRT_OK);
+    CHECK(view.remote_id == 0 && closes == 5); /* allowed retry consumes it */
+    view.remote_id = 4;
+    close_answer = XRT_FILE_CHANGED;
+    CHECK(xrt_file_view_release(&view) == XRT_FILE_CHANGED);
+    CHECK(view.remote_id == 0 && closes == 6); /* agent closes changed files too */
+    CHECK(xrt_file_view_release(&view) == XRT_OK && closes == 6);
     CHECK(pthread_mutex_destroy(&job.mutex) == 0);
     puts("ready metadata validates in foreground; background contention observed; stale bytes stay refused");
     return 0;

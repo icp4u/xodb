@@ -179,7 +179,7 @@ pub fn acceptOne(endpoint: []const u8, quitting: *volatile c.sig_atomic_t) !Stre
     if (requested_ephemeral_port)
         // Port zero makes this line required output: it is the only way for the
         // client to learn the selected port, including when -qq is active.
-        log.err(.runtime, announcement, .{ endpoint[0..colon], bound_port })
+        log.required(.runtime, announcement, .{ endpoint[0..colon], bound_port })
     else
         log.warn(.runtime, announcement, .{ endpoint[0..colon], bound_port });
     while (quitting.* == 0) {

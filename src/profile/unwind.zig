@@ -362,7 +362,7 @@ fn walkInner(batch: *Batch, sample: records.Sample, hash: *std.crypto.hash.sha2.
             };
             var scratch: [64 * 1024]u8 = undefined;
             var scratch_allocator = std.heap.FixedBufferAllocator.init(&scratch);
-            break :step debug.unwind(scratch_allocator.allocator(), link, .{ .registers = registers, .load_bias = module.bias, .user = &window, .read = Window.read }) catch |err| {
+            break :step debug.unwind(scratch_allocator.allocator(), link, .{ .registers = registers, .load_bias = module.bias, .insn_pac_mask = capture.insn_pac_mask, .user = &window, .read = Window.read }) catch |err| {
                 result.reason = switch (err) {
                     error.NoUnwindInfo => .cfi_missing,
                     error.SignalFrameUnsupported => .signal_frame,

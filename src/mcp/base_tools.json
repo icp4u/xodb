@@ -991,7 +991,7 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 4294967295,
-          "description": "Wall-clock deadline in milliseconds; 0 means until stopped. Omitted settings use session defaults (initially 60000 ms, 99 Hz, scheduling off); resource and scope limits still stop collection."
+          "description": "Wall-clock deadline in milliseconds, measured from collection_enabled_ns (setup before that does not count); 0 means until stopped. Omitted settings use session defaults (initially 60000 ms, 99 Hz, scheduling off); resource and scope limits still stop collection."
         },
         "context_switch": {
           "type": "boolean",

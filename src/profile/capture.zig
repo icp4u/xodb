@@ -45,6 +45,7 @@ pub const Config = struct {
     sample_limit: u32 = max_samples,
     frequency_hz: u32 = 99,
     /// Zero disables the wall-clock deadline; evidence/resource limits still apply.
+    /// A positive value starts when collection is enabled, then includes time stopped.
     duration_ms: u32 = 60000,
     context_switch: bool = false,
     syscall_timing: bool = false,
@@ -99,6 +100,9 @@ pub const Capture = struct {
     image_epoch: u64,
     pid: i32,
     started_ns: u64,
+    /// Set once the collector is armed and the capture is about to be published.
+    /// The duration deadline uses this clock. Null keeps the request clock.
+    collection_enabled_ns: ?u64 = null,
     ended_ns: ?u64 = null,
     observed_until_ns: u64 = 0,
     debugger_markers: std.ArrayList(timeline.Marker) = .empty,
@@ -109,6 +113,10 @@ pub const Capture = struct {
     /// ISA of the sampled target. Defaults to x86-64 so existing captures,
     /// including archives, keep the x86 register file and analysis ids.
     architecture: Arch = .x86_64,
+    /// AArch64 insn PAC mask copied from the target when the capture opens.
+    /// Sampled unwinds strip return addresses with this value. Zero on every
+    /// other architecture, and when the target could not be read.
+    insn_pac_mask: u64 = 0,
     accepted: perf.Acceptance,
     threads: [perf.max_threads]Thread = undefined,
     thread_count: usize,
@@ -150,6 +158,9 @@ pub const Capture = struct {
     unknown_records: u64 = 0,
     discarded_samples: u64 = 0,
     missing_images: u64 = 0,
+    /// A launch-owned startup capture keeps collecting its own process when a
+    /// child process is born; followed children get their own capture.
+    outlive_child_processes: bool = false,
     unselected_threads: usize = 0,
     // Samples after this time retain raw addresses only. Loss can hide an
     // earlier mapping event, so loss conservatively invalidates all symbols.
@@ -362,7 +373,7 @@ pub const Capture = struct {
         return null;
     }
     pub fn summary(self: *const Capture) Summary {
-        return .{ .producer = self.producer, .follow_threads = self.config.follow_threads, .ring_budget_bytes = if (self.config.ring_budget_bytes == 0) null else self.config.ring_budget_bytes, .ring_allocated_bytes = (if (self.collector) |collector| collector.allocatedRingBytes() else 0) + (if (self.syscall_collector != null) syscall_perf.ringBytes(self.thread_count) else 0), .opening_threads = self.openingThreads(), .scope = if (self.config.follow_threads) "all threads in this process, including held newborns; user CPU only; child processes remain outside scope" else "fixed selected threads, user CPU only; new tasks stop collection; a subset leaves mappings unverified", .id = self.id, .session_id = self.session_id, .opening_generation = self.generation, .image_epoch = self.image_epoch, .pid = self.pid, .revision = self.revision, .status = self.status, .stop_reasons = self.stop_reasons[0..self.stop_reason_count], .started_ns = self.started_ns, .ended_ns = self.ended_ns, .duration_ms = self.config.duration_ms, .accepted = self.accepted, .threads = self.threads[0..self.thread_count], .sampled_state = .{ .requested_bytes = self.config.user_stack_bytes, .budget_bytes = self.config.user_stack_budget_bytes, .retained_bytes = self.user_state.used, .records = self.user_state.count, .skipped_stacks = self.user_state.skipped, .first_skipped_sample = self.firstSkippedSample(), .allocated_bytes = self.user_state.allocationBytes() }, .stored_samples = self.samples.len(), .sample_limit = self.config.sample_limit, .discarded_samples = self.discarded_samples, .lost_records = self.lost_records, .lost_samples = self.lost_samples, .throttles = self.throttles, .unthrottles = self.unthrottles, .mapping_events = self.mapping_events, .exec_events = self.exec_events, .exit_events = self.exit_events, .fork_events = self.fork_events, .scope_change = self.scope_change, .unknown_records = self.unknown_records, .unselected_threads = self.unselected_threads, .missing_images = self.missing_images, .trusted_before_ns = if (self.trusted_before_ns == std.math.maxInt(u64)) null else self.trusted_before_ns, .failure = self.failure, .diagnostic = self.diagnostic, .cpu_activity = self.cpu_activity, .scheduling = self.schedulingSummary(), .syscalls = self.syscallSummary(), .application_intervals = self.application_intervals.items.items.len, .mapping_revision = self.mapping_revision, .mapping_history = .{ .per_image_bytes_limit = @import("../binary/snapshot.zig").per_image_limit, .total_image_bytes_limit = @import("../binary/snapshot.zig").total_limit, .opening_regions = self.history.opening_count, .recorded_changes = self.history.changes.items.len, .unresolved_executable_mappings = self.unresolvedMappings(), .opened_images = self.images.loaded.items.len + self.pe_assets.entries.items.len, .pe_images = self.pe_assets.entries.items.len, .pe_metadata_bytes = self.pe_assets.metadata_bytes, .pe_failed = self.pe_assets_failed, .pe_pending = self.pe_assets_pending, .snapshot_bytes = self.images.snapshot_bytes, .images_not_searched = self.images.skipped().count, .image_budget = self.images.skipped().first } };
+        return .{ .producer = self.producer, .follow_threads = self.config.follow_threads, .ring_budget_bytes = if (self.config.ring_budget_bytes == 0) null else self.config.ring_budget_bytes, .ring_allocated_bytes = (if (self.collector) |collector| collector.allocatedRingBytes() else 0) + (if (self.syscall_collector != null) syscall_perf.ringBytes(self.thread_count) else 0), .opening_threads = self.openingThreads(), .scope = if (self.config.follow_threads) "all threads in this process, including held newborns; user CPU only; child processes remain outside scope" else "fixed selected threads, user CPU only; new tasks stop collection; a subset leaves mappings unverified", .id = self.id, .session_id = self.session_id, .opening_generation = self.generation, .image_epoch = self.image_epoch, .pid = self.pid, .revision = self.revision, .status = self.status, .stop_reasons = self.stop_reasons[0..self.stop_reason_count], .started_ns = self.started_ns, .collection_enabled_ns = self.collection_enabled_ns, .ended_ns = self.ended_ns, .duration_ms = self.config.duration_ms, .accepted = self.accepted, .threads = self.threads[0..self.thread_count], .sampled_state = .{ .requested_bytes = self.config.user_stack_bytes, .budget_bytes = self.config.user_stack_budget_bytes, .retained_bytes = self.user_state.used, .records = self.user_state.count, .skipped_stacks = self.user_state.skipped, .first_skipped_sample = self.firstSkippedSample(), .allocated_bytes = self.user_state.allocationBytes() }, .stored_samples = self.samples.len(), .sample_limit = self.config.sample_limit, .discarded_samples = self.discarded_samples, .lost_records = self.lost_records, .lost_samples = self.lost_samples, .throttles = self.throttles, .unthrottles = self.unthrottles, .mapping_events = self.mapping_events, .exec_events = self.exec_events, .exit_events = self.exit_events, .fork_events = self.fork_events, .scope_change = self.scope_change, .unknown_records = self.unknown_records, .unselected_threads = self.unselected_threads, .missing_images = self.missing_images, .trusted_before_ns = if (self.trusted_before_ns == std.math.maxInt(u64)) null else self.trusted_before_ns, .failure = self.failure, .diagnostic = self.diagnostic, .cpu_activity = self.cpu_activity, .scheduling = self.schedulingSummary(), .syscalls = self.syscallSummary(), .application_intervals = self.application_intervals.items.items.len, .mapping_revision = self.mapping_revision, .mapping_history = .{ .per_image_bytes_limit = @import("../binary/snapshot.zig").per_image_limit, .total_image_bytes_limit = @import("../binary/snapshot.zig").total_limit, .opening_regions = self.history.opening_count, .recorded_changes = self.history.changes.items.len, .unresolved_executable_mappings = self.unresolvedMappings(), .opened_images = self.images.loaded.items.len + self.pe_assets.entries.items.len, .pe_images = self.pe_assets.entries.items.len, .pe_metadata_bytes = self.pe_assets.metadata_bytes, .pe_failed = self.pe_assets_failed, .pe_pending = self.pe_assets_pending, .snapshot_bytes = self.images.snapshot_bytes, .images_not_searched = self.images.skipped().count, .image_budget = self.images.skipped().first } };
     }
     pub fn poll(self: *Capture, now: u64) void {
         if (self.collector == null) return;
@@ -374,7 +385,15 @@ pub const Capture = struct {
         self.drain(4);
         if (self.status != .collecting) {
             self.stop(self.status, now);
-        } else if (self.config.duration_ms != 0 and now -| self.started_ns >= @as(u64, self.config.duration_ms) * 1_000_000) self.stop(.duration, now);
+        } else if (self.durationReached(now)) self.stop(.duration, now);
+    }
+    /// The requested window starts when collection is enabled. Setup before
+    /// that stamp does not shorten it. A capture with no stamp keeps the
+    /// request clock, which is the older behavior.
+    fn durationReached(self: *const Capture, now: u64) bool {
+        if (self.config.duration_ms == 0) return false;
+        const origin = self.collection_enabled_ns orelse self.started_ns;
+        return now -| origin >= @as(u64, self.config.duration_ms) * 1_000_000;
     }
     pub fn stop(self: *Capture, reason: Stop, now: u64) void {
         const collector = self.collector orelse return;
@@ -400,7 +419,7 @@ pub const Capture = struct {
         self.collector = null;
         if (self.net) |*net| net.sample(.stop);
         if (self.diagnostic.len == 0) self.diagnostic = switch (self.status) {
-            .duration => "configured capture duration reached (wall clock, including time stopped)",
+            .duration => "configured capture duration reached (wall clock from when collection was enabled, including time stopped)",
             .target_ended => "target exited or detached",
             .thread_scope_changed => "new task outside the capture scope; pause and start a new capture to include current threads",
             .mappings_changed, .image_changed => "target executed a different image; start a new capture for that image",
@@ -526,6 +545,7 @@ pub const Capture = struct {
             .exit => self.exit_events += 1,
             .fork => {
                 self.fork_events += 1;
+                if (self.outlive_child_processes and event.pid != self.pid) return;
                 // A parent's ring may report this before the child stop is
                 // observed. TRACECLONE holds the newborn until our enrollment
                 // callback; the live fallback excludes only pending newborns.
@@ -827,7 +847,8 @@ pub const Capture = struct {
             if (region.offset < captured.file_offset) return false;
             var relative = region;
             relative.offset -= captured.file_offset;
-            const bias = modules.Modules.observedBias(&captured.image, relative) catch return false;
+            const page = live.pageSize() catch return false;
+            const bias = modules.Modules.observedBias(&captured.image, relative, page) catch return false;
             return bias == captured.bias;
         }
         return false;
@@ -1009,6 +1030,7 @@ pub const Summary = struct {
     status: Stop,
     stop_reasons: []const Stop,
     started_ns: u64,
+    collection_enabled_ns: ?u64,
     ended_ns: ?u64,
     duration_ms: u32,
     accepted: perf.Acceptance,
@@ -1087,6 +1109,21 @@ test "sample IP is exact lookup, callers use return minus one, markers and recur
     const chain = userChain(sample);
     try std.testing.expectEqualSlices(u64, &.{ 100, 99, 199 }, chain.addresses[0..chain.count]);
     try std.testing.expect(chain.omitted_context);
+}
+
+test "duration is measured from collection enable, not from the earlier request clock" {
+    var capture: Capture = undefined;
+    capture.config = .{ .duration_ms = 1000 };
+    capture.started_ns = 1_000_000_000;
+    capture.collection_enabled_ns = null;
+    try std.testing.expect(capture.durationReached(1_000_000_000 + 1_000_000_000));
+    try std.testing.expect(!capture.durationReached(1_000_000_000 + 999_000_000));
+    // The request clock is already past the window. The armed window is not.
+    capture.collection_enabled_ns = 5_000_000_000;
+    try std.testing.expect(!capture.durationReached(5_000_000_000 + 999_000_000));
+    try std.testing.expect(capture.durationReached(5_000_000_000 + 1_000_000_000));
+    capture.config.duration_ms = 0;
+    try std.testing.expect(!capture.durationReached(std.math.maxInt(u64)));
 }
 
 test "metadata loss invalidates all mapping attribution" {

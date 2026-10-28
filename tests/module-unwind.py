@@ -145,6 +145,21 @@ def usage(pid):
                 rss_bytes=int(Path(f'/proc/{pid}/statm').read_text().split()[1])*os.sysconf('SC_PAGESIZE'))
 
 
+def agent_library_fds(parent):
+    """Descriptors the debugger's own agent child holds on the walked libraries."""
+    held = 0
+    for entry in Path('/proc').iterdir():
+        try:
+            if not entry.name.isdigit() or int((entry/'stat').read_text().rsplit(') ', 1)[1].split()[1]) != parent:
+                continue
+            for fd in (entry/'fd').iterdir():
+                target = os.readlink(fd)
+                held += target.startswith(str(w)+'/lib') and target.endswith('.so')
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            pass
+    return held
+
+
 def action(client, name, **arguments):
     deadline = time.monotonic()+15
     while True:
@@ -224,6 +239,9 @@ try:
                 changed = w/'lib01.so'
                 stat = changed.stat()
                 os.utime(changed, ns=(stat.st_atime_ns, stat.st_mtime_ns+1_000_000_000))
+        if a.file_slots:
+            # Parsed unwind jobs release their agent views (CFI-VIEWS).
+            assert agent_library_fds(c.p.pid) == 0, (index, agent_library_fds(c.p.pid))
         report['stacks'].append(dict(index=index, expected=expected, stack=stack, jobs=metadata, usage=usage(c.p.pid)))
         if (a.eviction and index < count+1) or (tiny and index < count-1):
             action(c, 'continue')

@@ -119,38 +119,38 @@ const test_region = modules.Region{ .start = 0x704000, .end = 0x705000, .offset 
 test "hook addresses translate from executable ELF file offsets through one observed VMA" {
     var bytes = testElf();
     var image = try elf.Image.parse(&bytes);
-    const location = try resolve(&image, test_region, "malloc", null);
+    const location = try resolve(&image, test_region, "malloc", 4096, null);
     try std.testing.expectEqual(Location{ .offset = 0x1040, .link_address = 0x4040, .runtime_address = 0x704040 }, location);
     // Same-address duplicates are common between ELF symbol tables/aliases.
     @memcpy(bytes[0x330..0x348], bytes[0x318..0x330]);
-    try std.testing.expectEqual(location, try resolve(&image, test_region, "malloc", null));
+    try std.testing.expectEqual(location, try resolve(&image, test_region, "malloc", 4096, null));
     testPut(u64, &bytes, 0x338, 0x4048);
-    try std.testing.expectError(error.AmbiguousAllocationSymbol, resolve(&image, test_region, "malloc", null));
+    try std.testing.expectError(error.AmbiguousAllocationSymbol, resolve(&image, test_region, "malloc", 4096, null));
 }
 test "hook preparation rejects IFUNC, data, undefined and non-file-backed code" {
     var bytes = testElf();
     var image = try elf.Image.parse(&bytes);
     for ([_]u8{ 0x1a, 0x11, 0x10 }) |typ| {
         bytes[0x31c] = typ;
-        try std.testing.expectError(error.UnsupportedAllocationSymbol, resolve(&image, test_region, "malloc", null));
+        try std.testing.expectError(error.UnsupportedAllocationSymbol, resolve(&image, test_region, "malloc", 4096, null));
     }
     bytes = testElf();
     testPut(u16, &bytes, 0x31e, 0);
-    try std.testing.expectError(error.AllocationSymbolNotFound, resolve(&image, test_region, "malloc", null));
+    try std.testing.expectError(error.AllocationSymbolNotFound, resolve(&image, test_region, "malloc", 4096, null));
     bytes = testElf();
     testPut(u64, &bytes, 96, 0x20);
-    try std.testing.expectError(error.AllocationSymbolNotFileBacked, resolve(&image, test_region, "malloc", null));
+    try std.testing.expectError(error.AllocationSymbolNotFileBacked, resolve(&image, test_region, "malloc", 4096, null));
     bytes = testElf();
     testPut(u64, &bytes, 0x148, 2);
-    try std.testing.expectError(error.AllocationSymbolNotExecutable, resolve(&image, test_region, "malloc", null));
+    try std.testing.expectError(error.AllocationSymbolNotExecutable, resolve(&image, test_region, "malloc", 4096, null));
     bytes = testElf();
     var region = test_region;
     region.permissions = "rw-p".*;
-    try std.testing.expectError(error.AllocationMappingNotExecutable, resolve(&image, region, "malloc", null));
+    try std.testing.expectError(error.AllocationMappingNotExecutable, resolve(&image, region, "malloc", 4096, null));
     region = test_region;
     region.end = region.start + 0x30;
-    try std.testing.expectError(error.AllocationSymbolOutsideMapping, resolve(&image, region, "malloc", null));
-    try std.testing.expectError(error.AllocationSymbolNotFound, resolve(&image, test_region, "free", null));
+    try std.testing.expectError(error.AllocationSymbolOutsideMapping, resolve(&image, region, "malloc", 4096, null));
+    try std.testing.expectError(error.AllocationSymbolNotFound, resolve(&image, test_region, "free", 4096, null));
     var stop = std.atomic.Value(bool).init(true);
-    try std.testing.expectError(error.AllocationPreparationCancelled, resolve(&image, test_region, "malloc", &stop));
+    try std.testing.expectError(error.AllocationPreparationCancelled, resolve(&image, test_region, "malloc", 4096, &stop));
 }

@@ -16,6 +16,7 @@ import sys
 import time
 
 from helpers.agent_proxy import relay
+from helpers.listen import listen_and_report
 
 root = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('broken_exit', root/'tests/remote-broken-exit.py')
@@ -177,11 +178,8 @@ def run(args):
                     argv += ['--', str(fixture)]
                     process = subprocess.Popen(argv, env=env, stdin=redirected or subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, bufsize=0)
                     if stop == 'socket-eof':
-                        def connect():
-                            # The listener reports its kernel-chosen port only after listen().
-                            bound = re.search(rb'^xodb: listening on 127\.0\.0\.1:([0-9]+); ', (directory/'stderr.log').read_bytes(), re.M)
-                            return bound and socket.create_connection(('127.0.0.1', int(bound.group(1))), timeout=5)
-                        peer = helper.wait(connect, 'owned MCP listener did not open')
+                        port, _ = listen_and_report(process, directory/'stderr.log', timeout=10)
+                        peer = socket.create_connection(('127.0.0.1', port), timeout=5)
                     fault = helper.wait(lambda: json.loads((directory/'fault.json').read_text()) if (directory/'fault.json').exists() else None, 'startup fault not reached')
                     owned = fault['owned']
                     assert fault['op'] == op and fault['mode'] == mode and len(owned) >= 2, fault

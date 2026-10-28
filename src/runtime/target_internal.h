@@ -125,6 +125,9 @@ struct xrt_target {
 };
 
 enum xrt_status xrt_trace(unsigned request, int32_t tid, uintptr_t address, uintptr_t data);
+/* NT_ARM_PAC_MASK for one stopped tid. EINVAL is unsupported, so a caller can
+ * cache "no note" apart from a transient ESRCH or EIO. */
+enum xrt_status xrt_pac_masks_of_tid(int32_t tid, uint64_t *data_mask, uint64_t *insn_mask);
 int xrt_thread_index(const struct xrt_target *t, int32_t tid);
 /* Owner-thread open may update the target's maps snapshot. */
 enum xrt_status xrt_target_file_owner(struct xrt_target *, const struct xrt_file_request *,

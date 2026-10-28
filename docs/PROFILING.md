@@ -48,7 +48,7 @@ The initial capture defaults are 99 Hz and a **60-second wall-clock deadline**,
 including time spent stopped. In the profile view, click the **Next** duration
 button or press **T** to cycle 10s, 30s, 60s, 5m and **until stopped**. These
 controls affect future captures; the current capture keeps its opening settings.
-Until stopped disables only the deadline; evidence/resource/scope limits remain.
+Until stopped disables only the deadline; evidence/resource/scope limits remain. A positive deadline starts when collection is enabled, and setup before that does not count.
 The current capture's limit is shown alongside its status.
 
 Load different defaults with --config FILE; see [PREFERENCES.md](PREFERENCES.md)
@@ -85,10 +85,18 @@ the existing `profile.frequency_hz` and `profile.duration_ms` keys. Command-line
 values win. `--start-profile --attach PID` keeps its established 99 Hz / 10 s
 default when no config or command-line override is supplied.
 
-The capture covers one process image. If the program forks a child (a shell
-running a command, `system`, `popen`) the capture stops at that scope boundary
-(`thread_scope_changed`), and an `exec` in the profiled process stops it with
-`mappings_changed`. Launch the program itself rather than a wrapper script.
+Each capture covers one process image. At an `exec`, xodb closes that image's
+capture and opens another with the same startup settings while the new image is
+still stopped, then resumes it. The current image replaces the earlier capture,
+so shell `exec` wrappers retain constructor and early-`main` work without mixing
+addresses from the shell and program.
+
+A child process (a shell command, `system`, `popen`) does not end the startup
+capture: the parent keeps its one capture, constructor work included. With
+`--follow-forks`, each followed fork/vfork child also gets its own startup
+capture while held at birth and continues it across exec in the same way.
+Without `--follow-forks`, a child is released under the usual process-tree
+policy and is not profiled.
 
 Owned launches through `--runtime-agent` and `--runtime-ssh` use the same
 exec-stop ordering for same-architecture targets. Kernel-stack capture is not
@@ -137,11 +145,14 @@ Set `profile.follow_threads` to false in preferences, or `follow_threads:false`
 on MCP `start_profile`, to keep the fixed opening set for an all-thread request.
 The setup panel labels the following mode as **All (…) + new**.
 
-**Child processes still stop collection**, including fork/vfork: process-tree
-profiling needs separate address-space identities. A reused numeric TID or a
-failed enrollment also stops collection with a specific diagnostic; xodb never
-silently merges identities or drops a requested thread. Kernel settings stay
-unchanged. [Implementation and test evidence](research/dynamic-threads.md).
+**Child processes still stop an ordinary manual collection**, including
+fork/vfork: process-tree profiling needs separate address-space identities. A
+launch-owned `--start-profile` capture is the exception described above: it
+keeps collecting its own process, and opens separate captures only for children
+explicitly retained by `--follow-forks`. A
+reused numeric TID or a failed enrollment also stops collection with a specific
+diagnostic; xodb never silently merges identities or drops a requested thread.
+Kernel settings stay unchanged. [Implementation and test evidence](research/dynamic-threads.md).
 
 ### Captures that stop early
 
@@ -163,7 +174,7 @@ first. Additional conditions also appear on stderr.
 
 | Stop reason | Meaning |
 | --- | --- |
-| `duration` | The requested wall-clock interval elapsed, including time spent stopped. Resume soon after starting capture. |
+| `duration` | The requested wall-clock interval elapsed, measured from when collection was enabled and including time stopped after that. Resume soon after starting capture. |
 | `metadata_lost` | Perf lost records or required metadata is unavailable. A ring overflow can lose mapping events as well as CPU samples; xodb stops and keeps raw addresses. |
 | `thread_scope_changed` | A child process was created, or a new thread appeared during a fixed-scope capture. Pause and start a new capture for the desired scope. `scope_change` identifies the first observed creation; the GUI footer distinguishes a thread from a child process. |
 | `mappings_changed` / `image_changed` | The target executed another image. Ordinary observed library loads and mapping changes now continue. |
@@ -554,9 +565,19 @@ and removes its temporary file on success or failure. MCP export
 requires control scope because it writes a file; it records an audited action
 without changing target registers or capture revision.
 
+With `--redact`, the complete JSON is passed through the same machine policy as
+a redacted native archive before publication. Home paths and user, host and
+distribution names are rewritten under a fresh export key, and the xodb
+extension reports `redacted: true`. Function names and numeric evidence remain:
+kernel and user addresses, PIDs and timestamps are transient capture facts, not
+long-lived identity.
+
 Validation: `python3 tests/m2-export.py` checks sample/path conservation against
 MCP, full/TID/time/empty filters, recursion, scheduling and interval agreement,
 post-exit retention, shutdown drain, stale/scope guards and no-overwrite behavior.
+It also plants the running machine's account, host, home and distribution names
+in a control export, then greps the redacted export to prove they are absent
+while numeric provenance and frame names remain.
 Its optional `--schema PATH` validates all outputs against the upstream
 [JSON schema](https://www.speedscope.app/file-format-schema.json) with the test-only
 Python `jsonschema` package. Live tests and schema validation passed on this

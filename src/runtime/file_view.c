@@ -110,9 +110,14 @@ enum xrt_status xrt_file_view_release(struct xrt_file_view *v)
 {
     if (!v || !v->target || !v->remote_id) return XRT_OK;
     uint64_t id = v->remote_id;
-    v->remote_id = 0;
-    return remember(v, xrt_remote_call(v->target, &(struct xrt_call){
-        .op = XRT_RPC_FILE_CLOSE, .args = {id}}));
+    enum xrt_status status = xrt_remote_call(v->target, &(struct xrt_call){
+        .op = XRT_RPC_FILE_CLOSE, .args = {id}});
+    /* The presentation guard refused before sending anything. Keep ownership
+     * so an allowed owner/worker can release this still-open slot later.
+     * Agent identity errors consume the slot; transport failures tear down
+     * the connection and its table. Neither needs a second close. */
+    if (status != XRT_REMOTE_IO_FORBIDDEN) v->remote_id = 0;
+    return remember(v, status);
 }
 /* A finished image keeps its original identity and request, not an agent
  * slot. Re-open only for this check and close even on an identity mismatch.

@@ -226,7 +226,7 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
                 \\  Addresses become per-session tags (docs/GUIDE.md "Redaction").
                 \\--record FILE saves investigation evidence at shutdown (must be a new file).
                 \\--expected-start-ticks N refuses attach if the sampled process identity changed.
-                \\--start-profile begins a CPU capture before resuming an attach or a launch's initial exec stop.
+                \\--start-profile begins before resume and follows exec; --follow-forks gives each followed child its own capture.
                 \\--profile-duration MS sets its deadline (0 means until stopped); launch defaults to 0, attach to 10000.
                 \\--profile-hz N sets its sampling rate from 1 to 1000 (default 99).
                 \\--profile-out FILE saves the full CPU aggregate as Speedscope JSON at shutdown (new file).
@@ -583,7 +583,7 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
                 return err;
             };
             if (startup_profile) |config| {
-                _ = try session.startProfile(config);
+                _ = try session.startStartupProfile(config);
                 try session.continueExecution(.human);
             }
             log.info(.session, "xodb: attached pid={d} threads={d} state={s} elapsed_ms={d}\n", .{ pid, session.target.snapshot().thread_count, @tagName(session.target.snapshot().state), (linux.now() -| started) / 1_000_000 });
@@ -594,7 +594,7 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
             _ = try session.breakSymbol(name);
         }
         if (launch.len > 0) if (startup_profile) |config| {
-            _ = try session.startProfile(config);
+            _ = try session.startStartupProfile(config);
             try session.continueExecution(.human);
         };
     }
@@ -1140,7 +1140,7 @@ const RemoteStartup = struct {
                 return err;
             };
             if (self.start_profile) |config| {
-                _ = try self.session.startProfile(config);
+                _ = try self.session.startStartupProfile(config);
                 try self.session.continueExecution(.human);
             }
             if (self.report_attach) log.info(.session, "xodb: attached pid={d} threads={d} state={s} elapsed_ms={d}\n", .{ pid, self.session.target.snapshot().thread_count, @tagName(self.session.target.snapshot().state), (linux.now() -| started) / 1_000_000 });
@@ -1151,7 +1151,7 @@ const RemoteStartup = struct {
             _ = try self.session.breakSymbol(name);
         }
         if (self.launch.len > 0) if (self.start_profile) |config| {
-            _ = try self.session.startProfile(config);
+            _ = try self.session.startStartupProfile(config);
             try self.session.continueExecution(.human);
         };
         self.completed = true;
@@ -1471,6 +1471,7 @@ test {
     _ = @import("profile/derived_test.zig");
     std.testing.refAllDecls(@import("profile/sample_state.zig"));
     std.testing.refAllDecls(@import("profile/records.zig"));
+    std.testing.refAllDecls(@import("profile/perf_regs_gen.zig"));
     std.testing.refAllDecls(@import("profile/unwind.zig"));
     if (build_options.gui) {
         std.testing.refAllDecls(@import("render/font.zig"));

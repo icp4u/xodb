@@ -77,6 +77,15 @@ int main(int argc,char **argv) {
         /* Kernel entry fact, with bias proved from the same mapped descriptor. */
         CHECK(aux.entry>=bias && !dwarf_cfi_addrframe(cfi,aux.entry-bias,&frame));
         free(frame);dwarf_cfi_end(cfi);elf_end(elf);
+        /* Released before the mutation too: a changed file is still reported. */
+        xmd_release_view(job);
+        xmd_release_view(job);
+        if(!mutation) {
+            unsigned char *again = NULL; size_t again_size = 0;
+            CHECK(xmd_cfi_result(job, &again, &again_size) == XBO_OK && again == bytes && again_size == size);
+            uint64_t bias_again = 1;
+            CHECK(xmd_mapping_bias(job, request.mapping.start, request.mapping.end, request.mapping.offset, aux.page_size, 0, &bias_again) == XBO_OK && bias_again == bias);
+        }
         if(mutation) {
             struct timespec times[]={st.st_atim,st.st_mtim};++times[1].tv_sec;CHECK(!futimens(fd,times));
             CHECK(xmd_cfi_result(job,&bytes,&size)==XBO_CHANGED && !bytes && !size);

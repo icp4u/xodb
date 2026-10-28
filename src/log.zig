@@ -2,8 +2,10 @@
 //! with a level and a topic; -qq/-q/-v/-vv, --log=VALUE and XODB_LOG=VALUE
 //! pick what is shown, and --log-file PATH sends it to a file instead.
 //!
-//! error, warn and info lines are written exactly as the caller formats them:
-//! scripts and tests match those bytes. debug and trace lines get
+//! required, error, warn and info lines are written exactly as the caller
+//! formats them: scripts and tests match those bytes. Required output cannot
+//! be filtered; it carries information needed to use a requested interface.
+//! debug and trace lines get
 //! "xodb[topic] +12.345s " in front (monotonic seconds since start). At every
 //! level the caller's format ends in "\n".
 //!
@@ -12,7 +14,7 @@
 //! src/runtime/log.c is the C half and reads the same XODB_LOG.
 const std = @import("std");
 
-pub const Level = enum(u8) { @"error", warn, info, debug, trace };
+pub const Level = enum(u8) { required, @"error", warn, info, debug, trace };
 pub const Topic = enum(u8) { render, window, runtime, agent, session, mcp, sidecar, semq, overview, redot, profile };
 const topic_count = @typeInfo(Topic).@"enum".fields.len;
 const Table = [topic_count]Level;
@@ -26,7 +28,11 @@ var value_len: usize = 0;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 pub inline fn on(topic: Topic, level: Level) bool {
+    if (level == .required) return true;
     return @intFromEnum(level) <= @intFromEnum(levels[@intFromEnum(topic)]);
+}
+pub fn required(topic: Topic, comptime fmt: []const u8, args: anytype) void {
+    emit(topic, .required, fmt, args);
 }
 pub fn err(topic: Topic, comptime fmt: []const u8, args: anytype) void {
     if (on(topic, .@"error")) emit(topic, .@"error", fmt, args);
@@ -127,9 +133,13 @@ pub fn parse(table: *Table, text: []const u8) error{InvalidLogValue}!void {
     while (items.next()) |item| {
         if (std.mem.indexOfScalar(u8, item, '=')) |eq| {
             const topic = std.meta.stringToEnum(Topic, item[0..eq]) orelse return error.InvalidLogValue;
-            table[@intFromEnum(topic)] = std.meta.stringToEnum(Level, item[eq + 1 ..]) orelse return error.InvalidLogValue;
-        } else table.* = @splat(std.meta.stringToEnum(Level, item) orelse return error.InvalidLogValue);
+            table[@intFromEnum(topic)] = configuredLevel(item[eq + 1 ..]) orelse return error.InvalidLogValue;
+        } else table.* = @splat(configuredLevel(item) orelse return error.InvalidLogValue);
     }
+}
+fn configuredLevel(text: []const u8) ?Level {
+    const level = std.meta.stringToEnum(Level, text) orelse return null;
+    return if (level == .required) null else level;
 }
 fn describe(table: *const Table, out: []u8) usize {
     var w: std.Io.Writer = .fixed(out);
@@ -226,10 +236,30 @@ test "a level sets every topic and topic=level one of them" {
     try std.testing.expectEqualSlices(Level, &table, &again);
     try std.testing.expectEqualStrings("trace", text[0..describe(&@as(Table, @splat(.trace)), &text)]);
 }
-test "an unknown level, topic or empty item is refused" {
+test "required and unknown levels, topics and empty items are refused as thresholds" {
     var table: Table = @splat(.info);
-    for ([_][]const u8{ "", "loud", "render", "render=", "paint=debug", "debug,", "render=debug=trace" }) |text|
+    for ([_][]const u8{ "", "required", "runtime=required", "loud", "render", "render=", "paint=debug", "debug,", "render=debug=trace" }) |text|
         try std.testing.expectError(error.InvalidLogValue, parse(&table, text));
+}
+test "required output is distinct and never filtered" {
+    const saved = .{ levels, fd };
+    defer {
+        levels = saved[0];
+        fd = saved[1];
+    }
+    try std.testing.expect(@intFromEnum(Level.required) != @intFromEnum(Level.@"error"));
+    var ends: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&ends));
+    defer _ = std.c.close(ends[0]);
+    fd = ends[1];
+    levels = @splat(.@"error");
+    required(.runtime, "xodb: required value {d}\n", .{17});
+    info(.runtime, "not shown\n", .{});
+    _ = std.c.close(ends[1]);
+    var text: [64]u8 = undefined;
+    const len = std.c.read(ends[0], text[0..].ptr, text.len);
+    try std.testing.expect(len > 0);
+    try std.testing.expectEqualStrings("xodb: required value 17\n", text[0..@intCast(len)]);
 }
 test "options are removed up to the program separator and win over the table" {
     const saved = levels;

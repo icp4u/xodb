@@ -27,6 +27,7 @@ const max_jobs = max_unwind_jobs + 4;
 const unwind_budget: u64 = 128 * 1024 * 1024;
 const Entry = struct {
     id: u64,
+    session_id: u64,
     kind: Kind,
     coverage: Coverage = .sections,
     epoch: u64,
@@ -52,6 +53,8 @@ const Entry = struct {
 };
 pub const JobStatus = struct {
     id: u64,
+    session_id: u64,
+    image_epoch: u64,
     kind: Kind,
     image: []const u8,
     image_truncated: bool,
@@ -85,6 +88,7 @@ pub const State = struct {
     image_refusals: [2]?ImageRefusal = @splat(null),
     image_refusal_next: usize = 0,
     epoch: u64 = 0,
+    session_id: u64 = 0,
     kernel: ?runtime.c.struct_xrt_auxv = null,
     revision: u64 = 0,
     next_id: u64 = 1,
@@ -107,6 +111,7 @@ pub const State = struct {
         };
     }
     fn synchronize(self: *State, session: *Session) void {
+        self.session_id = session.id;
         const snapshot_ = session.target.snapshot();
         const epoch = snapshot_.image_epoch;
         if (self.epoch != epoch) {
@@ -230,6 +235,9 @@ pub const State = struct {
                 if (complete_file) modules.refusal = reason else modules.refuseImage(region, reason);
                 return error.BinarySnapshotLimit;
             }
+            // Another owner holds this version in full. The synchronous open
+            // answers from those bytes after FILE_OPEN, so no worker copies it.
+            if (complete_file and !container and shared and size <= runtime.c.XRT_REMOTE_SYNC_IMAGE_LIMIT) return error.RemoteImageHeld;
         }
         // The worker notices a change only while its view is open. A view
         // reopened over the agent must match the identity stored for this file.
@@ -248,7 +256,7 @@ pub const State = struct {
         else
             c.xmd_start_cfi(view, &job);
         try check(status, null);
-        slot.* = .{ .id = self.next_id, .kind = kind, .coverage = coverage, .epoch = self.epoch, .region = region, .path = path, .job = job.?, .touched_query = self.query };
+        slot.* = .{ .id = self.next_id, .session_id = self.session_id, .kind = kind, .coverage = coverage, .epoch = self.epoch, .region = region, .path = path, .job = job.?, .touched_query = self.query };
         slot.*.?.region.path = path;
         self.next_id +|= 1;
         self.revision +%= 1;
@@ -456,11 +464,15 @@ pub const State = struct {
             if (snapshot_.machine != @intFromEnum(session.target.arch()) or snapshot_.address_size != session.target.arch().addressBytes() or
                 (snapshot_.little_endian != 0) != (session.target.arch().endian() == .little)) return error.DebugMetadataArchitectureMismatch;
             if (entry.cfi == null) entry.cfi = try info.Cfi.init(session.target.arch(), bytes[0..length]);
+            // The decoder borrows the copied unwind bytes, not the file view.
+            // Releasing frees the agent slot; the next query still revalidates
+            // by reopening the same file version.
+            c.xmd_release_view(entry.job);
             entry.checked_query = self.query;
         }
         const load_bias = try self.bias(session, entry);
         if (pc < load_bias) return error.InvalidAddress;
-        return entry.cfi.?.unwind(a, pc - load_bias, .{ .registers = registers, .load_bias = load_bias, .user = session, .read = readUnwind });
+        return entry.cfi.?.unwind(a, pc - load_bias, .{ .registers = registers, .load_bias = load_bias, .insn_pac_mask = session.target.pacInsnMask(), .user = session, .read = readUnwind });
     }
     pub fn javascript(self: *State, session: *Session) !c.struct_xjs_layout {
         if (session.target.snapshot().state != .stopped) return error.NotStopped;
@@ -574,7 +586,9 @@ pub const State = struct {
             // Full mapping paths remain available through paged list_modules.
             var path_end = @min(entry.path.len, 512);
             while (path_end < entry.path.len and path_end > 0 and entry.path[path_end] & 0xc0 == 0x80) path_end -= 1;
-            out.items[out.count] = .{ .id = entry.id, .kind = entry.kind, .image = entry.path[0..path_end], .image_truncated = path_end != entry.path.len, .state = state, .reason = entry.verify_error orelse if (progress.reason) |why| std.mem.span(why) else null, .source_bytes = progress.source_bytes, .source_reads = progress.source_reads, .source_size = progress.object.source_size, .units = if (progress.state == c.XMD_INDEXING) progress.index.units else progress.scan.dwarf.units, .dies = if (progress.state == c.XMD_INDEXING) progress.index.dies else progress.scan.dwarf.dies, .retained_unwind_bytes = progress.unwind.retained_bytes, .cached_bytes = progress.cache_bytes, .index_file_bytes = progress.index.file_bytes, .candidate_units = progress.candidate_units, .accelerator_hits = progress.accelerator_hits, .image_bytes = progress.image_bytes, .image_total = progress.image_total };
+            // Report the creation stamp, not the session displaying this row:
+            // a mistakenly inherited job must retain its original owner.
+            out.items[out.count] = .{ .id = entry.id, .session_id = entry.session_id, .image_epoch = entry.epoch, .kind = entry.kind, .image = entry.path[0..path_end], .image_truncated = path_end != entry.path.len, .state = state, .reason = entry.verify_error orelse if (progress.reason) |why| std.mem.span(why) else null, .source_bytes = progress.source_bytes, .source_reads = progress.source_reads, .source_size = progress.object.source_size, .units = if (progress.state == c.XMD_INDEXING) progress.index.units else progress.scan.dwarf.units, .dies = if (progress.state == c.XMD_INDEXING) progress.index.dies else progress.scan.dwarf.dies, .retained_unwind_bytes = progress.unwind.retained_bytes, .cached_bytes = progress.cache_bytes, .index_file_bytes = progress.index.file_bytes, .candidate_units = progress.candidate_units, .accelerator_hits = progress.accelerator_hits, .image_bytes = progress.image_bytes, .image_total = progress.image_total };
             out.count += 1;
         };
         return out;

@@ -149,6 +149,15 @@ enum xrt_status xrt_target_step(struct xrt_target *target, int32_t tid);
 enum xrt_status xrt_target_poll(struct xrt_target *target);
 enum xrt_status xrt_target_wait_stopped(struct xrt_target *target);
 enum xrt_status xrt_target_stopped_tid(const struct xrt_target *target, int32_t *tid);
+/* Read NT_ARM_PAC_MASK once for a stopped local aarch64 thread. Remote targets
+ * and every other architecture return XRT_UNSUPPORTED_ARCHITECTURE and zero both masks. */
+enum xrt_status xrt_target_pac_mask(const struct xrt_target *target, int32_t tid,
+                                    uint64_t *data_mask, uint64_t *insn_mask);
+/* HELLO suffix from an agent that was asked for XRT_RPC_CAP_PAC_MASK.
+ * False for a local target, a GDB target, and an agent that did not send it.
+ * A true result may still carry zero masks when the note is absent. */
+bool xrt_target_remote_pac(const struct xrt_target *target, uint64_t *data_mask, uint64_t *insn_mask,
+                           uint64_t *va_bits);
 enum xrt_status xrt_target_detach(struct xrt_target *target);
 enum xrt_status xrt_target_detach_family(struct xrt_target *target);
 enum xrt_status xrt_target_close(struct xrt_target *target);

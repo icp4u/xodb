@@ -680,6 +680,13 @@ enum xbo_status xmd_cfi_result(struct xmd_job *job, unsigned char **out, size_t 
     if (status != XBO_OK) return status;
     return xcf_result(job->unwind, out, size);
 }
+void xmd_release_view(struct xmd_job *job) {
+    if (!job || job->kind != JOB_CFI || !job->joined || job->working.state != XMD_READY || !job->view)
+        return;
+    /* The view keeps its identity and request; a later validate reopens,
+     * compares and closes, so a changed file is still reported. */
+    (void)xrt_file_view_release(job->view);
+}
 void xmd_poll(struct xmd_job *job, struct xmd_snapshot *out) {
     pthread_mutex_lock(&job->mutex);
     *out = job->snapshot;

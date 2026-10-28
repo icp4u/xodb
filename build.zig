@@ -16,6 +16,15 @@ fn loadRuntimeSources(b: *std.Build) []const []const u8 {
     return list.items;
 }
 
+/// Every perf_cpu.c compile includes the header generated from records.perfFile.
+fn addRuntimeSources(b: *std.Build, module: *std.Build.Module, sources: []const []const u8, flags: []const []const u8, perf_regs: std.Build.LazyPath) void {
+    for (sources) |source| {
+        if (std.mem.eql(u8, source, "perf_cpu.c"))
+            module.addIncludePath(perf_regs.dirname());
+        module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = flags });
+    }
+}
+
 // The subset of runtime_sources (plus the agent's main) that has no Linux-only
 // dependency; the macos-seam step and `test` compile it for aarch64-macos.
 const macos_seam_sources = [_][]const u8{ "cancel.c", "gdb_packet.c", "gdb_link.c", "log.c", "gdb_description.c", "gdb_lldb.c", "gdbremote.c", "target_state.c", "file_identity.c", "arch.c", "loongarch_step.c", "riscv_step.c", "wire.c", "wire_target.c", "agent.c", "agent_main.c", "remote.c", "file_view.c", "perf_wire.c", "agent_perf.c", "remote_perf.c", "fdinherit.c", "fdgraph.c", "fdgraph_layout.c", "fdtreemap.c", "fdevent_decode.c", "fdevent_count.c", "fdflow_decode.c", "fdflow_count.c", "fdflow_graph.c" };
@@ -31,6 +40,17 @@ pub fn build(b: *std.Build) void {
     abi_lint.dependOn(&b.addSystemCommand(&.{ "python3", "-B", "scripts/abi-lint" }).step);
     if (target.result.os.tag == .macos) return @import("build_macos.zig").build(b, target, optimize);
     const runtime_sources = loadRuntimeSources(b);
+    const perf_regs_gen = b.addExecutable(.{
+        .name = "perf-regs-gen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/profile/perf_regs_gen.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const perf_regs_run = b.addRunArtifact(perf_regs_gen);
+    const perf_regs_header = perf_regs_run.addOutputFileArg("perf_regs.h");
+    const perf_cflags = [_][]const u8{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" };
     // Helpers are copied to other machines: never inherit the build host ISA.
     var portable_query = target.query;
     portable_query.cpu_model = .baseline;
@@ -82,9 +102,7 @@ pub fn build(b: *std.Build) void {
     for ([_][]const u8{ "sha256.c", "xsq_mem.c", "xsq_graph.c", "xsq_query.c", "xsq_report.c", "ghx_host.c" }) |source| {
         module.addCSourceFile(.{ .file = b.path(b.fmt("src/semq/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     }
-    for (runtime_sources) |source| {
-        module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
-    }
+    addRuntimeSources(b, module, runtime_sources, &perf_cflags, perf_regs_header);
     module.addIncludePath(b.path("src/profile"));
     for ([_][]const u8{ "src/frames/bundle.c", "src/profile/logical_frames.c", "src/profile/jitmap.c", "src/import/jvm_json.c", "src/import/jvm_import.c", "src/import/jvm_query.c", "src/import/jvm_lframes.c", "src/import/sha256.c", "src/import/jvm_budget.c", "src/import/jvm_evidence.c" }) |source| {
         module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
@@ -305,15 +323,11 @@ pub fn build(b: *std.Build) void {
         file_path_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     const target_tests = b.addExecutable(.{ .name = "xodb-runtime-target-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     target_tests.root_module.addIncludePath(b.path("src/runtime"));
-    for (runtime_sources) |source| {
-        target_tests.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
-    }
+    addRuntimeSources(b, target_tests.root_module, runtime_sources, &perf_cflags, perf_regs_header);
     target_tests.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-target.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     const perf_tests = b.addExecutable(.{ .name = "xodb-runtime-perf-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     perf_tests.root_module.addIncludePath(b.path("src/runtime"));
-    for (runtime_sources) |source| {
-        perf_tests.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
-    }
+    addRuntimeSources(b, perf_tests.root_module, runtime_sources, &perf_cflags, perf_regs_header);
     perf_tests.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-perf.c"), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     const perf_run = b.addRunArtifact(perf_tests);
     b.step("test-perf", "Test C perf ownership, decoding and owned-thread capture").dependOn(&perf_run.step);
@@ -433,14 +447,12 @@ pub fn build(b: *std.Build) void {
     flow_owner_step.dependOn(&b.addRunArtifact(fdactivity_tests).step);
     const fdactivity_live = b.addExecutable(.{ .name = "xodb-fdactivity-live", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     fdactivity_live.root_module.addIncludePath(b.path("src/runtime"));
-    for (runtime_sources) |source|
-        fdactivity_live.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    addRuntimeSources(b, fdactivity_live.root_module, runtime_sources, &perf_cflags, perf_regs_header);
     fdactivity_live.root_module.addCSourceFile(.{ .file = b.path("tests/fdactivity-live.c"), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
     b.installArtifact(fdactivity_live);
     const fdactivity_scope = b.addExecutable(.{ .name = "xodb-fdactivity-scope", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     fdactivity_scope.root_module.addIncludePath(b.path("src/runtime"));
-    for (runtime_sources) |source|
-        fdactivity_scope.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    addRuntimeSources(b, fdactivity_scope.root_module, runtime_sources, &perf_cflags, perf_regs_header);
     fdactivity_scope.root_module.addCSourceFile(.{ .file = b.path("tests/fdactivity-scope.c"), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
     b.installArtifact(fdactivity_scope);
     const fd_events = b.addExecutable(.{ .name = "xodb-fd-events", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
@@ -494,8 +506,7 @@ pub fn build(b: *std.Build) void {
     macos_seam_step.dependOn(&macos_seam.step);
     const gdb_model_tests = b.addExecutable(.{ .name = "xodb-gdb-model-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     gdb_model_tests.root_module.addIncludePath(b.path("src/runtime"));
-    for (runtime_sources) |source|
-        gdb_model_tests.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    addRuntimeSources(b, gdb_model_tests.root_module, runtime_sources, &perf_cflags, perf_regs_header);
     gdb_model_tests.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-gdb-model.c"), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     b.installArtifact(gdb_model_tests);
     const wire_tests = b.addExecutable(.{ .name = "xodb-runtime-wire-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
@@ -507,7 +518,7 @@ pub fn build(b: *std.Build) void {
     const snapshot_tests = b.addExecutable(.{ .name = "xodb-runtime-snapshot-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     for ([_]*std.Build.Step.Compile{ agent, snapshot_tests }) |artifact| {
         artifact.root_module.addIncludePath(b.path("src/runtime"));
-        for (runtime_sources) |source| artifact.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+        addRuntimeSources(b, artifact.root_module, runtime_sources, &perf_cflags, perf_regs_header);
     }
     agent.root_module.addCSourceFile(.{ .file = b.path("src/runtime/agent_main.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
     snapshot_tests.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-snapshot.c"), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
@@ -540,7 +551,7 @@ pub fn build(b: *std.Build) void {
     const loader_tests = b.addExecutable(.{ .name = "xodb-runtime-loader-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     loader_tests.pie = false;
     loader_tests.root_module.addIncludePath(b.path("src/runtime"));
-    for (runtime_sources) |source| loader_tests.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    addRuntimeSources(b, loader_tests.root_module, runtime_sources, &perf_cflags, perf_regs_header);
     loader_tests.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-loader.c"), .flags = &.{ "-std=c11", "-UNDEBUG", "-fno-pie", "-Wall", "-Wextra", "-Werror" } });
     const install_agent = b.addInstallArtifact(agent, .{});
     b.getInstallStep().dependOn(&install_agent.step);
@@ -582,7 +593,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(symbol_tests).step);
     const symbol_job_tests = b.addExecutable(.{ .name = "xodb-runtime-symbol-job-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     symbol_job_tests.root_module.addIncludePath(b.path("src/runtime"));
-    for (runtime_sources) |source| symbol_job_tests.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    addRuntimeSources(b, symbol_job_tests.root_module, runtime_sources, &perf_cflags, perf_regs_header);
     symbol_job_tests.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-symbol-job.c"), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
     test_step.dependOn(&b.addRunArtifact(symbol_job_tests).step);
     test_step.dependOn(&b.addRunArtifact(loader_tests).step);
@@ -715,21 +726,21 @@ pub fn build(b: *std.Build) void {
         const uprobes = b.addExecutable(.{ .name = "xodb-runtime-uprobes-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
         uprobes.pie = false;
         uprobes.root_module.addIncludePath(b.path("src/runtime"));
-        for (runtime_sources) |source| uprobes.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+        addRuntimeSources(b, uprobes.root_module, runtime_sources, &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" }, perf_regs_header);
         uprobes.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-uprobes.c"), .flags = &.{ "-std=c11", "-fno-pie", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
         test_step.dependOn(&b.addRunArtifact(uprobes).step);
     }
     if (!target.result.abi.isAndroid()) {
         const probe_ids = b.addExecutable(.{ .name = "xodb-runtime-probe-ids-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
         probe_ids.root_module.addIncludePath(b.path("src/runtime"));
-        for (runtime_sources) |source| probe_ids.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+        addRuntimeSources(b, probe_ids.root_module, runtime_sources, &perf_cflags, perf_regs_header);
         probe_ids.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-probe-ids.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
         const probe_ids_run = b.addRunArtifact(probe_ids);
         probe_ids_run.addArtifactArg(agent);
         test_step.dependOn(&probe_ids_run.step);
         const replies = b.addExecutable(.{ .name = "xodb-runtime-replies-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
         replies.root_module.addIncludePath(b.path("src/runtime"));
-        for (runtime_sources) |source| replies.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+        addRuntimeSources(b, replies.root_module, runtime_sources, &perf_cflags, perf_regs_header);
         replies.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-replies.c"), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
         const replies_run = b.addRunArtifact(replies);
         replies_run.addArtifactArg(agent);
@@ -738,7 +749,7 @@ pub fn build(b: *std.Build) void {
         remote_tests.pie = false;
         b.installArtifact(remote_tests);
         remote_tests.root_module.addIncludePath(b.path("src/runtime"));
-        for (runtime_sources) |source| remote_tests.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+        addRuntimeSources(b, remote_tests.root_module, runtime_sources, &perf_cflags, perf_regs_header);
         remote_tests.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-remote.c"), .flags = &.{ "-std=c11", "-UNDEBUG", "-fno-pie", "-Wall", "-Wextra", "-Werror" } });
         const remote_run = b.addRunArtifact(remote_tests);
         remote_run.addArtifactArg(agent);

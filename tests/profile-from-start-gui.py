@@ -3,6 +3,7 @@
 import importlib.util
 import os
 from pathlib import Path
+import shlex
 import tempfile
 import time
 
@@ -11,7 +12,8 @@ os.chdir(root)
 spec = importlib.util.spec_from_file_location('input_repro', root / 'tests/helpers/input.py')
 h = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(h)
-work = Path(tempfile.mkdtemp(prefix='xpf-', dir=Path.home() / 'tmp'))
+temporary = tempfile.TemporaryDirectory(prefix='xpf-', dir=os.environ.get('TMPDIR'))
+work = Path(temporary.name)
 work.chmod(0o755)
 for name in ('tmp', 'cache', 'cache/mesa', 'cache/nvidia'):
     (work / name).mkdir(parents=True, exist_ok=True)
@@ -50,10 +52,18 @@ try:
     display = h.Display(str(root), [
         '--agent-scope', 'control', '--start-profile', '--profile-hz', '997',
         '--profile-duration', '0', '--',
-        './zig-out/bin/xodb-profile-start-fixture', str(stop), str(ready),
+        '/bin/sh', '-c', 'exec ' + shlex.join([
+            './zig-out/bin/xodb-profile-start-fixture', str(stop), str(ready)]),
     ])
-    first = display.tool('get_profile')
-    assert first['capture'] is not None and first['capture']['status'] == 'collecting', first
+    deadline = time.monotonic() + 15 * h.load_scale()
+    while time.monotonic() < deadline:
+        first = display.tool('get_profile')
+        if (first['capture'] is not None and first['capture']['id'] >= 2 and
+                first['capture']['status'] == 'collecting'):
+            break
+        time.sleep(.02)
+    else:
+        raise AssertionError((first, display.tail()))
     deadline = time.monotonic() + 30 * h.load_scale()
     ready_samples = None
     ready_view_samples = None
@@ -105,3 +115,4 @@ try:
 finally:
     if display is not None:
         display.close()
+    temporary.cleanup()

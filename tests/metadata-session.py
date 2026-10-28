@@ -26,10 +26,8 @@ w.mkdir(mode=0o755, parents=True)
 cache = w / 'cache'
 cache.mkdir(mode=0o700)
 os.environ['XDG_CACHE_HOME'] = str(cache)
-# Static-analysis warm-up loads a forked child's main image on its own, which
-# the inherited-job check below cannot tell from an inherited job. The gate
-# already runs with the sidecar off; a direct run must too (and must not
-# start a private Ghidra JVM that outlives the test).
+# Do not start a private static-analysis JVM that could outlive the test.
+# The child-image case below explicitly starts its own metadata query.
 os.environ['XODB_GHIDRA_SIDECAR'] = 'off'
 if a.agent:
     os.environ['XODB_RUNTIME_AGENT'] = str(root / 'tests/fixtures/metadata-agent-proxy.py')
@@ -77,6 +75,9 @@ def state(client, process=1):
 
 def jobs(client, process=1, kind=None):
     found = client.tool('get_debug_metadata', process_id=process)['jobs']
+    current = state(client, process)
+    for job in found:
+        assert (job['session_id'], job['image_epoch']) == (current['session_id'], current['image_epoch']), (job, current)
     return [job for job in found if kind is None or job['kind'] == kind]
 
 
@@ -191,9 +192,18 @@ try:
                     assert snap['state'] == 'stopped', snap
                     owned[snap['pid']] = shared.process_identity(snap['pid'])
                     if ident_ != 1:
-                        # No job kind may be inherited, including a prepared
-                        # native image started alongside JavaScript discovery.
-                        assert not jobs(observer, ident_), jobs(observer, ident_)
+                        # Check every kind against its creation owner/epoch;
+                        # legitimate child work is allowed, inherited work is not.
+                        assert snap['session_id'] != original['session_id'], (snap, original)
+                        jobs(observer, ident_)
+                        # Start work without awaiting the delayed native image:
+                        # this case checks who owns it, not completed unwinding.
+                        child_stack = observer.raw('get_stack', tid=snap['threads'][0]['tid'], process_id=ident_)
+                        assert not child_stack['result']['isError'], child_stack
+                        child_jobs = jobs(observer, ident_)
+                        if a.agent:
+                            assert any(entry['kind'] == 'image' for entry in child_jobs), child_jobs
+                        report['child_jobs'] = child_jobs
                         start(observer, ident_)
                 if name == 'fork':
                     action(owner, 'detach_process_family', process=2)

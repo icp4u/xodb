@@ -37,7 +37,7 @@ and pass its path. This keeps location, merging and persistence choices open.
 | appearance.theme | builtin:dark | GUI theme preset or file relative to these preferences; CLI --theme wins |
 | appearance.ui_scale | compositor | Device pixels per UI unit, 0.5–4; CLI `--ui-scale` wins, and omitting both follows the window system |
 | appearance.density | `"auto"` | Debugger spacing and text size: `"auto"`, `"normal"`, or `"compact"`; Ctrl+Shift+D cycles for this window |
-| profile.duration_ms | 60000 | Wall-clock deadline in milliseconds; 0 means until stopped |
+| profile.duration_ms | 60000 | Wall-clock deadline in milliseconds, starting when collection is enabled; 0 means until stopped. Time stopped after enable still counts. Setup before enable does not |
 | profile.frequency_hz | 99 | Requested user CPU sample rate per selected thread, 1–1000 Hz |
 | profile.sample_limit | 16384 | Maximum retained samples, 1–65536; the independent 32 MiB sample store may fill earlier |
 | profile.syscall_timing | false | Record syscall durations on x86-64; requires 1–32 explicitly chosen threads |

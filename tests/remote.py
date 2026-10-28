@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """Real single-client TCP lifecycle and bounded remote view, using owned fixtures."""
-import argparse, json, os, re, select, socket, subprocess, time, signal
+import argparse, json, os, socket, subprocess, time, signal
 from pathlib import Path
+
+from helpers.listen import listen_and_report
+
+# A direct run must not start or adopt the user's Ghidra sidecar.
+os.environ.setdefault('XODB_GHIDRA_SIDECAR', 'off')
 
 root = Path.cwd() if __file__ == '<stdin>' else Path(__file__).resolve().parents[1]
 os.chdir(root)
@@ -18,6 +23,23 @@ def wait_for(fn, timeout=10):
         time.sleep(.02)
     raise AssertionError('Timed out')
 
+def buffered_report_regression():
+    """Two lines in one pipe write must not strand the report in readline()."""
+    read_fd, write_fd = os.pipe()
+    report = b'xodb: listening on 127.0.0.1:43210; one client, plaintext TCP without authentication\n'
+    diagnostic = b'xodb: synthetic startup diagnostic\n'
+    with os.fdopen(read_fd, 'rb') as stream:
+        process = type('SyntheticListener', (), {'stderr': stream})()
+        try:
+            payload = diagnostic + report
+            assert os.write(write_fd, payload) == len(payload)
+            port, startup = listen_and_report(process, timeout=.5)
+            assert port == 43210 and startup == payload, (port, startup)
+        finally:
+            os.close(write_fd)
+
+buffered_report_regression()
+
 class Server:
     def __init__(self, scope='control', attach=None, quiet=False):
         argv = [str(bin/'xodb'),'--headless','--mcp','--listen','127.0.0.1:0',
@@ -25,13 +47,9 @@ class Server:
         if quiet: argv.insert(1,'-qq')
         argv += ['--attach',str(attach)] if attach else ['--',str(bin/'xodb-m1-fixture'),'w']
         self.p = subprocess.Popen(argv, stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        self.listener_startup = b''
         try:
-            ready = select.select([self.p.stderr],[],[],10)[0]
-            assert ready, 'Listener did not start'
-            line = self.p.stderr.readline().decode()
-            bound = re.fullmatch(r'xodb: listening on 127\.0\.0\.1:([0-9]+); one client, plaintext TCP without authentication\n', line)
-            assert bound, line
-            self.port = int(bound.group(1))
+            self.port, self.listener_startup = listen_and_report(self.p, timeout=10)
             self.sock = socket.create_connection(('127.0.0.1',self.port),timeout=10)
             self.f = self.sock.makefile('rb')
             self.seq = 0
@@ -41,7 +59,7 @@ class Server:
             self.p.send_signal(signal.SIGINT)
             try: self.p.wait(timeout=10)
             except subprocess.TimeoutExpired: self.p.kill(); self.p.wait()
-            print(self.p.stderr.read().decode(errors='replace'), end='', flush=True)
+            print((self.listener_startup + self.p.stderr.read()).decode(errors='replace'), end='', flush=True)
             raise
         self.sock.sendall(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
     def call(self,method,params=None,fragment=False):

@@ -173,6 +173,36 @@ pub const Cfi = struct {
     }
 };
 
+/// Strip an AArch64 return address with the insn PAC mask. Other architectures
+/// keep the bits. A bit still set at or above bit 48 is not a code address.
+pub fn authenticatedReturn(architecture: @import("../target/arch.zig").Arch, ra: u64, insn_mask: u64) !u64 {
+    if (architecture != .aarch64) return ra;
+    const stripped = ra & ~insn_mask;
+    // The kernel's mask is GENMASK(54, va_bits). A 49- to 52-bit address space
+    // keeps its low mask bit as the limit; anything else stays at bit 48.
+    const low = @ctz(insn_mask);
+    const limit: u6 = if (insn_mask != 0 and low > 48 and low <= 52) @intCast(low) else 48;
+    if (stripped >> limit != 0) return error.PointerAuthenticationUnsupported;
+    return stripped;
+}
+
+test "aarch64 return addresses strip with the insn mask" {
+    const arch = @import("../target/arch.zig").Arch;
+    const canonical: u64 = 0x0000aaaaaaaaaaaa;
+    const signed = canonical | (@as(u64, 1) << 48);
+    const top: u64 = 0xffff << 48;
+    try std.testing.expectError(error.PointerAuthenticationUnsupported, authenticatedReturn(arch.aarch64, signed, 0));
+    try std.testing.expectEqual(canonical, try authenticatedReturn(arch.aarch64, signed, top));
+    try std.testing.expectEqual(canonical, try authenticatedReturn(arch.aarch64, canonical, 0));
+    try std.testing.expectEqual(signed, try authenticatedReturn(arch.x86_64, signed, 0));
+    try std.testing.expectError(error.PointerAuthenticationUnsupported, authenticatedReturn(arch.aarch64, signed, @as(u64, 1) << 55));
+    // 52-bit user VA: bits 48..51 are address bits, not PAC bits.
+    const wide: u64 = 0x000f_aaaa_aaaa_aaa8;
+    const lpa2_mask: u64 = 0x0070_0000_0000_0000;
+    try std.testing.expectEqual(wide, try authenticatedReturn(arch.aarch64, wide | (@as(u64, 0x5) << 52), lpa2_mask));
+    try std.testing.expectError(error.PointerAuthenticationUnsupported, authenticatedReturn(arch.aarch64, wide, 0));
+}
+
 pub const Image = struct {
     architecture: @import("../target/arch.zig").Arch,
     object: *c.Elf,
@@ -623,10 +653,14 @@ pub const Image = struct {
         // Only an explicit undefined rule declares the outermost frame. Failed
         // evaluation or an unreadable saved address must remain a partial walk.
         if (!outermost and caller[self.architecture.ra()] == null) return error.ReturnAddressUnavailable;
-        // AArch64 pac-ret signs the return address. Its PAC bits sit above the
-        // user VA, so an unstripped value is not a code address. Stop here
-        // instead of naming a bogus caller; stripping needs the PAC mask.
-        if (self.architecture == .aarch64) if (caller[self.architecture.ra()]) |ra| if (ra >> 48 != 0) return error.PointerAuthenticationUnsupported;
+        // AArch64 pac-ret signs the return address. Strip with the insn mask
+        // recorded for this target. A bit still set at or above bit 48 is not
+        // a code address: stop instead of naming a bogus caller.
+        if (self.architecture == .aarch64) {
+            if (caller[self.architecture.ra()]) |ra| {
+                caller[self.architecture.ra()] = try authenticatedReturn(self.architecture, ra, ctx.insn_pac_mask);
+            }
+        }
         caller[self.architecture.sp()] = cfa;
         if (self.architecture == .aarch64) caller[self.architecture.pc()] = caller[self.architecture.ra()];
         return .{ .cfa = cfa, .caller = caller, .method = method, .outermost = outermost };

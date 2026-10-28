@@ -71,6 +71,10 @@ enum xbo_status xmd_start_cfi_local(struct xrt_file_view *, struct xmd_job **);
 /* Joins nonblockingly and revalidates before lending the CFI-only ELF bytes.
  * Close all libelf/libdw handles borrowing these bytes before destroying job. */
 enum xbo_status xmd_cfi_result(struct xmd_job *, unsigned char **, size_t *);
+/* Joined, ready CFI job only. Releases the agent file slot (a local view stays
+ * pinned). The copied unwind bytes and the prepared segment table stay. A
+ * second call is a no-op. Later result calls revalidate by reopening. */
+void xmd_release_view(struct xmd_job *);
 /* Cancelled means publication was withdrawn; join still determines whether
  * the worker has returned and its borrowed target may be released. */
 void xmd_poll(struct xmd_job *, struct xmd_snapshot *);

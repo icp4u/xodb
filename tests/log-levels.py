@@ -4,9 +4,13 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
+import socket
 import subprocess
 import sys
 import time
+
+from helpers.listen import listen_and_report
 
 root = Path(__file__).resolve().parents[1]
 os.chdir(root)
@@ -166,6 +170,51 @@ status, stdout, stderr, out = run(f'--log-file={log}')
 check(status == 0 and stderr == '', stderr)
 second = log.read_text()
 check(second.startswith(first) and INFO.search(second[len(first):]) and second.endswith(f'no capture; {out}\n'), second)
+
+# A required port-zero announcement follows --log-file even under -qq. The
+# reported endpoint is live, stderr/stdout stay empty, and no other line is
+# added to the file.
+listen_log = work/'listen.log'
+listener = subprocess.Popen([
+    xodb, '-qq', '--headless', '--mcp', '--log-file', str(listen_log),
+    '--listen', '127.0.0.1:0', '--', './zig-out/bin/xodb-m1-fixture', 'w',
+], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=base)
+peer = None
+try:
+    port, startup = listen_and_report(listener, listen_log, timeout=10)
+    expected = f'xodb: listening on 127.0.0.1:{port}; one client, plaintext TCP without authentication\n'.encode()
+    check(startup == expected, startup, expected)
+    peer = socket.create_connection(('127.0.0.1', port), timeout=10)
+    peer.settimeout(10)
+    with peer.makefile('rwb') as wire:
+        wire.write((json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {
+            'protocolVersion': '2025-06-18', 'capabilities': {},
+            'clientInfo': {'name': 'log-file-listen-test', 'version': '1'},
+        }}, separators=(',', ':')) + '\n').encode())
+        wire.flush()
+        reply = json.loads(wire.readline())
+        check(reply.get('id') == 1 and reply.get('result', {}).get('protocolVersion') == '2025-06-18', reply)
+        wire.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+        wire.flush()
+    peer.close()
+    peer = None
+    stdout, stderr = listener.communicate(timeout=10)
+    check(listener.returncode == 0 and stdout == b'' and stderr == b'', listener.returncode, stdout, stderr)
+    final_log = listen_log.read_bytes()
+    check(final_log == expected, final_log, expected)
+finally:
+    if peer is not None:
+        peer.close()
+    if listener.poll() is None:
+        os.kill(listener.pid, signal.SIGINT)
+        try:
+            listener.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.kill(listener.pid, signal.SIGKILL)
+            listener.wait()
+    for stream in (listener.stdout, listener.stderr):
+        if stream is not None and not stream.closed:
+            stream.close()
 
 # Options after "--" belong to the program.
 done = subprocess.run([xodb, '--headless', '--mcp', '--', '/bin/echo', '-qq', '--log=loud'], input=b'', capture_output=True, env=base, timeout=30)
