@@ -97,6 +97,14 @@ time. See [sampling sources and limits](GDSCRIPT.md#frame-time-scripts-and-nativ
 
 ## Memory: defrag to Gibson
 
+For a Linux kernel wait census without KGDB, open
+`xodb --overview --panel kernel_stacks --kernel-pid PID` on an owned blocking
+workload with existing root/access permissions. Identical pipe-waiting threads
+share a symbolized stack and count; D-state groups sort first. **P** pauses.
+Unprivileged reads explicitly show denied stacks. The same collector is verified
+with owned pipe-waiting threads in a disposable kernel-lab guest and on a
+privileged test host; see [kernel census](KERNEL_CENSUS.md).
+
 Start `xodb --overview --look win95` for the classic desktop. Select an owned
 process on **Processes**, then press **m** to see its memory map. **t** cycles
 Win95, DOS, modern, deep and Gibson looks.

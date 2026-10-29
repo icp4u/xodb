@@ -19,7 +19,8 @@ pub const usage =
     \\  --platform wayland|x11  window system; otherwise WAYLAND_DISPLAY, then DISPLAY
     \\  --config FILE  load UI scale and galaxy look from provisional JSON preferences
     \\  --panel NAME    start on summary, performance, processes, memory, disk, disk_space,
-    \\                  network, connections, power, system, users, services, apps, files, memory_map, graph, galaxy, inheritance, treemap, fetch or radio
+    \\                  network, connections, power, system, users, services, apps, files, memory_map, graph, galaxy, inheritance, treemap, fetch, radio or kernel_stacks
+    \\  --kernel-pid N  restrict the opt-in kernel-stack census to one process (otherwise all tasks)
     \\  Graph/galaxy/treemap starts LIVE SYSCALL TRACING · ~11% host syscall overhead · E to stop
     \\  --graph-pid N   restrict descriptor collection and captured threads to these PIDs (repeatable)
     \\  --files-pid N   start Files & IO scoped to one process; its first observed start is pinned
@@ -51,7 +52,7 @@ pub const usage =
     \\  --no-vk-layers Vulkan implicit layers (overlays, capture hooks) off for this window
     \\  -q, -qq, -v, -vv, --log=LEVEL|TOPIC=LEVEL[,...] and --log-file FILE choose what is logged (xodb --help).
     \\Keys: 1-9 0 Tab panels, arrows, / search, s sort, r reverse, v tree, L files, M memory map, F profile, Enter debugger (all confirmed),
-    \\      B treemap, N xodbfetch (B there runs benchmarks), W radio, t theme, p pause, x redact (cannot be turned off), q quit. Mouse: click and wheel.
+    \\      B treemap, N xodbfetch (B there runs benchmarks), W radio, K kernel stacks, t theme, p pause, x redact (cannot be turned off), q quit. Mouse: click and wheel.
     \\
 ;
 
@@ -69,6 +70,7 @@ pub const Options = struct {
     files_start: u64 = 0,
     graph_pids: [c.XRT_FD_INTEREST_MAX]i32 = @splat(0),
     graph_count: usize = 0,
+    kernel_pid: ?i32 = null,
     galaxy_demo: u32 = 0,
     galaxy_demo_idle: bool = false,
     galaxy_tour: bool = false,
@@ -92,7 +94,7 @@ pub const Options = struct {
 };
 
 /// The overview options that are followed by a value.
-pub const takes = [_][]const u8{ "--replay", "--theme", "--panel", "--interval-ms", "--frames", "--font", "--ui-scale", "--platform", "--session-socket", "--files-pid", "--files-start-ticks", "--look", "--memmap-pid", "--memmap-start-ticks", "--graph-pid", "--galaxy-demo", "--vk-device", "--config", "--radio", "--radio-channel", "--radio-demo", "--radio-traffic", "--radio-focus" };
+pub const takes = [_][]const u8{ "--replay", "--theme", "--panel", "--interval-ms", "--frames", "--font", "--ui-scale", "--platform", "--session-socket", "--files-pid", "--files-start-ticks", "--look", "--memmap-pid", "--memmap-start-ticks", "--graph-pid", "--galaxy-demo", "--vk-device", "--config", "--radio", "--radio-channel", "--radio-demo", "--radio-traffic", "--radio-focus", "--kernel-pid" };
 
 /// Parses overview arguments (args[0] is the program). Debugger options are
 /// rejected: the overview has no target.
@@ -149,6 +151,10 @@ pub fn parse(args: []const [:0]const u8) !Options {
         i += 1;
         if (i == args.len) return error.MissingArgument;
         const value = args[i];
+        if (std.mem.eql(u8, arg, "--kernel-pid")) {
+            o.kernel_pid = std.fmt.parseInt(i32, value, 10) catch return error.InvalidKernelPid;
+            if (o.kernel_pid.? <= 0) return error.InvalidKernelPid;
+        }
         if (std.mem.eql(u8, arg, "--config")) o.config = value;
         if (std.mem.eql(u8, arg, "--ui-scale")) {
             const scale = std.fmt.parseFloat(f32, value) catch return error.InvalidUiScale;

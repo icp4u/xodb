@@ -320,6 +320,13 @@ pub const Server = struct {
             return result;
         }
         // Whole-system observation needs no debug target or process routing.
+        if (std.mem.eql(u8, name, "get_kernel_stacks")) {
+            const census = @import("kernel_census.zig");
+            const collector = self.overview_shared orelse &self.overview;
+            var result = try census.call(a, &collector.kernel_census, args, collector.redact);
+            try census.withUserStack(a, &result, &collector.kernel_census, root, args);
+            return result;
+        }
         const redot_graph = std.mem.eql(u8, name, "get_graph") and std.mem.eql(u8, try @import("graph.zig").kind(args), "redot");
         if (redot_graph and self.overview_only) return error.GraphKindUnavailable;
         if (overview.handles(name) and !redot_graph) return overview.call(a, self.overview_shared orelse &self.overview, name, args);

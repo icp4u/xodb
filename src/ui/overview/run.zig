@@ -34,6 +34,7 @@ const Source = struct {
     capture_sequence: u64 = 0,
 
     pub fn prepare(self: *Source, view: *vw.View) !void {
+        view.kernel_census = &self.collector.kernel_census;
         if (self.o.memmap_pid) |pid| {
             // pid + start is the identity; without --memmap-start-ticks the current start is pinned.
             const start = if (self.o.memmap_start != 0) self.o.memmap_start else @import("../../memdefrag/tui.zig").startTicks(pid) orelse {
@@ -67,6 +68,10 @@ const Source = struct {
         if (self.launcher.poll()) view.setStatus("Process action failed; check target identity and access", .{}, current);
         const started = vw.threadNs();
         self.collector.redact = view.redact;
+        if (self.collector.kernel_census.poll()) window.dirty = true;
+        if (view.panel == .kernel_stacks and !view.paused) {
+            self.collector.kernel_census.request() catch |err| view.setStatus("Kernel census: {s}", .{@errorName(err)}, current);
+        }
         if (self.collector.capture.ownsFlow()) {
             // Agent consent must not turn into unbounded pane demand afterward.
             view.graph.events_enabled = false;
@@ -168,6 +173,7 @@ fn live(o: *const Options, startup_started: u64) !void {
     defer radio.shutdown();
     var collector: Collector = .{ .redact = o.redact, .fd_scope = o.graph_pids[0..o.graph_count] };
     collector.capture.mode = .gui;
+    collector.kernel_census.pid = o.kernel_pid;
     defer collector.deinit();
     const session = try gpa.create(Session);
     defer gpa.destroy(session);

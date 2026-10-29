@@ -38,6 +38,7 @@ pub fn failureRemedy(f: c.struct_xrt_perf_failure) ?[]const u8 {
 }
 
 pub const Collector = struct {
+    kernel_census: @import("kernel_census.zig").Cache = .{},
     ctx: ?*c.struct_xrt_sys = null,
     memory_ctx: ?*c.struct_xrt_memobserver = null,
     memory_opens: u64 = 0,
@@ -100,6 +101,7 @@ pub const Collector = struct {
     }
 
     pub fn deinit(self: *Collector) void {
+        self.kernel_census.deinit();
         c.xrt_fdflow_live_free(self.capture_flow);
         if (self.fd_collector) |owner| c.xrt_fdactivity_destroy(owner);
         if (self.cache) |p| {

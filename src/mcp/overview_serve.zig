@@ -17,6 +17,7 @@ pub const usage =
     \\  --interval-ms N        owner sampling interval, 250..10000 (default 500); processes at 1 Hz
     \\  --redact               every reply redacted
     \\  --graph-pid N          restrict descriptor collection to these PIDs (repeatable)
+    \\  --kernel-pid N         restrict the opt-in get_kernel_stacks census to one process
     \\  --radio IFACE          burrito mode: take this spare card (or up to four, comma-separated) for spectrum
     \\                         (root, receive-only); the cards sweep the band
     \\  --radio-traffic IFACE  count frames per channel on this spare card (root, receive-only, counts only)
@@ -36,6 +37,7 @@ pub const Options = struct {
     agent_scope: @import("../model/command.zig").AgentScope = .observe,
     graph_pids: [c.XRT_FD_INTEREST_MAX]i32 = @splat(0),
     graph_count: usize = 0,
+    kernel_pid: ?i32 = null,
     radio: ?[:0]const u8 = null,
     radio_traffic: ?[:0]const u8 = null,
     radio_channel: ?u8 = null,
@@ -68,13 +70,17 @@ pub fn parse(args: []const [:0]const u8) !Options {
             continue;
         }
         const takes = std.mem.eql(u8, arg, "--session-socket") or std.mem.eql(u8, arg, "--interval-ms") or std.mem.eql(u8, arg, "--graph-pid") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--radio") or std.mem.eql(u8, arg, "--radio-channel") or std.mem.eql(u8, arg, "--radio-demo") or std.mem.eql(u8, arg, "--radio-traffic") or std.mem.eql(u8, arg, "--radio-focus");
-        if (!takes) {
+        if (!takes and !std.mem.eql(u8, arg, "--kernel-pid")) {
             log.err(.overview, "xodb: --overview --headless does not accept {s}\n{s}", .{ arg, usage });
             return error.OverviewOptionConflict;
         }
         i += 1;
         if (i == args.len) return error.MissingArgument;
         const value = args[i];
+        if (std.mem.eql(u8, arg, "--kernel-pid")) {
+            o.kernel_pid = std.fmt.parseInt(i32, value, 10) catch return error.InvalidKernelPid;
+            if (o.kernel_pid.? <= 0) return error.InvalidKernelPid;
+        }
         if (std.mem.eql(u8, arg, "--agent-scope")) o.agent_scope = std.meta.stringToEnum(@import("../model/command.zig").AgentScope, value) orelse return error.InvalidAgentScope;
         if (std.mem.eql(u8, arg, "--session-socket")) o.session_socket = value;
         if (std.mem.eql(u8, arg, "--radio")) o.radio = value;

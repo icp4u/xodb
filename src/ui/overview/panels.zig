@@ -35,6 +35,7 @@ pub fn render(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !v
         .memory_map => try @import("memmap.zig").render(v, ctx, rect, now),
         .fetch => try fetchCard(v, ctx, rect, s, now),
         .radio => try radioPanel(v, ctx, rect, now),
+        .kernel_stacks => try @import("kernel_census.zig").render(v, ctx, rect),
     }
 }
 

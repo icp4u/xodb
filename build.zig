@@ -426,6 +426,12 @@ pub fn build(b: *std.Build) void {
     for ([_][]const u8{ "src/runtime/fdscan.c", "tests/runtime-fdscan.c" }) |source| {
         fdscan_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     }
+    const fdscan_priority = b.addExecutable(.{ .name = "xodb-fdscan-priority-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    fdscan_priority.root_module.addIncludePath(b.path("src/runtime"));
+    fdscan_priority.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-fdscan-priority.c"), .flags = &.{ "-std=c11", "-DNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    b.installArtifact(fdscan_priority);
+    const fdscan_priority_run = b.addRunArtifact(fdscan_priority);
+    b.step("test-fdscan-priority", "Test bounded foreground/background scan scheduling").dependOn(&fdscan_priority_run.step);
     const fdinherit_tests = b.addExecutable(.{ .name = "xodb-fdinherit-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     fdinherit_tests.root_module.addIncludePath(b.path("src/runtime"));
     for ([_][]const u8{ "src/runtime/fdscan.c", "src/runtime/fdgraph.c", "src/runtime/fdinherit.c", "tests/runtime-fdinherit.c" }) |source|
@@ -782,7 +788,7 @@ pub fn build(b: *std.Build) void {
         const libdir = b.option([]const u8, "android-lib-dir", "NDK library directory for the selected Android API") orelse
             @panic("Android requires -Dandroid-lib-dir pointing to the NDK API library directory");
         // Android requires PIE; permit both 4 KiB and 16 KiB page kernels.
-        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, observations, profile, profile_start, lifecycle, process, fd_fixture, fdscan_tests, fdevent_tests, fdcount_tests, fdactivity_tests, cancel_tests, resolve_tests, gdb_packet_tests, gdb_link_tests, debugserver_tests, gdb_description_tests, gdb_model_tests, fdactivity_live, fdactivity_scope, fd_events, tests, remote_lifecycle_tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests, sysstat_tests, sys_services_tests, memstat_system_tests, memstat_process_tests, memstat_cells_tests, memobserver_tests, perl_tests, python_tests, lua_tests, ruby_tests, elisp_tests, go_tests, javascript_tests, javascript_layout_tests }) |artifact| {
+        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, observations, profile, profile_start, lifecycle, process, fd_fixture, fdscan_tests, fdscan_priority, fdevent_tests, fdcount_tests, fdactivity_tests, cancel_tests, resolve_tests, gdb_packet_tests, gdb_link_tests, debugserver_tests, gdb_description_tests, gdb_model_tests, fdactivity_live, fdactivity_scope, fd_events, tests, remote_lifecycle_tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests, sysstat_tests, sys_services_tests, memstat_system_tests, memstat_process_tests, memstat_cells_tests, memobserver_tests, perl_tests, python_tests, lua_tests, ruby_tests, elisp_tests, go_tests, javascript_tests, javascript_layout_tests }) |artifact| {
             artifact.root_module.addLibraryPath(.{ .cwd_relative = libdir });
             artifact.pie = true;
             artifact.link_z_max_page_size = 16384;
@@ -806,6 +812,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&flow_graph_run.step);
     test_step.dependOn(&b.addRunArtifact(wire_tests).step);
     test_step.dependOn(&b.addRunArtifact(fdscan_tests).step);
+    test_step.dependOn(&fdscan_priority_run.step);
     test_step.dependOn(&b.addRunArtifact(fdactivity_tests).step);
     test_step.dependOn(&b.addRunArtifact(fdevent_tests).step);
     test_step.dependOn(&b.addRunArtifact(fdcount_tests).step);

@@ -45,7 +45,7 @@ if args.tracing_failure:
         frame['tracing_failure'] = 'perf_event_open: Permission denied · recorded access failure; no live tracing in replay'
     replay.write_text(''.join(json.dumps(frame) + '\n' for frame in frames))
 os.environ['XODB_OVERVIEW_LAYOUT'] = '1'
-panels = 'summary performance processes memory disk disk_space network connections power system users services apps files memory_map graph galaxy inheritance treemap fetch radio'.split()
+panels = 'summary performance processes memory disk disk_space network connections power system users services apps files memory_map graph galaxy inheritance treemap fetch radio kernel_stacks'.split()
 themes = 'dark light green amber blue mono win95'.split() if args.matrix else ['dark']
 bad = []
 seen = []
@@ -69,7 +69,8 @@ if args.live:
         assert layout['text_overlaps'] == 0 and layout['unmarked_text'] == 0, layout
         assert any(row['value'] == 'Procs' and not row['value_elided'] for row in layout['rows']), layout
         heat_y = layout['panes'][0]['rect']['y'] + 208 + 2  # text audit's ink inset
-        histories = [row for row in layout['rows'] if abs(row['rect']['y'] - heat_y) < 1]
+        # Content-pane rows only: the panel menu's rows can share this height.
+        histories = [row for row in layout['rows'] if abs(row['rect']['y'] - heat_y) < 1 and row['rect']['x'] >= layout['panes'][0]['rect']['x'] - 8]
         assert histories and all(row['value'].isdigit() and not row['value_elided'] for row in histories), histories
         assert len({row['value'] for row in histories}) == len(histories), histories
         for row in layout['rows']:

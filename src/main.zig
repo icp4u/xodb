@@ -1265,6 +1265,7 @@ fn overviewHeadless(args: []const [:0]const u8) !void {
     const a = std.heap.c_allocator;
     var collector: @import("model/system.zig").Collector = .{ .redact = o.redact, .fd_scope = o.graph_pids[0..o.graph_count], .fast_ns = o.interval_ms * 1_000_000 };
     collector.capture.mode = .headless;
+    collector.kernel_census.pid = o.kernel_pid;
     defer collector.deinit();
     const session = try a.create(Session);
     defer a.destroy(session);

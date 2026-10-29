@@ -1,5 +1,11 @@
 [
   {
+    "name": "get_kernel_stacks",
+    "description": "Live Linux task kernel-stack census on the debugger host, grouped by identical ordered symbols/callsites, D-state groups first. Opt-in bounded worker; no tracing, attach or stop. Root/access is needed for stack files; denied, empty, vanished and truncated data remain explicit. Refresh defaults true, at most once per second; false reads the cache. Use sequence plus refresh=false while paging to detect replacement. group selects task membership. --kernel-pid restricts collection. User stacks remain available through get_stack on already stopped debugger threads.",
+    "annotations": {"readOnlyHint": true, "xodbSessionAccess": "observer"},
+    "inputSchema": {"type": "object", "properties": {"start": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 32}, "group": {"type": "integer", "minimum": 0}, "member_start": {"type": "integer", "minimum": 0}, "member_limit": {"type": "integer", "minimum": 1, "maximum": 128}, "refresh": {"type": "boolean"}, "sequence": {"type": "integer", "minimum": 0}, "user_tid": {"type": "integer", "minimum": 1, "maximum": 2147483647}}, "additionalProperties": false}
+  },
+  {
     "name": "request_system_capture",
     "description": "Request one bounded overview CPU profile or fd-flow/syscall capture. GUI: waits for human cost/scope confirmation. Headless: requires explicit agent-scope control or mutate. Never grants general debugger control. Maximum 10 seconds, CPU 99 Hz; one outstanding request, one request per second. FD flow is exact tracing with bounded rings/drains, not a sampled event-rate guarantee.",
     "annotations": {"readOnlyHint": false, "xodbSessionAccess": "requester"},

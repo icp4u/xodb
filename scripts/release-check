@@ -104,12 +104,14 @@ COVERS = (
     (('src/mcp/memstat*', 'src/runtime/memstat*', 'src/runtime/memobserver.c', 'src/runtime/xrt_mem*', 'src/memdefrag/*'),
      ('memory-observer', 'memdefrag-tui', 'gui-memdefrag*', 'gui-gibson*', 'gui-deepmap*', 'gui-vga')),
     (('src/mcp/fd*', 'src/runtime/fd*', 'src/runtime/xrt_fd*', 'src/runtime/files.c', 'src/runtime/file_view.c',
-      'src/runtime/xrt_files.h', 'src/lsoftop/*'), ('fdactivity', 'lsof-top', 'gui-fd*', 'gui-files*')),
+      'src/runtime/xrt_files.h', 'src/lsoftop/*', 'tests/runtime-fdscan-priority.c'), ('fdscan-priority', 'fdactivity', 'lsof-top', 'gui-fd*', 'gui-files*')),
     (('src/ui/overview/fetch*', 'src/ui/overview/png.zig', 'tests/fetch*.py'), ('fetch', 'gui-fetch')),
     (('src/radio/*', 'src/mcp/radio.zig', 'src/ui/overview/radio_panel.zig', 'tests/radio-gui.py'), ('radio-detector', 'sysstat-headless', 'gui-radio')),
     (('src/mcp/overview*', 'src/ui/overview/*', 'src/runtime/sysstat*', 'src/runtime/xrt_sysstat.h', 'src/model/system*.zig'),
      ('sysstat-*', 'gui-overview*', 'gui-win95', 'gui-decoration', 'gui-files*', 'gui-fd*', 'gui-memdefrag*', 'gui-gibson*', 'gui-deepmap*', 'gui-safe-keys*', 'gui-themes')),
     (('tests/runtime-sysstat.c',), ('sysstat-*', 'build-tests')),
+    (('src/model/kernel_census.zig', 'src/mcp/kernel_census.zig', 'src/ui/overview/kernel_census.zig',
+      'tests/kernel-census*'), ('kernel-census*', 'gui-kernel-census')),
     (('src/mcp/shared*', 'src/mcp/session_tools.json', 'src/mcp/processes.zig', 'src/service/*'),
      ('shared-*', 'gui-shared-*', 'controller-scope-*', 'client-control', '*-shared-*', 'jai-*-1', 'elisp-bindings-*-1')),
     (('src/mcp/inspection.zig', 'src/ui/inspection.zig'), ('inspections*', 'inspection-lifecycle*', 'gui-inspection')),
@@ -206,6 +208,7 @@ NO_RETRY = {'scene3d-faults', 'vulkan-faults', 'vulkan-enumeration', 'vulkan-dev
 # of the rest. host/gui/all keep a quicker check of each area. `affected`
 # still selects one of these when a test script it runs changes.
 PERIODIC = (
+    'kernel-census-lab',
     'gdscript-stack-file-slots-*',
     'gui-overview-small-matrix*',
     'redot-time-demo-gui',
@@ -364,6 +367,7 @@ AGENT_DIRECT = {
     'tests/remote-queued-drop.py': 'an existing agent twin runs this command',
     'tests/remote-stops.py': 'an existing agent twin runs this command',
     'tests/overview-headless.py': 'this step has no target for the C agent',
+    'tests/kernel-census.py': 'this step has no target for the C agent',
     'tests/system-capture-flow.py': 'this step has no target for the C agent',
     'tests/ghidra-static-images.py': 'this step has no target for the C agent',
     'tests/apk/check.py': 'this step has no target for the C agent',
@@ -879,8 +883,13 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps.append((f'controller-scope-{int(remote)}', [sys.executable, '-B', 'tests/controller-scope.py',
                           '--work', f'.work/scope{int(remote)}', *(['--agent', 'zig-out/bin/xodb-agent'] if remote else [])], 90))
         steps.append(('sysstat-sensors', [sys.executable, '-B', 'tests/sysstat-sensors.py'], 30))
+        steps.append(('fdscan-priority', ['./zig-out/bin/xodb-fdscan-priority-test'], 15))
         steps.append(('fetch', [sys.executable, '-B', 'tests/fetch.py'], 60))
         steps.append(('sysstat-headless', [sys.executable, '-B', 'tests/overview-headless.py'], 120))
+        steps.append(('kernel-census-component', ['zig', 'test', 'src/model/kernel_census.zig', '-lc', '-OReleaseSafe'], 60))
+        steps.append(('kernel-census', [sys.executable, '-B', 'tests/kernel-census.py'], 30))
+        steps.append(('kernel-census-native', [sys.executable, '-B', 'tests/kernel-census-native.py'], 30))
+        steps.append(('kernel-census-lab', [sys.executable, '-B', 'tests/kernel-census-lab.py'], 180))
         steps.append(('system-capture', [sys.executable, '-B', 'tests/system-capture.py'], 60))
         steps.append(('system-capture-flow', [sys.executable, '-B', 'tests/system-capture-flow.py'], 60))
         steps.append(('memory-observer', [sys.executable, '-B', 'tests/memory-observer.py'], 180))
@@ -1166,6 +1175,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('gui-overview-small-matrix-unavailable', [sys.executable, '-B', 'tests/overview-small-gui.py', '--matrix', '--unavailable'], 600))
         steps.append(('gui-overview-small-matrix-tracing-failure', [sys.executable, '-B', 'tests/overview-small-gui.py', '--matrix', '--tracing-failure'], 600))
         steps.append(('gui-overview-live', [sys.executable, '-B', 'tests/overview-live.py'], 180))
+        steps.append(('gui-kernel-census', [sys.executable, '-B', 'tests/kernel-census-gui.py'], 30))
         steps.append(('gui-system-capture', [sys.executable, '-B', 'tests/system-capture-gui.py'], 60))
         steps.append(('gui-fetch', [sys.executable, '-B', 'tests/fetch-gui.py'], 120))
         steps.append(('gui-radio', [sys.executable, '-B', 'tests/radio-gui.py'], 180))

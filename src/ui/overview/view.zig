@@ -20,9 +20,9 @@ pub const Rect = draw.Rect;
 pub const Color = draw.Color;
 const fade = draw.fade;
 
-pub const Panel = enum { summary, performance, processes, memory, disk, disk_space, network, connections, power, system, users, services, apps, files, memory_map, graph, galaxy, inheritance, treemap, fetch, radio };
+pub const Panel = enum { summary, performance, processes, memory, disk, disk_space, network, connections, power, system, users, services, apps, files, memory_map, graph, galaxy, inheritance, treemap, fetch, radio, kernel_stacks };
 pub const panel_count = @typeInfo(Panel).@"enum".fields.len;
-pub const titles = [panel_count][]const u8{ "Summary", "Performance", "Processes", "Memory", "Disk", "Disk Space", "Network", "Connections", "Power & Thermals", "System Info", "Users", "Services", "Installed Apps", "Files & IO", "Memory Map", "FD Graph", "FD Galaxy", "Parent/Child FDs", "FD Treemap", "xodbfetch", "Radio" };
+pub const titles = [panel_count][]const u8{ "Summary", "Performance", "Processes", "Memory", "Disk", "Disk Space", "Network", "Connections", "Power & Thermals", "System Info", "Users", "Services", "Installed Apps", "Files & IO", "Memory Map", "FD Graph", "FD Galaxy", "Parent/Child FDs", "FD Treemap", "xodbfetch", "Radio", "Kernel stacks" };
 pub fn shortTitle(panel: Panel) []const u8 {
     return switch (panel) {
         .power => "Power / Temp",
@@ -31,7 +31,7 @@ pub fn shortTitle(panel: Panel) []const u8 {
         else => titles[@intFromEnum(panel)],
     };
 }
-const keys = [panel_count][]const u8{ "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "", "", "", "L", "M", "G", "Y", "I", "B", "N", "W" };
+const keys = [panel_count][]const u8{ "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "", "", "", "L", "M", "G", "Y", "I", "B", "N", "W", "K" };
 
 pub const Sort = enum { cpu, memory, disk, net, fds, threads, pid, name };
 pub const sort_names = [_][]const u8{ "CPU", "Memory", "Disk", "Net", "FDs", "Threads", "PID", "Name" };
@@ -94,6 +94,7 @@ pub const View = struct {
     treemap: @import("treemap_model.zig").State = .{},
     fetch: @import("fetch_panel.zig").State = .{},
     radio: @import("radio_panel.zig").State = .{},
+    kernel_census: ?*@import("../../model/kernel_census.zig").Cache = null,
     /// Start to first presented frame, for the fetch panel.
     startup_ns: u64 = 0,
     /// The Memory map looks draw period-styled tooltips.
@@ -654,6 +655,7 @@ pub const View = struct {
             'b' => self.show(.treemap),
             'n' => self.show(.fetch),
             'w' => self.show(.radio),
+            'k' => self.show(.kernel_stacks),
             'm' => if (self.panel == .processes) memmap.openSelected(self, now) else self.show(.memory_map),
             'v' => {
                 self.tree = !self.tree;
@@ -1429,6 +1431,7 @@ pub const View = struct {
                 .files => .{ .text = if (self.files.snapshot) |fds| std.fmt.bufPrint(&vb, "{d} descriptors", .{fds.fd_count}) catch "" else "sampled when shown" },
                 .treemap => .{ .text = if (self.treemap.tree) |tree| std.fmt.bufPrint(&vb, "{d} handles", .{tree.fd_count}) catch "" else "sampled when shown" },
                 .radio => .{ .text = if (self.radio.report) |r| r.kind else "listens when shown" },
+                .kernel_stacks => .{ .text = "sampled when shown" },
                 .fetch => .{ .text = if (snapshot.uptime_s.get()) |u| std.fmt.bufPrint(&vb, "up {s}", .{@import("fetch.zig").uptime(&ub, u, false)}) catch "" else "this machine" },
                 .inheritance => .{ .text = if (self.graph.inheritance) |rows| std.fmt.bufPrint(&vb, "{d} sampled matches", .{rows.matched}) catch "" else "sampled when shown" },
                 .graph, .galaxy => .{ .text = if (self.graph.graph) |g| std.fmt.bufPrint(&vb, "{d} processes · {d} fds", .{ g.processes, g.member_count }) catch "" else "sampled when shown" },
@@ -2044,7 +2047,7 @@ test "short classic menus expose every full-height item by keyboard and paging" 
         win95.scrollMenu(&v, 1000);
         try std.testing.expectEqual(panel_count - 1, v.classic_cursor);
         v.key(.{ .kind = .press, .sym = 0xff0d }, 1);
-        try std.testing.expectEqual(Panel.radio, v.panel);
+        try std.testing.expectEqual(Panel.kernel_stacks, v.panel);
         try std.testing.expect(v.classic_menu == null);
     }
 }

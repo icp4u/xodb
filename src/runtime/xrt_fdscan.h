@@ -200,7 +200,10 @@ void xrt_fdscan_fdinfo(struct xrt_fdscan *, int all);
  * operation per cached descriptor, fdinfo only at periodic refresh, and a
  * same-count/no-IO hint may retain the whole process marked stale. A path/offset
  * refresh occurs at least every eight scan sequences when the budget reaches
- * that process. Zero count means none; all != 0 requests every process. */
+ * that process. While a budget windows the sweep, explicit PIDs (including
+ * detail) rotate through alternating foreground/background scan turns; the
+ * ordinary sweep retains its cursor. PIDs absent from the scan list do not take a turn. Zero count means none;
+ * all != 0 refreshes every reached process but does not change scan order. */
 #define XRT_FD_INTEREST_MAX 128u
 enum xrt_status xrt_fdscan_interest(struct xrt_fdscan *, const int32_t *pids,
                                     uint32_t count, int all);

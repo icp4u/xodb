@@ -57,6 +57,8 @@ struct xrt_fdscan {
     int cur;
     uint64_t epoch, sequence;
     int32_t resume;  /* budgeted scans continue from this pid */
+    int32_t priority_after; /* last explicit foreground turn, independent of resume */
+    int background_due;
     uint32_t window; /* processes per budgeted scan; 0: all */
     int32_t *numbers;
     uint32_t numbers_cap;
@@ -225,6 +227,8 @@ void xrt_fdscan_budget(struct xrt_fdscan *s, uint32_t ms)
     if (!ms) {
         s->window = 0;
         s->resume = 0;
+        s->priority_after = 0;
+        s->background_due = 0;
     }
 }
 
@@ -259,6 +263,31 @@ static int interested(const struct xrt_fdscan *s, int32_t pid)
     if (s->all_interest || s->detail == pid) return 1;
     for (uint32_t i = 0; i < s->ninterest; ++i) if (s->interest[i] == pid) return 1;
     return 0;
+}
+
+/* Only explicit PID demand changes scan order. Whole-snapshot metadata demand
+ * must not promote every process. Search the current listing so missing or
+ * excluded PIDs consume neither a turn nor a background cursor position. */
+static uint32_t priority_index(const struct xrt_fdscan *s, const int32_t *list, uint32_t total)
+{
+    uint32_t first = total, next = total;
+    for (uint32_t i = 0; i <= s->ninterest && total; i++) {
+        const int32_t pid = i < s->ninterest ? s->interest[i] : s->detail;
+        if (pid <= 0 || (pid == s->self && !s->o.include_self))
+            continue;
+        uint32_t lo = 0, hi = total;
+        while (lo < hi) {
+            const uint32_t mid = lo + (hi - lo) / 2;
+            if (list[mid] < pid) lo = mid + 1;
+            else hi = mid;
+        }
+        if (lo == total || list[lo] != pid)
+            continue;
+        const uint32_t index = lo;
+        if (index < first) first = index;
+        if (pid > s->priority_after && index < next) next = index;
+    }
+    return next < total ? next : first;
 }
 
 /* Returns the string offset, or 0 (the empty string) when the arena is full. */
@@ -864,12 +893,22 @@ enum xrt_status xrt_fdscan_poll(struct xrt_fdscan *s, struct xrt_fd_snapshot *ou
     /* Under a time budget each scan covers the next window of the pid list,
      * sized from the previous scan's pace, so every process is reached in
      * turn. Output stays in pid order; the others are carried over, stale,
-     * and those never sampled yet are counted as unscanned. */
+     * and those never sampled yet are counted as unscanned. Explicit foreground
+     * demand gets alternating turns, preserving the ordinary sweep's cursor. */
     uint32_t from = 0;
     while (from < total && list[from] < s->resume)
         from++;
     if (from == total)
         from = 0;
+    int priority = 0;
+    /* A full-window sweep already reaches every requested PID. */
+    if (s->o.budget_ms && s->window && !s->background_due) {
+        const uint32_t foreground = priority_index(s, list, total);
+        if (foreground < total) {
+            from = foreground;
+            priority = 1;
+        }
+    }
     const uint32_t to = s->window && s->window < total - from ? from + s->window : total;
     uint32_t next = to;
     int late = 0;
@@ -913,7 +952,11 @@ enum xrt_status xrt_fdscan_poll(struct xrt_fdscan *s, struct xrt_fd_snapshot *ou
             s->window = next > from ? next - from : 1;
         else if (s->window)
             s->window = s->window + s->window / 8 + 1 >= total ? 0 : s->window + s->window / 8 + 1;
-        s->resume = next < total ? list[next] : 0;
+        if (priority)
+            s->priority_after = list[from];
+        else
+            s->resume = next < total ? list[next] : 0;
+        s->background_due = priority;
     }
     free(pids);
     if (s->allocation_failed) return XRT_OUT_OF_MEMORY;
