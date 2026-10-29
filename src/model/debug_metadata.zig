@@ -426,7 +426,7 @@ pub const State = struct {
     fn mapped(session: *Session, address: u64) !Region {
         try session.refreshMaps();
         for (session.modules.regions.items) |region| {
-            if (address >= region.start and address < region.end and region.inode != 0 and std.mem.startsWith(u8, region.path, "/")) return region;
+            if (address >= region.start and address < region.end and region.inode != 0 and region.imageKind() == .file) return region;
         }
         return error.DebugMetadataMappingUnavailable;
     }

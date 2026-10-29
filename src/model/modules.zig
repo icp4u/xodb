@@ -20,7 +20,41 @@ const BudgetThrottle = struct {
 };
 var budget_throttle: BudgetThrottle = .{};
 pub const PeMapping = struct { id: u64, base: u64, path: []const u8 };
-pub const Region = struct { start: u64, end: u64, offset: u64, inode: u64, device_major: u64, device_minor: u64, permissions: [4]u8, path: []const u8, file_source: mapped_file.Source = .unopened, full_image_deferred: bool = false, pe_image: ?PeMapping = null };
+pub const ImageKind = enum { none, file, memory };
+pub const Region = struct {
+    start: u64,
+    end: u64,
+    offset: u64,
+    inode: u64,
+    device_major: u64,
+    device_minor: u64,
+    permissions: [4]u8,
+    path: []const u8,
+    file_source: mapped_file.Source = .unopened,
+    full_image_deferred: bool = false,
+    pe_image: ?PeMapping = null,
+
+    /// A leading slash is a host file. `[vdso]` is an in-memory image.
+    /// An empty path and every other bracket name are not images.
+    pub fn imageKind(self: Region) ImageKind {
+        if (std.mem.eql(u8, self.path, "[vdso]")) return .memory;
+        if (self.path.len != 0 and self.path[0] == '/') return .file;
+        return .none;
+    }
+};
+test "region image kind distinguishes a host file, the vdso, and other paths" {
+    const sample = struct {
+        fn region(path: []const u8, inode: u64) Region {
+            return .{ .start = 0, .end = 1, .offset = 0, .inode = inode, .device_major = 0, .device_minor = 0, .permissions = "r-xp".*, .path = path };
+        }
+    };
+    try std.testing.expectEqual(ImageKind.file, sample.region("/lib/libc.so.6", 1).imageKind());
+    try std.testing.expectEqual(ImageKind.file, sample.region("/lib/libc.so.6", 0).imageKind());
+    try std.testing.expectEqual(ImageKind.memory, sample.region("[vdso]", 0).imageKind());
+    try std.testing.expectEqual(ImageKind.none, sample.region("[heap]", 0).imageKind());
+    try std.testing.expectEqual(ImageKind.none, sample.region("[vvar]", 0).imageKind());
+    try std.testing.expectEqual(ImageKind.none, sample.region("", 0).imageKind());
+}
 pub const Module = struct {
     id: u64,
     inode: u64,
@@ -566,7 +600,7 @@ pub const Modules = struct {
         return load_attempt: {
             // [vdso] is an ELF the kernel maps with no filesystem path.
             if (std.mem.eql(u8, region.path, "[vdso]")) break :load_attempt self.loadMappedElf(region, why, false);
-            if (region.path.len == 0 or region.path[0] != '/') break :load_attempt error.NoBinaryImage;
+            if (region.imageKind() != .file) break :load_attempt error.NoBinaryImage;
             break :load_attempt self.loadRange(region, false, why, null);
         } catch |err| {
             // A source sweep restarts at its first region after Pending. A
@@ -857,7 +891,7 @@ pub const Modules = struct {
                 return err;
             };
         }
-        if (region.path.len == 0 or region.path[0] != '/') return error.NoBinaryImage;
+        if (region.imageKind() != .file) return error.NoBinaryImage;
         return self.loadRange(region, true, .sweep, null) catch |err| {
             self.noteSkipped(region, err);
             return err;
@@ -1830,7 +1864,7 @@ pub const Modules = struct {
     pub fn projectedRestore(self: *Modules, address: u64) !ProjectedSite {
         if (self.core_source != null or !rt.xrt_target_is_remote(self.target)) return error.BreakpointAddressNotRestorable;
         const region = for (self.regions.items) |r| {
-            if (address >= r.start and address < r.end and r.inode != 0 and r.path.len > 0 and r.path[0] == '/') break r;
+            if (address >= r.start and address < r.end and r.inode != 0 and r.imageKind() == .file) break r;
         } else return error.UnmappedAddress;
         const image = try self.symbolImage(region);
         const index = self.identityIndex(region) orelse return error.BinaryIdentityUnavailable;
@@ -1887,7 +1921,7 @@ pub const Modules = struct {
         if (self.name_fallback) |chosen| return std.meta.eql(chosen, key);
         if (self.pid <= 0 or self.core_source != null) return false;
         if (rt.xrt_target_is_remote(self.target)) {
-            if (r.inode == 0 or r.path.len == 0 or r.path[0] != '/') return false;
+            if (r.inode == 0 or r.imageKind() != .file) return false;
             const main = self.remoteMainFile() orelse return false;
             if (!std.meta.eql(main, key)) return false;
             self.name_fallback = key;
@@ -1917,7 +1951,7 @@ pub const Modules = struct {
         const phdr = self.cachedMainPhdr() orelse return null;
         for (self.regions.items) |other| {
             if (phdr < other.start or phdr >= other.end) continue;
-            if (other.inode == 0 or other.path.len == 0 or other.path[0] != '/') continue;
+            if (other.inode == 0 or other.imageKind() != .file) continue;
             self.remote_main_file = fileKey(other);
             break;
         }
@@ -2055,7 +2089,7 @@ pub const Modules = struct {
                 continue;
             }
             if (r.offset != 0 and r.permissions[2] != 'x') continue;
-            if (r.path.len == 0 or r.path[0] != '/' or
+            if (r.imageKind() != .file or
                 std.mem.startsWith(u8, r.path, "/dev/") or
                 std.mem.startsWith(u8, r.path, "/memfd:") or
                 std.mem.endsWith(u8, r.path, " (deleted)"))
@@ -2317,7 +2351,7 @@ pub const Modules = struct {
         const region = for (self.regions.items) |region| {
             if (address >= region.start and address < region.end) break region;
         } else return error.NotMachO;
-        if (region.inode == 0 or region.path.len == 0 or region.path[0] != '/') return error.NotMachO;
+        if (region.inode == 0 or region.imageKind() != .file) return error.NotMachO;
         if (try self.fileKind(region) != .macho) return error.NotMachO;
         const path = try self.allocator.dupeZ(u8, region.path);
         defer self.allocator.free(path);
@@ -2331,7 +2365,7 @@ pub const Modules = struct {
     }
     fn peRegion(self: *Modules, region: Region) !*pe.Entry {
         if (self.immutable or self.target == null or rt.xrt_target_is_remote(self.target)) return error.NotPe;
-        if (region.offset != 0 or region.inode == 0 or region.path.len == 0 or region.path[0] != '/') return error.NotPe;
+        if (region.offset != 0 or region.inode == 0 or region.imageKind() != .file) return error.NotPe;
         if (try self.fileKind(region) != .pe) return error.NotPe;
         // fileKind proved this identity for the revision. A malformed "MZ" file
         // mapped thousands of times must not be reopened for each mapping.
@@ -2366,7 +2400,7 @@ pub const Modules = struct {
         const mapped = for (self.regions.items) |region| {
             if (address >= region.start and address < region.end) break region;
         } else return error.NotPe;
-        if (mapped.path.len != 0 and mapped.path[0] != '/') return error.NotPe;
+        if (mapped.path.len != 0 and mapped.imageKind() != .file) return error.NotPe;
         var next = self.regions.items.len;
         var attempts: usize = 0;
         while (next > 0) {
@@ -2374,7 +2408,7 @@ pub const Modules = struct {
             const region = self.regions.items[next];
             if (region.start > address) continue;
             if (address - region.start > std.math.maxInt(u32)) break;
-            if (region.offset != 0 or region.inode == 0 or region.path.len == 0 or region.path[0] != '/') continue;
+            if (region.offset != 0 or region.inode == 0 or region.imageKind() != .file) continue;
             if (mapped.inode != 0 and !sameFile(mapped, region)) continue;
             // Cached classifications prove file identity once per map revision.
             attempts += 1;
@@ -2399,7 +2433,7 @@ pub const Modules = struct {
         var checked: usize = 0;
         while (self.pe_scan_next < self.regions.items.len and checked < 8) : (self.pe_scan_next += 1) {
             const region = self.regions.items[self.pe_scan_next];
-            if (region.offset != 0 or region.inode == 0 or region.path.len == 0 or region.path[0] != '/' or
+            if (region.offset != 0 or region.inode == 0 or region.imageKind() != .file or
                 std.mem.startsWith(u8, region.path, "/dev/") or std.mem.startsWith(u8, region.path, "/memfd:")) continue;
             if (self.pe_images.backgroundDeferred(region)) continue;
             checked += 1;

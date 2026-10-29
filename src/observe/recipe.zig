@@ -168,7 +168,7 @@ fn functionMapping(session: *Session, recipe: *const Recipe, start_address: ?u64
     defer if (session.modules.skipped().first) |first| log.warn(.session, "xodb: observation recipe: {d} images not searched; {s}\n", .{ session.modules.skipped().count, first });
     const page = try session.modules.pageSize();
     for (session.modules.regions.items) |region| {
-        if (region.permissions[2] != 'x' or region.inode == 0 or region.path.len == 0 or region.path[0] != '/') continue;
+        if (region.permissions[2] != 'x' or region.inode == 0 or region.imageKind() != .file) continue;
         const module = session.modules.load(region, .sweep) catch |err| {
             if (err == error.DebugMetadataPending) return err;
             continue;

@@ -874,7 +874,7 @@ pub const Capture = struct {
         var entry = mappings.Mapping{ .start = region.start, .end = region.end, .offset = region.offset, .device_major = region.device_major, .device_minor = region.device_minor, .inode = region.inode, .path = region.path, .executable = region.permissions[2] == 'x' };
         if (!entry.executable) {
             entry.reason = .non_executable;
-        } else if (!std.mem.eql(u8, region.path, "[vdso]") and (region.inode == 0 or region.path.len == 0 or region.path[0] != '/')) {
+        } else if (region.imageKind() != .memory and (region.inode == 0 or region.imageKind() == .none)) {
             // [vdso] is the one pathless ELF; loadObserved reads it from the stopped target.
             entry.reason = .anonymous;
         } else if (images.loaded.items.len + pe_count >= 256) {

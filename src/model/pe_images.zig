@@ -277,7 +277,7 @@ pub const State = struct {
     /// identity. Eviction drops the file metadata, retaining instance IDs.
     pub fn get(self: *State, a: std.mem.Allocator, target: ?*rt.struct_xrt_target, region: anytype, expected: c.struct_xrt_file_identity) !*Entry {
         if (target == null or rt.xrt_target_is_remote(target)) return error.PeRemoteMetadataUnavailable;
-        if (region.offset != 0 or region.inode == 0 or region.path.len == 0 or region.path[0] != '/') return error.NotPe;
+        if (region.offset != 0 or region.inode == 0 or region.imageKind() != .file) return error.NotPe;
         self.poll();
         self.collectDeparted(a);
         var existing: ?*Entry = null;
