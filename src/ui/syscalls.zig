@@ -86,7 +86,7 @@ pub const Panel = struct {
         try r.rect(.{ .x = 0, .y = 84, .w = width, .h = height - 112 }, theme.overlay);
         try style.box(r, b, theme.surface, theme.focus, @splat(8));
         try r.textFit(font, b.x + 14, b.y + 10, b.w - 28, "SYSCALLS   X / Esc close   Wheel / PgUp / PgDown   Click a row", theme.text);
-        try r.textFit(font, b.x + 14, b.y + 35, b.w - 28, "Elapsed includes off-CPU time and debugger pauses. Names assume the x86-64 syscall ABI.", theme.weak);
+        try r.textFit(font, b.x + 14, b.y + 35, b.w - 28, "Elapsed includes off-CPU time and debugger pauses. Names use the capture's native syscall ABI.", theme.weak);
         const view = self.view orelse {
             try r.textFit(font, b.x + 14, b.y + 70, b.w - 28, "Preparing syscall details for the current selection", theme.weak);
             return;

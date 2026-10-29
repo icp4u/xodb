@@ -24,7 +24,7 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     module.addIncludePath(b.path("src/runtime"));
     module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{capstone}) });
     module.addObjectFile(.{ .cwd_relative = b.fmt("{s}/lib/libcapstone.a", .{capstone}) });
-    for ([_][]const u8{ "cancel.c", "gdb_packet.c", "gdb_link.c", "gdb_description.c", "gdb_lldb.c", "gdbremote.c", "target_state.c", "file_identity.c", "arch.c", "loongarch_step.c", "riscv_step.c", "wire.c", "wire_target.c", "macos_debugserver.c", "../binary/macho.c", "../binary/macho_job.c", "../debug/macho_dwarf.c", "../debug/macho_object.c", "../debug/macho_unwind.c" }) |source|
+    for ([_][]const u8{ "cancel.c", "gdb_packet.c", "gdb_link.c", "gdb_description.c", "gdb_lldb.c", "gdbremote.c", "target_state.c", "file_identity.c", "arch.c", "loongarch_step.c", "riscv_step.c", "wire.c", "wire_target.c", "macos_debugserver.c", "owned_helper.c", "owned_helper_stub.c", "../binary/macho.c", "../binary/macho_job.c", "../debug/macho_dwarf.c", "../debug/macho_object.c", "../debug/macho_unwind.c" }) |source|
         module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
     module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{mvk}) });
     module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include/freetype2", .{deps}) });
@@ -90,7 +90,7 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
 
     const bootstrap_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
     bootstrap_module.addIncludePath(b.path("src/runtime"));
-    for ([_][]const u8{ "tests/macos-bootstrap.c", "src/runtime/macos_debugserver.c", "src/runtime/cancel.c", "src/runtime/gdb_link.c", "src/runtime/gdb_packet.c", "src/runtime/log.c" }) |source|
+    for ([_][]const u8{ "tests/macos-bootstrap.c", "src/runtime/macos_debugserver.c", "src/runtime/owned_helper.c", "src/runtime/owned_helper_stub.c", "src/runtime/cancel.c", "src/runtime/gdb_link.c", "src/runtime/gdb_packet.c", "src/runtime/log.c" }) |source|
         bootstrap_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
     const bootstrap = b.addExecutable(.{ .name = "xodb-macos-bootstrap", .root_module = bootstrap_module });
     const bootstrap_check = b.step("test-debugserver", "Opt-in: test native debugserver bootstrap on owned fixtures");

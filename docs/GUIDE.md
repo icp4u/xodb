@@ -405,7 +405,11 @@ python3 scripts/build-capstone
 zig build app -Doptimize=ReleaseSafe -Dcapstone=vendored
 ```
 
-That installs `xodb` and `xodb-agent`. Hardware watches, CPU, syscall and allocation capture, and uprobes stay unsupported. Instruction step uses the software step. When the Vulkan loader does not see the driver manifest in its default directories, set `VK_ICD_FILENAMES` to that manifest and run `xodb --vk-list`.
+That installs `xodb` and `xodb-agent`. CPU and native syscall capture are
+supported; hardware watches, allocation capture and uprobes remain unsupported.
+Instruction step uses the software step. When the Vulkan loader does not see
+the driver manifest in its default directories, set `VK_ICD_FILENAMES` to that
+manifest and run `xodb --vk-list`.
 
 ## The window is blank
 

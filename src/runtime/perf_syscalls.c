@@ -84,7 +84,15 @@ static bool metadata(bool enter, uint16_t *out, struct xrt_perf_failure *f)
     size_t size;
     uint64_t id;
     if (!xrt_perf_read_file(id_path, id_text, sizeof(id_text), &size)) {
-        xrt_perf_fail(f, "syscalls.metadata.read", errno, -1, id_path);
+        /* ENOENT: no syscall tracepoints here. Name the kernel feature; the
+         * detail still starts with the path, which the tracefs remedy keys on. */
+        const int error = errno;
+        xrt_perf_fail(f, "syscalls.metadata.read", error, -1,
+                      error != ENOENT ? id_path
+                      : enter ? "/sys/kernel/tracing/events/raw_syscalls/sys_enter/id: this kernel exposes no "
+                                "syscall tracepoints (needs CONFIG_FTRACE_SYSCALLS and tracefs mounted at /sys/kernel/tracing)"
+                              : "/sys/kernel/tracing/events/raw_syscalls/sys_exit/id: this kernel exposes no "
+                                "syscall tracepoints (needs CONFIG_FTRACE_SYSCALLS and tracefs mounted at /sys/kernel/tracing)");
         return false;
     }
     if (!xrt_perf_unsigned(id_text, size, &id) || !id || id > UINT16_MAX) {
@@ -112,9 +120,10 @@ static bool metadata(bool enter, uint16_t *out, struct xrt_perf_failure *f)
 static struct xrt_perf *start(int32_t pid, const int32_t *tids, size_t count, uint16_t *entry,
                                     uint16_t *exit, struct xrt_perf_failure *f, bool loss)
 {
-#if !defined(__x86_64__)
+#if !defined(__x86_64__) && !defined(__aarch64__) && !defined(__loongarch__) &&                  \
+    !(defined(__riscv) && __riscv_xlen == 64)
     xrt_perf_fail(f, "syscalls.architecture", 0, -1,
-                  "raw syscall decoding currently supports native Linux x86-64");
+                  "raw syscall decoding requires native Linux x86-64, AArch64, LoongArch64 or RISC-V 64");
     return NULL;
 #endif
     if (pid <= 0 || !tids || !count || count > 32) {

@@ -71,6 +71,8 @@ COVERS = (
     (('src/runtime/mapped_file.c', 'src/runtime/file_view.c', 'src/runtime/files.c', 'src/runtime/family.c'),
      ('runtime-host', 'runtime-agent', 'shared-processes', 'fork-release*', 'mapping-identity', 'module-*', 'pe-*', 'pdb-*', 'image-budget-hostile')),
     (('src/model/process_*', 'src/ui/processes.zig', 'tests/fixtures/process-tree.c', 'tests/process-tree.py', 'tests/process-gui.py'), ('fork-release*', 'process-tree', 'process-gui', 'm2-robustness', 'shared-processes*')),
+    (('src/runtime/family.c', 'src/runtime/owned_helper.c', 'src/runtime/owned_helper_stub.c', 'src/runtime/xrt_process.h', 'src/semq/ghidra_sidecar.zig', 'src/semq/ghx_host.c', 'src/capture/live.zig', 'src/runtime/remote.c', 'src/runtime/agent.c', 'src/runtime/macos_debugserver.c', 'src/profile/allocation_broker.c', 'src/ui/overview/actions.zig', 'src/remote/transport.zig', 'src/platform/macos_process.c', 'src/target/runtime.zig', 'src/model/modules.zig', 'tests/reap-helpers.py'),
+     ('reap-helpers', 'orphan-reap', 'i386-m1')),
     (('tests/fixtures/elf/unwind.S',), ('frame-archive', 'm2-archive')),
     (('tests/fixtures/unwind-realigned.c',), ('unwind-realigned*',)),
     (('src/debug/demangle.*', 'tests/demangle-names.*', 'tests/fixtures/stack-symbol-names.cc'), ('demangle-names', 'stack-symbol-names*')),
@@ -80,6 +82,8 @@ COVERS = (
     (('src/language/python*', 'tests/fixtures/python/*'), ('python-*', 'runtime-binding*', 'gui-runtime-binding*', *LANGUAGE_PANES)),
     (('src/language/perl*', 'tests/fixtures/perl/*'), ('perl-*', 'runtime-binding*', 'gui-runtime-binding*', *LANGUAGE_PANES)),
     (('src/language/ruby*', 'tests/fixtures/ruby/*'), ('ruby-*', *LANGUAGE_PANES)),
+    (('tests/runtime-cores.py', 'tests/fixtures/core.c', 'src/language/python*', 'src/language/ruby*',
+      'src/language/perl*', 'src/language/lua*', 'src/language/runtime_binding.zig', 'src/model/language_tabs.zig'), ('runtime-cores',)),
     (('src/language/javascript*', 'tests/fixtures/javascript/*'), ('javascript-*', *LANGUAGE_PANES)),
     (('src/language/go*', 'tests/fixtures/go/*', 'docs/GO.md'), ('go-*',)),
     (('src/language/gdscript*', 'tests/fixtures/redot/*', 'tests/fixtures/redot-values/*', 'scripts/demo-redot', 'src/debug/dwarf_types.*', 'src/binary/tls.zig'),
@@ -139,11 +143,14 @@ COVERS = (
       'go-type-index', 'symbol-discovery*', 'local-large-symbols', 'metadata-session*', 'source-fetch', 'gui-inline',
       'gui-symbol-discovery', 'gui-debug', 'm2-recovery', 'unwind-realigned*', 'unwind-return-address*', 'module-unwind*')),
     (('src/binary/*', 'src/model/modules.zig'),
-     ('mapping-identity', 'cache-pool', 'object-cache', 'symbol-query', 'module-*', 'source-paths*', 'apk-symbols', 'core-debugging', 'local-large-symbols', 'symbol-discovery*',
+     ('mapping-identity', 'cache-pool', 'object-cache', 'symbol-query', 'module-*', 'source-paths*', 'apk-symbols', 'core-debugging', 'python-core', 'runtime-cores', 'local-large-symbols', 'symbol-discovery*',
       'mcp-modules', 'm2-mappings', 'demo-binary', 'gui-symbol-discovery', 'python-image-budget', 'image-budget', 'image-budget-hostile', 'image-budget-held', 'gui-image-budget')),
     (('src/binary/snapshot.zig', 'src/model/modules.zig', 'src/runtime/remote.c', 'src/runtime/xrt_files.h',
       'tests/image-budget-held.py', 'tests/fixtures/file-read-count.py'),
      ('image-budget-held',)),
+    (('src/model/modules.zig', 'src/binary/snapshot.zig', 'src/binary/mapped_file.zig', 'src/binary/core.zig',
+      'src/profile/capture.zig', 'src/profile/archive.zig', 'tests/vdso-module.py'),
+     ('vdso-module*',)),
     (('src/target/*', 'src/runtime/target*', 'src/runtime/process.c', 'src/runtime/watchpoints.c', 'src/runtime/arch.c',
       'src/runtime/events.c', 'src/runtime/xstate.c', 'src/runtime/loader.c', 'src/runtime/xrt_target.h', 'src/runtime/xrt_process.h',
       'tests/runtime-target.c',
@@ -160,6 +167,8 @@ COVERS = (
      ('gdb-debugserver*', 'macos-debugserver')),
     (('scripts/release-check',), ('release-runner',)),
     (('scripts/deps', 'tools/deps/*', 'tests/deps-selftest.py'), ('deps', 'deps-selftest')),
+    (('scripts/generate-syscall-tables', 'src/profile/syscalls_generic.zig',
+      'src/runtime/xrt_generic_syscalls.h'), ('syscall-tables',)),
     (('src/evidence/*', 'src/capture/*', 'src/mcp/evidence*', 'src/model/profile_timeline.zig', 'src/profile/net_context.zig', 'tests/network-evidence.py', 'tests/private-network-evidence.py', 'tests/live-network-evidence.py', 'tests/usb-evidence.py', 'tests/dbus-evidence.py', 'tests/fixtures/net-peer.py', 'tests/fixtures/capture-tool.py'),
      ('network-evidence', 'private-network-evidence', 'live-network-evidence', 'usb-evidence', 'dbus-evidence', 'pcap-magic', 'gui-network-evidence', 'm2-archive', 'gui-profile')),
     (('tests/pcap-magic.py',), ('pcap-magic',)),
@@ -173,7 +182,7 @@ COVERS = (
 
 # Cheap steps that cover every source file without counting as its coverage in
 # `affected`: a file only they cover still selects the full gui tier.
-ALWAYS = ('deps', 'abi-lint')
+ALWAYS = ('deps', 'abi-lint', 'syscall-tables')
 
 # GUI steps that must run alone under --jobs: they assert frame time, CPU or
 # RSS, inject compositor/Vulkan timeouts, rank processes by CPU, make many
@@ -289,6 +298,8 @@ AGENT_BIN = './zig-out/bin/xodb-agent'
 AGENT_LANE_SUFFIX = '-agent-lane'
 AGENT_INELIGIBLE = {
     'core-debugging': 'reads an ELF core in-process; the C agent is not a core reader',
+    'python-core': 'reads an ELF core in-process; the C agent is not a core reader',
+    'runtime-cores': 'reads ELF cores in-process; the C agent is not a core reader',
     'gdb-debugserver': 'GDB remote protocol, not the C agent',
     'gdb-debugserver-deadline': 'GDB remote protocol, not the C agent',
     'gdb-lldb-fuzz': 'GDB remote packet fuzz, not a live C agent target',
@@ -630,6 +641,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
     steps.append(('release-runner', [sys.executable, '-B', 'tests/release-runner.py'], 30))
     steps.append(('deps', [sys.executable, '-B', 'scripts/deps', 'check'], 30))
     steps.append(('deps-selftest', [sys.executable, '-B', 'tests/deps-selftest.py'], 30))
+    steps.append(('syscall-tables', [sys.executable, '-B', 'scripts/generate-syscall-tables', '--check'], 30))
     # Privacy: no tracked file may be a packet capture; fixtures are generated at run time.
     steps.append(('pcap-magic', [sys.executable, '-B', 'tests/pcap-magic.py'], 30))
     steps.append(('complete-log-lines', [sys.executable, '-B', 'tests/complete-log-lines.py', '--work', '.work/complete-log-lines'], 10))
@@ -817,6 +829,9 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             label = 'unwind-return-address' + ('-agent' if remote else '')
             steps.append((label, [sys.executable, '-B', 'tests/unwind-return-address.py', '--work', '.work/' + label,
                           *(['--agent', 'zig-out/bin/xodb-agent'] if remote else [])], 60))
+        steps.append(('i386-m1', [sys.executable, '-B', 'tests/i386-m1.py', '--work', '.work/i386'], 180))
+        steps.append(('orphan-reap', [sys.executable, '-B', 'tests/orphan-reap.py', '--work', '.work/orphan-reap'], 60))
+        steps.append(('reap-helpers', [sys.executable, '-B', 'tests/reap-helpers.py', '--work', '.work/reap-helpers'], 60))
         for remote in (False, True):
             label = 'unwind-realigned' + ('-agent' if remote else '')
             steps.append((label, [sys.executable, '-B', 'tests/unwind-realigned.py', '--work', '.work/' + label,
@@ -829,6 +844,10 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps.append((label, [sys.executable, '-B', 'tests/proton-metadata.py', '--work', '.work/' + label,
                           *(['--agent', 'zig-out/bin/xodb-agent'] if agent else [])], 30))
         steps.append(('module-symbols', [sys.executable, '-B', 'tests/module-symbols.py', '--work', '.work/module-symbols'], 60))
+        for remote in (False, True):
+            label = 'vdso-module' + ('-agent' if remote else '')
+            steps.append((label, [sys.executable, '-B', 'tests/vdso-module.py', '--work', '.work/' + label,
+                          *(['--agent', 'zig-out/bin/xodb-agent'] if remote else [])], 120))
         for variant in ('chain', 'debug-frame', 'companions', 'mixed'):
             label = 'module-unwind-' + variant
             steps.append((label, [sys.executable, '-B', 'tests/module-unwind.py', *([] if variant == 'chain' else ['--'+variant]), '--work', '.work/'+label], 60))
@@ -930,8 +949,16 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('agent-startup', [sys.executable, '-B', 'tests/agent-startup.py'], 30))
         steps.append(('source-fetch', [sys.executable, '-B', 'tests/source-fetch.py'], 180))
         steps.append(('apk-symbols', [sys.executable, '-B', 'tests/apk/check.py', '--debug-files'], 90))
+        core_runtimes = []
+        for language, executable in (('python', python), ('ruby', ruby), ('perl', perl)):
+            if executable:
+                core_runtimes += ['--' + language, executable]
+        for executable, _, _ in lua or []:
+            core_runtimes += ['--lua', executable]
+        steps.append(('runtime-cores', [sys.executable, '-B', 'tests/runtime-cores.py', '--work', '.work/rtcores', *core_runtimes], 120))
         if python:
             sdk = ['--python', python]
+            steps.append(('python-core', [sys.executable, '-B', 'tests/python-core.py', *sdk, '--work', '.work/pycore'], 60))
             for remote in (False, True):
                 label = 'pe-runtime-anchor' + ('-agent' if remote else '')
                 steps.append((label, [sys.executable, '-B', 'tests/pe-runtime-anchor.py',

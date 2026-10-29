@@ -203,9 +203,10 @@ investigations](OBSERVATIONS.md) for a Ruby example and the CLI/MCP workflow.
 | Target ISA | Execution and analysis | Additional support |
 | --- | --- | --- |
 | x86-64 | Launch/attach, threads, signals, break/step, registers/memory, host symbols/DWARF | Hardware watches, fork/vfork coordination, SIMD/FP, CPU/syscall/allocation capture |
-| AArch64 | Existing execution backend now in C; target registers and host ISA selection | Hardware data watches; no process following or remote profiling |
+| AArch64 | Existing execution backend now in C; target registers and host ISA selection | Hardware data watches; CPU and native syscall capture; no process following or allocation capture |
 | m68k | GCC-built agent tested in the VM: launch, break/step, GPR writes, ELF32 big-endian files, host disassembly, CFI and expressions | Hardware watches, FP state, process following and profiling explicitly unsupported |
-| LoongArch64 | GCC-built agent on a LoongArch64 Linux host: launch/attach, threads, signals, software breakpoints, register and memory read/write, host symbols, CFI and expressions. Host assembly is decoded when xodb links the private Capstone 6 prefix | Hardware watches, CPU/syscall/allocation capture and uprobes explicitly unsupported. The default system Capstone 5.x build reports disassembly unavailable. Instruction step is a software step; hardware step stays off. `r0` is read-only. This slice reads the general regset |
+| LoongArch64 | GCC-built agent on a LoongArch64 Linux host: launch/attach, threads, signals, software breakpoints, register and memory read/write, host symbols, CFI and expressions. Host assembly is decoded when xodb links the private Capstone 6 prefix | CPU and native syscall capture use the LoongArch64 register file and generated asm-generic syscall row. Hardware watches, allocation capture and uprobes remain unsupported. The default system Capstone 5.x build reports disassembly unavailable. Instruction step is a software step; hardware step stays off. `r0` is read-only. This slice reads the general regset |
+| RISC-V 64 | GCC-built agent on a RISC-V Linux host: launch, threads, signals, software breakpoints and stepping, register and memory access, host symbols, CFI and expressions | CPU and native syscall capture use the RISC-V register file and generated asm-generic plus arch-specific syscall row. Hardware watches, allocation capture and uprobes remain unsupported |
 | ppc64le | GCC-built agent on a little-endian ELFv2 POWER host: launch/attach, threads, signals, software breakpoints, hardware single-step, register and memory read/write, host symbols, CFI and expressions. Host assembly uses Capstone's PPC decoder, including the default system library. A step at `lwarx`/`ldarx`/`lbarx`/`lharx`/`lqarx` runs through the matching store-conditional instead of single-stepping it | Hardware watches, CPU/syscall/allocation capture, uprobes and process following explicitly unsupported. VSX and VMX notes are not decoded. Function breakpoints and opening-line breakpoints stop at the ELFv2 local entry when the symbol has one |
 
 Kernel permissions and kernel feature availability are checked by each operation.
@@ -294,7 +295,8 @@ GUI test uses a private headless compositor. For the cross-ISA host check, compi
 on the target, then pass `--ssh HOST --ssh-config FILE --agent /path/xodb-agent
 --fixture /path/fixture --arch m68k` (or `loongarch64`, `ppc64le`, `riscv64`) to
 `tests/runtime-host.py`. On riscv64 that smoke row checks that `x0` is omitted,
-steps one instruction in software and refuses watchpoints, profile and uprobes.
+steps one instruction in software, opens CPU/syscall profiling, and refuses
+watchpoints and uprobes.
 The full software-step table is `tests/runtime-riscv64.py` against
 `tests/fixtures/runtime-riscv64.c`, built on the guest with `-g -O0 -pthread`.
 It checks exact successors for 2-byte and 4-byte steps, compressed and full

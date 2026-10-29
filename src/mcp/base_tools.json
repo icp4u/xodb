@@ -1022,7 +1022,7 @@
         },
         "syscall_timing": {
           "type": "boolean",
-          "description": "Opt-in x86-64 syscall timing; requires explicit tids (1..32). Arguments discarded."
+          "description": "Opt-in native syscall timing on x86-64, AArch64, LoongArch64 or RISC-V 64; requires explicit tids (1..32). Arguments discarded."
         },
         "syscall_limit": {
           "type": "integer",
@@ -2666,7 +2666,7 @@
   },
   {
     "name": "get_profile_syscalls",
-    "description": "Page scoped x86-64 syscall entry/exit elapsed durations, raw return values and observed scheduling overlap. Missing endpoints stay null; durations include debugger pauses. Arguments are not retained.",
+    "description": "Page scoped native syscall entry/exit elapsed durations, raw return values and observed scheduling overlap on supported 64-bit targets. Missing endpoints stay null; durations include debugger pauses. Arguments are not retained.",
     "inputSchema": {
       "type": "object",
       "properties": {

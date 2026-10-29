@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define XRT_I386 3
 #define XRT_M68K 4
 #define XRT_X86_64 62
 #define XRT_AARCH64 183
@@ -67,6 +68,30 @@
     X(eflags, XRT_DWARF_NONE, 18, 17, XRT_ROLE_NONE)                                               \
     X(fs_base, XRT_DWARF_NONE, 21, 18, XRT_ROLE_NONE)                                              \
     X(gs_base, XRT_DWARF_NONE, 22, 19, XRT_ROLE_NONE)
+
+/* i386 psABI DWARF numbers. The third column is the x86-64 user_regs_struct
+ * word a 64-bit tracer reads. Values are the low 4 bytes of that word.
+ * orig_eax is orig_rax so syscall restart stays visible. gs_base is filled
+ * from the thread area, not from fs_base. */
+#define XRT_I386_REGISTERS(X)                                                                      \
+    X(eax, 0, 10, 0, XRT_ROLE_NONE)                                                                \
+    X(ecx, 1, 11, 1, XRT_ROLE_NONE)                                                                \
+    X(edx, 2, 12, 2, XRT_ROLE_NONE)                                                                \
+    X(ebx, 3, 5, 3, XRT_ROLE_NONE)                                                                 \
+    X(esp, 4, 19, 4, XRT_ROLE_SP)                                                                  \
+    X(ebp, 5, 4, 5, XRT_ROLE_NONE)                                                                 \
+    X(esi, 6, 13, 6, XRT_ROLE_NONE)                                                                \
+    X(edi, 7, 14, 7, XRT_ROLE_NONE)                                                                \
+    X(eip, 8, 16, 8, XRT_ROLE_PC)                                                                  \
+    X(eflags, XRT_DWARF_NONE, 18, 9, XRT_ROLE_NONE)                                                \
+    X(cs, XRT_DWARF_NONE, 17, 10, XRT_ROLE_NONE)                                                   \
+    X(ss, XRT_DWARF_NONE, 20, 11, XRT_ROLE_NONE)                                                   \
+    X(ds, XRT_DWARF_NONE, 23, 12, XRT_ROLE_NONE)                                                   \
+    X(es, XRT_DWARF_NONE, 24, 13, XRT_ROLE_NONE)                                                   \
+    X(fs, XRT_DWARF_NONE, 25, 14, XRT_ROLE_NONE)                                                   \
+    X(gs, XRT_DWARF_NONE, 26, 15, XRT_ROLE_NONE)                                                   \
+    X(orig_eax, XRT_DWARF_NONE, 15, 16, XRT_ROLE_NONE)                                             \
+    X(gs_base, XRT_DWARF_NONE, 22, 17, XRT_ROLE_NONE)
 
 #define XRT_ARM_REGISTERS(X)                                                                       \
     X(x0, 0, 0, 0, XRT_ROLE_NONE)                                                                  \
@@ -263,6 +288,9 @@ struct xrt_m68k_registers {
 struct xrt_x86_registers {
     XRT_X86_REGISTERS(XRT_REGISTER_FIELD)
 };
+struct xrt_i386_registers {
+    XRT_I386_REGISTERS(XRT_REGISTER_FIELD)
+};
 struct xrt_arm_registers {
     XRT_ARM_REGISTERS(XRT_REGISTER_FIELD)
 };
@@ -328,6 +356,7 @@ struct xrt_registers {
     uint16_t unknown_id[XRT_ABSENT_MAX];
     union {
         struct xrt_x86_registers x86;
+        struct xrt_i386_registers i386;
         struct xrt_arm_registers arm;
         struct xrt_m68k_registers m68k;
         struct xrt_loongarch_registers loongarch;
@@ -379,6 +408,8 @@ const struct xrt_arch *xrt_arch_resolve_in(struct xrt_abi_id id,
 const struct xrt_arch *xrt_arch_resolve_id(const struct xrt_abi_id *id);
 void xrt_arch_abi_copy(const struct xrt_arch *arch, struct xrt_abi_id *out);
 const struct xrt_arch *xrt_arch_native(void);
+/* Native, or i386 compat traced by an x86-64 host. Not a second native row. */
+int xrt_arch_host_traceable(const struct xrt_arch *arch);
 struct xrt_abi_id xrt_arch_abi(const struct xrt_arch *arch);
 enum xrt_status xrt_arch_validate(const struct xrt_arch *arch);
 const struct xrt_register_desc *xrt_arch_register(uint16_t machine, const char *name,
@@ -438,12 +469,22 @@ enum xrt_status xrt_registers_mutate(const struct xrt_arch *arch, struct xrt_reg
                                      struct xrt_mutation_result *out);
 
 enum xrt_status xrt_registers_read(int32_t tid, struct xrt_registers *out);
+enum xrt_status xrt_registers_read_for(const struct xrt_arch *arch, int32_t tid,
+                                       struct xrt_registers *out);
 enum xrt_status xrt_register_write(int32_t tid, const char *name, size_t length, uint64_t value);
 enum xrt_status xrt_register_write_result(int32_t tid, const char *name, size_t length,
                                           uint64_t value, struct xrt_reg_io *io,
                                           struct xrt_mutation_result *out);
+enum xrt_status xrt_register_write_result_for(const struct xrt_arch *arch, int32_t tid,
+                                              const char *name, size_t length, uint64_t value,
+                                              struct xrt_reg_io *io,
+                                              struct xrt_mutation_result *out);
 enum xrt_status xrt_register_write_pc(int32_t tid, uint64_t pc);
+enum xrt_status xrt_register_write_pc_for(const struct xrt_arch *arch, int32_t tid, uint64_t pc);
 enum xrt_status xrt_control_write(int32_t tid, const struct xrt_control_request *request,
                                   struct xrt_reg_io *io, struct xrt_mutation_result *out);
+enum xrt_status xrt_control_write_for(const struct xrt_arch *arch, int32_t tid,
+                                      const struct xrt_control_request *request,
+                                      struct xrt_reg_io *io, struct xrt_mutation_result *out);
 
 #endif

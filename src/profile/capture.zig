@@ -8,13 +8,18 @@ const Arch = @import("../target/arch.zig").Arch;
 pub fn perfFile(arch: Arch) ?records.PerfFile {
     return records.perfFile(@intFromEnum(arch));
 }
-/// Syscall names and the raw_syscalls layout are the x86-64 ABI. Other
-/// architectures keep CPU sampling and refuse this option by name.
 pub fn requireSyscallTiming(arch: Arch) !void {
-    if (arch != .x86_64) return error.SyscallTimingUnsupportedArchitecture;
+    switch (arch) {
+        .x86_64, .aarch64, .loongarch64, .riscv64 => {},
+        else => return error.SyscallTimingUnsupportedArchitecture,
+    }
 }
 const x86_syscall_number_abi = "x86-64 syscall ABI; raw tracepoints do not distinguish int 0x80 compatibility calls; such names require separate ABI confirmation";
 const x86_syscall_scope = "fixed explicitly selected x86-64 threads; no inherited children; syscall arguments are discarded";
+const aarch64_syscall_number_abi = "native AArch64 syscall ABI; raw tracepoints have no AArch32 compatibility tag; target validation requires a 64-bit executable";
+const loongarch64_syscall_number_abi = "native LoongArch64 asm-generic syscall ABI; target validation requires a 64-bit executable";
+const riscv64_syscall_number_abi = "native RISC-V 64 asm-generic syscall ABI; target validation requires a 64-bit executable";
+const generic_syscall_scope = "fixed explicitly selected native 64-bit threads; no inherited children; syscall arguments are discarded";
 const other_syscall_number_abi = "syscall names are not recorded on this architecture";
 const other_syscall_scope = "syscall timing is not recorded on this architecture";
 const modules = @import("../model/modules.zig");
@@ -454,8 +459,14 @@ pub const Capture = struct {
     };
     pub fn syscallSummary(self: *const Capture) SyscallSummary {
         const calls = &self.syscalls;
-        const x86 = self.architecture == .x86_64;
-        return .{ .enabled = calls.enabled, .retained = calls.items.items.len, .limit = calls.limit, .lost = calls.lost, .throttles = calls.throttles, .discarded = calls.discarded, .invalid = calls.invalid, .finished = calls.finished, .unread_possible = calls.unread_possible, .number_abi = if (x86) x86_syscall_number_abi else other_syscall_number_abi, .scope = if (x86) x86_syscall_scope else other_syscall_scope };
+        const abi, const scope = switch (self.architecture) {
+            .x86_64 => .{ x86_syscall_number_abi, x86_syscall_scope },
+            .aarch64 => .{ aarch64_syscall_number_abi, generic_syscall_scope },
+            .loongarch64 => .{ loongarch64_syscall_number_abi, generic_syscall_scope },
+            .riscv64 => .{ riscv64_syscall_number_abi, generic_syscall_scope },
+            else => .{ other_syscall_number_abi, other_syscall_scope },
+        };
+        return .{ .enabled = calls.enabled, .retained = calls.items.items.len, .limit = calls.limit, .lost = calls.lost, .throttles = calls.throttles, .discarded = calls.discarded, .invalid = calls.invalid, .finished = calls.finished, .unread_possible = calls.unread_possible, .number_abi = abi, .scope = scope };
     }
     fn firstSkippedSample(self: *const Capture) ?usize {
         const entry = self.user_state.first_skipped orelse return null;
@@ -785,7 +796,7 @@ pub const Capture = struct {
                     }
                 }
             }
-            try rows.append(a, .{ .ordinal = ordinal, .thread = thread, .nr = span.nr, .name = syscall_model.name(span.nr), .exit_nr = span.exit_nr, .entry_ns = span.entry_ns, .exit_ns = span.exit_ns, .elapsed_ns = span.elapsed(), .result = span.result, .return_class = if (span.result) |v| syscall_model.returnClass(v) else null, .reason = span.reason, .scheduling_overlap = overlap });
+            try rows.append(a, .{ .ordinal = ordinal, .thread = thread, .nr = span.nr, .name = syscall_model.name(self.architecture, span.nr), .exit_nr = span.exit_nr, .entry_ns = span.entry_ns, .exit_ns = span.exit_ns, .elapsed_ns = span.elapsed(), .result = span.result, .return_class = if (span.result) |v| syscall_model.returnClass(v) else null, .reason = span.reason, .scheduling_overlap = overlap });
         }
         if (start > total) return error.InvalidArguments;
         const end = start + rows.items.len;
@@ -863,7 +874,8 @@ pub const Capture = struct {
         var entry = mappings.Mapping{ .start = region.start, .end = region.end, .offset = region.offset, .device_major = region.device_major, .device_minor = region.device_minor, .inode = region.inode, .path = region.path, .executable = region.permissions[2] == 'x' };
         if (!entry.executable) {
             entry.reason = .non_executable;
-        } else if (region.inode == 0 or region.path.len == 0 or region.path[0] != '/') {
+        } else if (!std.mem.eql(u8, region.path, "[vdso]") and (region.inode == 0 or region.path.len == 0 or region.path[0] != '/')) {
+            // [vdso] is the one pathless ELF; loadObserved reads it from the stopped target.
             entry.reason = .anonymous;
         } else if (images.loaded.items.len + pe_count >= 256) {
             entry.reason = .image_limit;

@@ -1083,7 +1083,7 @@ time.sleep(60)
 
     def test_portable_never_schedules_live_commands(self):
         portable = {s[0] for s in gate.plan('portable')}
-        self.assertTrue({'build-tests', 'release-runner', 'package-source', 'mapping-identity'} <= portable)
+        self.assertTrue({'build-tests', 'release-runner', 'package-source', 'mapping-identity', 'syscall-tables'} <= portable)
         self.assertFalse(portable & {'remote', 'mcp', 'shared-sessions', 'gui-overview', 'vulkan-faults', 'observations-live'})
         names = [s[0] for s in gate.plan('all')]
         for required in ('remote', 'm2-archive', 'hidden-window', 'wayland-read-race', 'vulkan-faults'):

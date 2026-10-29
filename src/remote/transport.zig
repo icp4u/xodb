@@ -23,6 +23,21 @@ extern "c" fn bind(c_int, *const c.sockaddr, c.socklen_t) c_int;
 extern "c" fn accept4(c_int, ?*c.sockaddr, ?*c.socklen_t, c_int) c_int;
 extern "c" fn getsockname(c_int, *c.sockaddr, *c.socklen_t) c_int;
 extern "c" fn xodb_macos_spawn_ssh([*:null]const ?[*:0]const u8, c_int, c_int, *c.pid_t) c_int;
+extern fn xrt_spawn_owned_helper(pid: *i32, create: *const fn (*i32, ?*anyopaque) callconv(.c) c_int, context: ?*anyopaque) c_int;
+extern fn xrt_drop_owned_helper(pid: i32) void;
+const SshSpawn = if (macos) void else struct {
+    actions: *c.posix_spawn_file_actions_t,
+    argv: [*c]?[*:0]const u8,
+};
+fn sshSpawn(pid: *i32, raw: ?*anyopaque) callconv(.c) c_int {
+    if (macos) return 0;
+    const ctx: *SshSpawn = @ptrCast(@alignCast(raw orelse return @intCast(c.EINVAL)));
+    var child: c.pid_t = 0;
+    const rc = c.posix_spawnp(&child, "ssh", ctx.actions, null, @ptrCast(ctx.argv), c.environ);
+    if (rc != 0) return rc;
+    pid.* = @intCast(child);
+    return 0;
+}
 const a = std.heap.page_allocator;
 pub fn now() u64 {
     var ts: c.timespec = undefined;
@@ -92,6 +107,7 @@ pub const Stream = struct {
                     _ = c.waitpid(self.child, &status, 0);
                 }
             }
+            if (self.child > 1) xrt_drop_owned_helper(@intCast(self.child));
             self.child = 0;
         }
     }
@@ -143,7 +159,10 @@ pub const Stream = struct {
         defer _ = c.posix_spawn_file_actions_destroy(&actions);
         if (c.posix_spawn_file_actions_adddup2(&actions, fds[1], 0) != 0 or c.posix_spawn_file_actions_adddup2(&actions, fds[1], 1) != 0 or c.posix_spawn_file_actions_addclose(&actions, fds[0]) != 0 or c.posix_spawn_file_actions_addclose(&actions, fds[1]) != 0) return error.RemoteSpawnFailed;
         var stream = Stream{ .fd = fds[0] };
-        if (c.posix_spawnp(&stream.child, "ssh", &actions, null, @ptrCast(@constCast(&argv)), c.environ) != 0) return error.RemoteSpawnFailed;
+        var spawned: i32 = 0;
+        var spawn_ctx = SshSpawn{ .actions = &actions, .argv = @ptrCast(@constCast(&argv)) };
+        if (xrt_spawn_owned_helper(&spawned, sshSpawn, &spawn_ctx) != 0) return error.RemoteSpawnFailed;
+        stream.child = @intCast(spawned);
         return stream;
     }
 };

@@ -221,7 +221,7 @@ enum xrt_status xrt_target_write(struct xrt_target *t, uint64_t address, const v
 }
 static enum xrt_status admitted_native(const struct xrt_target *t)
 {
-    if (!t || !t->identity_admitted || !t->arch || t->arch != xrt_arch_native())
+    if (!t || !t->identity_admitted || !xrt_arch_host_traceable(t->arch))
         return XRT_UNSUPPORTED_ARCHITECTURE;
     return XRT_OK;
 }

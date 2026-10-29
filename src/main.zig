@@ -509,6 +509,7 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
         if (swept > 0) log.info(.session, "xodb: removed {d} static analysis scratch director{s} of exited xodb processes\n", .{ swept, if (swept == 1) "y" else "ies" });
     }
     var remote_destroyed = false; // Read only after the remote owner finishes.
+    defer reapOwnedOrphans();
     defer if (!remote_destroyed) session.deinit();
     if (live_capture) |interface| {
         const tool = capture_tool orelse @import("capture/live.zig").defaultTool();
@@ -1183,6 +1184,18 @@ const RemoteShutdown = struct {
         try finishRequestedArchive(self.session, if (started) self.capture_out else null);
     }
 };
+/// Backstop after the session drops a followed family. The subreaper is armed
+/// only while following is on, and the poll loop reaps during the session.
+/// WNOHANG leaves a live helper for the waiter that already owns it.
+fn reapOwnedOrphans() void {
+    var status: c_int = 0;
+    while (true) {
+        const got = c.waitpid(-1, &status, c.WNOHANG);
+        if (got > 0) continue;
+        if (got < 0 and std.c._errno().* == c.EINTR) continue;
+        break;
+    }
+}
 fn exportProfileOnExit(session: *Session, profile_out: ?[:0]const u8) void {
     if (profile_out) |path| {
         if (session.profile) |capture| {

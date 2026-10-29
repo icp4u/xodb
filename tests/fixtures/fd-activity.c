@@ -2,6 +2,8 @@
  * Each mode prints "ready PID [PID...]" once set up, then runs until killed.
  *   churn DIR RATE        open/close RATE files per second, eight held at a time
  *   leak RATE MAX         open RATE fds per second (pipes, /dev/null, eventfd) up to MAX
+ *   leak-step             read 'g' on stdin to add eight fds, then print "grown N";
+ *                         at most sixteen batches, independent of elapsed time
  *   deleted DIR BYTES     hold an unlinked file of BYTES written bytes
  *   write DIR RATE        append RATE bytes per second to a file
  *   read DIR RATE BYTES   read a BYTES sparse file at RATE bytes per second
@@ -160,6 +162,18 @@ int main(int argc, char **argv)
         leak_max = atoi(argv[3]);
         ready(NULL, 0);
         paced(atof(argv[2]), leak, 1);
+    } else if (!strcmp(mode, "leak-step") && argc == 2) {
+        uint64_t step = 0;
+        ready(NULL, 0);
+        for (int command; (command = getchar()) != EOF;) {
+            if (command != 'g' || leak_max >= 128)
+                return 2;
+            leak_max += 8;
+            while (leaked < leak_max)
+                leak(step++);
+            printf("grown %d\n", leaked);
+        }
+        return 0;
     } else if (!strcmp(mode, "deleted") && argc == 4) {
         char path[4096];
         snprintf(path, sizeof(path), "%s/held", argv[2]);

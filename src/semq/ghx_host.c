@@ -9,6 +9,8 @@
 #include <ftw.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <sys/prctl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +18,22 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+/* The runtime's in-session orphan reap skips a noted pid, so the waits
+ * below still read the supervisor's own exit status (src/runtime/family.c). */
+int xrt_spawn_owned_helper(int32_t *pid, int (*create)(int32_t *pid, void *context), void *context);
+void xrt_drop_owned_helper(int32_t pid);
+
+static int fork_owned(int32_t *pid, void *context)
+{
+    pid_t child;
+    (void)context;
+    child = fork();
+    if (child < 0)
+        return errno ? errno : EAGAIN;
+    *pid = (int32_t)child;
+    return 0;
+}
 
 extern char **environ;
 
@@ -146,7 +164,18 @@ static int supervisor_hello(int fd, const struct xsq_cancel *cancel, double dead
     }
 }
 
+static enum xghx_status run(const struct xghx_request *r, const struct xsq_cancel *cancel, struct xghx_outcome *o, pid_t *noted);
+
 enum xghx_status xghx_run(const struct xghx_request *r, const struct xsq_cancel *cancel, struct xghx_outcome *o)
+{
+    pid_t noted = -1;
+    const enum xghx_status status = run(r, cancel, o, &noted);
+    if (noted > 1)
+        xrt_drop_owned_helper(noted);
+    return status;
+}
+
+static enum xghx_status run(const struct xghx_request *r, const struct xsq_cancel *cancel, struct xghx_outcome *o, pid_t *noted)
 {
     memset(o, 0, sizeof *o);
     o->supervisor_status = -1;
@@ -173,8 +202,12 @@ enum xghx_status xghx_run(const struct xghx_request *r, const struct xsq_cancel 
     pid_t parent = getpid();
     sigset_t none;
     sigemptyset(&none);
-    pid = fork();
-    if (pid < 0) goto failed;
+    {
+        int32_t spawned = 0;
+        if (xrt_spawn_owned_helper(&spawned, fork_owned, NULL) != 0)
+            goto failed;
+        pid = (pid_t)spawned;
+    }
     if (pid == 0) {
         struct sigaction dfl;
         memset(&dfl, 0, sizeof dfl);
@@ -194,6 +227,8 @@ enum xghx_status xghx_run(const struct xghx_request *r, const struct xsq_cancel 
         _exit(127);
     }
     setpgid(pid, pid);
+    if (pid > 1)
+        *noted = pid;
     close(status_pipe[1]);
     status_pipe[1] = -1;
     {

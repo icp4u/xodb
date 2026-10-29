@@ -3,6 +3,7 @@
 const std = @import("std");
 const c = @import("runtime.zig").c;
 pub const Arch = enum(u16) {
+    i386 = c.XRT_I386,
     m68k = c.XRT_M68K,
     x86_64 = c.XRT_X86_64,
     aarch64 = c.XRT_AARCH64,
@@ -35,6 +36,7 @@ pub const Arch = enum(u16) {
     /// numbers; m68k 24 is the PC, not a link-register role.
     pub fn ra(self: Arch) usize {
         return switch (self) {
+            .i386 => 8,
             .x86_64 => 16,
             .m68k => 24,
             .aarch64 => 30,
@@ -73,6 +75,10 @@ test "breakpoint PC and caller lookup have separate ISA rules" {
     try std.testing.expectEqual(@as(?u64, 0xffc), Arch.aarch64.callerLookup(0x1000));
     try std.testing.expectEqual(@as(?u64, 0xfff), Arch.x86_64.breakpointPc(0x1000));
     try std.testing.expectEqual(@as(?u64, null), Arch.x86_64.breakpointPc(0));
+    try std.testing.expectEqual(@as(?u64, 0xfff), Arch.i386.breakpointPc(0x1000));
+    try std.testing.expectEqual(@as(?u64, null), Arch.i386.breakpointPc(0));
+    try std.testing.expectEqual(@as(?u64, null), Arch.i386.breakpointPc(0x1_0000_0000));
+    try std.testing.expectEqual(@as(usize, 8), Arch.i386.ra());
     try std.testing.expectEqual(@as(?u64, null), Arch.aarch64.callerLookup(3));
     try std.testing.expectEqual(@as(?u64, 0x1000), Arch.loongarch64.breakpointPc(0x1000));
     try std.testing.expectEqual(@as(?u64, 0xffc), Arch.loongarch64.callerLookup(0x1000));

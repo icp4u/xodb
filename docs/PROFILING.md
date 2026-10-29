@@ -235,7 +235,7 @@ partial: the callers above that leaf were not recovered. An archive stores
 the kernel symbols the graph used and keeps the raw kernel addresses. A
 redacted archive still keeps those addresses. Kernel symbol text is cached
 for the boot id of the machine whose kallsyms was read.
-Syscall timings are a separate x86-64 capture, not part of this kernel-stack view.
+Native syscall timings on x86-64, AArch64, LoongArch64 and RISC-V 64 are a separate capture, not part of this kernel-stack view. See [SYSCALL_TIMING.md](SYSCALL_TIMING.md).
 
 Off-CPU attribution is a separate capture (`off_cpu` on `start_profile`, or the
 Off-CPU chip). It samples `sched:sched_switch` once per switch on each selected

@@ -1,8 +1,14 @@
 #define _GNU_SOURCE 1
 #include "target_internal.h"
-#include <sys/ptrace.h>
+#include "xrt_process.h"
+#include <dirent.h>
+#include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <sys/prctl.h>
+#include <sys/ptrace.h>
 #include <sys/syscall.h>
+#include <time.h>
 
 bool xrt_target_address_space_unstable(const struct xrt_target *t)
 {
@@ -63,7 +69,7 @@ enum xrt_status xrt_execution_allowed(const struct xrt_target *t)
         return XRT_DETACH_INCOMPLETE;
     if (t->birth_count)
         return XRT_PROCESS_BIRTH_PENDING;
-    if (!t->identity_admitted || !t->arch || t->arch != xrt_arch_native())
+    if (!t->identity_admitted || !xrt_arch_host_traceable(t->arch))
         return XRT_UNSUPPORTED_ARCHITECTURE;
     if (t->plant_cleanup.active)
         return XRT_INVALID_STATE;
@@ -79,11 +85,12 @@ enum xrt_status xrt_execution_allowed(const struct xrt_target *t)
     }
     return XRT_OK;
 }
+static void xrt_follow_subreaper_acquire(struct xrt_target *t);
 enum xrt_status xrt_target_set_following(struct xrt_target *t, bool enabled)
 {
     if (t && t->connection)
         return xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_FOLLOW, .args = {enabled}});
-    if (!t->arch || t->arch->machine != XRT_X86_64)
+    if (!t->arch || (t->arch->machine != XRT_X86_64 && t->arch->machine != XRT_I386))
         return XRT_UNSUPPORTED_PROCESS_FOLLOWING;
     if (t->core)
         return XRT_READ_ONLY_CORE;
@@ -103,9 +110,179 @@ enum xrt_status xrt_target_set_following(struct xrt_target *t, bool enabled)
                 return status;
             }
         }
+    const bool previous = t->follow_processes;
     t->follow_processes = enabled;
     ++t->generation;
+    if (previous != enabled) {
+        if (enabled)
+            xrt_follow_subreaper_acquire(t);
+        else
+            xrt_follow_subreaper_release(t);
+    }
     return XRT_OK;
+}
+/* One process-wide subreaper, referenced by each target that enabled following.
+ * Orphans of a debuggee are reparented here only while that count is positive. */
+static int follow_subreaper_users;
+
+/* Every child this process will wait for is noted here. The orphan reap
+ * must not take the status that wait is about to read. 256 slots cover the
+ * overview launcher, the remote agents, and the short helpers together. */
+enum { XRT_OWNED_HELPERS = 256 };
+static int32_t owned_helpers[XRT_OWNED_HELPERS];
+
+bool xrt_note_owned_helper(int32_t pid)
+{
+    int i;
+    if (pid <= 1)
+        return false;
+    for (i = 0; i < XRT_OWNED_HELPERS; ++i) {
+        int32_t slot = 0;
+        if (__atomic_compare_exchange_n(&owned_helpers[i], &slot, pid, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            return true;
+        if (slot == pid)
+            return true;
+    }
+    return false;
+}
+
+void xrt_drop_owned_helper(int32_t pid)
+{
+    int i;
+    if (pid <= 1)
+        return;
+    for (i = 0; i < XRT_OWNED_HELPERS; ++i) {
+        int32_t slot = __atomic_load_n(&owned_helpers[i], __ATOMIC_RELAXED);
+        if (slot == pid)
+            __atomic_compare_exchange_n(&owned_helpers[i], &slot, 0, false,
+                                        __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    }
+}
+
+static int helper_owned(int32_t pid)
+{
+    int i;
+    for (i = 0; i < XRT_OWNED_HELPERS; ++i)
+        if (__atomic_load_n(&owned_helpers[i], __ATOMIC_ACQUIRE) == pid)
+            return 1;
+    return 0;
+}
+
+static void reap_one_zombie(int32_t pid)
+{
+    struct xrt_task_info info;
+    if (pid <= 1 || xrt_task_inspect(pid, &info) != XRT_OK)
+        return;
+    /* A traced stop or an unreaped ptrace death still names our tracer.
+     * waitpid of that pid would consume a status the event loop owns.
+     * A helper this process noted keeps its status for the waiter that
+     * spawned it. */
+    if (info.state != 'Z' || info.tracer != 0 || helper_owned(pid))
+        return;
+    int status = 0;
+    while (waitpid((pid_t)pid, &status, WNOHANG) < 0 && errno == EINTR) {
+    }
+}
+
+static void reap_children_list(const char *path)
+{
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return;
+    char buf[8192];
+    size_t used = 0;
+    for (;;) {
+        ssize_t count;
+        do {
+            count = read(fd, buf + used, sizeof(buf) - used);
+        } while (count < 0 && errno == EINTR);
+        if (count <= 0)
+            break;
+        used += (size_t)count;
+        if (used == sizeof(buf))
+            break;
+    }
+    close(fd);
+    size_t i = 0;
+    while (i < used) {
+        while (i < used && (buf[i] == ' ' || buf[i] == '\n' || buf[i] == '\t'))
+            ++i;
+        if (i >= used || buf[i] < '0' || buf[i] > '9')
+            break;
+        long value = 0;
+        int overflow = 0;
+        while (i < used && buf[i] >= '0' && buf[i] <= '9') {
+            const int digit = buf[i] - '0';
+            if (value > (INT32_MAX - digit) / 10)
+                overflow = 1;
+            else
+                value = value * 10 + digit;
+            ++i;
+        }
+        /* The fixed buffer can end in the middle of a pid. That token is incomplete. */
+        if (i == used && used == sizeof(buf))
+            break;
+        if (!overflow && value > 1)
+            reap_one_zombie((int32_t)value);
+    }
+}
+
+void xrt_reap_orphan_zombies(void)
+{
+    DIR *tasks = opendir("/proc/self/task");
+    if (!tasks)
+        return;
+    struct dirent *entry;
+    while ((entry = readdir(tasks)) != NULL) {
+        if (entry->d_name[0] == '.')
+            continue;
+        char path[80];
+        const int wrote = snprintf(path, sizeof(path), "/proc/self/task/%s/children", entry->d_name);
+        if (wrote > 0 && (size_t)wrote < sizeof(path))
+            reap_children_list(path);
+    }
+    closedir(tasks);
+}
+
+void xrt_reap_orphans_if_due(void)
+{
+    if (follow_subreaper_users <= 0)
+        return;
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return;
+    static struct timespec last;
+    const int64_t elapsed_ms = (int64_t)(now.tv_sec - last.tv_sec) * 1000 +
+                               ((int64_t)now.tv_nsec - (int64_t)last.tv_nsec) / 1000000;
+    if (last.tv_sec != 0 && elapsed_ms >= 0 && elapsed_ms < 50)
+        return;
+    last = now;
+    xrt_reap_orphan_zombies();
+}
+
+static void xrt_follow_subreaper_acquire(struct xrt_target *t)
+{
+    if (!t || t->follow_subreaper_held)
+        return;
+    if (follow_subreaper_users == 0 && prctl(PR_SET_CHILD_SUBREAPER, 1L, 0L, 0L, 0L) != 0)
+        return;
+    t->follow_subreaper_held = 1;
+    ++follow_subreaper_users;
+}
+
+void xrt_follow_subreaper_release(struct xrt_target *t)
+{
+    if (!t || !t->follow_subreaper_held)
+        return;
+    xrt_reap_orphan_zombies();
+    t->follow_subreaper_held = 0;
+    if (follow_subreaper_users > 0)
+        --follow_subreaper_users;
+    if (follow_subreaper_users == 0) {
+        prctl(PR_SET_CHILD_SUBREAPER, 0L, 0L, 0L, 0L);
+        xrt_reap_orphan_zombies();
+    }
 }
 enum xrt_status xrt_poll_births(struct xrt_target *t)
 {
@@ -138,11 +315,13 @@ static void admit_adopted(const struct xrt_target *parent, struct xrt_target *ou
 {
     out->arch = parent->arch;
     out->identity_admitted = 0;
-    if (exited || !out->arch || xrt_process_validate_native(pid) != XRT_OK)
+    if (exited)
         return;
-    const struct xrt_arch *native = xrt_arch_native();
-    if (out->arch == native && native && xrt_arch_validate(native) == XRT_OK)
-        out->identity_admitted = 1;
+    const struct xrt_arch *identified = NULL;
+    if (xrt_process_identify(pid, &identified) != XRT_OK || !xrt_arch_host_traceable(identified))
+        return;
+    out->arch = identified;
+    out->identity_admitted = 1;
 }
 enum xrt_status xrt_target_adopt(struct xrt_target *t, int32_t pid, struct xrt_target *out,
                                  struct xrt_birth *result)

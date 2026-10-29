@@ -435,7 +435,7 @@ fn applyPerfRegs(arch: Arch, state: records.UserState) ?struct { registers: loc.
                 registers[index] = state.regs[index];
             }
         },
-        .loongarch64 => {
+        .loongarch64, .riscv64 => {
             var index: usize = 1;
             while (index < file.limit) : (index += 1) {
                 if (state.regs_mask & (@as(u64, 1) << @as(u6, @intCast(index))) == 0) continue;
@@ -464,12 +464,14 @@ test "perf register machine numbers match the target arch enum" {
     try std.testing.expectEqual(records.machine_riscv64, @intFromEnum(Arch.riscv64));
     try std.testing.expect(records.perfFile(@intFromEnum(Arch.ppc64le)) == null);
     try std.testing.expect(records.perfFile(@intFromEnum(Arch.m68k)) == null);
+    try std.testing.expect(records.perfFile(@intFromEnum(Arch.i386)) == null);
 }
 
 test "perf registers map onto the dwarf file and the next frame uses that isa" {
     try std.testing.expectEqualStrings(algorithm, algorithmFor(.x86_64));
     try std.testing.expectEqualStrings("xodb-sampled-cfi-v1", algorithmFor(.aarch64));
     try std.testing.expectEqualStrings("xodb-sampled-cfi-v1", algorithmFor(.loongarch64));
+    try std.testing.expectEqualStrings("xodb-sampled-cfi-v1", algorithmFor(.riscv64));
 
     var x86 = records.UserState{ .regs_mask = records.user_regs_gpr_mask };
     x86.regs[8] = 0x1000;
@@ -509,6 +511,19 @@ test "perf registers map onto the dwarf file and the next frame uses that isa" {
     try std.testing.expectEqual(@as(u64, 0x9300), applied_arm.registers[29].?);
     try std.testing.expectEqual(@as(u64, 0x9000), applied_arm.pc);
     try std.testing.expectEqual(@as(u64, 0x9100), applied_arm.sp);
+
+    var riscv = records.UserState{ .regs_mask = records.perfFile(@intFromEnum(Arch.riscv64)).?.mask };
+    riscv.regs[0] = 0xa000;
+    riscv.regs[1] = 0xa004;
+    riscv.regs[2] = 0xb000;
+    riscv.regs[31] = 0xc000;
+    const applied_riscv = applyPerfRegs(.riscv64, riscv).?;
+    try std.testing.expectEqual(@as(?u64, null), applied_riscv.registers[0]);
+    try std.testing.expectEqual(@as(u64, 0xa004), applied_riscv.registers[1].?);
+    try std.testing.expectEqual(@as(u64, 0xb000), applied_riscv.registers[2].?);
+    try std.testing.expectEqual(@as(u64, 0xc000), applied_riscv.registers[31].?);
+    try std.testing.expectEqual(@as(u64, 0xa000), applied_riscv.pc);
+    try std.testing.expectEqual(@as(u64, 0xb000), applied_riscv.sp);
 
     var caller: loc.RegisterSet = @splat(null);
     caller[16] = 0x111;

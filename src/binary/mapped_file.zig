@@ -10,6 +10,8 @@ pub const Source = enum {
     host_path,
     remote_snapshot,
     core_path,
+    /// Bytes read from the target address space. No file was opened.
+    target_memory,
     pub fn fromRuntime(selected: rt.enum_xrt_file_source) Source {
         return switch (selected) {
             rt.XRT_FILE_SOURCE_MAP_FILES => .map_files,

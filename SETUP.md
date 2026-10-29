@@ -71,10 +71,11 @@ environment; no tracefs output means no tracefs mount was found.
 | --- | --- |
 | Debug launch / attach | Ptrace access to the target; independent of perf settings |
 | Current user-CPU sampling and scheduling | Works with `perf_event_paranoid=2`; no tracefs mount needed |
-| Experimental T17 syscall timing | Readable tracefs event IDs/formats, plus `perf_event_paranoid=1` (or CAP_PERFMON for the collector) |
+| Syscall timing | Readable tracefs event IDs/formats, plus `perf_event_paranoid=1` (or CAP_PERFMON for the collector) |
 
-T17 is still a prototype. Configuring the host does not add a syscall capture
-button to xodb. [Configured evaluation and measurements](docs/T17_CONFIGURED_RERUN.md).
+Syscall timing is opt-in and task-scoped. Configuring the host only prepares
+the kernel interfaces; xodb does not install a privileged helper or change
+system policy. [Configured evaluation and measurements](docs/T17_CONFIGURED_RERUN.md).
 
 ## Enable task-scoped syscall tracing
 

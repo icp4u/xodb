@@ -91,12 +91,17 @@ pub const Tag = enum(u32) {
     evidence_context = 0x58544345, // "ECTX", optional collector context for external evidence (2.9)
     usb_evidence_context = 0x42535545, // "EUSB", optional USB fd rows (2.10)
     kernel_stacks = 0x4b54534b, // "KSTK", optional kernel symbols the graph used (2.11)
+    memory_image = 0x494d454d, // "MEMI", optional in-memory ELF bytes such as [vdso] (2.12)
 };
 /// Lowest minor that writes ECTX; captures without it keep their previous minor.
 const evidence_context_minor: u16 = 9;
 const usb_evidence_context_minor: u16 = 10;
 /// Written only when a capture asked for kernel stacks or has kernel frames.
 const kernel_stacks_minor: u16 = 11;
+/// Written only when a loaded image has no host file, such as [vdso].
+const memory_image_minor: u16 = 12;
+/// Header minor field, two bytes after the major.
+const minor_field: usize = 8 + 2;
 const kernel_symbol_cap = 8192;
 /// Required sections, in this order. A future minor version may append
 /// sections whose table flag marks them ignorable (bit 0).
@@ -209,7 +214,7 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
     if (capture.config.sample_limit == 0 or capture.config.sample_limit > capture_model.max_sample_limit) return error.ArchiveLimit;
     try validateUserState(capture);
     try validateThreadScope(capture);
-    var selected_storage: [section_order.len + 8]Tag = undefined;
+    var selected_storage: [section_order.len + 9]Tag = undefined;
     @memcpy(selected_storage[0..section_order.len], &section_order);
     var selected_count: usize = section_order.len;
     if (sampled) {
@@ -248,11 +253,16 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
         selected_storage[selected_count] = .kernel_stacks;
         selected_count += 1;
     }
+    const write_memory = hasMemoryImage(capture);
+    if (write_memory) {
+        selected_storage[selected_count] = .memory_image;
+        selected_count += 1;
+    }
     const selected = selected_storage[0..selected_count];
     if (capture.thread_count > perf.max_threads or capture.samples.len() > capture.config.sample_limit or capture.images.loaded.items.len + capture.pe_assets.entries.items.len > max_images) return error.ArchiveLimit;
     // Lanes beyond the recorded threads are never written by the collector.
     for (capture.switches.lanes[capture.thread_count..]) |lane| if (lane.events.items.len != 0 or lane.cutoff_ns != null or lane.contradictory) return error.ArchiveInconsistent;
-    var bodies: [section_order.len + 8]std.ArrayList(u8) = @splat(.empty);
+    var bodies: [section_order.len + 9]std.ArrayList(u8) = @splat(.empty);
     defer for (&bodies) |*body| body.deinit(a);
     for (selected, bodies[0..selected.len], 0..) |tag, *body, section_index| {
         try progress.step(env.progress, .encoding, section_index);
@@ -283,6 +293,7 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
                 try w.out.appendSlice(a, payload);
             },
             .kernel_stacks => try encodeKernel(w, capture, &kernel_plan),
+            .memory_image => try encodeMemoryImages(w, capture),
         }
     }
     var total: usize = header_bytes + entry_bytes * selected.len;
@@ -304,12 +315,13 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
     std.mem.writeInt(u32, out[36..40], clock_monotonic, .little);
     std.mem.writeInt(u64, out[40..48], (@as(u64, if (capture.config.duration_ms == 0 or capture.config.duration_ms > 60000) 3 else 1) | @as(u64, if (sampled) 4 else 0) | 8 | @as(u64, if (custom_limit) 16 else 0) | @as(u64, if (capture.syscalls.enabled) 32 else 0) | @as(u64, if (typed_images) 64 else 0)), .little); // bit 6: typed ELF/PE assets
     std.mem.writeInt(u64, out[48..56], if (policy != null) optional_redacted else 0, .little);
+    if (write_memory) std.mem.writeInt(u16, out[minor_field..][0..2], @max(minor, memory_image_minor), .little);
     std.mem.writeInt(u32, out[56..60], std.hash.Crc32.hash(out[0..56]), .little);
     var offset: usize = header_bytes + entry_bytes * selected.len;
     for (selected, bodies[0..selected.len], 0..) |tag, body, i| {
         const entry = out[header_bytes + i * entry_bytes ..][0..entry_bytes];
         std.mem.writeInt(u32, entry[0..4], @intFromEnum(tag), .little);
-        std.mem.writeInt(u32, entry[4..8], if (tag == .producer or tag == .evidence_context or tag == .usb_evidence_context or tag == .kernel_stacks) flag_ignorable else 0, .little);
+        std.mem.writeInt(u32, entry[4..8], if (tag == .producer or tag == .evidence_context or tag == .usb_evidence_context or tag == .kernel_stacks or tag == .memory_image) flag_ignorable else 0, .little);
         std.mem.writeInt(u64, entry[8..16], offset, .little);
         std.mem.writeInt(u32, entry[16..20], @intCast(body.items.len), .little);
         std.mem.writeInt(u32, entry[20..24], std.hash.Crc32.hash(body.items), .little);
@@ -585,6 +597,28 @@ const KernelPlan = struct {
         try self.slots.append(self.a, .{ .address = symbol.address, .limit = symbol.limit, .name = symbol.name[0..@min(symbol.name.len, max_text)], .module = symbol.module[0..@min(symbol.module.len, max_text)] });
     }
 };
+fn isMemoryImage(image: *const modules.Module) bool {
+    return image.file_source == .target_memory or std.mem.eql(u8, image.path, "[vdso]");
+}
+fn hasMemoryImage(capture: *const Capture) bool {
+    for (capture.images.loaded.items) |image| if (isMemoryImage(image)) return true;
+    return false;
+}
+/// Id, length, then the raw mapping bytes. Only images with no host file.
+fn encodeMemoryImages(w: Writer, capture: *const Capture) !void {
+    var n: usize = 0;
+    for (capture.images.loaded.items) |image| {
+        if (isMemoryImage(image)) n += 1;
+    }
+    try w.count(n);
+    for (capture.images.loaded.items) |image| {
+        if (!isMemoryImage(image)) continue;
+        if (image.mapping.len == 0 or image.mapping.len > snapshot.per_image_limit or image.mapping.len > std.math.maxInt(u32)) return error.ArchiveLimit;
+        try w.int(u64, image.id);
+        try w.int(u32, @intCast(image.mapping.len));
+        try w.out.appendSlice(w.a, image.mapping);
+    }
+}
 fn encodeKernel(w: Writer, capture: *const Capture, plan: *const KernelPlan) !void {
     try w.code(1);
     const flags: u8 = @as(u8, @intFromBool(capture.kernel_stacks_requested)) | @as(u8, @intFromBool(capture.kernel_stacks_granted)) << 1 | @as(u8, @intFromBool(capture.kernel_symbolizable)) << 2 | @as(u8, @intFromBool(capture.kallsyms.addresses_hidden)) << 3;
@@ -803,7 +837,7 @@ pub const Opened = struct {
     }
 };
 
-const Header = struct { evidence_context: ?[]const u8 = null, usb_evidence_context: ?[]const u8 = null, kernel_stacks: ?[]const u8 = null, frames: ?[]const u8 = null, producer: ?[]const u8 = null, syscalls: ?[]const u8 = null, limits: ?[]const u8 = null, thread_scope: ?[]const u8 = null, user_state: ?[]const u8 = null, minor: u16, sections: [section_order.len][]const u8, ignored: usize, required_features: u64, optional_features: u64 };
+const Header = struct { evidence_context: ?[]const u8 = null, usb_evidence_context: ?[]const u8 = null, kernel_stacks: ?[]const u8 = null, memory_image: ?[]const u8 = null, frames: ?[]const u8 = null, producer: ?[]const u8 = null, syscalls: ?[]const u8 = null, limits: ?[]const u8 = null, thread_scope: ?[]const u8 = null, user_state: ?[]const u8 = null, minor: u16, sections: [section_order.len][]const u8, ignored: usize, required_features: u64, optional_features: u64 };
 fn readHeader(bytes: []const u8, limit: usize) Error!Header {
     if (bytes.len > limit) return error.ArchiveTooLarge;
     if (bytes.len < header_bytes) return error.ArchiveTruncated;
@@ -866,6 +900,11 @@ fn readHeader(bytes: []const u8, limit: usize) Error!Header {
         } else if (tag == @intFromEnum(Tag.kernel_stacks)) {
             if (flags != flag_ignorable or required != section_order.len or result.kernel_stacks != null or minor < kernel_stacks_minor) return error.ArchiveSectionLayout;
             result.kernel_stacks = body;
+        } else if (tag == @intFromEnum(Tag.memory_image)) {
+            // No minor floor: frame attachment may stamp an older minor and
+            // leave this ignorable section in place. Writers still record 12.
+            if (flags != flag_ignorable or required != section_order.len or result.memory_image != null) return error.ArchiveSectionLayout;
+            result.memory_image = body;
         } else if (tag == frames_tag) {
             if (flags != flag_ignorable or required != section_order.len or result.frames != null) return error.ArchiveSectionLayout;
             result.frames = body;
@@ -962,9 +1001,13 @@ fn decodeInner(budget: *Budget, bytes: []const u8, options: Options) !Opened {
     source.annotation_count = self.recorded.count();
     self.boot_id = source.boot_id;
     // Optional assets enrich assembly only. They never replace recorded labels.
+    const embeds = if (header.memory_image) |body| blk: {
+        var memory_reader = Reader{ .bytes = body, .cancel = if (options.progress) |p| &p.cancel else null };
+        break :blk try decodeMemoryImages(&memory_reader, reports, arena.allocator());
+    } else &.{};
     for (reports, 0..) |*report, i| {
         try progress.step(options.progress, .assets, i);
-        try loadImage(self, report, options.resolver, arena.allocator(), options.progress);
+        try loadImage(self, report, options.resolver, embeds, arena.allocator(), options.progress);
     }
     source.images = reports;
     var reanalysis_digest: ?[32]u8 = null;
@@ -1299,7 +1342,67 @@ fn decodeIntervals(r: *Reader, self: *Capture) !void {
     }
     try r.end();
 }
-fn loadImage(self: *Capture, report: *ImageReport, resolver: Resolver, a: Allocator, state: ?*progress.Progress) !void {
+const EmbeddedImage = struct { id: u64, bytes: []const u8 };
+fn decodeMemoryImages(r: *Reader, reports: []const ImageReport, a: Allocator) ![]EmbeddedImage {
+    const n = try r.count(max_images, 12);
+    const embeds = try a.alloc(EmbeddedImage, n);
+    for (embeds, 0..) |*embed, i| {
+        const id = try r.int(u64);
+        const length = try r.int(u32);
+        if (length == 0) return error.ArchiveInvalidValue;
+        if (length > snapshot.per_image_limit) return error.ArchiveLimit;
+        if (length > r.bytes.len - r.pos) return error.ArchiveTruncated;
+        for (embeds[0..i]) |prior| if (prior.id == id) return error.ArchiveInconsistent;
+        const report = for (reports) |item| {
+            if (item.id == id) break item;
+        } else return error.ArchiveInconsistent;
+        if (report.kind != .elf or length != report.identity.file_bytes) return error.ArchiveInconsistent;
+        embed.* = .{ .id = id, .bytes = try r.take(length) };
+    }
+    try r.end();
+    return embeds;
+}
+fn loadEmbedded(self: *Capture, report: *ImageReport, raw: []const u8) !void {
+    if (raw.len != report.identity.file_bytes) {
+        report.status = .size_mismatch;
+        return;
+    }
+    const bytes = snapshot.copyAnonymous(raw) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        report.status = if (err == error.BinarySnapshotLimit) .limit else .unreadable;
+        return;
+    };
+    var keep = false;
+    defer if (!keep) snapshot.free(bytes);
+    const identity = identify(bytes);
+    if (!std.mem.eql(u8, &identity.sha256, &report.identity.sha256)) {
+        report.status = .content_mismatch;
+        return;
+    }
+    const image = elf.Image.parse(bytes) catch {
+        report.status = .invalid_elf;
+        return;
+    };
+    if (@intFromEnum(image.header.machine) != machine_x86_64) {
+        report.status = .invalid_elf;
+        return;
+    }
+    const name = try self.images.allocator.dupeZ(u8, report.path);
+    errdefer self.images.allocator.free(name);
+    const module = try self.images.allocator.create(modules.Module);
+    errdefer self.images.allocator.destroy(module);
+    const p = report.placement;
+    module.* = .{ .id = report.id, .device_major = p.device_major, .device_minor = p.device_minor, .inode = p.inode, .bias = p.bias, .start = p.start, .end = p.end, .path = name, .image = image, .mapping = bytes, .immutable = true, .file_source = .target_memory };
+    try self.images.loaded.append(self.images.allocator, module);
+    self.images.snapshot_bytes += bytes.len;
+    keep = true;
+    report.status = .verified;
+}
+fn loadImage(self: *Capture, report: *ImageReport, resolver: Resolver, embeds: []const EmbeddedImage, a: Allocator, state: ?*progress.Progress) !void {
+    if (!resolver.enabled) return;
+    for (embeds) |embed| {
+        if (embed.id == report.id) return loadEmbedded(self, report, embed.bytes);
+    }
     var buffer: [max_path + 256]u8 = undefined;
     const path = resolver.candidate(&buffer, report.*) orelse return;
     report.opened_path = try a.dupe(u8, path);
@@ -1791,7 +1894,7 @@ test "non-x86 captures are not written as x86 archives" {
     try std.testing.expectError(error.ArchiveUnsupportedArchitecture, encode(a, source, .{}));
 }
 
-test "syscall summary names the x86-64 ABI only on x86-64" {
+test "syscall summaries name each supported native ABI" {
     const a = std.testing.allocator;
     const fixture = @import("archive_fixture.zig");
     const source = try fixture.build(a, .empty, null);
@@ -1804,15 +1907,24 @@ test "syscall summary names the x86-64 ABI only on x86-64" {
     const arm = source.syscallSummary();
     try std.testing.expect(std.mem.indexOf(u8, arm.number_abi, "x86-64") == null);
     try std.testing.expect(std.mem.indexOf(u8, arm.scope, "x86-64") == null);
-    try std.testing.expect(std.mem.indexOf(u8, arm.number_abi, "not recorded") != null);
-    try std.testing.expect(std.mem.indexOf(u8, arm.scope, "not recorded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, arm.number_abi, "AArch64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, arm.number_abi, "AArch32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, arm.scope, "native 64-bit threads") != null);
     source.architecture = .loongarch64;
     const loong = source.syscallSummary();
-    try std.testing.expectEqualStrings(arm.number_abi, loong.number_abi);
+    try std.testing.expect(std.mem.indexOf(u8, loong.number_abi, "LoongArch64") != null);
     try std.testing.expectEqualStrings(arm.scope, loong.scope);
-    try std.testing.expectError(error.SyscallTimingUnsupportedArchitecture, capture_model.requireSyscallTiming(.aarch64));
-    try std.testing.expectError(error.SyscallTimingUnsupportedArchitecture, capture_model.requireSyscallTiming(.loongarch64));
-    try std.testing.expectError(error.SyscallTimingUnsupportedArchitecture, capture_model.requireSyscallTiming(.riscv64));
+    source.architecture = .riscv64;
+    const riscv = source.syscallSummary();
+    try std.testing.expect(std.mem.indexOf(u8, riscv.number_abi, "RISC-V 64") != null);
+    try std.testing.expectEqualStrings(arm.scope, riscv.scope);
+    source.architecture = .ppc64le;
+    const unsupported = source.syscallSummary();
+    try std.testing.expect(std.mem.indexOf(u8, unsupported.number_abi, "not recorded") != null);
+    try std.testing.expectError(error.SyscallTimingUnsupportedArchitecture, capture_model.requireSyscallTiming(.ppc64le));
+    try capture_model.requireSyscallTiming(.aarch64);
+    try capture_model.requireSyscallTiming(.loongarch64);
+    try capture_model.requireSyscallTiming(.riscv64);
     try capture_model.requireSyscallTiming(.x86_64);
 }
 
@@ -1827,7 +1939,7 @@ test "x86 archives reject ARM64 images even with a matching asset identity" {
     const destination = try fixture.build(a, .empty, null);
     defer destination.deinit();
     var report = ImageReport{ .id = 1, .path = path, .opened_path = "", .status = .not_requested, .identity = identify(arm.mapping), .placement = .{ .device_major = 0, .device_minor = 0, .inode = 0, .bias = 0, .start = 0, .end = 4096 } };
-    try loadImage(destination, &report, .{ .enabled = true }, destination.arena.allocator(), null);
+    try loadImage(destination, &report, .{ .enabled = true }, &.{}, destination.arena.allocator(), null);
     try std.testing.expectEqual(ImageStatus.invalid_elf, report.status);
     try std.testing.expectEqual(@as(usize, 0), destination.images.loaded.items.len);
 }
@@ -1908,9 +2020,9 @@ test "archive resolver refuses FIFO without an open side effect" {
     const capture = try fixture.build(std.testing.allocator, .empty, null);
     defer capture.deinit();
     var report = ImageReport{ .id = 1, .path = path, .opened_path = "", .status = .not_requested, .identity = identify(""), .placement = .{ .device_major = 0, .device_minor = 0, .inode = 0, .bias = 0, .start = 0, .end = 4096 } };
-    try loadImage(capture, &report, .{}, capture.arena.allocator(), null);
+    try loadImage(capture, &report, .{}, &.{}, capture.arena.allocator(), null);
     try std.testing.expectEqual(ImageStatus.not_requested, report.status);
-    try loadImage(capture, &report, .{ .enabled = true }, capture.arena.allocator(), null);
+    try loadImage(capture, &report, .{ .enabled = true }, &.{}, capture.arena.allocator(), null);
     try std.testing.expectEqual(ImageStatus.unreadable, report.status);
     // An ordinary nonblocking FIFO open emits IN_OPEN, even if closed at once.
     // O_PATH must emit no event; this checks the side effect without races.

@@ -26,7 +26,7 @@ ADDRESS_TYPES = {0, 1, 2, 10}  # NOTYPE, OBJECT, FUNC, GNU_IFUNC
 BIND_RANK = {1: 0, 10: 0, 2: 1, 0: 2}  # GLOBAL, GNU_UNIQUE, WEAK, LOCAL
 SYSTEM = ["/usr/lib/libc.so.6", "/usr/lib/ld-linux-x86-64.so.2", "/usr/lib/libstdc++.so.6", "/usr/bin/ld", os.path.join(ROOT, "zig-out", "bin", "xodb")]
 RUNNABLE = {"gcc-exec": "libfix.so", "gcc-pie": "libfix.so", "clang-pie": "libfix.so", "clang-lld-pie": "libfix-lld.so"}
-REJECTED = {"reject-rel.o", "reject-i386", "reject-ppc64be", "reject-aarch64"}
+REJECTED = {"reject-rel.o", "reject-ppc64be", "reject-aarch64"}
 
 failures = []
 

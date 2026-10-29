@@ -223,9 +223,8 @@ pub fn processOptions(owned: bool, follow: bool) usize {
 }
 
 pub fn validateNativeAbi(tid: i32) !void {
-    const status = c.xrt_process_validate_native(tid);
-    if (status == c.XRT_UNSUPPORTED_ARCHITECTURE) return error.UnsupportedTargetArchitecture;
-    try check(status);
+    // Same name launch, attach, and poll already surface.
+    try check(c.xrt_process_validate_native(tid));
 }
 
 pub fn tracedMember(tid: i32, pid: i32) bool {

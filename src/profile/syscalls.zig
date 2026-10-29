@@ -1,6 +1,8 @@
 //! Bounded syscall evidence. One ordered kernel ring per selected task.
 //! Elapsed time includes descheduling and debugger stops. Arguments are discarded.
 const std = @import("std");
+const Arch = @import("../target/arch.zig").Arch;
+const generic = @import("syscalls_generic.zig");
 pub const max_threads = 32;
 pub const default_limit = 16384;
 pub const max_limit = 65536;
@@ -11,10 +13,16 @@ pub fn returnClass(value: i64) ReturnClass {
     if (value == -512 or value == -513 or value == -514 or value == -516) return .restart_internal;
     return if (value >= -4095 and value <= -1) .errno else .value;
 }
-pub fn name(nr: i64) ?[]const u8 {
+pub fn name(arch: Arch, nr: i64) ?[]const u8 {
     if (nr < 0) return null;
-    const n = std.enums.fromInt(std.os.linux.syscalls.X64, @as(u64, @intCast(nr))) orelse return null;
-    return @tagName(n);
+    const number: u64 = @intCast(nr);
+    return switch (arch) {
+        .x86_64 => if (std.enums.fromInt(std.os.linux.syscalls.X64, number)) |n| @tagName(n) else null,
+        .aarch64 => if (number <= std.math.maxInt(u32)) generic.name(.aarch64, @intCast(number)) else null,
+        .loongarch64 => if (number <= std.math.maxInt(u32)) generic.name(.loongarch64, @intCast(number)) else null,
+        .riscv64 => if (number <= std.math.maxInt(u32)) generic.name(.riscv64, @intCast(number)) else null,
+        else => null,
+    };
 }
 pub const Span = struct {
     thread_index: u16,
@@ -136,7 +144,8 @@ fn checkTask(bytes: []const u8, offset: usize, who: Identity) !void {
         try num(u32, bytes, offset + 4) != @as(u32, @intCast(who.tid))) return error.SyscallTaskIdentity;
 }
 /// PERF_SAMPLE_TID|TIME|ID|RAW; sample_id_all trailers have TID|TIME|ID.
-/// Fields and byte order are accepted only after validateFormat on x86-64.
+/// Fields and byte order are accepted only after validateFormat on a supported
+/// native 64-bit little-endian target.
 pub fn decode(bytes: []const u8, who: Identity) !?Event {
     if (bytes.len != try num(u16, bytes, 6) or bytes.len % 8 != 0) return error.SyscallRecordSize;
     const typ = try num(u32, bytes, 0);
@@ -213,8 +222,20 @@ test "syscall missing boundaries, loss, reuse protection and storage limits" {
     try std.testing.expect(store.items.items[4].elapsed() == null);
     try std.testing.expectError(error.SyscallLimit, store.feed(a, 1, .{ .call = .{ .enter = false, .nr = 0, .time = 110, .result = 1 } }));
     try std.testing.expectEqual(1, store.discarded);
-    try std.testing.expectEqualStrings("read", name(0).?);
-    try std.testing.expect(name(0x40000000) == null);
+    try std.testing.expectEqualStrings("read", name(.x86_64, 0).?);
+    try std.testing.expect(name(.x86_64, 0x40000000) == null);
+}
+
+test "syscall names use the selected native ABI row" {
+    try std.testing.expectEqualStrings("read", name(.x86_64, 0).?);
+    try std.testing.expectEqualStrings("read", name(.aarch64, 63).?);
+    try std.testing.expectEqualStrings("newfstatat", name(.loongarch64, 79).?);
+    try std.testing.expectEqualStrings("riscv_hwprobe", name(.riscv64, 258).?);
+    try std.testing.expectEqualStrings("riscv_flush_icache", name(.riscv64, 259).?);
+    try std.testing.expect(name(.aarch64, 258) == null);
+    try std.testing.expect(name(.loongarch64, 447) == null);
+    try std.testing.expect(name(.ppc64le, 63) == null);
+    try std.testing.expect(name(.riscv64, -1) == null);
 }
 
 test "syscall decoder rejects foreign identities and malformed records" {

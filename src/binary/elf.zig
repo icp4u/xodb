@@ -1,6 +1,6 @@
 //! ELF image reader: a validated, typed view over a borrowed byte slice.
 //!
-//! Accepts ELF64 little-endian x86-64/AArch64/LoongArch and ELF32 big-endian m68k executables
+//! Accepts ELF64 little-endian x86-64/AArch64/LoongArch, ELF32 little-endian i386, and ELF32 big-endian m68k executables
 //! (ET_EXEC) and shared objects/PIEs (ET_DYN). Anything else is rejected by `Image.parse` with a
 //! specific error. Live targets and archive consumers also check their supported ISA.
 //!
@@ -67,7 +67,7 @@ const shn_xindex = 0xffff;
 const pn_xnum = 0xffff;
 
 pub const Type = enum { executable, shared };
-pub const Machine = enum(u16) { m68k = 4, ppc64 = 21, x86_64 = 62, aarch64 = 183, riscv = 243, loongarch = 258, _ };
+pub const Machine = enum(u16) { i386 = 3, m68k = 4, ppc64 = 21, x86_64 = 62, aarch64 = 183, riscv = 243, loongarch = 258, _ };
 pub const SegmentType = enum(u32) { null = 0, load = 1, dynamic = 2, interp = 3, note = 4, shlib = 5, phdr = 6, tls = 7, gnu_eh_frame = 0x6474e550, gnu_stack = 0x6474e551, gnu_relro = 0x6474e552, gnu_property = 0x6474e553, _ };
 pub const SectionType = enum(u32) { null = 0, progbits = 1, symtab = 2, strtab = 3, rela = 4, hash = 5, dynamic = 6, note = 7, nobits = 8, rel = 9, shlib = 10, dynsym = 11, init_array = 14, fini_array = 15, preinit_array = 16, group = 17, symtab_shndx = 18, gnu_hash = 0x6ffffff6, gnu_verdef = 0x6ffffffd, gnu_verneed = 0x6ffffffe, gnu_versym = 0x6fffffff, _ };
 /// Bits of `Segment.flags`.
@@ -293,12 +293,13 @@ pub const Image = struct {
         const f = Format{ .is64 = bytes[4] == 2, .endian = if (bytes[5] == 1) .little else .big };
         if (bytes.len < (if (f.is64) @as(usize, 64) else 52)) return error.Truncated;
         const machine: Machine = @enumFromInt(f.read(u16, bytes, 18));
-        if (machine != .m68k) {
+        const bits32 = machine == .m68k or machine == .i386;
+        if (!bits32) {
             if (!f.is64) return error.UnsupportedClass;
             if (f.endian != .little) return error.UnsupportedEncoding;
         }
-        if (machine != .x86_64 and machine != .aarch64 and machine != .m68k and machine != .loongarch and machine != .ppc64 and machine != .riscv) return error.UnsupportedMachine;
-        if ((machine == .m68k) == f.is64) return error.UnsupportedClass;
+        if (machine != .x86_64 and machine != .aarch64 and machine != .m68k and machine != .i386 and machine != .loongarch and machine != .ppc64 and machine != .riscv) return error.UnsupportedMachine;
+        if (bits32 == f.is64) return error.UnsupportedClass;
         if (f.endian != (if (machine == .m68k) std.builtin.Endian.big else .little)) return error.UnsupportedEncoding;
         if (bytes[6] != 1 or f.read(u32, bytes, 20) != 1) return error.UnsupportedVersion;
         const file_type: Type = switch (f.read(u16, bytes, 16)) {
@@ -1355,10 +1356,18 @@ test "fixtures: more than 0xff00 sections" {
     try testing.expectEqualStrings("main", image.symbolAt(image.findSymbol("main").?.value).?.symbol.name);
 }
 
+test "fixtures: ELF32 i386 is a supported image" {
+    const bytes = try fixture("reject-i386");
+    defer testing.allocator.free(bytes);
+    const image = try Image.parse(bytes);
+    try testing.expectEqual(Machine.i386, image.header.machine);
+    try testing.expect(!image.format.is64);
+    try testing.expectEqual(std.builtin.Endian.little, image.format.endian);
+}
+
 test "fixtures: other object kinds are rejected by name" {
     inline for (.{
         .{ "reject-rel.o", error.UnsupportedType },
-        .{ "reject-i386", error.UnsupportedClass },
         .{ "reject-ppc64be", error.UnsupportedEncoding },
     }) |case| {
         const bytes = try fixture(case[0]);

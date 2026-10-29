@@ -20,6 +20,9 @@ const c = @cImport({
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 extern "c" fn connect(c_int, *const c.sockaddr, c.socklen_t) c_int;
+extern fn xrt_spawn_owned_helper(pid: *i32, create: *const fn (*i32, ?*anyopaque) callconv(.c) c_int, context: ?*anyopaque) c_int;
+extern fn xrt_drop_owned_helper(pid: i32) void;
+extern fn xrt_reap_orphan_zombies() void;
 const protocol = 1;
 const schema = 1;
 pub const producer = "ghidra-jvm-sidecar-0.1.10";
@@ -312,6 +315,51 @@ fn hello(a: Allocator, path: [:0]const u8, cancel: *const std.atomic.Value(bool)
     return (try call(a, path, .{ .id = "xodb-hello", .verb = "hello", .deadline_ms = 2000 }, cancel, deadline)).value;
 }
 
+const SidecarSpawn = struct {
+    file: [*:0]const u8,
+    actions: *c.posix_spawn_file_actions_t,
+    argv: [*c]?[*:0]const u8,
+};
+
+fn sidecarSpawn(pid: *i32, raw: ?*anyopaque) callconv(.c) c_int {
+    const ctx: *SidecarSpawn = @ptrCast(@alignCast(raw orelse return @intCast(c.EINVAL)));
+    var child: c.pid_t = 0;
+    const rc = c.posix_spawnp(&child, ctx.file, ctx.actions, null, @ptrCast(ctx.argv), c.environ);
+    if (rc != 0) return rc;
+    pid.* = @intCast(child);
+    return 0;
+}
+
+fn dropOwned(pid: c.pid_t) void {
+    if (pid > 1) xrt_drop_owned_helper(@intCast(pid));
+}
+
+fn taskZombie(pid: c.pid_t) bool {
+    var path_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/stat", .{pid}) catch return false;
+    const fd = c.open(path.ptr, c.O_RDONLY | c.O_CLOEXEC);
+    if (fd < 0) return false;
+    defer _ = c.close(fd);
+    var buf: [512]u8 = undefined;
+    const n = c.read(fd, &buf, buf.len);
+    if (n <= 0) return false;
+    const text = buf[0..@intCast(n)];
+    const paren = std.mem.lastIndexOfScalar(u8, text, ')') orelse return false;
+    if (paren + 2 >= text.len) return false;
+    return text[paren + 2] == 'Z';
+}
+
+/// Test-only. After the helper is a zombie, run the same orphan reap the
+/// follow poll uses, then let the wait below read the status. Unset in
+/// ordinary runs. The helper is noted first, so the reap leaves it alone.
+fn reapBeforeHelperWait(pid: c.pid_t) void {
+    const flag = c.getenv("XODB_TEST_REAP_BEFORE_HELPER_WAIT") orelse return;
+    if (flag[0] != '1' or flag[1] != 0) return;
+    const deadline = nowNs() + 8 * std.time.ns_per_s;
+    while (nowNs() < deadline and !taskZombie(pid)) _ = c.poll(null, 0, 20);
+    xrt_reap_orphan_zombies();
+}
+
 fn start(starter: [:0]const u8, cancel: *const std.atomic.Value(bool), deadline: u64) !void {
     var pid: c.pid_t = 0;
     const argv = [_:null]?[*:0]const u8{ starter.ptr, "start", null };
@@ -322,13 +370,25 @@ fn start(starter: [:0]const u8, cancel: *const std.atomic.Value(bool), deadline:
     if (c.posix_spawn_file_actions_init(&actions) != 0) return error.SidecarStarterFailed;
     defer _ = c.posix_spawn_file_actions_destroy(&actions);
     if (c.posix_spawn_file_actions_adddup2(&actions, devnull, 1) != 0 or c.posix_spawn_file_actions_adddup2(&actions, devnull, 2) != 0 or c.posix_spawn_file_actions_addclose(&actions, devnull) != 0) return error.SidecarStarterFailed;
-    const rc = c.posix_spawnp(&pid, starter.ptr, &actions, null, @ptrCast(@constCast(&argv)), c.environ);
-    if (rc != 0) return error.SidecarStarterFailed;
+    var spawned: i32 = 0;
+    var spawn_ctx = SidecarSpawn{ .file = starter.ptr, .actions = &actions, .argv = @ptrCast(@constCast(&argv)) };
+    if (xrt_spawn_owned_helper(&spawned, sidecarSpawn, &spawn_ctx) != 0) return error.SidecarStarterFailed;
+    pid = @intCast(spawned);
+    defer dropOwned(pid);
+    reapBeforeHelperWait(pid);
     var status: c_int = 0;
     while (true) {
         const waited = c.waitpid(pid, &status, c.WNOHANG);
         if (waited == pid) break;
-        if (waited < 0) return error.SidecarStarterFailed;
+        if (waited < 0) {
+            // Noted too late: the follow reap already collected this child.
+            // The status is gone. A clean exit lets the hello below decide.
+            if (std.c._errno().* == c.ECHILD) {
+                status = 0;
+                break;
+            }
+            return error.SidecarStarterFailed;
+        }
         if (cancel.load(.acquire) or nowNs() >= deadline) {
             _ = c.kill(pid, c.SIGTERM);
             _ = c.waitpid(pid, &status, 0);

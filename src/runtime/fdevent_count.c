@@ -1,64 +1,8 @@
 #include "fdevent_internal.h"
-#include "xrt_arch_syscalls.h"
+#include "fdevent_syscalls.h"
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* Linux x86-64 numbers from xrt_arch_syscalls.h. The counter decodes that
- * ABI, including when this file is built into the macOS seam. */
-enum {
-    X64_read = XRT_X86_64_NR_read,
-    X64_write = XRT_X86_64_NR_write,
-    X64_open = XRT_X86_64_NR_open,
-    X64_close = XRT_X86_64_NR_close,
-    X64_pread64 = XRT_X86_64_NR_pread64,
-    X64_pwrite64 = XRT_X86_64_NR_pwrite64,
-    X64_readv = XRT_X86_64_NR_readv,
-    X64_writev = XRT_X86_64_NR_writev,
-    X64_pipe = XRT_X86_64_NR_pipe,
-    X64_dup = XRT_X86_64_NR_dup,
-    X64_dup2 = XRT_X86_64_NR_dup2,
-    X64_sendfile = XRT_X86_64_NR_sendfile,
-    X64_socket = XRT_X86_64_NR_socket,
-    X64_accept = XRT_X86_64_NR_accept,
-    X64_sendto = XRT_X86_64_NR_sendto,
-    X64_recvfrom = XRT_X86_64_NR_recvfrom,
-    X64_sendmsg = XRT_X86_64_NR_sendmsg,
-    X64_recvmsg = XRT_X86_64_NR_recvmsg,
-    X64_socketpair = XRT_X86_64_NR_socketpair,
-    X64_fcntl = XRT_X86_64_NR_fcntl,
-    X64_creat = XRT_X86_64_NR_creat,
-    X64_epoll_create = XRT_X86_64_NR_epoll_create,
-    X64_inotify_init = XRT_X86_64_NR_inotify_init,
-    X64_openat = XRT_X86_64_NR_openat,
-    X64_splice = XRT_X86_64_NR_splice,
-    X64_tee = XRT_X86_64_NR_tee,
-    X64_vmsplice = XRT_X86_64_NR_vmsplice,
-    X64_signalfd = XRT_X86_64_NR_signalfd,
-    X64_timerfd_create = XRT_X86_64_NR_timerfd_create,
-    X64_eventfd = XRT_X86_64_NR_eventfd,
-    X64_accept4 = XRT_X86_64_NR_accept4,
-    X64_signalfd4 = XRT_X86_64_NR_signalfd4,
-    X64_eventfd2 = XRT_X86_64_NR_eventfd2,
-    X64_epoll_create1 = XRT_X86_64_NR_epoll_create1,
-    X64_dup3 = XRT_X86_64_NR_dup3,
-    X64_pipe2 = XRT_X86_64_NR_pipe2,
-    X64_inotify_init1 = XRT_X86_64_NR_inotify_init1,
-    X64_preadv = XRT_X86_64_NR_preadv,
-    X64_pwritev = XRT_X86_64_NR_pwritev,
-    X64_recvmmsg = XRT_X86_64_NR_recvmmsg,
-    X64_sendmmsg = XRT_X86_64_NR_sendmmsg,
-    X64_memfd_create = XRT_X86_64_NR_memfd_create,
-    X64_userfaultfd = XRT_X86_64_NR_userfaultfd,
-    X64_copy_file_range = XRT_X86_64_NR_copy_file_range,
-    X64_preadv2 = XRT_X86_64_NR_preadv2,
-    X64_pwritev2 = XRT_X86_64_NR_pwritev2,
-    X64_io_uring_setup = XRT_X86_64_NR_io_uring_setup,
-    X64_io_uring_enter = XRT_X86_64_NR_io_uring_enter,
-    X64_pidfd_open = XRT_X86_64_NR_pidfd_open,
-    X64_close_range = XRT_X86_64_NR_close_range,
-    X64_openat2 = XRT_X86_64_NR_openat2,
-};
 
 static void add(struct fd_event_counter *c, uint64_t *to, uint64_t n)
 {
@@ -125,57 +69,57 @@ static struct xrt_fdevent_row *row(struct fd_event_counter *c, uint64_t argument
 static int relevant(int64_t nr)
 {
     switch (nr) {
-    case X64_read:
-    case X64_write:
-    case X64_open:
-    case X64_close:
-    case X64_pread64:
-    case X64_pwrite64:
-    case X64_readv:
-    case X64_writev:
-    case X64_pipe:
-    case X64_dup:
-    case X64_dup2:
-    case X64_sendfile:
-    case X64_socket:
-    case X64_accept:
-    case X64_sendto:
-    case X64_recvfrom:
-    case X64_sendmsg:
-    case X64_recvmsg:
-    case X64_socketpair:
-    case X64_fcntl:
-    case X64_creat:
-    case X64_epoll_create:
-    case X64_inotify_init:
-    case X64_openat:
-    case X64_splice:
-    case X64_tee:
-    case X64_vmsplice:
-    case X64_signalfd:
-    case X64_timerfd_create:
-    case X64_eventfd:
-    case X64_accept4:
-    case X64_signalfd4:
-    case X64_eventfd2:
-    case X64_epoll_create1:
-    case X64_dup3:
-    case X64_pipe2:
-    case X64_inotify_init1:
-    case X64_preadv:
-    case X64_pwritev:
-    case X64_recvmmsg:
-    case X64_sendmmsg:
-    case X64_memfd_create:
-    case X64_userfaultfd:
-    case X64_copy_file_range:
-    case X64_preadv2:
-    case X64_pwritev2:
-    case X64_io_uring_setup:
-    case X64_io_uring_enter:
-    case X64_pidfd_open:
-    case X64_close_range:
-    case X64_openat2:
+    case XRT_FDEVENT_NR_read:
+    case XRT_FDEVENT_NR_write:
+    case XRT_FDEVENT_NR_open:
+    case XRT_FDEVENT_NR_close:
+    case XRT_FDEVENT_NR_pread64:
+    case XRT_FDEVENT_NR_pwrite64:
+    case XRT_FDEVENT_NR_readv:
+    case XRT_FDEVENT_NR_writev:
+    case XRT_FDEVENT_NR_pipe:
+    case XRT_FDEVENT_NR_dup:
+    case XRT_FDEVENT_NR_dup2:
+    case XRT_FDEVENT_NR_sendfile:
+    case XRT_FDEVENT_NR_socket:
+    case XRT_FDEVENT_NR_accept:
+    case XRT_FDEVENT_NR_sendto:
+    case XRT_FDEVENT_NR_recvfrom:
+    case XRT_FDEVENT_NR_sendmsg:
+    case XRT_FDEVENT_NR_recvmsg:
+    case XRT_FDEVENT_NR_socketpair:
+    case XRT_FDEVENT_NR_fcntl:
+    case XRT_FDEVENT_NR_creat:
+    case XRT_FDEVENT_NR_epoll_create:
+    case XRT_FDEVENT_NR_inotify_init:
+    case XRT_FDEVENT_NR_openat:
+    case XRT_FDEVENT_NR_splice:
+    case XRT_FDEVENT_NR_tee:
+    case XRT_FDEVENT_NR_vmsplice:
+    case XRT_FDEVENT_NR_signalfd:
+    case XRT_FDEVENT_NR_timerfd_create:
+    case XRT_FDEVENT_NR_eventfd:
+    case XRT_FDEVENT_NR_accept4:
+    case XRT_FDEVENT_NR_signalfd4:
+    case XRT_FDEVENT_NR_eventfd2:
+    case XRT_FDEVENT_NR_epoll_create1:
+    case XRT_FDEVENT_NR_dup3:
+    case XRT_FDEVENT_NR_pipe2:
+    case XRT_FDEVENT_NR_inotify_init1:
+    case XRT_FDEVENT_NR_preadv:
+    case XRT_FDEVENT_NR_pwritev:
+    case XRT_FDEVENT_NR_recvmmsg:
+    case XRT_FDEVENT_NR_sendmmsg:
+    case XRT_FDEVENT_NR_memfd_create:
+    case XRT_FDEVENT_NR_userfaultfd:
+    case XRT_FDEVENT_NR_copy_file_range:
+    case XRT_FDEVENT_NR_preadv2:
+    case XRT_FDEVENT_NR_pwritev2:
+    case XRT_FDEVENT_NR_io_uring_setup:
+    case XRT_FDEVENT_NR_io_uring_enter:
+    case XRT_FDEVENT_NR_pidfd_open:
+    case XRT_FDEVENT_NR_close_range:
+    case XRT_FDEVENT_NR_openat2:
         return 1;
     default:
         return 0;
@@ -210,94 +154,94 @@ static void complete(struct fd_event_counter *c, const struct xrt_fdevent_record
     const uint64_t *a = entry->args;
     const uint64_t n = (uint64_t)result;
     switch (entry->number) {
-    case X64_read:
-    case X64_pread64:
-    case X64_readv:
-    case X64_recvfrom:
-    case X64_recvmsg:
-    case X64_preadv:
-    case X64_preadv2:
+    case XRT_FDEVENT_NR_read:
+    case XRT_FDEVENT_NR_pread64:
+    case XRT_FDEVENT_NR_readv:
+    case XRT_FDEVENT_NR_recvfrom:
+    case XRT_FDEVENT_NR_recvmsg:
+    case XRT_FDEVENT_NR_preadv:
+    case XRT_FDEVENT_NR_preadv2:
         bytes(c, a[0], n, 0);
         break;
-    case X64_write:
-    case X64_pwrite64:
-    case X64_writev:
-    case X64_sendto:
-    case X64_sendmsg:
-    case X64_vmsplice:
-    case X64_pwritev:
-    case X64_pwritev2:
+    case XRT_FDEVENT_NR_write:
+    case XRT_FDEVENT_NR_pwrite64:
+    case XRT_FDEVENT_NR_writev:
+    case XRT_FDEVENT_NR_sendto:
+    case XRT_FDEVENT_NR_sendmsg:
+    case XRT_FDEVENT_NR_vmsplice:
+    case XRT_FDEVENT_NR_pwritev:
+    case XRT_FDEVENT_NR_pwritev2:
         bytes(c, a[0], n, 1);
         break;
-    case X64_sendfile:
+    case XRT_FDEVENT_NR_sendfile:
         bytes(c, a[1], n, 0);
         bytes(c, a[0], n, 1);
         break; /* sendfile */
-    case X64_splice:
-    case X64_copy_file_range:
+    case XRT_FDEVENT_NR_splice:
+    case XRT_FDEVENT_NR_copy_file_range:
         bytes(c, a[0], n, 0);
         bytes(c, a[2], n, 1);
         break; /* splice/copy_file_range */
-    case X64_tee:
+    case XRT_FDEVENT_NR_tee:
         bytes(c, a[0], n, 0);
         bytes(c, a[1], n, 1);
         break; /* tee: successful transferred bytes */
-    case X64_open:
-    case X64_socket:
-    case X64_accept:
-    case X64_creat:
-    case X64_epoll_create:
-    case X64_inotify_init:
-    case X64_openat:
-    case X64_timerfd_create:
-    case X64_eventfd:
-    case X64_accept4:
-    case X64_eventfd2:
-    case X64_epoll_create1:
-    case X64_inotify_init1:
-    case X64_memfd_create:
-    case X64_userfaultfd:
-    case X64_io_uring_setup:
-    case X64_pidfd_open:
-    case X64_openat2:
+    case XRT_FDEVENT_NR_open:
+    case XRT_FDEVENT_NR_socket:
+    case XRT_FDEVENT_NR_accept:
+    case XRT_FDEVENT_NR_creat:
+    case XRT_FDEVENT_NR_epoll_create:
+    case XRT_FDEVENT_NR_inotify_init:
+    case XRT_FDEVENT_NR_openat:
+    case XRT_FDEVENT_NR_timerfd_create:
+    case XRT_FDEVENT_NR_eventfd:
+    case XRT_FDEVENT_NR_accept4:
+    case XRT_FDEVENT_NR_eventfd2:
+    case XRT_FDEVENT_NR_epoll_create1:
+    case XRT_FDEVENT_NR_inotify_init1:
+    case XRT_FDEVENT_NR_memfd_create:
+    case XRT_FDEVENT_NR_userfaultfd:
+    case XRT_FDEVENT_NR_io_uring_setup:
+    case XRT_FDEVENT_NR_pidfd_open:
+    case XRT_FDEVENT_NR_openat2:
         opened(c, result, 0);
         break;
-    case X64_signalfd:
-    case X64_signalfd4:
+    case XRT_FDEVENT_NR_signalfd:
+    case XRT_FDEVENT_NR_signalfd4:
         if ((int32_t)(uint32_t)a[0] == -1)
             opened(c, result, 0);
         break;
-    case X64_dup:
+    case XRT_FDEVENT_NR_dup:
         opened(c, result, 1);
         break;
-    case X64_dup2:
-    case X64_dup3:
+    case XRT_FDEVENT_NR_dup2:
+    case XRT_FDEVENT_NR_dup3:
         if ((int32_t)(uint32_t)a[0] != (int32_t)(uint32_t)a[1])
             opened(c, result, 1);
         break; /* A successful replacement's implicit close is not inferred. */
-    case X64_fcntl:
+    case XRT_FDEVENT_NR_fcntl:
         if (a[1] == 0 || a[1] == 1030)
             opened(c, result, 1);
         break; /* F_DUPFD/_CLOEXEC */
-    case X64_close: {
+    case XRT_FDEVENT_NR_close: {
         struct xrt_fdevent_row *r = row(c, a[0]);
         add(c, &c->snapshot.close_successes, 1);
         if (r)
             add(c, &r->close_successes, 1);
         break;
     }
-    case X64_pipe:
-    case X64_socketpair:
-    case X64_pipe2:
+    case XRT_FDEVENT_NR_pipe:
+    case XRT_FDEVENT_NR_socketpair:
+    case XRT_FDEVENT_NR_pipe2:
         /* Two descriptors were created; their numbers live in user memory.
          * Keep the global count and flag incomplete per-fd attribution. */
         add(c, &c->snapshot.open_returns, 2);
         c->snapshot.flags |= XRT_FDEVENT_UNSUPPORTED;
         break;
-    case X64_recvmmsg:
-    case X64_sendmmsg:
-    case X64_io_uring_enter:
-    case X64_close_range:
+    case XRT_FDEVENT_NR_recvmmsg:
+    case XRT_FDEVENT_NR_sendmmsg:
+    case XRT_FDEVENT_NR_io_uring_enter:
+    case XRT_FDEVENT_NR_close_range:
         c->snapshot.flags |= XRT_FDEVENT_UNSUPPORTED;
         break;
     default:

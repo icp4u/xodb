@@ -21,7 +21,18 @@ enum xrt_status xrt_process_restore_launch_signals(void);
  * to stderr so target output cannot corrupt a debugger protocol stream. */
 enum xrt_status xrt_process_launch(const char *const argv[], bool follow, int32_t *pid);
 uintptr_t xrt_process_options(bool owned, bool follow);
+struct xrt_arch;
+enum xrt_status xrt_process_identify(int32_t tid, const struct xrt_arch **out);
 enum xrt_status xrt_process_validate_native(int32_t tid);
+
+/* A child this process spawned and will wait for itself. The in-session
+ * orphan reap skips it so that wait still sees the exit status. A full
+ * table returns false; the waiter then has to tolerate a missing status.
+ * Spawn and fork of such a child go through xrt_spawn_owned_helper, which
+ * notes the parent pid before it returns. A fork child (pid 0) is not noted. */
+bool xrt_note_owned_helper(int32_t pid);
+void xrt_drop_owned_helper(int32_t pid);
+int xrt_spawn_owned_helper(int32_t *pid, int (*create)(int32_t *pid, void *context), void *context);
 
 /* A transient /proc observation, not authoritative debugger stop state.
  * Missing tasks return PROCESS_GONE; denied/incomplete reads remain distinct.

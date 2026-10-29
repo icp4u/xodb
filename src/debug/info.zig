@@ -20,7 +20,7 @@ pub const Local = struct {
 };
 /// `outermost`: CFI marks the return address undefined (DW_CFA_undefined),
 /// the DWARF end-of-stack convention (glibc _start and clone3).
-pub const Unwind = struct { cfa: u64, caller: loc.RegisterSet, method: enum { eh_frame, debug_frame, windows_unwind, windows_leaf, windows_epilog, macho_compact }, outermost: bool = false };
+pub const Unwind = struct { cfa: u64, caller: loc.RegisterSet, method: enum { eh_frame, debug_frame, frame_pointer, windows_unwind, windows_leaf, windows_epilog, macho_compact }, outermost: bool = false };
 const Unit = struct { die: c.Dwarf_Die, kind: u8, split: ?c.Dwarf_Die = null, split_error: ?anyerror = null };
 pub const Inline = struct { name: []const u8, depth: usize, die_offset: u64, call_path: ?[]const u8 = null, call_line: ?u32 = null, call_column: ?u32 = null, decl_path: ?[]const u8 = null, decl_line: ?u32 = null };
 const unknown = eval.Type{ .name = "unknown", .kind = .unknown, .size = 0 };
@@ -612,12 +612,35 @@ pub const Image = struct {
         context.address_bytes = self.architecture.addressBytes();
         return loc.composite(a, context, normalized);
     }
+    /// i386 only, and only after both CFI sources miss. ebp is DWARF 5.
+    fn framePointer(self: *Image, ctx: loc.Context) !Unwind {
+        if (self.architecture != .i386) return error.NoUnwindInfo;
+        const ebp_index = self.architecture.registerNumber("ebp") orelse return error.NoUnwindInfo;
+        const esp_index = self.architecture.sp();
+        const eip_index = self.architecture.ra();
+        if (ebp_index >= ctx.registers.len or esp_index >= ctx.registers.len or eip_index >= ctx.registers.len) return error.NoUnwindInfo;
+        const ebp = ctx.registers[ebp_index] orelse return error.NoUnwindInfo;
+        const esp = ctx.registers[esp_index] orelse return error.NoUnwindInfo;
+        if (ebp > 0xffffffff or esp > 0xffffffff or (ebp & 3) != 0 or ebp < esp or ebp - esp > 0x1000000) return error.NoUnwindInfo;
+        var saved: [4]u8 = undefined;
+        var retb: [4]u8 = undefined;
+        if ((ctx.read(ctx.user, ebp, &saved) catch return error.NoUnwindInfo) != 4) return error.NoUnwindInfo;
+        if ((ctx.read(ctx.user, ebp + 4, &retb) catch return error.NoUnwindInfo) != 4) return error.NoUnwindInfo;
+        const next_ebp: u64 = std.mem.readInt(u32, &saved, .little);
+        const ret: u64 = std.mem.readInt(u32, &retb, .little);
+        if (ret == 0) return error.NoUnwindInfo;
+        var caller: loc.RegisterSet = @splat(null);
+        caller[ebp_index] = next_ebp;
+        caller[eip_index] = ret;
+        caller[esp_index] = ebp + 8;
+        return .{ .cfa = ebp + 8, .caller = caller, .method = .frame_pointer, .outermost = next_ebp == 0 };
+    }
     pub fn unwind(self: *Image, a: std.mem.Allocator, pc: u64, ctx: loc.Context) !Unwind {
         var frame: ?*c.Dwarf_Frame = null;
         var method: @FieldType(Unwind, "method") = .eh_frame;
         if (self.eh == null or c.dwarf_cfi_addrframe(self.eh.?, pc, &frame) != 0) {
             method = .debug_frame;
-            if (self.debug_cfi == null or c.dwarf_cfi_addrframe(self.debug_cfi.?, pc, &frame) != 0) return error.NoUnwindInfo;
+            if (self.debug_cfi == null or c.dwarf_cfi_addrframe(self.debug_cfi.?, pc, &frame) != 0) return self.framePointer(ctx);
         }
         defer c.free(frame);
         var signal = false;

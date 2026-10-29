@@ -131,30 +131,124 @@ enum xrt_status xrt_process_launch(const char *const argv[], bool follow, int32_
     return result;
 }
 
-enum xrt_status xrt_process_validate_native(int32_t tid)
+static enum xrt_status read_elf_ident(int32_t tid, unsigned char header[20])
 {
     if (tid <= 0)
         return XRT_INVALID_ARGUMENT;
-    const struct xrt_arch *arch = xrt_arch_native();
-    if (!arch)
-        return XRT_UNSUPPORTED_ARCHITECTURE;
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/exe", (int)tid);
     const int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
         return XRT_TARGET_IMAGE_UNAVAILABLE;
+    ssize_t count;
+    do {
+        count = pread(fd, header, 20, 0);
+    } while (count < 0 && errno == EINTR);
+    close(fd);
+    if (count != 20)
+        return XRT_TARGET_IMAGE_UNAVAILABLE;
+    return XRT_OK;
+}
+
+static enum xrt_status classify_elf_header(const unsigned char header[20], const struct xrt_arch **out)
+{
+    if (memcmp(header, "\177ELF", 4) != 0)
+        return XRT_UNSUPPORTED_ARCHITECTURE;
+    const struct xrt_arch *native = xrt_arch_native();
+    const int class = header[4];
+    const int data = header[5];
+    const uint16_t machine =
+        native && !native->little_endian
+            ? (uint16_t)((uint16_t)header[19] | (uint16_t)header[18] << 8)
+            : (uint16_t)((uint16_t)header[18] | (uint16_t)header[19] << 8);
+    if (native && class == (native->address_bits == 32 ? 1 : 2) &&
+        data == (native->little_endian ? 1 : 2) && machine == native->machine) {
+        *out = native;
+        return XRT_OK;
+    }
+#if defined(__x86_64__) && !defined(__ILP32__)
+    const struct xrt_arch *compat = xrt_arch_get(XRT_I386);
+    if (compat && class == 1 && data == 1 && machine == XRT_I386) {
+        *out = compat;
+        return XRT_OK;
+    }
+#endif
+    return XRT_UNSUPPORTED_ARCHITECTURE;
+}
+
+enum xrt_status xrt_process_identify(int32_t tid, const struct xrt_arch **out)
+{
+    if (!out)
+        return XRT_INVALID_ARGUMENT;
+    unsigned char header[20];
+    const enum xrt_status read = read_elf_ident(tid, header);
+    if (read != XRT_OK)
+        return read;
+    return classify_elf_header(header, out);
+}
+
+static enum xrt_status identify_fd(int fd, const struct xrt_arch **out)
+{
     unsigned char header[20];
     ssize_t count;
     do {
-        count = pread(fd, header, sizeof(header), 0);
+        count = pread(fd, header, 20, 0);
     } while (count < 0 && errno == EINTR);
-    close(fd);
-    if (count != sizeof(header))
+    if (count != 20)
         return XRT_TARGET_IMAGE_UNAVAILABLE;
-    if (memcmp(header, "\177ELF", 4) != 0 || header[4] != (arch->address_bits == 32 ? 1 : 2) ||
-        header[5] != (arch->little_endian ? 1 : 2) ||
-        (arch->little_endian ? ((uint16_t)header[18] | (uint16_t)header[19] << 8)
-                             : ((uint16_t)header[19] | (uint16_t)header[18] << 8)) != arch->machine)
+    return classify_elf_header(header, out);
+}
+
+enum xrt_status xrt_launch_image(const char *file, const struct xrt_arch **out)
+{
+    if (!file || !*file || !out)
+        return XRT_INVALID_ARGUMENT;
+    if (strchr(file, '/')) {
+        const int fd = open(file, O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+            return XRT_TARGET_IMAGE_UNAVAILABLE;
+        const enum xrt_status status = identify_fd(fd, out);
+        close(fd);
+        return status;
+    }
+    const char *path = getenv("PATH");
+    if (!path || !*path)
+        path = "/usr/bin:/bin";
+    enum xrt_status missing = XRT_TARGET_IMAGE_UNAVAILABLE;
+    const char *at = path;
+    while (*at) {
+        const char *colon = strchr(at, ':');
+        const size_t len = colon ? (size_t)(colon - at) : strlen(at);
+        char full[4096];
+        int wrote;
+        if (len == 0)
+            wrote = snprintf(full, sizeof(full), "%s", file);
+        else
+            wrote = snprintf(full, sizeof(full), "%.*s/%s", (int)len, at, file);
+        if (wrote > 0 && (size_t)wrote < sizeof(full)) {
+            const int fd = open(full, O_RDONLY | O_CLOEXEC);
+            if (fd >= 0) {
+                const enum xrt_status status = identify_fd(fd, out);
+                close(fd);
+                return status;
+            }
+            if (errno != ENOENT)
+                missing = XRT_TARGET_IMAGE_UNAVAILABLE;
+        }
+        if (!colon)
+            break;
+        at = colon + 1;
+    }
+    return missing;
+}
+
+enum xrt_status xrt_process_validate_native(int32_t tid)
+{
+    const struct xrt_arch *found = NULL;
+    const enum xrt_status status = xrt_process_identify(tid, &found);
+    if (status != XRT_OK)
+        return status;
+    if (!found || found != xrt_arch_native())
         return XRT_UNSUPPORTED_ARCHITECTURE;
     return XRT_OK;
 }

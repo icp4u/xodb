@@ -1,7 +1,8 @@
 # Syscall durations and scheduling context
 
 Adopted workflow; see [critical review](M2_SYSCALL_TIMING_PROPOSAL.md).
-Linux x86-64 live collection; saved captures can be inspected offline.
+Linux native 64-bit x86-64, AArch64, LoongArch64 and RISC-V live collection.
+The current capture archive format remains x86-64-only.
 
 ## GUI
 
@@ -61,13 +62,18 @@ ring suffix after a limit or error.
 - Unknown entry/exit boundaries, loss, mismatches and interrupted collection
   never produce a fabricated duration. A terminal `exit_group` commonly has
   an entry and no return. Kernel restart codes are labeled separately from errno.
-- Names use the x86-64 syscall ABI. Raw tracepoints do not identify every
-  compatibility call (for example `int 0x80` from a 64-bit image); confirm that
-  ABI separately before interpreting those names. Unknown numbers stay numeric.
-  On any other architecture `start_profile` with `syscall_timing` returns
-  `SyscallTimingUnsupportedArchitecture` before a collector opens. A CPU
-  capture on that architecture reports that syscall names are not recorded.
-  CPU sampling on AArch64 and LoongArch is unchanged.
+- Names use the target's native syscall ABI: x86-64, or the generated Linux
+  asm-generic row plus target UAPI additions for AArch64, LoongArch64 and
+  RISC-V. `scripts/generate-syscall-tables --check` regenerates all three
+  non-x86 rows from Zig's target Linux headers and cross-compiles the collectors.
+  Unknown numbers stay numeric.
+- Raw tracepoints have no compatibility-ABI tag. x86 `int 0x80`/x32 and AArch32
+  numbers must not be interpreted as native names. xodb accepts syscall timing
+  on these targets only after native 64-bit ELF validation; an exec that changes
+  the image ends collection. AArch32 targets are therefore refused during
+  target validation instead of being decoded as AArch64. Unsupported native
+  architectures return `SyscallTimingUnsupportedArchitecture` before opening a
+  syscall collector.
 - The kernel writes argument words into its raw ring; xodb discards them during
   decoding. Retained spans/MCP/archive contain no argument words, paths or buffers.
 - This traces every observed call. Short CPU fixtures and responsive status
@@ -81,5 +87,6 @@ ring suffix after a limit or error.
   opening. Failure reports the stage, errno, TID and cleanup count; a requested
   combined capture never silently becomes CPU-only. Earlier completed capture
   evidence survives a failed start. See [SETUP.md](../SETUP.md) for host policy.
-- Save/reopen carries spans and diagnostics in archive 2.5. An older reader
-  rejects this feature explicitly. Ordinary captures keep their prior format.
+- On x86-64, save/reopen carries spans and diagnostics in archive 2.5. An older
+  reader rejects this feature explicitly. Non-x86 capture archives remain
+  unsupported and return `ArchiveUnsupportedArchitecture`.

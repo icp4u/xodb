@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "allocation_broker.h"
+#include "../runtime/xrt_process.h"
 #include "../runtime/xrt_uprobes.h"
 #include "../runtime/mapped_file.h"
 #include <sys/socket.h>
@@ -73,6 +74,20 @@ static int receive_packet(int socket, void *data, size_t size, int fds[2], size_
 
 #ifndef XODB_ALLOCATION_HELPER
 extern char **environ;
+struct broker_spawn {
+    posix_spawn_file_actions_t *actions;
+    char *const *args;
+};
+static int broker_spawn(int32_t *pid, void *context)
+{
+    struct broker_spawn *spawn = context;
+    pid_t child = -1;
+    int error = posix_spawnp(&child, "sudo", spawn->actions, NULL, spawn->args, environ);
+    if (error)
+        return error;
+    *pid = (int32_t)child;
+    return 0;
+}
 int xodb_allocation_broker_start(const char *helper, int *socket_fd, int *child_pid) {
     if (!helper || !*helper || !socket_fd || !child_pid) { errno = EINVAL; return -1; }
     int pair[2];
@@ -90,9 +105,11 @@ int xodb_allocation_broker_start(const char *helper, int *socket_fd, int *child_
     if (!error) error = posix_spawn_file_actions_adddup2(&actions, STDERR_FILENO, STDOUT_FILENO);
     if (!error) error = posix_spawn_file_actions_addclose(&actions, pair[0]);
     if (!error && pair[1] != STDIN_FILENO) error = posix_spawn_file_actions_addclose(&actions, pair[1]);
-    pid_t child = -1;
+    int32_t spawned = 0;
     char *const args[] = { "sudo", "-n", "--", (char *)helper, "--stdio", NULL };
-    if (!error) error = posix_spawnp(&child, "sudo", &actions, NULL, args, environ);
+    struct broker_spawn spawn_ctx = { &actions, args };
+    if (!error) error = xrt_spawn_owned_helper(&spawned, broker_spawn, &spawn_ctx);
+    pid_t child = error ? -1 : (pid_t)spawned;
     posix_spawn_file_actions_destroy(&actions);
     if (!error) { close(pair[1]); *socket_fd = pair[0]; *child_pid = child; return 0; }
 done:
@@ -145,12 +162,16 @@ void xodb_allocation_broker_close(int socket_fd, int child_pid) {
     for (unsigned i = 0; i < 20; ++i) {
         int status;
         pid_t result = waitpid(child_pid, &status, WNOHANG);
-        if (result == child_pid || (result < 0 && errno == ECHILD)) return;
+        if (result == child_pid || (result < 0 && errno == ECHILD)) {
+            xrt_drop_owned_helper((int32_t)child_pid);
+            return;
+        }
         struct timespec delay = { .tv_nsec = 10000000 };
         nanosleep(&delay, NULL);
     }
     kill(child_pid, SIGKILL);
     while (waitpid(child_pid, NULL, 0) < 0 && errno == EINTR) {}
+    xrt_drop_owned_helper((int32_t)child_pid);
 }
 #else
 static int read_file(const char *path, char *buffer, size_t size) {

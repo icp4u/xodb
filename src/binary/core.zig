@@ -20,6 +20,8 @@ pub const Core = struct {
     pid: i32 = 0,
     command: []const u8 = "",
     page_size: u64 = 4096,
+    /// AT_SYSINFO_EHDR from NT_AUXV: where the kernel mapped [vdso].
+    vdso: ?u64 = null,
     note_bytes: usize = 0,
     pub fn open(a: std.mem.Allocator, path: []const u8) !Core {
         var self = Core{ .arena = std.heap.ArenaAllocator.init(a) };
@@ -184,6 +186,13 @@ pub const Core = struct {
                     const offset = std.math.mul(u64, u64le(desc, 32 + i * 24), self.page_size) catch return error.InvalidCoreFileNotes;
                     try self.mappings.append(a, .{ .start = begin, .end = finish, .offset = offset, .path = path });
                 }
+            } else if (core and kind == 6) {
+                var at: usize = 0;
+                while (at + 16 <= desc.len) : (at += 16) {
+                    const key = u64le(desc, at);
+                    if (key == 0) break;
+                    if (key == 33 and u64le(desc, at + 8) != 0) self.vdso = u64le(desc, at + 8);
+                }
             } else if ((core and kind == 2) or (linux and kind == 0x202)) {
                 if (self.threads.items.len == 0 or desc.len > 65536 or desc.len < 512) return error.InvalidCoreFpRegisters;
                 const t = &self.threads.items[self.threads.items.len - 1];
@@ -240,7 +249,15 @@ pub const Core = struct {
             if (size > 65536) return error.CoreModuleNoteLimit;
             const bytes = try a.alloc(u8, @intCast(size));
             defer a.free(bytes);
-            if (try self.mappedFileBytes(mapping.path, u64le(ph, 8), bytes) != bytes.len) return error.CoreModuleIdentityUnavailable;
+            // The ordinary dump filter retains ELF header pages but can omit
+            // later file-backed notes (for example GNU properties). Only a
+            // fully captured note segment supplies identity; an omitted one
+            // must not discard a build ID captured in another segment.
+            const captured = self.mappedFileBytes(mapping.path, u64le(ph, 8), bytes) catch |err| {
+                if (err == error.CoreModuleIdentityUnavailable) continue;
+                return err;
+            };
+            if (captured != bytes.len) continue;
             var pos: usize = 0;
             while (pos < bytes.len) {
                 if (bytes.len - pos < 12) return error.MalformedCoreNote;
@@ -281,6 +298,70 @@ fn u32le(bytes: []const u8, at: usize) u32 {
 }
 fn u64le(bytes: []const u8, at: usize) u64 {
     return std.mem.readInt(u64, bytes[at..][0..8], .little);
+}
+
+test "core module identity survives unrelated omitted note segments" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bytes: [4096]u8 = @splat(0);
+    @memcpy(bytes[0..4], "\x7fELF");
+    bytes[4] = 2;
+    bytes[5] = 1;
+    std.mem.writeInt(u16, bytes[18..20], 62, .little);
+    std.mem.writeInt(u64, bytes[32..40], 64, .little);
+    std.mem.writeInt(u16, bytes[54..56], 56, .little);
+    std.mem.writeInt(u16, bytes[56..58], 2, .little);
+    for (0..2) |i| {
+        const ph = bytes[64 + i * 56 ..][0..56];
+        std.mem.writeInt(u32, ph[0..4], 4, .little);
+        std.mem.writeInt(u64, ph[8..16], if (i == 0) 512 else 8192, .little);
+        std.mem.writeInt(u64, ph[32..40], 20, .little);
+    }
+    std.mem.writeInt(u32, bytes[512..516], 4, .little);
+    std.mem.writeInt(u32, bytes[516..520], 4, .little);
+    std.mem.writeInt(u32, bytes[520..524], 3, .little);
+    @memcpy(bytes[524..528], "GNU\x00");
+    @memcpy(bytes[528..532], "test");
+    const file = try tmp.dir.createFile(std.testing.io, "captured-pages", .{ .read = true });
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, &bytes);
+    var core = Core{ .arena = std.heap.ArenaAllocator.init(a) };
+    defer core.deinit();
+    core.fd = c.dup(file.handle);
+    try std.testing.expect(core.fd >= 0);
+    var stat: c.struct_stat = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.fstat(core.fd, &stat));
+    core.size = @intCast(stat.st_size);
+    core.modified = stat.st_mtim;
+    core.changed = stat.st_ctim;
+    try core.segments.append(core.arena.allocator(), .{ .start = 0x10000, .end = 0x13000, .offset = 0, .stored = bytes.len, .flags = 4 });
+    const mapping = Mapping{ .start = 0x10000, .end = 0x13000, .offset = 0, .path = "python-fixture" };
+    try core.mappings.append(core.arena.allocator(), mapping);
+    const id = try core.buildId(a, mapping);
+    defer a.free(id);
+    try std.testing.expectEqualStrings("test", id);
+    // Omitted notes can precede the captured build-ID note as well.
+    std.mem.swap([56]u8, bytes[64..120], bytes[120..176]);
+    try file.writePositionalAll(std.testing.io, &bytes, 0);
+    try std.testing.expectEqual(@as(c_int, 0), c.fstat(core.fd, &stat));
+    core.modified = stat.st_mtim;
+    core.changed = stat.st_ctim;
+    const reordered = try core.buildId(a, mapping);
+    defer a.free(reordered);
+    try std.testing.expectEqualStrings("test", reordered);
+    // A partially captured unrelated segment is equally unavailable.
+    std.mem.writeInt(u64, bytes[72..80], 4090, .little);
+    try file.writePositionalAll(std.testing.io, &bytes, 0);
+    try std.testing.expectEqual(@as(c_int, 0), c.fstat(core.fd, &stat));
+    core.modified = stat.st_mtim;
+    core.changed = stat.st_ctim;
+    const partial = try core.buildId(a, mapping);
+    defer a.free(partial);
+    try std.testing.expectEqualStrings("test", partial);
+    // Without any captured build ID, host files still cannot establish it.
+    core.segments.items[0].stored = 512;
+    try std.testing.expectError(error.CoreModuleIdentityUnavailable, core.buildId(a, mapping));
 }
 
 test "core notes retain per-thread signal identity and reject malformed metadata" {

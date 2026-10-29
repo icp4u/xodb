@@ -49,7 +49,7 @@ done
 } > out/many.c
 clang -O0 -fPIE -pie -fuse-ld=lld out/many.c -o out/many-sections
 
-# Inputs the reader must reject: relocatable object, 32-bit, big-endian, other machine.
+# reject-rel.o and reject-ppc64be stay rejected. reject-i386 is a real ELF32 i386 image.
 gcc $cflags -c dup.c -o out/reject-rel.o
 clang --target=i386-unknown-linux -nostdlib -static -fuse-ld=lld reject.c -o out/reject-i386
 clang --target=powerpc64-unknown-linux -nostdlib -static -fuse-ld=lld reject.c -o out/reject-ppc64be

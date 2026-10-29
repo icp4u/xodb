@@ -38,6 +38,29 @@ def until(fn, predicate, label, seconds=20):
         assert time.monotonic() < deadline, (label, value)
         time.sleep(.04)
 
+def sampled(fn, predicate, label):
+    # A global snapshot is not a sample of this PID. The owner walks a bounded
+    # window of /proc, so load can leave our scope stale across many sequences.
+    # Fail after repeated actual samples that miss the condition, not after an
+    # assumed number of 250ms polls. The wall ceiling only bounds lack of service.
+    started = time.monotonic()
+    deadline = started + 90
+    sequences, fresh = set(), set()
+    while True:
+        value = fn()
+        sequence = value.get('sequence')
+        sequences.add(sequence)
+        if value.get('scope', {}).get('state') == 'sampled':
+            fresh.add(sequence)
+        if predicate(value):
+            print('sample progress', dict(check=label, seconds=round(time.monotonic() - started, 3),
+                                         sequences=len(sequences), target_samples=len(fresh),
+                                         scope=value.get('scope')), flush=True)
+            return value
+        assert len(fresh) < 12 and time.monotonic() < deadline, (label, dict(
+            sequences=len(sequences), target_samples=len(fresh), latest=value))
+        time.sleep(.04)
+
 def cache(peer, name, **args):
     deadline = time.monotonic() + 5
     while True:
@@ -48,8 +71,8 @@ def cache(peer, name, **args):
         assert message == 'FdCacheBusy' and time.monotonic() < deadline, reply
         time.sleep(.003)
 
-def spawn(mode, *args):
-    p = subprocess.Popen([str(root / 'zig-out/bin/xodb-fd-fixture'), mode, *map(str, args)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+def spawn(mode, *args, interactive=False):
+    p = subprocess.Popen([str(root / 'zig-out/bin/xodb-fd-fixture'), mode, *map(str, args)], stdin=subprocess.PIPE if interactive else subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     fixtures.append(p)
     assert select.select([p.stdout], [], [], 5)[0]
     assert p.stdout.readline().startswith('ready ')
@@ -84,7 +107,6 @@ try:
     for label in ('writer', 'deleted'): (work / label).mkdir(mode=0o755)
     writer = spawn('write', work / 'writer', 65536)
     deleted = spawn('deleted', work / 'deleted', 8192)
-    leaker = spawn('leak', 32, 1000)
     writer_rows = until(lambda: cache(first, 'get_fd_activity', pid=writer.pid, interval_ms=250), lambda r: any(x['kind'] == 'file' or x['kind'] == 'regular' for x in r['rows']), 'writer fd page')
     regular = next(x for x in writer_rows['rows'] if x['kind'] in ('file', 'regular'))
     st = os.stat(f'/proc/{writer.pid}/fd/{regular["fd"]}')
@@ -101,7 +123,7 @@ try:
     descriptors.append(unusual)
     os.write(unusual, b'fixture'); os.lseek(unusual, 2, os.SEEK_SET)
     unusual_stat = os.fstat(unusual)
-    unusual_page = until(lambda: cache(first, 'who_has_open', pid=os.getpid(), device=str(unusual_stat.st_dev), inode=str(unusual_stat.st_ino), interval_ms=250), lambda r: bool(r['rows']), 'non-UTF-8 inode')
+    unusual_page = sampled(lambda: cache(first, 'who_has_open', pid=os.getpid(), device=str(unusual_stat.st_dev), inode=str(unusual_stat.st_ino), interval_ms=250), lambda r: any(x['fd'] == unusual for x in r['rows']), 'non-UTF-8 inode')
     unusual_row = next(x for x in unusual_page['rows'] if x['fd'] == unusual)
     check('non-UTF-8 path remains queryable by inode with valid JSON', unusual_row['path'] is None and unusual_row['path_state'] == 'non-UTF-8; query by device and inode')
     check('fdinfo offset and per-pid coverage match the owned descriptor', unusual_row['offset'] == 2 and unusual_page['scope']['state'] in ('sampled', 'stale') and unusual_page['scope']['start_ticks'] == ticks(os.getpid()))
@@ -114,7 +136,25 @@ try:
     check('denied fd table is explicit rather than a fabricated empty table', not denied_page['rows'] and denied_page['coverage']['hidden'] > 0)
     held = until(lambda: cache(second, 'get_deleted_open', pid=deleted.pid, interval_ms=250), lambda r: bool(r['rows']), 'deleted holder')
     check('deleted-open size agrees with owned fixture', any(x['deleted'] and x['size_bytes'] == 8192 for x in held['rows']))
-    growth = until(lambda: cache(first, 'get_fd_leaks', pid=leaker.pid, interval_ms=250), lambda r: bool(r['rows']), 'growth history', 30)
+    # Only grow after the previous count has actually been sampled. A timed
+    # leaker can hit its cap while earlier checks or a /proc sweep are delayed;
+    # waiting longer then cannot reconstruct the six samples growth requires.
+    # Each wait has its own ceiling: one loaded run spent 60s of seven waits.
+    leaker = spawn('leak-step', interactive=True)
+    scope = lambda: cache(first, 'get_fd_activity', pid=leaker.pid, interval_ms=250)
+    baseline = sampled(scope, lambda r: r.get('scope', {}).get('state') == 'sampled', 'growth baseline')
+    baseline_fds = baseline['scope']['fds']
+    growth_samples = [baseline['sequence']]
+    for batch in range(1, 7):
+        leaker.stdin.write('g'); leaker.stdin.flush()
+        assert select.select([leaker.stdout], [], [], 5)[0], 'growth fixture handshake'
+        assert leaker.stdout.readline().strip() == f'grown {batch * 8}'
+        observed = sampled(scope, lambda r: r.get('scope', {}).get('state') == 'sampled' and
+                           r['scope']['fds'] == baseline_fds + batch * 8,
+                           f'growth batch {batch}')
+        growth_samples.append(observed['sequence'])
+    check('each growth batch has a distinct observed sample', all(a < b for a, b in zip(growth_samples, growth_samples[1:])))
+    growth = sampled(lambda: cache(first, 'get_fd_leaks', pid=leaker.pid, interval_ms=250), lambda r: bool(r['rows']), 'growth history')
     check('sustained growth is reported with a history', growth['rows'][0]['growth_candidate'] and len(growth['rows'][0]['history']) >= 6 and growth['rows'][0]['growth_above_window_low'] >= 8)
     shared.expect_invalid(first.raw('get_fd_activity', mode='events', pid=writer.pid))
     shared.expect_invalid(first.raw('who_has_open', path=regular['path'], inode='1', device='2'))

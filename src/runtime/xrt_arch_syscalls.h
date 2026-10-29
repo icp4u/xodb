@@ -2,10 +2,12 @@
 #define XODB_RUNTIME_XRT_ARCH_SYSCALLS_H
 /* Linux syscall numbers by architecture. These are the ABI numbers a traced
  * task uses, not whatever <sys/syscall.h> means on the build host. The fd
- * event counter decodes the x86-64 row. A native fdflow build on x86-64
- * checks its host SYS_* macros against the same row.
+ * event counter selects the x86-64 or generated asm-generic row in
+ * fdevent_syscalls.h. Native fdflow builds check their host SYS_* macros
+ * against the same applicable row.
  *
- * Only x86-64 is filled. Tests assert against this row, not their own literals. A missing architecture is not a guessed row.
+ * The asm-generic rows are generated in xrt_generic_syscalls.h. Tests assert
+ * against these rows, not their own literals. A missing architecture is not a guessed row.
  * Register rows and software-breakpoint bytes stay in arch.c. */
 
 #define XRT_X86_64_NR_read 0
@@ -75,5 +77,7 @@
 #define XRT_X86_64_NR_close_range 436
 #define XRT_X86_64_NR_openat2 437
 #define XRT_X86_64_NR_pidfd_getfd 438
+
+#include "xrt_generic_syscalls.h"
 
 #endif

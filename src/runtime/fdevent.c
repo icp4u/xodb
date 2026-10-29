@@ -50,6 +50,20 @@ static uint64_t start_at(int dir, const char *name)
     uint64_t value;
     return xrt_perf_unsigned(p, (size_t)(end - p), &value) ? value : 0;
 }
+static Elf64_Half native_machine(void)
+{
+#if defined(__linux__) && defined(__x86_64__) && !defined(__ILP32__)
+    return EM_X86_64;
+#elif defined(__linux__) && defined(__aarch64__)
+    return EM_AARCH64;
+#elif defined(__linux__) && defined(__loongarch__)
+    return EM_LOONGARCH;
+#elif defined(__linux__) && defined(__riscv) && __riscv_xlen == 64
+    return EM_RISCV;
+#else
+    return EM_NONE;
+#endif
+}
 static int native_image(int dir)
 {
     int fd = openat(dir, "exe", O_RDONLY | O_CLOEXEC);
@@ -64,9 +78,10 @@ static int native_image(int dir)
         return -1;
     }
     errno = 0;
-    return n == sizeof(e) && !memcmp(e.e_ident, ELFMAG, SELFMAG) &&
+    const Elf64_Half machine = native_machine();
+    return machine && n == sizeof(e) && !memcmp(e.e_ident, ELFMAG, SELFMAG) &&
            e.e_ident[EI_CLASS] == ELFCLASS64 && e.e_ident[EI_DATA] == ELFDATA2LSB &&
-           e.e_machine == EM_X86_64;
+           e.e_machine == machine;
 }
 static int same_scope(const struct xrt_fdevent *c)
 {
@@ -132,9 +147,12 @@ enum xrt_status xrt_fdevent_open(const struct xrt_fdevent_options *opts, struct 
         opts->drain_records > 1048576)
         return failure(f, XRT_INVALID_ARGUMENT, EINVAL, -1,
                        "positive pid/start identity and bounded limits required");
-#if !defined(__x86_64__)
+#if !defined(__linux__) ||                                                                  \
+    (!defined(__x86_64__) && !defined(__aarch64__) && !defined(__loongarch__) &&           \
+     !(defined(__riscv) && __riscv_xlen == 64)) ||                                         \
+    (defined(__x86_64__) && defined(__ILP32__))
     return failure(f, XRT_UNSUPPORTED_ARCHITECTURE, 0, opts->pid,
-                   "native x86-64 syscall events only");
+                   "native Linux x86-64, AArch64, LoongArch64 or RISC-V 64 syscall events only");
 #endif
     struct xrt_fdevent *c = calloc(1, sizeof(*c));
     if (!c)
@@ -164,7 +182,7 @@ enum xrt_status xrt_fdevent_open(const struct xrt_fdevent_options *opts, struct 
                                     : XRT_UNSUPPORTED_ARCHITECTURE,
                          native < 0 ? errno : 0, opts->pid,
                          native < 0 ? "executable identity unavailable"
-                                    : "native x86-64 executable identity required");
+                                    : "matching native 64-bit executable identity required");
         goto fail;
     }
     int task_fd = openat(c->proc_fd, "task", O_RDONLY | O_DIRECTORY | O_CLOEXEC);

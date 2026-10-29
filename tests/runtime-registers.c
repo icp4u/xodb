@@ -1059,9 +1059,67 @@ static void stopped_child(const char *executable)
     CHECK(ptrace(PTRACE_SETOPTIONS, child, (void *)0, (void *)(uintptr_t)PTRACE_O_EXITKILL) == 0);
 }
 
+static void i386_file(void)
+{
+    const struct xrt_arch *arch = xrt_arch_get(XRT_I386);
+    const struct xrt_arch *x86 = xrt_arch_get(XRT_X86_64);
+    CHECK(arch && x86 && arch != x86 && x86->register_count == 20);
+    CHECK(arch->machine == XRT_I386 && arch->address_bits == 32 && arch->little_endian);
+    CHECK(arch->elf_class == XRT_ELF_CLASS_32 && arch->linux_abi == XRT_LINUX_ABI_COMPAT32);
+    CHECK(arch->tracer_bits == 64 && arch->kernel_gpr_bytes == 216);
+    CHECK(arch->register_count == 18 && arch->dwarf_count == 9 && arch->hardware_step == 1);
+    CHECK(arch->trap_size == 1 && arch->trap[0] == 0xcc && arch->breakpoint_adjust == 1);
+    const struct xrt_register_desc *eip = xrt_arch_role(arch, XRT_ROLE_PC);
+    const struct xrt_register_desc *esp = xrt_arch_role(arch, XRT_ROLE_SP);
+    CHECK(eip && esp && eip->dwarf == 8 && eip->kernel_offset == 16 * 8 && eip->width == 4);
+    CHECK(esp->dwarf == 4 && esp->kernel_offset == 19 * 8);
+    CHECK(strcmp(xrt_arch_dwarf_name(XRT_I386, 0), "eax") == 0);
+    CHECK(strcmp(xrt_arch_dwarf_name(XRT_I386, 8), "eip") == 0);
+    CHECK(xrt_arch_dwarf_name(XRT_I386, 9) == NULL);
+    const struct xrt_register_desc *orig = xrt_arch_register(XRT_I386, "orig_eax", 8);
+    const struct xrt_register_desc *gs_base = xrt_arch_register(XRT_I386, "gs_base", 7);
+    CHECK(orig && orig->id == 16 && orig->kernel_offset == 15 * 8 && orig->width == 4);
+    CHECK(gs_base && gs_base->id == 17 && gs_base->access == XRT_REG_READ_ONLY);
+    CHECK(gs_base->kernel_offset == 22 * 8);
+    CHECK(xrt_register_admit(orig, 0x10e) == XRT_OK);
+    CHECK(xrt_register_admit(eip, 0x100000000ull) == XRT_INVALID_ARGUMENT);
+    CHECK(xrt_register_admit(gs_base, 1) == XRT_REGISTER_NOT_WRITABLE);
+    unsigned char raw[216];
+    memset(raw, 0x11, sizeof(raw));
+    for (size_t i = 0; i < 27; ++i) {
+        const uint64_t value = word(i);
+        memcpy(raw + i * 8, &value, 8);
+    }
+    struct xrt_registers regs;
+    const struct xrt_abi_id abi = xrt_arch_abi(arch);
+    CHECK(xrt_registers_decode(&abi, raw, sizeof(raw), &regs) == XRT_OK);
+    CHECK(regs.values.i386.eax == (uint32_t)word(10));
+    CHECK(regs.values.i386.eip == (uint32_t)word(16));
+    CHECK(regs.values.i386.esp == (uint32_t)word(19));
+    CHECK(regs.values.i386.orig_eax == (uint32_t)word(15));
+    CHECK(regs.values.i386.gs == (uint32_t)word(26));
+    memset(raw, 0x11, sizeof(raw));
+    CHECK(xrt_registers_poke(arch, raw, sizeof(raw), "eip", 3, 0xf7f3f35c) == XRT_OK);
+    CHECK(raw[16 * 8] == 0x5c && raw[16 * 8 + 1] == 0xf3 && raw[16 * 8 + 2] == 0xf3 &&
+          raw[16 * 8 + 3] == 0xf7);
+    CHECK(raw[16 * 8 + 4] == 0 && raw[16 * 8 + 5] == 0 && raw[16 * 8 + 6] == 0 &&
+          raw[16 * 8 + 7] == 0);
+    CHECK(raw[0] == 0x11 && raw[15 * 8] == 0x11);
+    CHECK(xrt_registers_poke(arch, raw, sizeof(raw), "orig_eax", 8, 0x10e) == XRT_OK);
+    CHECK(raw[15 * 8] == 0x0e && raw[15 * 8 + 1] == 0x01 && raw[15 * 8 + 4] == 0);
+    CHECK(xrt_registers_poke(arch, raw, sizeof(raw), "gs_base", 7, 0x1000) ==
+          XRT_REGISTER_NOT_WRITABLE);
+    uint64_t pc = 0;
+    CHECK(xrt_arch_breakpoint_pc(XRT_I386, 0x1000, &pc) && pc == 0xfff);
+    CHECK(!xrt_arch_breakpoint_pc(XRT_I386, 0, &pc));
+    CHECK(!xrt_arch_breakpoint_valid(XRT_I386, 0x100000000ull, 1));
+    CHECK(xrt_arch_breakpoint_valid(XRT_I386, 0x8048000, 1));
+}
+
 int main(int argc, char **argv)
 {
     descriptors();
+    i386_file();
     contract();
     loongarch_replay();
     riscv_replay();

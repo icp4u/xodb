@@ -1,4 +1,5 @@
 #include "../src/runtime/fdevent_internal.h"
+#include "../src/runtime/fdevent_syscalls.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -37,29 +38,29 @@ static void transfer_families(void)
     assert(fd_event_counter_init(&c, 16));
     /* sendfile(out,in,...), splice/copy_file_range(in,offset,out,...),
      * tee(in,out,...): each return accounts once on each endpoint. */
-    transfer(&c, 40, 4, 3, 0, 5);
-    transfer(&c, 275, 3, 0, 4, 7);
-    transfer(&c, 326, 3, 0, 4, 11);
-    transfer(&c, 276, 3, 4, 0, 13);
+    transfer(&c, XRT_FDEVENT_NR_sendfile, 4, 3, 0, 5);
+    transfer(&c, XRT_FDEVENT_NR_splice, 3, 0, 4, 7);
+    transfer(&c, XRT_FDEVENT_NR_copy_file_range, 3, 0, 4, 11);
+    transfer(&c, XRT_FDEVENT_NR_tee, 3, 4, 0, 13);
     assert(find(&c, 3)->read_bytes == 36 && find(&c, 3)->write_bytes == 0);
     assert(find(&c, 4)->write_bytes == 36 && find(&c, 4)->read_bytes == 0);
     assert(c.snapshot.read_bytes == 36 && c.snapshot.write_bytes == 36);
     /* fd arguments use signed low 32 bits, as the native kernel ABI does. */
-    pair(&c, 1, 327, UINT64_C(0x123400000003), 17);
-    pair(&c, 1, 328, 4, 19);
+    pair(&c, 1, XRT_FDEVENT_NR_preadv2, UINT64_C(0x123400000003), 17);
+    pair(&c, 1, XRT_FDEVENT_NR_pwritev2, 4, 19);
     assert(find(&c, 3)->read_bytes == 53 && find(&c, 4)->write_bytes == 55);
-    transfer(&c, 33, 3, 3, 0, 3); /* dup2(fd,fd) creates no descriptor. */
+    transfer(&c, XRT_FDEVENT_NR_dup3, 3, 3, 0, 3); /* same fd creates no descriptor. */
     assert(c.snapshot.dup_returns == 0);
-    transfer(&c, 33, 3, 4, 0, 4);
-    transfer(&c, 72, 3, 1030, 0, 5); /* F_DUPFD_CLOEXEC */
+    transfer(&c, XRT_FDEVENT_NR_dup3, 3, 4, 0, 4);
+    transfer(&c, XRT_FDEVENT_NR_fcntl, 3, 1030, 0, 5); /* F_DUPFD_CLOEXEC */
     assert(c.snapshot.dup_returns == 2 && c.snapshot.close_successes == 0);
     assert(find(&c, 4)->dup_returns == 1 && find(&c, 5)->dup_returns == 1);
-    pair(&c, 1, 22, 0, 0); /* pipe result is an array pointer, not an fd. */
+    pair(&c, 1, XRT_FDEVENT_NR_pipe2, 0, 0); /* pipe result is an array pointer, not an fd. */
     assert(c.snapshot.open_returns == 2 && find(&c, 0) == NULL);
     assert(c.snapshot.flags == XRT_FDEVENT_UNSUPPORTED);
-    transfer(&c, 299, 3, 0, 0, 8); /* message count must not become bytes. */
-    transfer(&c, 307, 4, 0, 0, 8);
-    transfer(&c, 436, 3, 100, 0, 0); /* range closes are not fabricated. */
+    transfer(&c, XRT_FDEVENT_NR_recvmmsg, 3, 0, 0, 8); /* message count is not bytes. */
+    transfer(&c, XRT_FDEVENT_NR_sendmmsg, 4, 0, 0, 8);
+    transfer(&c, XRT_FDEVENT_NR_close_range, 3, 100, 0, 0); /* no fabricated closes. */
     assert(c.snapshot.read_bytes == 53 && c.snapshot.write_bytes == 55 &&
            c.snapshot.close_successes == 0);
     fd_event_counter_destroy(&c);
@@ -68,7 +69,9 @@ static void loss_reads(void)
 {
     struct fd_event_counter c;
     assert(fd_event_counter_init(&c, 4));
-    struct xrt_fdevent_record event = {.kind = XRT_FDEVENT_ENTER, .number = 1, .time_ns = now++, .args = {3}};
+    struct xrt_fdevent_record event = {
+        .kind = XRT_FDEVENT_ENTER, .number = XRT_FDEVENT_NR_write,
+        .time_ns = now++, .args = {3}};
     fd_event_counter_feed(&c, 0, &event);
     assert(c.lane[0].has_pending);
     fd_event_counter_loss(&c, 0, 5, 1, 0);
@@ -99,25 +102,26 @@ int main(void)
     transfer_families();
     struct fd_event_counter c;
     assert(fd_event_counter_init(&c, 4));
-    pair(&c, 0, 257, 99, 3);
-    pair(&c, 0, 1, 3, 13);
-    pair(&c, 0, 1, 3, -9);
-    pair(&c, 0, 0, 3, 7);
-    pair(&c, 0, 3, 3, 0);
-    pair(&c, 0, 257, 99, 3);
-    pair(&c, 1, 18, 3, 19);
-    pair(&c, 1, 17, 3, 0);
+    pair(&c, 0, XRT_FDEVENT_NR_openat, 99, 3);
+    pair(&c, 0, XRT_FDEVENT_NR_write, 3, 13);
+    pair(&c, 0, XRT_FDEVENT_NR_write, 3, -9);
+    pair(&c, 0, XRT_FDEVENT_NR_read, 3, 7);
+    pair(&c, 0, XRT_FDEVENT_NR_close, 3, 0);
+    pair(&c, 0, XRT_FDEVENT_NR_openat, 99, 3);
+    pair(&c, 1, XRT_FDEVENT_NR_pwrite64, 3, 19);
+    pair(&c, 1, XRT_FDEVENT_NR_pread64, 3, 0);
     const struct xrt_fdevent_row *r = find(&c, 3);
     assert(r);
     assert(r->open_returns == 2 && r->close_successes == 1 && r->write_bytes == 32 &&
            r->read_bytes == 7);
     assert(r->write_calls == 2 && r->read_calls == 2 && c.snapshot.flags == 0);
-    pair(&c, 0, 32, 3, 4);
+    pair(&c, 0, XRT_FDEVENT_NR_dup, 3, 4);
     assert(find(&c, 4)->dup_returns == 1);
     assert(c.snapshot.open_returns == 2 && c.snapshot.dup_returns == 1);
     /* A syscall lost between entry/exit must never yield invented bytes. */
     struct xrt_fdevent_record e = {
-        .kind = XRT_FDEVENT_ENTER, .number = 1, .time_ns = now++, .args = {3}};
+        .kind = XRT_FDEVENT_ENTER, .number = XRT_FDEVENT_NR_write,
+        .time_ns = now++, .args = {3}};
     fd_event_counter_feed(&c, 0, &e);
     e.kind = XRT_FDEVENT_LOST;
     e.lost = 9;
@@ -131,21 +135,22 @@ int main(void)
     assert((c.snapshot.flags & (XRT_FDEVENT_LOSS | XRT_FDEVENT_UNPAIRED)) ==
            (XRT_FDEVENT_LOSS | XRT_FDEVENT_UNPAIRED));
     /* Exact global bytes remain available when the bounded per-fd table fills. */
-    pair(&c, 1, 1, 5, 10);
-    pair(&c, 1, 1, 6, 20);
-    pair(&c, 1, 1, 7, 30);
+    pair(&c, 1, XRT_FDEVENT_NR_write, 5, 10);
+    pair(&c, 1, XRT_FDEVENT_NR_write, 6, 20);
+    pair(&c, 1, XRT_FDEVENT_NR_write, 7, 30);
     assert(c.snapshot.row_count == 4 && c.snapshot.dropped_rows == 1);
     assert(c.snapshot.write_bytes == 92 && (c.snapshot.flags & XRT_FDEVENT_ROW_LIMIT));
     /* Unrelated syscalls and errors do not become byte traffic. */
-    pair(&c, 2, 39, 0, 999);
-    pair(&c, 2, 1, 3, -512);
+    pair(&c, 2, -999, 0, 999);
+    pair(&c, 2, XRT_FDEVENT_NR_write, 3, -512);
     assert(c.snapshot.write_bytes == 92);
     /* A different syscall number cannot complete a pending IO operation. */
     e = (struct xrt_fdevent_record){
-        .kind = XRT_FDEVENT_ENTER, .number = 0, .time_ns = now++, .args = {3}};
+        .kind = XRT_FDEVENT_ENTER, .number = XRT_FDEVENT_NR_read,
+        .time_ns = now++, .args = {3}};
     fd_event_counter_feed(&c, 2, &e);
     e.kind = XRT_FDEVENT_EXIT;
-    e.number = 1;
+    e.number = XRT_FDEVENT_NR_write;
     e.result = 300;
     e.time_ns = now++;
     fd_event_counter_feed(&c, 2, &e);
@@ -153,7 +158,7 @@ int main(void)
     /* No counters from a lane after exec are associated with the old capture. */
     e = (struct xrt_fdevent_record){.kind = XRT_FDEVENT_EXEC, .time_ns = now++};
     fd_event_counter_feed(&c, 2, &e);
-    pair(&c, 2, 1, 3, 1000);
+    pair(&c, 2, XRT_FDEVENT_NR_write, 3, 1000);
     assert(c.snapshot.write_bytes == 92);
     /* Loss remains counted when its trailer timestamp is older. */
     e = (struct xrt_fdevent_record){.kind = XRT_FDEVENT_LOST, .time_ns = 1, .lost = 4};
@@ -161,7 +166,7 @@ int main(void)
     assert(c.snapshot.lost == 13);
     /* Saturation is explicit, never wraparound. */
     c.snapshot.write_bytes = UINT64_MAX - 2;
-    pair(&c, 1, 1, 3, 3);
+    pair(&c, 1, XRT_FDEVENT_NR_write, 3, 3);
     assert(c.snapshot.write_bytes == UINT64_MAX && (c.snapshot.flags & XRT_FDEVENT_SATURATED));
     fd_event_counter_destroy(&c);
     assert(!c.rows && !c.table);

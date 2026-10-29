@@ -78,6 +78,9 @@ struct xrt_target {
                              size_t size, size_t *accepted);
     void *patch_ctx;
     bool core, owned, follow_processes;
+    /* Set only by set_following on this handle. Adopted children copy
+     * follow_processes and do not take another subreaper reference. */
+    uint8_t follow_subreaper_held;
     int32_t pid;
     struct xrt_birth births[XRT_MAX_THREADS];
     size_t birth_count;
@@ -171,6 +174,14 @@ enum xrt_status xrt_poll_births(struct xrt_target *t);
 enum xrt_status xrt_stop_peers(struct xrt_target *t);
 void xrt_recompute_state(struct xrt_target *t);
 void xrt_reap_detached(struct xrt_target *t);
+/* Untraced zombie children of this process. Skips tasks a tracer still owns. */
+void xrt_reap_orphan_zombies(void);
+/* Rate-limited orphan reap while this process is following forks or execs. */
+void xrt_reap_orphans_if_due(void);
+/* Drop this handle's subreaper reference after its children have been closed. */
+void xrt_follow_subreaper_release(struct xrt_target *t);
+/* ELF identity of a launch path. Non-ELF and missing files are not success. */
+enum xrt_status xrt_launch_image(const char *file, const struct xrt_arch **out);
 void xrt_remember_reap(struct xrt_target *t, int32_t tid);
 bool xrt_traced_member(int32_t tid, int32_t group);
 bool xrt_task_zombie(int32_t tid);

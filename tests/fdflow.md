@@ -54,12 +54,12 @@ one-byte synchronization acknowledgements, are counted. Polling identities are
 sampled correlations, not atomic kernel-file proofs. Mutations, stale samples,
 loss, partial CPU coverage and pending calls keep uncertain bytes explicit.
 Processes observed using asynchronous io_uring descriptor operations lose inode
-correlation until a new capture or a proved new process identity. Only native
-x86-64 descriptor-mutating numbers withdraw correlations. Raw records carry no
-ABI, so a compat (`int $0x80`) or x32 close/dup in ABI-switching code is not
-seen as a mutation and a later native IO on that fd can be joined to the old
-inode; that code is outside coverage. Raw numbers alone never establish a
-native operation.
+correlation until a new capture or a proved new process identity. Native
+x86-64, AArch64, LoongArch64 and RISC-V 64 descriptor-mutating numbers withdraw
+correlations. Raw records carry no ABI, so an x86 compat/x32 or AArch32
+close/dup in ABI-switching code is not seen as a mutation and a later native IO
+on that fd can be joined to the old inode; that code is outside coverage.
+Raw numbers alone never establish a native operation.
 
 The integrated worker and graph projection have fast, unprivileged checks:
 

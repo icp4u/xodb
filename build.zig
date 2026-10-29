@@ -27,7 +27,7 @@ fn addRuntimeSources(b: *std.Build, module: *std.Build.Module, sources: []const 
 
 // The subset of runtime_sources (plus the agent's main) that has no Linux-only
 // dependency; the macos-seam step and `test` compile it for aarch64-macos.
-const macos_seam_sources = [_][]const u8{ "cancel.c", "gdb_packet.c", "gdb_link.c", "log.c", "gdb_description.c", "gdb_lldb.c", "gdbremote.c", "target_state.c", "file_identity.c", "arch.c", "loongarch_step.c", "riscv_step.c", "wire.c", "wire_target.c", "agent.c", "agent_main.c", "remote.c", "file_view.c", "perf_wire.c", "agent_perf.c", "remote_perf.c", "fdinherit.c", "fdgraph.c", "fdgraph_layout.c", "fdtreemap.c", "fdevent_decode.c", "fdevent_count.c", "fdflow_decode.c", "fdflow_count.c", "fdflow_graph.c" };
+const macos_seam_sources = [_][]const u8{ "cancel.c", "gdb_packet.c", "gdb_link.c", "log.c", "gdb_description.c", "gdb_lldb.c", "gdbremote.c", "target_state.c", "file_identity.c", "arch.c", "loongarch_step.c", "riscv_step.c", "wire.c", "wire_target.c", "agent.c", "agent_main.c", "remote.c", "file_view.c", "perf_wire.c", "agent_perf.c", "remote_perf.c", "fdinherit.c", "fdgraph.c", "fdgraph_layout.c", "fdtreemap.c", "fdevent_decode.c", "fdevent_count.c", "fdflow_decode.c", "fdflow_count.c", "fdflow_graph.c", "owned_helper.c", "owned_helper_stub.c" };
 
 /// C cannot list its own macros, so the rpc.h static asserts only see bits
 /// named in XRT_RPC_CAP_DEFINED. Every `#define XRT_RPC_CAP_<name> UINT64_C(`
@@ -502,7 +502,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(gdb_link_tests);
     const debugserver_tests = b.addExecutable(.{ .name = "xodb-debugserver-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     debugserver_tests.root_module.addIncludePath(b.path("src/runtime"));
-    for ([_][]const u8{ "src/runtime/cancel.c", "src/runtime/gdb_packet.c", "src/runtime/gdb_link.c", "src/runtime/macos_debugserver.c", "src/runtime/log.c", "tests/runtime-debugserver.c" }) |source|
+    for ([_][]const u8{ "src/runtime/cancel.c", "src/runtime/gdb_packet.c", "src/runtime/gdb_link.c", "src/runtime/macos_debugserver.c", "src/runtime/owned_helper.c", "src/runtime/owned_helper_stub.c", "src/runtime/log.c", "tests/runtime-debugserver.c" }) |source|
         debugserver_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     b.installArtifact(debugserver_tests);
     const gdb_description_tests = b.addExecutable(.{ .name = "xodb-gdb-description-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });

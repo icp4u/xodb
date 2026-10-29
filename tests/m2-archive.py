@@ -243,6 +243,9 @@ for image in origin['images']:
     digest = bytes(image['identity']['sha256']).hex()
     src = Path(image['path'])
     if src == fixture: src = run / 'retired-build' / fixture.name
+    # [vdso] is not a host file. Its bytes are embedded in the archive.
+    # The verified-status assertion below is unchanged.
+    if not src.is_file(): continue
     if not (assets / digest).exists(): shutil.copy2(src, assets / digest)
 reanalyzed = Offline(original, symbols=assets, reanalyze=True)
 try:

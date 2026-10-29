@@ -138,11 +138,11 @@ enum xrt_status xrt_agent_perf_dispatch(struct xrt_agent_perf *a, struct xrt_tar
     if (!a || !t)
         return XRT_INVALID_ARGUMENT;
     if (opening) {
-        /* Syscall and allocation sampling stay on x86-64. CPU sampling also
-         * accepts the AArch64 and LoongArch64 user register files. */
-        if (op == XRT_RPC_CPU_START) {
+        /* CPU and syscall sampling use the four native 64-bit register/syscall
+         * rows. Allocation/function probes remain x86-64 only. */
+        if (op == XRT_RPC_CPU_START || op == XRT_RPC_SYSCALLS_START) {
             if (t->arch->machine != XRT_X86_64 && t->arch->machine != XRT_AARCH64 &&
-                t->arch->machine != XRT_LOONGARCH)
+                t->arch->machine != XRT_LOONGARCH && t->arch->machine != XRT_RISCV)
                 return XRT_UNSUPPORTED_ARCHITECTURE;
         } else if (t->arch->machine != XRT_X86_64)
             return XRT_UNSUPPORTED_ARCHITECTURE;

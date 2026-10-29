@@ -20,6 +20,7 @@ riscv_step.c
 watchpoints.c
 events.c
 family.c
+owned_helper.c
 xstate.c
 perf.c
 perf_cpu.c

@@ -12,6 +12,9 @@ const log = @import("../log.zig");
 const network = @import("../evidence/stream.zig");
 const pcap = network.pcap;
 
+extern fn xrt_spawn_owned_helper(pid: *i32, create: *const fn (*i32, ?*anyopaque) callconv(.c) c_int, context: ?*anyopaque) c_int;
+extern fn xrt_drop_owned_helper(pid: i32) void;
+
 const c = @cImport({
     @cUndef("_FORTIFY_SOURCE");
     @cDefine("_GNU_SOURCE", "1");
@@ -24,6 +27,20 @@ const c = @cImport({
     @cInclude("sys/prctl.h");
     @cInclude("sys/wait.h");
 });
+
+fn forkOwned(pid: *i32, _: ?*anyopaque) callconv(.c) c_int {
+    const child = c.fork();
+    if (child < 0) {
+        const err = std.c._errno().*;
+        return if (err > 0) @intCast(err) else @intCast(c.EAGAIN);
+    }
+    pid.* = @intCast(child);
+    return 0;
+}
+
+fn dropHelper(pid: c.pid_t) void {
+    if (pid > 1) xrt_drop_owned_helper(@intCast(pid));
+}
 
 pub const default_ring_bytes = 64 * 1024 * 1024;
 pub const min_ring_bytes = 64 * 1024;
@@ -255,13 +272,16 @@ pub const Live = struct {
         // instead of publishing a capture that can never produce a header.
         _ = c.poll(null, 0, 150);
         var status: c_int = 0;
-        if (c.waitpid(self.pid, &status, c.WNOHANG) == self.pid) {
+        const waited = c.waitpid(self.pid, &status, c.WNOHANG);
+        const stolen = waited < 0 and std.c._errno().* == c.ECHILD;
+        if (waited == self.pid or stolen) {
+            const code: c_int = if (waited == self.pid and c.WIFEXITED(status)) c.WEXITSTATUS(status) else -1;
+            dropHelper(self.pid);
             self.pid = 0;
             self.stopChild();
             self.worker.?.join();
             self.worker = null;
             self.closeData();
-            const code: c_int = if (c.WIFEXITED(status)) c.WEXITSTATUS(status) else -1;
             log.err(.session, "xodb: live capture: {s} exited during startup (status {d}). This account may lack capture permission on that interface, or the interface does not exist; xodb uses no sudo or helper, so grant {s} capture rights (for example its packaged group) and retry.\n", .{ @tagName(version.producer), code, @tagName(version.producer) });
             return error.LiveCaptureStartFailed;
         }
@@ -347,12 +367,14 @@ pub const Live = struct {
             self.life = -1;
         }
         if (self.pid > 0) {
+            const pid = self.pid;
+            defer dropHelper(pid);
             var status: c_int = 0;
             const deadline = nowNs() + 2 * std.time.ns_per_s;
-            while (c.waitpid(self.pid, &status, c.WNOHANG) == 0 and nowNs() < deadline) _ = c.poll(null, 0, 10);
-            if (c.waitpid(self.pid, &status, c.WNOHANG) == 0) {
-                _ = c.kill(-self.pid, c.SIGKILL);
-                _ = c.waitpid(self.pid, &status, 0);
+            while (c.waitpid(pid, &status, c.WNOHANG) == 0 and nowNs() < deadline) _ = c.poll(null, 0, 10);
+            if (c.waitpid(pid, &status, c.WNOHANG) == 0) {
+                _ = c.kill(-pid, c.SIGKILL);
+                _ = c.waitpid(pid, &status, 0);
             }
             self.pid = 0;
         }
@@ -404,8 +426,9 @@ fn pipeChild(argv: anytype) !Child {
         _ = c.close(fds[0]);
         _ = c.close(fds[1]);
     }
-    const pid = c.fork();
-    if (pid < 0) return error.LiveCaptureSpawnFailed;
+    var spawned: i32 = 0;
+    if (xrt_spawn_owned_helper(&spawned, forkOwned, null) != 0) return error.LiveCaptureSpawnFailed;
+    const pid: c.pid_t = @intCast(spawned);
     if (pid == 0) {
         _ = c.close(fds[0]);
         if (c.dup2(fds[1], c.STDOUT_FILENO) < 0) c._exit(126);
@@ -431,8 +454,9 @@ fn spawnCapture(argv: anytype) !Child {
         _ = c.close(life[0]);
         _ = c.close(life[1]);
     }
-    const pid = c.fork();
-    if (pid < 0) return error.LiveCaptureSpawnFailed;
+    var spawned: i32 = 0;
+    if (xrt_spawn_owned_helper(&spawned, forkOwned, null) != 0) return error.LiveCaptureSpawnFailed;
+    const pid: c.pid_t = @intCast(spawned);
     if (pid == 0) supervise(argv, data, life);
     _ = c.setpgid(pid, pid);
     _ = c.close(data[1]);
@@ -447,6 +471,7 @@ fn supervise(argv: anytype, data: [2]c_int, life: [2]c_int) noreturn {
     _ = c.close(life[1]);
     _ = c.setpgid(0, 0); // own group: no terminal signals; one group to kill
     const supervisor = c.getpid();
+    // This tool is the supervisor's child. The debugger's reap does not see it.
     const tool = c.fork();
     if (tool < 0) c._exit(126);
     if (tool == 0) {
@@ -493,6 +518,7 @@ fn exitCode(status: c_int) u8 {
 fn probeVersion(tool: [:0]const u8) !Version {
     const argv = [_:null]?[*:0]const u8{ tool.ptr, "--version", null };
     const child = try pipeChild(&argv);
+    defer dropHelper(child.pid);
     defer _ = c.close(child.fd);
     const flags = c.fcntl(child.fd, c.F_GETFL);
     if (flags >= 0) _ = c.fcntl(child.fd, c.F_SETFL, flags | c.O_NONBLOCK);
@@ -511,6 +537,8 @@ fn probeVersion(tool: [:0]const u8) !Version {
             reaped = true;
             break;
         }
+        // Already collected. Do not signal the pid: it may have been reused.
+        if (waited < 0 and std.c._errno().* == c.ECHILD) return error.CaptureVersionFailed;
         _ = c.poll(null, 0, 10);
     }
     if (!reaped) {

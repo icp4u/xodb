@@ -503,13 +503,11 @@ pub const Target = struct {
         // A target never inherits xodb's own Vulkan loader variables.
         @import("../child_env.zig").settle();
         const status = rt.xrt_target_launch(try self.get(), @ptrCast(&args));
-        if (status == rt.XRT_UNSUPPORTED_ARCHITECTURE) return error.UnsupportedTargetArchitecture;
         try runtime.check(status);
     }
     pub fn attach(self: *Target, pid: i32) !void {
         self.forgetPacMask();
         const status = rt.xrt_target_attach(try self.get(), pid);
-        if (status == rt.XRT_UNSUPPORTED_ARCHITECTURE) return error.UnsupportedTargetArchitecture;
         try runtime.check(status);
     }
     pub fn sharedVm(self: *const Target) bool {
@@ -536,7 +534,6 @@ pub const Target = struct {
         rt.xrt_target_observer(handle, if (self.new_thread_observer != null) observe else null, self);
         defer rt.xrt_target_observer(handle, null, null);
         const status = rt.xrt_target_poll(handle);
-        if (status == rt.XRT_UNSUPPORTED_ARCHITECTURE) return error.UnsupportedTargetArchitecture;
         try runtime.check(status);
     }
     pub fn reset(self: *Target) !void {

@@ -3,15 +3,25 @@
 from datetime import datetime
 from pathlib import Path
 import argparse, json, os, signal, subprocess, time
+import platform
 from client import Client
 root = Path(__file__).resolve().parents[1]
 os.chdir(root)
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--perf', action='store_true', help='record status latency and resource costs; no speed gate')
 parser.add_argument('--work', type=Path)
+parser.add_argument('--expect-arch', choices=['x86_64','aarch64','loongarch64','riscv64'])
 args = parser.parse_args()
 os.umask(0o022)
 work = args.work or Path('.work') / ('syscall-timing-' + datetime.now().strftime('%Y%m%dT%H%M%S%f'))
+machine = {'amd64':'x86_64','arm64':'aarch64'}.get(platform.machine().lower(), platform.machine().lower())
+expected_arch = args.expect_arch or machine
+abi_text = {
+    'x86_64': 'x86-64 syscall ABI',
+    'aarch64': 'native AArch64 syscall ABI',
+    'loongarch64': 'native LoongArch64 asm-generic syscall ABI',
+    'riscv64': 'native RISC-V 64 asm-generic syscall ABI',
+}[expected_arch]
 measurements = []
 def resources(client):
     pids = {'frontend': client.p.pid}
@@ -42,6 +52,16 @@ def archive_ready(client):
         assert time.monotonic()<deadline,state
         time.sleep(.005)
 
+def archive_failed(client, name):
+    deadline=time.monotonic()+20
+    while True:
+        state=client.inspect('get_archive_status')
+        if state['job'] and state['job']['done']:
+            assert state['job']['error_name']==name,state
+            return
+        assert time.monotonic()<deadline,state
+        time.sleep(.005)
+
 def rows(client, cap, **filters):
     out=[];start=0
     while True:
@@ -55,6 +75,7 @@ def rows(client, cap, **filters):
 for mode,limit in [('wait',16384),('sustained',65536),('burst',256),('exit',16384),('exec',16384),('loss',4096)]:
     c=Client('control',str(work/'fixture'),args=['burst' if mode=='loss' else mode])
     try:
+        assert c.session()['architecture']==expected_arch,c.session()
         ready=c.action('set_breakpoint',symbol='profile_ready')['id']
         c.action('set_breakpoint',symbol='profile_done')
         c.action('continue');state=c.stopped('breakpoint')
@@ -84,6 +105,8 @@ for mode,limit in [('wait',16384),('sustained',65536),('burst',256),('exit',1638
         after = resources(c) if args.perf else None
         detail=rows(c,cap)
         assert cap['syscalls']['enabled'] and cap['syscalls']['finished'] and detail,cap
+        assert abi_text in cap['syscalls']['number_abi'],cap['syscalls']
+        assert ('x86-64 threads' if expected_arch=='x86_64' else 'native 64-bit threads') in cap['syscalls']['scope'],cap['syscalls']
         assert not cap['syscalls']['invalid'],cap
         assert cap['status'] in ('manual','syscall_limit','target_ended','image_changed','mappings_changed'),cap
         if mode=='wait':
@@ -109,7 +132,7 @@ for mode,limit in [('wait',16384),('sustained',65536),('burst',256),('exit',1638
                 assert r['elapsed_ns']==sum(r['scheduling_overlap'].values()),r
                 assert r['reason']=='complete'
             else: assert r['scheduling_overlap'] is None,r
-        if mode in ('wait','sustained','burst'):
+        if mode in ('wait','sustained','burst') and expected_arch=='x86_64':
             archive=work/(mode+'.xcap')
             c.action('save_capture_archive',capture_id=cap['id'],revision=cap['revision'],path=str(archive))
             archive_ready(c)
@@ -120,6 +143,11 @@ for mode,limit in [('wait',16384),('sustained',65536),('burst',256),('exit',1638
                 assert saved['syscalls']==cap['syscalls'],(saved['syscalls'],cap['syscalls'])
                 assert rows(offline,saved)==detail
             finally:offline.close()
+        elif mode in ('wait','sustained','burst'):
+            archive=work/(mode+'.xcap')
+            c.action('save_capture_archive',capture_id=cap['id'],revision=cap['revision'],path=str(archive))
+            archive_failed(c,'ArchiveUnsupportedArchitecture')
+            assert not archive.exists(),archive
         if args.perf:
             overloaded = any(max(load) > before['allowed_cpus'] for load in [before['load'], *loads, after['load']])
             measurements.append(dict(mode=mode, status='not-measurable' if overloaded else 'measured',

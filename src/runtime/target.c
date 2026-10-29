@@ -72,6 +72,7 @@ enum xrt_status xrt_target_destroy(struct xrt_target *t)
     if (!t)
         return XRT_OK;
     TRY(xrt_target_close(t));
+    xrt_follow_subreaper_release(t);
     xodb_maps_free(&t->maps);
     free(t);
     return XRT_OK;
@@ -158,13 +159,14 @@ enum xrt_status xrt_target_launch(struct xrt_target *t, const char *const argv[]
     }
     if (status == XRT_OK && t->state == XRT_EXITED)
         status = XRT_EXEC_FAILED;
+    const struct xrt_arch *identified = NULL;
     if (status == XRT_OK)
-        status = xrt_process_validate_native(pid);
-    if (status == XRT_OK) {
-        t->arch = xrt_arch_native();
-        t->identity_admitted = t->arch && xrt_arch_validate(t->arch) == XRT_OK;
-        if (!t->identity_admitted)
-            status = XRT_UNSUPPORTED_ARCHITECTURE;
+        status = xrt_process_identify(pid, &identified);
+    if (status == XRT_OK && xrt_arch_host_traceable(identified)) {
+        t->arch = identified;
+        t->identity_admitted = 1;
+    } else if (status == XRT_OK) {
+        status = XRT_UNSUPPORTED_ARCHITECTURE;
     }
     if (status != XRT_OK)
         xrt_target_close(t);
@@ -289,7 +291,11 @@ static enum xrt_status attach(struct xrt_target *t, int32_t pid)
         if (!added) {
             int32_t tid;
             TRY(xrt_target_stopped_tid(t, &tid));
-            return xrt_process_validate_native(tid);
+            const struct xrt_arch *identified = NULL;
+            const enum xrt_status ident = xrt_process_identify(tid, &identified);
+            if (ident != XRT_OK)
+                return ident;
+            return xrt_arch_host_traceable(identified) ? XRT_OK : XRT_UNSUPPORTED_ARCHITECTURE;
         }
     }
     return XRT_STOP_TIMEOUT;
@@ -308,13 +314,23 @@ enum xrt_status xrt_target_attach(struct xrt_target *t, int32_t pid)
     t->pid = pid;
     t->owned = false;
     t->state = XRT_RUNNING;
-    const enum xrt_status result = attach(t, pid);
-    if (result == XRT_OK) {
-        t->arch = xrt_arch_native();
-        t->identity_admitted = t->arch && xrt_arch_validate(t->arch) == XRT_OK;
-        if (!t->identity_admitted) {
+    enum xrt_status result = attach(t, pid);
+    /* A zombie group leader has no /proc/pid/exe. The stopped worker still
+     * names the image, and an already-exited target has nothing to identify. */
+    if (result == XRT_OK && t->state != XRT_EXITED) {
+        int32_t tid = 0;
+        const struct xrt_arch *identified = NULL;
+        result = xrt_target_stopped_tid(t, &tid);
+        if (result == XRT_OK)
+            result = xrt_process_identify(tid, &identified);
+        if (result == XRT_OK && xrt_arch_host_traceable(identified)) {
+            t->arch = identified;
+            t->identity_admitted = 1;
+        } else {
+            if (result == XRT_OK)
+                result = XRT_UNSUPPORTED_ARCHITECTURE;
             xrt_target_close(t);
-            return XRT_UNSUPPORTED_ARCHITECTURE;
+            return result;
         }
     }
     if (result != XRT_OK)
@@ -412,7 +428,9 @@ enum xrt_status xrt_target_registers(const struct xrt_target *t, int32_t tid,
         return XRT_NOT_STOPPED;
     if (t->core)
         return XRT_READ_ONLY_CORE;
-    return xrt_registers_read(tid, out);
+    if (!t->arch || !xrt_arch_host_traceable(t->arch))
+        return XRT_UNSUPPORTED_ARCHITECTURE;
+    return xrt_registers_read_for(t->arch, tid, out);
 }
 static void unpack_mutation(struct xrt_target *t, uint64_t packed)
 {
@@ -459,7 +477,7 @@ enum xrt_status xrt_target_register_write(struct xrt_target *t, int32_t tid, con
         unpack_mutation(t, packed);
         return status;
     }
-    if (!t->identity_admitted || !t->arch || t->arch != xrt_arch_native())
+    if (!t->identity_admitted || !xrt_arch_host_traceable(t->arch))
         return XRT_UNSUPPORTED_ARCHITECTURE;
     if (t->core)
         return XRT_READ_ONLY_CORE;
@@ -469,7 +487,7 @@ enum xrt_status xrt_target_register_write(struct xrt_target *t, int32_t tid, con
         return XRT_UNKNOWN_THREAD;
     struct xrt_mutation_result result = {0};
     const enum xrt_status status =
-        xrt_register_write_result(tid, name, length, value, t->reg_io, &result);
+        xrt_register_write_result_for(t->arch, tid, name, length, value, t->reg_io, &result);
     finish_mutation(t, tid, status, result);
     return status;
 }
@@ -498,7 +516,7 @@ enum xrt_status xrt_target_control_write(struct xrt_target *t, int32_t tid,
         unpack_mutation(t, packed);
         return status;
     }
-    if (!t->identity_admitted || !t->arch || t->arch != xrt_arch_native())
+    if (!t->identity_admitted || !xrt_arch_host_traceable(t->arch))
         return XRT_UNSUPPORTED_ARCHITECTURE;
     if (t->core)
         return XRT_READ_ONLY_CORE;
@@ -507,7 +525,7 @@ enum xrt_status xrt_target_control_write(struct xrt_target *t, int32_t tid,
     if (xrt_thread_index(t, tid) < 0)
         return XRT_UNKNOWN_THREAD;
     struct xrt_mutation_result result = {0};
-    const enum xrt_status status = xrt_control_write(tid, request, t->reg_io, &result);
+    const enum xrt_status status = xrt_control_write_for(t->arch, tid, request, t->reg_io, &result);
     finish_mutation(t, tid, status, result);
     return status;
 }
@@ -558,7 +576,13 @@ enum xrt_status xrt_target_extended(const struct xrt_target *t, int32_t tid, str
         return XRT_UNKNOWN_THREAD;
     if (t->threads[i].state != XRT_STOPPED)
         return XRT_NOT_STOPPED;
-    return xrt_xstate_read(tid, out);
+    const enum xrt_status status = xrt_xstate_read(tid, out);
+    /* A 32-bit task has xmm0-7 only; the 64-bit xstate's upper rows are not its state. */
+    if (status == XRT_OK && t->arch && t->arch->machine == XRT_I386 && out->vector_count > 8) {
+        memset(out->vectors[8], 0, sizeof(out->vectors) - sizeof(out->vectors[0]) * 8);
+        out->vector_count = 8;
+    }
+    return status;
 }
 void xrt_target_observer(struct xrt_target *t, xrt_new_thread_observer observer, void *context)
 {

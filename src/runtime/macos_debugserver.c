@@ -7,7 +7,30 @@
 #include <crt_externs.h>
 #endif
 #include <poll.h>
+#include <stdint.h>
 #include <spawn.h>
+
+int xrt_spawn_owned_helper(int32_t *pid, int (*create)(int32_t *pid, void *context), void *context);
+void xrt_drop_owned_helper(int32_t pid);
+static char **environment(void);
+
+struct debugserver_spawn {
+    const char *path;
+    char *const *argv;
+    posix_spawn_file_actions_t *actions;
+    posix_spawnattr_t *attr;
+};
+
+static int debugserver_create(int32_t *out, void *context)
+{
+    struct debugserver_spawn *spawn = context;
+    pid_t child = 0;
+    int status = posix_spawn(&child, spawn->path, spawn->actions, spawn->attr, spawn->argv, environment());
+    if (status)
+        return status;
+    *out = (int32_t)child;
+    return 0;
+}
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -103,7 +126,13 @@ static int spawn_child(const char *path, char *const *argv, int output, int inhe
     short flags = POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF |
         POSIX_SPAWN_CLOEXEC_DEFAULT;
     if (!status) status = posix_spawnattr_setflags(&attr, flags);
-    if (!status) status = posix_spawn(pid, path, &actions, &attr, argv, environment());
+    if (!status) {
+        int32_t spawned = 0;
+        struct debugserver_spawn spawn = { path, argv, &actions, &attr };
+        status = xrt_spawn_owned_helper(&spawned, debugserver_create, &spawn);
+        if (!status)
+            *pid = (pid_t)spawned;
+    }
     if (!attr_status) posix_spawnattr_destroy(&attr);
     posix_spawn_file_actions_destroy(&actions);
     if (output_copy >= 0) close(output_copy);
@@ -116,6 +145,8 @@ static enum xrt_status reap(struct xrt_debugserver *child, uint64_t until)
         int status;
         pid_t result = waitpid(child->pid, &status, WNOHANG);
         if (result == child->pid || (result < 0 && errno == ECHILD)) {
+            if (child->pid > 1)
+                xrt_drop_owned_helper((int32_t)child->pid);
             child->pid = 0;
             return XRT_OK;
         }
@@ -138,6 +169,8 @@ static enum xrt_status early_exit(struct xrt_debugserver *child, struct xrt_canc
         int status;
         pid_t result = waitpid(child->pid, &status, WNOHANG);
         if (result == child->pid || (result < 0 && errno == ECHILD)) {
+            if (child->pid > 1)
+                xrt_drop_owned_helper((int32_t)child->pid);
             child->pid = 0;
             return XRT_EXEC_FAILED;
         }

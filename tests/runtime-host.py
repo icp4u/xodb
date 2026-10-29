@@ -3,7 +3,7 @@
 
 Native: python3 tests/runtime-host.py
 Cross ISA: add --ssh HOST --ssh-config FILE --agent PATH --fixture PATH --arch m68k
-or --arch loongarch64 or --arch ppc64le or --arch riscv64. The remote fixture is
+or --arch aarch64, loongarch64, ppc64le or riscv64. The remote fixture is
 tests/fixtures/runtime-isa.c compiled with -g -O0. The riscv64 row is the smoke
 check. The full software-step table is tests/runtime-riscv64.py.
 """
@@ -19,7 +19,7 @@ p.add_argument('--ssh')
 p.add_argument('--ssh-config')
 p.add_argument('--agent', default='./zig-out/bin/xodb-agent')
 p.add_argument('--fixture', default='./zig-out/bin/xodb-m1-fixture')
-p.add_argument('--arch', default='x86_64', choices=['x86_64', 'm68k', 'loongarch64', 'ppc64le', 'riscv64'])
+p.add_argument('--arch', default='x86_64', choices=['x86_64', 'aarch64', 'm68k', 'loongarch64', 'ppc64le', 'riscv64'])
 a = p.parse_args()
 os.chdir(Path(__file__).resolve().parents[1])
 options = ['--runtime-agent', a.agent]
@@ -72,10 +72,11 @@ try:
         assert stepped[pc] != regs[pc], (stepped[pc], regs[pc])
         assert stepped['r0'] == regs['r0'], (stepped['r0'], regs['r0'])
         refused('set_watchpoint', 'UnsupportedArchitecture', address=symbol['address'], length=8)
-        # CPU sampling opens on LoongArch64. Syscall timing, allocation and observation stay x86-64.
-        capture = c.action('start_profile')['capture']
+        # CPU and native syscall sampling open on LoongArch64. Allocation and
+        # function observation remain x86-64-only.
+        capture = c.action('start_profile', syscall_timing=True, tids=[tid])['capture']
+        assert 'LoongArch64' in capture['syscalls']['number_abi'], capture
         c.action('stop_profile', capture_id=capture['id'])
-        refused('start_profile', 'SyscallTimingUnsupportedArchitecture', syscall_timing=True, tids=[tid])
         refused('start_allocations', 'UnsupportedAllocationArchitecture', tids=[tid])
         refused('start_observation', 'UnsupportedObservationArchitecture', tids=[tid], mapping_address='0x1000', functions=['malloc'])
         assert c.session()['state'] == 'stopped'
@@ -117,7 +118,9 @@ try:
         assert stepped[pc] != regs[pc], (stepped[pc], regs[pc])
         assert stepped['ra'] == regs['ra'], (stepped['ra'], regs['ra'])
         refused('set_watchpoint', 'UnsupportedArchitecture', address=symbol['address'], length=8)
-        refused('start_profile', 'ProfilingUnsupportedArchitecture')
+        capture = c.action('start_profile', syscall_timing=True, tids=[tid])['capture']
+        assert 'RISC-V 64' in capture['syscalls']['number_abi'], capture
+        c.action('stop_profile', capture_id=capture['id'])
         refused('start_allocations', 'UnsupportedAllocationArchitecture', tids=[tid])
         refused('start_observation', 'UnsupportedObservationArchitecture', tids=[tid], mapping_address='0x1000', functions=['malloc'])
         assert c.session()['state'] == 'stopped'
@@ -155,6 +158,10 @@ try:
             refused('start_observation', 'UnsupportedObservationArchitecture', tids=[tid], mapping_address='0x1000', functions=['malloc'])
             assert set(['r0', 'r1', 'r2', 'lr', 'pc']).issubset(regs), regs
             c.action('write_register', tid=tid, name='r12', value=regs['r12'])
+        if a.arch == 'aarch64':
+            capture = c.action('start_profile', syscall_timing=True, tids=[tid])['capture']
+            assert 'AArch64' in capture['syscalls']['number_abi'], capture
+            c.action('stop_profile', capture_id=capture['id'])
     c.action('remove_breakpoint', id=bp)
     c.action('continue')
     until = time.monotonic() + 5
@@ -162,9 +169,9 @@ try:
         assert time.monotonic() < until
         time.sleep(.002)
     if a.arch == 'loongarch64':
-        print(f'C agent host integration passed (loongarch64): symbols, registers, breakpoint, stack, expression; {disasm_note}; software step; profile opened; syscall timing, watchpoints and uprobes refused')
+        print(f'C agent host integration passed (loongarch64): symbols, registers, breakpoint, stack, expression; {disasm_note}; software step; CPU/syscall profile opened; watchpoints and uprobes refused')
     elif a.arch == 'riscv64':
-        print(f'C agent host integration passed (riscv64): symbols, registers, breakpoint, stack, expression; {disasm_note}; software step; x0 omitted; watchpoints, profile and uprobes refused')
+        print(f'C agent host integration passed (riscv64): symbols, registers, breakpoint, stack, expression; {disasm_note}; software step; x0 omitted; CPU/syscall profile opened; watchpoints and uprobes refused')
     elif a.arch == 'ppc64le':
         print('C agent host integration passed (ppc64le): symbols, registers, local-entry breakpoint, break/step, disassembly, stack, expression; watches, profile and uprobes refused')
     else:

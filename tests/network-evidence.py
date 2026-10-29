@@ -124,11 +124,12 @@ finally:
     c.close()
 listener.close(); receiver.close()
 
-# The archive carries the evidence context (ECTX) in an ignorable section, minor 9.
+# ECTX stays. The in-memory [vdso] image selects minor 12, above the evidence minor.
 raw = archive.read_bytes()
-assert raw[:8] == b'XODBCAPT' and struct.unpack_from('<H', raw, 10)[0] == 9, raw[:16]
+assert raw[:8] == b'XODBCAPT' and struct.unpack_from('<H', raw, 10)[0] == 12, raw[:16]
 tags = [struct.unpack_from('<I', raw, 64 + 24 * i)[0] for i in range(struct.unpack_from('<I', raw, 24)[0])]
 assert 0x58544345 in tags, tags
+assert 0x494d454d in tags, tags
 
 # ------------------------------------------------------------ synthetic files
 

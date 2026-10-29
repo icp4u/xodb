@@ -85,7 +85,7 @@ static int settle_child(int32_t child)
  * child would leave continue and step stuck on PROCESS_BIRTH_PENDING. */
 static int row_cannot_follow(const struct xrt_target *t)
 {
-    return t->arch && t->arch->machine != XRT_X86_64;
+    return !t->arch || (t->arch->machine != XRT_X86_64 && t->arch->machine != XRT_I386);
 }
 /* Move every probe the record still calls patched. The flag is the list of
  * traps to put back; only the shared bytes change. */
@@ -362,8 +362,11 @@ static enum xrt_status poll(struct xrt_target *t)
             t->watch_cancelled = false;
             ++t->image_epoch;
             xrt_target_event(t, XRT_EVENT_IMAGE_REPLACED, tid, (int64_t)t->image_epoch);
-            const enum xrt_status ident = xrt_process_validate_native(tid);
+            const struct xrt_arch *identified = NULL;
+            const enum xrt_status ident = xrt_process_identify(tid, &identified);
             xrt_target_apply_exec_identity(t, ident);
+            if (ident == XRT_OK && xrt_arch_host_traceable(identified))
+                t->arch = identified;
             if (ident != XRT_OK)
                 return ident;
         }
@@ -871,7 +874,7 @@ static enum xrt_status poll(struct xrt_target *t)
                                   : -1;
                 if (b >= 0 && t->breakpoints[b].patched) {
                     struct xrt_breakpoint *probe = &t->breakpoints[b];
-                    TRY(xrt_register_write_pc(tid, probe->address));
+                    TRY(xrt_register_write_pc_for(t->arch, tid, probe->address));
                     t->threads[i].signal = 0;
                     t->threads[i].reason = XRT_STOP_BREAKPOINT;
                     t->threads[i].breakpoint_address = probe->address;
@@ -922,6 +925,7 @@ enum xrt_status xrt_target_poll(struct xrt_target *t)
         return xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_SYNC});
     if (t->core)
         return XRT_OK;
+    xrt_reap_orphans_if_due();
     xrt_reap_detached(t);
     TRY(xrt_poll_births(t));
     if (!t->pid || !t->thread_count)

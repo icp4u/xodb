@@ -70,11 +70,23 @@ static uint64_t mutation_flags(const struct xrt_target *t)
  * mask: the caller retries and does not remember the miss as zero. The macOS
  * seam compiles this file and has no ptrace headers, so the read stays Linux. */
 #if defined(__linux__)
-static enum xrt_status agent_read_pac(uint64_t *data, uint64_t *insn)
+int xrt_spawn_owned_helper(int32_t *pid, int (*create)(int32_t *pid, void *context), void *context);
+void xrt_drop_owned_helper(int32_t pid);
+static int fork_owned(int32_t *pid, void *context)
 {
     pid_t child = fork();
+    (void)context;
     if (child < 0)
+        return errno ? errno : EAGAIN;
+    *pid = (int32_t)child;
+    return 0;
+}
+static enum xrt_status agent_read_pac(uint64_t *data, uint64_t *insn)
+{
+    int32_t spawned = 0;
+    if (xrt_spawn_owned_helper(&spawned, fork_owned, NULL) != 0)
         return XRT_FORK_FAILED;
+    pid_t child = (pid_t)spawned;
     if (child == 0) {
         if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0)
             _exit(127);
@@ -95,6 +107,8 @@ static enum xrt_status agent_read_pac(uint64_t *data, uint64_t *insn)
     do
         got = waitpid(child, &status, 0);
     while (got < 0 && errno == EINTR);
+    if (child > 1)
+        xrt_drop_owned_helper((int32_t)child);
     return result;
 }
 #endif
@@ -274,6 +288,13 @@ static enum xrt_status dispatch(struct agent *a, struct xrt_wire_frame *frame, u
         if (at != size || !*argv[0])
             return XRT_INVALID_ARGUMENT;
         argv[args[0]] = NULL;
+        /* Remote i386 is not on the wire yet. Refuse before the image is
+         * seized: a later snapshot whose arch differs from HELLO becomes an
+         * unknown mutation outcome. In-process launch does not take this path. */
+        const struct xrt_arch *image = NULL;
+        const enum xrt_status ident = xrt_launch_image(argv[0], &image);
+        if (ident == XRT_OK && image != xrt_arch_native())
+            return XRT_UNSUPPORTED_ARCHITECTURE;
         return xrt_target_launch(t, argv);
     }
     case XRT_RPC_ATTACH:
@@ -625,6 +646,15 @@ int xrt_agent_serve(int input, int output, const volatile sig_atomic_t *stop)
         size_t extra_size = 0;
         struct xrt_target *snapshot = NULL;
         enum xrt_status status = dispatch(a, &f, &value, &extra_size, &snapshot);
+        /* An exec or attach can still change the machine after a native HELLO.
+         * Drop that snapshot and the target; the client keeps its native row. */
+        if (snapshot && snapshot->arch && xrt_arch_native() &&
+            snapshot->arch != xrt_arch_native()) {
+            (void)xrt_target_close(snapshot);
+            if (status == XRT_OK)
+                status = XRT_UNSUPPORTED_ARCHITECTURE;
+            snapshot = NULL;
+        }
         xrt_log(XRT_LOG_TRACE, XRT_LOG_AGENT, "request %llu op %u target %u: status %d, %zu reply bytes\n",
                 (unsigned long long)f.request, (unsigned)f.op, (unsigned)f.target, (int)status, extra_size);
         struct xrt_codec out = xrt_codec(a->reply, XRT_WIRE_MAX_BODY, false);

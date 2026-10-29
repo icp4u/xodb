@@ -352,6 +352,19 @@ pub const Modules = struct {
             };
             try self.regions.append(self.allocator, .{ .start = mapping.start, .end = mapping.end, .offset = mapping.offset, .inode = std.hash.Wyhash.hash(0, mapping.path), .device_major = 0, .device_minor = 0, .permissions = permissions, .path = try self.allocator.dupe(u8, mapping.path) });
         }
+        // NT_FILE omits [vdso]. NT_AUXV names its base; the stored PT_LOAD there holds it.
+        if (core.vdso) |base| for (core.segments.items) |seg| if (seg.start == base and seg.flags & 1 != 0) {
+            const covered = for (self.regions.items) |r| {
+                if (r.start < seg.end and seg.start < r.end) break true;
+            } else false;
+            if (covered) break;
+            var slot: usize = 0;
+            while (slot < self.regions.items.len and self.regions.items[slot].start < seg.start) slot += 1;
+            const name = try self.allocator.dupe(u8, "[vdso]");
+            errdefer self.allocator.free(name);
+            try self.regions.insert(self.allocator, slot, .{ .start = seg.start, .end = seg.end, .offset = 0, .inode = 0, .device_major = 0, .device_minor = 0, .permissions = "r-xp".*, .path = name });
+            break;
+        };
     }
     pub fn fromGdbExecutable(self: *Modules, name: []const u8, machine: u16, target: anytype) !void {
         if (self.loaded.items.len != 0) return;
@@ -372,7 +385,7 @@ pub const Modules = struct {
             stat.st_ctim.tv_sec != after.st_ctim.tv_sec or stat.st_ctim.tv_nsec != after.st_ctim.tv_nsec) return error.BinaryChangedDuringRead;
         const image = try elf.Image.parse(mapped);
         if (image.header.type != .executable) return error.GdbExecutablePositionIndependentUnsupported;
-        if (@intFromEnum(image.header.machine) != machine) return error.UnsupportedTargetArchitecture;
+        if (@intFromEnum(image.header.machine) != machine) return error.UnsupportedArchitecture;
         // The stub cannot name its image. A rebuild can keep every code byte
         // and still change its DWARF, so the loaded GNU build ID must match.
         if (image.buildId()) |id| {
@@ -550,8 +563,12 @@ pub const Modules = struct {
         };
     }
     pub fn load(self: *Modules, region: Region, why: Reason) !*Module {
-        if (region.path.len == 0 or region.path[0] != '/') return error.NoBinaryImage;
-        return self.loadRange(region, false, why, null) catch |err| {
+        return load_attempt: {
+            // [vdso] is an ELF the kernel maps with no filesystem path.
+            if (std.mem.eql(u8, region.path, "[vdso]")) break :load_attempt self.loadMappedElf(region, why, false);
+            if (region.path.len == 0 or region.path[0] != '/') break :load_attempt error.NoBinaryImage;
+            break :load_attempt self.loadRange(region, false, why, null);
+        } catch |err| {
             // A source sweep restarts at its first region after Pending. A
             // completed, unplaceable mapping must not start a new worker on
             // every retry and prevent the sweep from ever reaching its end.
@@ -834,6 +851,12 @@ pub const Modules = struct {
     /// A perf record describes one range at one file offset, not the current
     /// collection of VMAs. Do not combine it with the opening/live map snapshot.
     pub fn loadObserved(self: *Modules, region: Region) !*Module {
+        if (std.mem.eql(u8, region.path, "[vdso]")) {
+            return self.loadMappedElf(region, .sweep, true) catch |err| {
+                self.noteSkipped(region, err);
+                return err;
+            };
+        }
         if (region.path.len == 0 or region.path[0] != '/') return error.NoBinaryImage;
         return self.loadRange(region, true, .sweep, null) catch |err| {
             self.noteSkipped(region, err);
@@ -1003,6 +1026,112 @@ pub const Modules = struct {
         return null;
     }
     const Prepared = struct { fd: c_int, coverage: snapshot.Completeness };
+    /// Above this, a special mapping is not treated as an ELF image.
+    const vdso_read_cap: usize = 1024 * 1024;
+    const MappedSpan = struct { start: u64, size: usize };
+    fn mappedSpan(region: Region) !MappedSpan {
+        if (region.end <= region.start) return error.BadMapping;
+        const size = std.math.cast(usize, region.end - region.start) orelse return error.BadMapping;
+        if (size > vdso_read_cap or size > snapshot.per_image_limit) return error.BadMapping;
+        return .{ .start = region.start, .size = size };
+    }
+    /// One contiguous [vdso] span when every such region abuts the next.
+    /// Otherwise only the offset-zero mapping, which is where the ELF header is.
+    fn vdsoSpan(self: *const Modules, region: Region, observed: bool) !MappedSpan {
+        if (observed) return mappedSpan(region);
+        var count: usize = 0;
+        var low: ?Region = null;
+        var file_start: ?Region = null;
+        for (self.regions.items) |item| {
+            if (!std.mem.eql(u8, item.path, "[vdso]")) continue;
+            count += 1;
+            if (low == null or item.start < low.?.start) low = item;
+            if (item.offset == 0 and (file_start == null or item.start < file_start.?.start)) file_start = item;
+        }
+        const base = low orelse return mappedSpan(region);
+        var cursor = base.start;
+        var seen: usize = 0;
+        while (seen < count) {
+            const piece = for (self.regions.items) |item| {
+                if (std.mem.eql(u8, item.path, "[vdso]") and item.start == cursor) break item;
+            } else break;
+            if (piece.end <= cursor) return error.BadMapping;
+            cursor = piece.end;
+            seen += 1;
+        }
+        if (seen == count) {
+            const size = std.math.cast(usize, cursor - base.start) orelse return error.BadMapping;
+            if (size != 0 and size <= vdso_read_cap and size <= snapshot.per_image_limit) return .{ .start = base.start, .size = size };
+        }
+        return mappedSpan(file_start orelse base);
+    }
+    fn readMappedBytes(self: *Modules, address: u64, out: []u8) !void {
+        var done: usize = 0;
+        while (done < out.len) {
+            const here = std.math.add(u64, address, done) catch return error.UnmappedAddress;
+            const n: usize = if (self.core_source) |core| try core.read(here, out[done..]) else blk: {
+                var count: usize = 0;
+                try runtime_api.check(rt.xrt_target_read(self.target, here, out[done..].ptr, out.len - done, &count));
+                if (count > out.len - done) return error.UnmappedAddress;
+                break :blk count;
+            };
+            if (n == 0) return error.UnmappedAddress;
+            done += n;
+        }
+    }
+    /// Load the ELF the kernel placed at `[vdso]`. Live reads use the target;
+    /// a core uses the bytes it already stored. `[vsyscall]` and every other
+    /// pathless mapping stay unloaded.
+    fn loadMappedElf(self: *Modules, region: Region, why: Reason, observed: bool) !*Module {
+        self.refusal = null;
+        if (self.cachedRange(region, observed)) |module| {
+            if (why == .frame) module.debug_sweep = false;
+            return module;
+        }
+        const span = try self.vdsoSpan(region, observed);
+        if (self.allowance(why, region)) |bound| if (bound.pool == .lookups) {
+            const left = lookup_total_limit -| self.lookup_bytes;
+            if (span.size > bound.each or span.size > left) {
+                self.refusal = .{ .size = span.size, .limit = @min(bound.each, left), .which = bound.which, .stack_loads = if (bound.which == .runtime) self.stackLoads(region) else null };
+                return error.BinarySnapshotLimit;
+            }
+        } else if (span.size > bound.each or span.size > snapshot.sweepLeft()) {
+            self.refusal = .{ .size = span.size, .limit = @min(bound.each, snapshot.sweepLeft()), .which = .sweep, .sweep_each = bound.each };
+            return error.BinarySnapshotLimit;
+        };
+        const scratch = try self.allocator.alloc(u8, span.size);
+        defer self.allocator.free(scratch);
+        if (self.core_source == null) {
+            const target = self.target orelse return error.InvalidState;
+            var expected: rt.struct_xrt_target_view = undefined;
+            rt.xrt_target_view(target, &expected);
+            if (expected.state != rt.XRT_STOPPED) return error.NotStopped;
+            try self.readMappedBytes(span.start, scratch);
+            var current: rt.struct_xrt_target_view = undefined;
+            rt.xrt_target_view(target, &current);
+            if (current.state != rt.XRT_STOPPED or current.pid != expected.pid or current.generation != expected.generation or current.image_epoch != expected.image_epoch) return error.BinaryChangedDuringRead;
+        } else try self.readMappedBytes(span.start, scratch);
+        if (scratch.len < 4 or !std.mem.eql(u8, scratch[0..4], "\x7fELF")) return error.NotElf;
+        const mapped = try snapshot.copyAnonymous(scratch);
+        errdefer snapshot.free(mapped);
+        const image = try elf.Image.parse(mapped);
+        if (@intFromEnum(image.header.machine) != (self.expected_machine orelse rt.xrt_target_arch(self.target).*.machine)) return error.UnsupportedTargetArchitecture;
+        const p = try self.placement(&image, 0, region, observed);
+        const path = try self.allocator.dupeZ(u8, region.path);
+        errdefer self.allocator.free(path);
+        const module = try self.allocator.create(Module);
+        errdefer self.allocator.destroy(module);
+        module.* = .{ .id = try self.moduleId(region, p.bias, 0), .inode = region.inode, .device_major = region.device_major, .device_minor = region.device_minor, .path = path, .image = image, .bias = p.bias, .start = p.first.start, .end = p.end, .mapping = mapped, .file_offset = 0, .immutable = self.immutable, .debug_sweep = why == .sweep, .file_source = .target_memory };
+        try self.loaded.ensureUnusedCapacity(self.allocator, 1);
+        self.loaded.appendAssumeCapacity(module);
+        self.snapshot_bytes += mapped.len;
+        if (self.allowance(why, region)) |bound| if (bound.pool == .lookups) {
+            self.lookup_bytes += mapped.len;
+        };
+        self.budget_dirty = true;
+        self.recordSource(region, .target_memory);
+        return module;
+    }
     fn loadRange(self: *Modules, region: Region, observed: bool, why: Reason, prepared: ?Prepared) !*Module {
         self.refusal = null;
         if (self.cachedRange(region, observed)) |module| {
@@ -1143,7 +1272,7 @@ pub const Modules = struct {
         }
         const image = try elf.Image.parse(mapped);
         if (expected) |id| if (!std.mem.eql(u8, id, image.buildId() orelse return error.CoreModuleBuildIdMissing)) return error.CoreModuleBuildIdMismatch;
-        if (@intFromEnum(image.header.machine) != (self.expected_machine orelse rt.xrt_target_arch(self.target).*.machine)) return error.UnsupportedTargetArchitecture;
+        if (@intFromEnum(image.header.machine) != (self.expected_machine orelse rt.xrt_target_arch(self.target).*.machine)) return error.UnsupportedArchitecture;
         const p = try self.placement(&image, entry.offset, region, observed);
         var module = try self.allocator.create(Module);
         errdefer self.allocator.destroy(module);
@@ -1263,6 +1392,8 @@ pub const Modules = struct {
         const remote = rt.xrt_target_is_remote(self.target);
         for (self.regions.items) |region| {
             if (address < region.start or address >= region.end) continue;
+            // A pathless ELF is loaded in full. Opening a file named [vdso] is not a symbol view.
+            if (std.mem.eql(u8, region.path, "[vdso]")) return false;
             if (self.cachedRange(region, false) != null) return false;
             const image = try self.symbolImage(region);
             const index = try self.fileIdentity(region);
@@ -1516,7 +1647,7 @@ pub const Modules = struct {
         const bytes: []align(std.heap.page_size_min) u8 = @as([*]align(std.heap.page_size_min) u8, @ptrCast(@alignCast(ptr)))[0..size];
         errdefer _ = c.munmap(bytes.ptr, bytes.len);
         const image = try elf.Image.parse(bytes);
-        if (@intFromEnum(image.header.machine) != rt.xrt_target_arch(self.target).*.machine) return error.UnsupportedTargetArchitecture;
+        if (@intFromEnum(image.header.machine) != rt.xrt_target_arch(self.target).*.machine) return error.UnsupportedArchitecture;
         try self.trimSymbols(retained);
         // A remote projection carries the agent's stat of the file it read,
         // so a later file view is compared with the version symbols came from.
@@ -1912,6 +2043,16 @@ pub const Modules = struct {
                     if (symbol.hasAddress()) return publishedSymbol(module.image.header.machine, module.id, symbol, try module.runtimeAddress(symbol.value));
                 } else if (module.file_offset == 0) noteSymbolMiss(&missed, &missed_n, r);
                 continue :regions;
+            }
+            // [vdso] has no file for a symbols-only view. It is small, so load it in full.
+            // Only its own names: plain aliases such as gettimeofday belong to libc,
+            // which is not mapped yet at the exec stop.
+            if (std.mem.eql(u8, r.path, "[vdso]")) {
+                if (r.offset != 0 or !(std.mem.startsWith(u8, name, "__vdso_") or std.mem.startsWith(u8, name, "__kernel_"))) continue;
+                const module = self.load(r, .name) catch continue;
+                const symbol = module.symbols().findSymbol(name) orelse continue;
+                if (symbol.hasAddress()) return publishedSymbol(module.image.header.machine, module.id, symbol, try module.runtimeAddress(symbol.value));
+                continue;
             }
             if (r.offset != 0 and r.permissions[2] != 'x') continue;
             if (r.path.len == 0 or r.path[0] != '/' or

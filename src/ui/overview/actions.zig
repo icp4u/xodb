@@ -4,11 +4,27 @@ const c = @cImport({
     @cUndef("_FORTIFY_SOURCE");
     @cDefine("_GNU_SOURCE", "1");
     @cInclude("spawn.h");
+    @cInclude("errno.h");
     @cInclude("unistd.h");
     @cInclude("fcntl.h");
     @cInclude("sys/wait.h");
 });
 const identity = @import("../../model/process_identity.zig");
+extern fn xrt_spawn_owned_helper(pid: *i32, create: *const fn (*i32, ?*anyopaque) callconv(.c) c_int, context: ?*anyopaque) c_int;
+extern fn xrt_drop_owned_helper(pid: i32) void;
+const ActionSpawn = struct {
+    program: [*:0]const u8,
+    actions: *c.posix_spawn_file_actions_t,
+    argv: [*c]?[*:0]const u8,
+};
+fn actionSpawn(pid: *i32, raw: ?*anyopaque) callconv(.c) c_int {
+    const ctx: *ActionSpawn = @ptrCast(@alignCast(raw orelse return @intCast(c.EINVAL)));
+    var child: c.pid_t = 0;
+    const rc = c.posix_spawn(&child, ctx.program, ctx.actions, null, @ptrCast(ctx.argv), c.environ);
+    if (rc != 0) return rc;
+    pid.* = @intCast(child);
+    return 0;
+}
 pub const Kind = enum { files, profile, attach, events };
 pub const Request = struct { kind: Kind, id: identity.Identity, capture_id: ?u64 = null };
 pub const Launcher = struct {
@@ -18,9 +34,11 @@ pub const Launcher = struct {
         var failed = false;
         for (&self.children) |*pid| if (pid.* != 0) {
             var status: c_int = 0;
-            if (c.waitpid(pid.*, &status, c.WNOHANG) == pid.*) {
+            const waited = c.waitpid(pid.*, &status, c.WNOHANG);
+            if (waited == pid.* or (waited < 0 and std.c._errno().* == c.ECHILD)) {
+                if (pid.* > 1) xrt_drop_owned_helper(@intCast(pid.*));
+                if (waited == pid.*) failed = failed or status != 0;
                 pid.* = 0;
-                failed = failed or status != 0;
             }
         };
         return failed;
@@ -81,7 +99,10 @@ pub const Launcher = struct {
         defer _ = c.posix_spawn_file_actions_destroy(&fa);
         if (c.posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", c.O_RDONLY, 0) != 0 or
             c.posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", c.O_WRONLY, 0) != 0) return error.ActionSpawnFailed;
-        if (c.posix_spawn(slot, program, &fa, null, @ptrCast(&args), c.environ) != 0) return error.ActionSpawnFailed;
+        var spawned: i32 = 0;
+        var spawn_ctx = ActionSpawn{ .program = program, .actions = &fa, .argv = @ptrCast(&args) };
+        if (xrt_spawn_owned_helper(&spawned, actionSpawn, &spawn_ctx) != 0) return error.ActionSpawnFailed;
+        slot.* = @intCast(spawned);
     }
 };
 

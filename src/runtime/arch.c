@@ -19,6 +19,12 @@ enum xrt_status xrt_register_admit(const struct xrt_register_desc *reg, uint64_t
      (id) >= 18 ? XRT_REG_READ_ONLY : XRT_REG_READ_WRITE, XRT_REG_ALWAYS},
 static const struct xrt_register_desc x86_registers[] = {XRT_X86_REGISTERS(X86_DESC)};
 #undef X86_DESC
+/* gs_base is the thread-area base. The kernel word is not that value's source. */
+#define I386_DESC(name, dwarf, word, id, role)                                                     \
+    {#name, id, dwarf, offsetof(struct xrt_i386_registers, name), (word) * 8, 4, role,            \
+     (id) == 17 ? XRT_REG_READ_ONLY : XRT_REG_READ_WRITE, XRT_REG_ALWAYS},
+static const struct xrt_register_desc i386_registers[] = {XRT_I386_REGISTERS(I386_DESC)};
+#undef I386_DESC
 #define ARM_DESC(name, dwarf, word, id, role)                                                      \
     {#name, id, dwarf, offsetof(struct xrt_arm_registers, name), (word) * 8, 8, role,             \
      XRT_REG_READ_WRITE, XRT_REG_ALWAYS},
@@ -102,6 +108,26 @@ static const struct xrt_arch architectures[] = {
      .registers = x86_registers,
      .elf_class = XRT_ELF_CLASS_64,
      .linux_abi = XRT_LINUX_ABI_NATIVE,
+     .isa_mode = XRT_ISA_MODE_ORDINARY,
+     .control_kind = XRT_CONTROL_SINGLE_PC,
+     .tracer_bits = 64,
+     .hardware_step = 1,
+     .probes = x86_probes,
+     .probe_count = 1},
+    {.machine = XRT_I386,
+     .kernel_gpr_bytes = 216,
+     .address_bits = 32,
+     .little_endian = 1,
+     .register_count = 18,
+     .dwarf_count = 9,
+     .trap_size = 1,
+     .trap_alignment = 1,
+     .breakpoint_adjust = 1,
+     .caller_adjust = 1,
+     .trap = {0xcc},
+     .registers = i386_registers,
+     .elf_class = XRT_ELF_CLASS_32,
+     .linux_abi = XRT_LINUX_ABI_COMPAT32,
      .isa_mode = XRT_ISA_MODE_ORDINARY,
      .control_kind = XRT_CONTROL_SINGLE_PC,
      .tracer_bits = 64,
@@ -195,8 +221,9 @@ static const struct xrt_arch architectures[] = {
 
 static int product_machine(uint16_t machine)
 {
-    return machine == XRT_M68K || machine == XRT_X86_64 || machine == XRT_AARCH64 ||
-           machine == XRT_LOONGARCH || machine == XRT_RISCV || machine == XRT_PPC64;
+    return machine == XRT_M68K || machine == XRT_X86_64 || machine == XRT_I386 ||
+           machine == XRT_AARCH64 || machine == XRT_LOONGARCH || machine == XRT_RISCV ||
+           machine == XRT_PPC64;
 }
 
 static int choice_bounds(const struct xrt_probe_choice *choice)
@@ -407,6 +434,20 @@ const struct xrt_arch *xrt_arch_native(void)
     if (!arch || arch->tracer_bits != sizeof(long) * 8)
         return NULL;
     return arch;
+}
+
+int xrt_arch_host_traceable(const struct xrt_arch *arch)
+{
+    const struct xrt_arch *native = xrt_arch_native();
+    if (!arch || !native)
+        return 0;
+    if (arch == native)
+        return 1;
+#if defined(__x86_64__) && !defined(__ILP32__)
+    if (arch == xrt_arch_get(XRT_I386))
+        return 1;
+#endif
+    return 0;
 }
 
 const struct xrt_register_desc *xrt_arch_register_id(const struct xrt_arch *arch, uint16_t id)

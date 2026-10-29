@@ -23,7 +23,7 @@ pub const max_retained_user_stack: usize = 256 * 1024;
 /// AX, BX, CX, DX, SI, DI, BP, SP, IP, and R8–R15. Skips flags and segment regs.
 pub const user_regs_gpr_mask: u64 = 0x1ff | (0xff << 16);
 /// Kernel perf user-register file for one architecture. Indices are perf
-/// positions, not DWARF numbers. LoongArch perf index 0 is the PC.
+/// positions, not DWARF numbers. LoongArch and RISC-V perf index 0 is the PC.
 pub const PerfFile = struct {
     limit: u6,
     mask: u64,
@@ -42,6 +42,7 @@ pub fn perfFile(machine: u16) ?PerfFile {
         machine_x86_64 => .{ .limit = 24, .mask = user_regs_gpr_mask, .sp = 7, .pc = 8 },
         machine_aarch64 => .{ .limit = 33, .mask = (@as(u64, 1) << 33) - 1, .sp = 31, .pc = 32 },
         machine_loongarch64 => .{ .limit = 32, .mask = (@as(u64, 1) << 32) - 1, .sp = 3, .pc = 0 },
+        machine_riscv64 => .{ .limit = 32, .mask = (@as(u64, 1) << 32) - 1, .sp = 2, .pc = 0 },
         else => null,
     };
 }
@@ -784,7 +785,7 @@ pub fn copyRing(ring: []const u8, offset: u64, dest: []u8) void {
     }
 }
 
-test "perf user register files cover x86-64, aarch64, and loongarch64" {
+test "perf user register files cover native sampled architectures" {
     const x86 = perfFile(machine_x86_64).?;
     try std.testing.expectEqual(user_regs_gpr_mask, x86.mask);
     try std.testing.expectEqual(@as(u6, 24), x86.limit);
@@ -811,5 +812,10 @@ test "perf user register files cover x86-64, aarch64, and loongarch64" {
     try std.testing.expectEqual(max_user_regs, archivedUserRegs(loong.mask));
     try std.testing.expectEqual(221 + (max_user_regs - x86_user_regs) * 8, archivedUserStateBytes(loong.mask));
 
-    try std.testing.expect(perfFile(machine_riscv64) == null);
+    const riscv = perfFile(machine_riscv64).?;
+    try std.testing.expectEqual(@as(u6, 0), riscv.pc);
+    try std.testing.expectEqual(@as(u6, 2), riscv.sp);
+    try std.testing.expect(riscv.mask & (@as(u64, 1) << 1) != 0);
+    try std.testing.expect(riscv.mask & (@as(u64, 1) << 31) != 0);
+    try std.testing.expectEqual(@as(u64, 0), riscv.mask >> 32);
 }

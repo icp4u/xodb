@@ -343,5 +343,18 @@ _Static_assert(SYS_exit == XRT_X86_64_NR_exit && SYS_exit_group == XRT_X86_64_NR
 #endif
 _Static_assert(SYS_uname == XRT_X86_64_NR_uname && SYS_getuid == XRT_X86_64_NR_getuid, "x86 harmless numbers");
 _Static_assert(XRT_FDFLOW_IO_COUNT == 14, "x86 keeps 14 IO calls");
+#elif defined(__linux__) &&                                                                      \
+    (defined(__aarch64__) || defined(__loongarch__) ||                                           \
+     (defined(__riscv) && __riscv_xlen == 64))
+/* Every syscall used by fdflow must agree with the generated native
+ * asm-generic row. Missing deprecated calls expand to no assertion. */
+#define XRT_FDFLOW_GENERIC_CHECK(name, number, unused)                                           \
+    _Static_assert((number) == XRT_GENERIC_NR_##name, "asm-generic " #name);
+XRT_FDFLOW_EACH_IO(XRT_FDFLOW_GENERIC_CHECK)
+XRT_FDFLOW_EACH_MUTATION(XRT_FDFLOW_GENERIC_CHECK)
+#undef XRT_FDFLOW_GENERIC_CHECK
+_Static_assert(SYS_exit == XRT_GENERIC_NR_exit && SYS_exit_group == XRT_GENERIC_NR_exit_group,
+               "asm-generic exit/exit_group");
+_Static_assert(XRT_FDFLOW_IO_COUNT == 14, "asm-generic keeps 14 IO calls");
 #endif
 #endif

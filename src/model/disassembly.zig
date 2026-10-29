@@ -21,7 +21,7 @@ pub fn decodeFlowFor(architecture: Arch, bytes: []const u8, address: u64, out: [
 }
 fn capstoneArch(architecture: Arch) c.cs_arch {
     return switch (architecture) {
-        .x86_64 => c.CS_ARCH_X86,
+        .i386, .x86_64 => c.CS_ARCH_X86,
         .aarch64 => if (comptime c.CS_API_MAJOR >= 6) c.CS_ARCH_AARCH64 else c.CS_ARCH_ARM64,
         .m68k => c.CS_ARCH_M68K,
         .loongarch64 => if (comptime c.CS_API_MAJOR >= 6) c.CS_ARCH_LOONGARCH else unreachable,
@@ -31,6 +31,7 @@ fn capstoneArch(architecture: Arch) c.cs_arch {
 }
 fn capstoneMode(architecture: Arch) c.cs_mode {
     return switch (architecture) {
+        .i386 => c.CS_MODE_32,
         .x86_64 => c.CS_MODE_64,
         .aarch64 => c.CS_MODE_ARM,
         .m68k => c.CS_MODE_BIG_ENDIAN | c.CS_MODE_M68K_040,

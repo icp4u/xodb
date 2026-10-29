@@ -170,6 +170,8 @@ static enum xrt_status invalid_reply(struct xrt_connection *c, bool mutation)
     (void)broken(c, XRT_PROTOCOL_ERROR);
     return mutation ? XRT_REMOTE_OUTCOME_UNKNOWN : XRT_PROTOCOL_ERROR;
 }
+static void drop_owned_child(pid_t pid);
+
 static bool reap_for(struct xrt_connection *c, uint64_t timeout)
 {
     if (c->reaped)
@@ -188,12 +190,14 @@ static bool reap_for(struct xrt_connection *c, uint64_t timeout)
         if (got == c->child) {
             c->reaped = true;
             c->exit_status_known = true;
+            drop_owned_child(c->child);
             return true;
         }
         if (got < 0 && errno == ECHILD) {
             /* Another reaper owns the exit status. Never signal this PID
              * again: it could already identify an unrelated process. */
             c->reaped = true;
+            drop_owned_child(c->child);
             return true;
         }
         if (got < 0 && errno != EINTR)
@@ -261,6 +265,8 @@ static void release_connection(struct xrt_connection *c)
             pid_t got;
             do got = waitpid(c->child, &c->exit_status, 0); while (got < 0 && errno == EINTR);
             c->reaped = got == c->child || (got < 0 && errno == ECHILD);
+            if (c->reaped)
+                drop_owned_child(c->child);
             c->exit_status_known = got == c->child;
         }
     }
@@ -689,6 +695,20 @@ static bool pac_suffix_ok(uint64_t insn, uint64_t va)
         return false;
     return va == (uint64_t)__builtin_ctzll(insn);
 }
+static int fork_owned(int32_t *pid, void *context)
+{
+    pid_t child = fork();
+    (void)context;
+    if (child < 0)
+        return errno ? errno : EAGAIN;
+    *pid = (int32_t)child;
+    return 0;
+}
+static void drop_owned_child(pid_t pid)
+{
+    if (pid > 1)
+        xrt_drop_owned_helper((int32_t)pid);
+}
 enum xrt_status xrt_target_remote(const char *const argv[], struct xrt_target **out)
 {
     return xrt_target_remote_cancel(argv, out, NULL);
@@ -773,18 +793,21 @@ enum xrt_status xrt_target_remote_cancel(const char *const argv[], struct xrt_ta
             close(sockets[i]);
             sockets[i] = high;
         }
-    c->child = fork();
-    if (c->child < 0) {
-        close(sockets[0]);
-        close(sockets[1]);
-        free(t);
-        free(c->request_bytes);
-        free(c->reply);
-        free(c->decoded);
-        pthread_mutex_destroy(&c->mutex);
-        xrt_cancel_release(c->cancel);
-        free(c);
-        return XRT_FORK_FAILED;
+    {
+        int32_t spawned = 0;
+        if (xrt_spawn_owned_helper(&spawned, fork_owned, NULL) != 0) {
+            close(sockets[0]);
+            close(sockets[1]);
+            free(t);
+            free(c->request_bytes);
+            free(c->reply);
+            free(c->decoded);
+            pthread_mutex_destroy(&c->mutex);
+            xrt_cancel_release(c->cancel);
+            free(c);
+            return XRT_FORK_FAILED;
+        }
+        c->child = (pid_t)spawned;
     }
     if (!c->child) {
         close(sockets[0]);

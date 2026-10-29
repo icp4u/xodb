@@ -5,6 +5,10 @@
 #include <string.h>
 #include <sys/ptrace.h>
 #include <sys/uio.h>
+#if defined(__x86_64__) && !defined(__ILP32__)
+#include <asm/ldt.h>
+#include <sys/user.h>
+#endif
 
 static enum xrt_status ptrace_failure(void)
 {
@@ -24,6 +28,20 @@ static enum xrt_status ptrace_read(void *ctx, int32_t tid, const struct xrt_arch
 #if defined(__m68k__)
     if (arch->machine == XRT_M68K)
         return ptrace(PTRACE_GETREGS, tid, (void *)0, raw) == -1 ? ptrace_failure() : XRT_OK;
+#endif
+#if defined(__x86_64__) && !defined(__ILP32__)
+    /* Compat tasks answer NT_PRSTATUS with a 68-byte i386 regset. The 64-bit
+     * tracer's GETREGS image is the 216-byte user_regs_struct this row maps. */
+    if (arch->machine == XRT_I386) {
+        struct user_regs_struct regs;
+        if (size != sizeof(regs))
+            return XRT_UNEXPECTED_REGISTER_SIZE;
+        memset(&regs, 0, sizeof(regs));
+        if (ptrace(PTRACE_GETREGS, tid, (void *)0, &regs) == -1)
+            return ptrace_failure();
+        memcpy(raw, &regs, size);
+        return XRT_OK;
+    }
 #endif
     /* LoongArch fills 280 of its 360 NT_PRSTATUS bytes and still reports
        360; the reserved tail is whatever the buffer held. */
@@ -45,6 +63,17 @@ static enum xrt_status ptrace_write(void *ctx, int32_t tid, const struct xrt_arc
         return ptrace(PTRACE_SETREGS, tid, (void *)0, (void *)raw) == -1 ? ptrace_failure()
                                                                          : XRT_OK;
 #endif
+#if defined(__x86_64__) && !defined(__ILP32__)
+    if (arch->machine == XRT_I386) {
+        struct user_regs_struct regs;
+        if (size != sizeof(regs))
+            return XRT_UNEXPECTED_REGISTER_SIZE;
+        memcpy(&regs, raw, size);
+        if (ptrace(PTRACE_SETREGS, tid, (void *)0, &regs) == -1)
+            return ptrace_failure();
+        return XRT_OK;
+    }
+#endif
     struct iovec io = {.iov_base = (void *)raw, .iov_len = size};
     if (ptrace(PTRACE_SETREGSET, tid, (void *)(uintptr_t)1, &io) == -1)
         return ptrace_failure();
@@ -57,6 +86,10 @@ static void store_field(const struct xrt_arch *arch, unsigned char *raw,
     for (uint8_t b = 0; b < reg->width; ++b)
         raw[reg->kernel_offset + b] =
             (unsigned char)(value >> (8 * (arch->little_endian ? b : reg->width - 1 - b)));
+    /* SETREGS keeps a dirty high half. A 32-bit write must clear it. */
+    if (arch->machine == XRT_I386 && reg->width < 8 &&
+        (size_t)reg->kernel_offset + 8 <= arch->kernel_gpr_bytes)
+        memset(raw + reg->kernel_offset + reg->width, 0, (size_t)(8 - reg->width));
 }
 
 enum xrt_status xrt_registers_poke(const struct xrt_arch *arch, void *raw, size_t size,
@@ -170,30 +203,69 @@ enum xrt_status xrt_registers_mutate(const struct xrt_arch *arch, struct xrt_reg
     return XRT_OK;
 }
 
-enum xrt_status xrt_registers_read(int32_t tid, struct xrt_registers *out)
+#if defined(__x86_64__) && !defined(__ILP32__)
+/* 32-bit TLS lives in the GDT thread area selected by gs. fs_base is not it.
+ * A failed lookup stays absent so the kernel's gs_base word is not shown. */
+static void i386_gs_base(int32_t tid, struct xrt_registers *regs)
 {
-    const struct xrt_arch *arch = xrt_arch_native();
+    const struct xrt_arch *arch = xrt_arch_get(XRT_I386);
+    const struct xrt_register_desc *gs = xrt_arch_register(XRT_I386, "gs", 2);
+    const struct xrt_register_desc *base = xrt_arch_register(XRT_I386, "gs_base", 7);
+    uint64_t selector = 0;
+    if (!arch || !gs || !base || xrt_registers_value_desc_row(arch, regs, gs, &selector) != XRT_OK) {
+        if (base)
+            xrt_registers_mark_absent(regs, base->id);
+        return;
+    }
+    struct user_desc desc;
+    memset(&desc, 0, sizeof(desc));
+    const unsigned idx = (unsigned)((selector & 0xffffu) >> 3);
+    if (ptrace(PTRACE_GET_THREAD_AREA, tid, (void *)(uintptr_t)idx, &desc) != 0) {
+        xrt_registers_mark_absent(regs, base->id);
+        return;
+    }
+    const uint64_t value = desc.base_addr;
+    memcpy((unsigned char *)&regs->values + base->snapshot_offset, &value, sizeof(value));
+}
+#endif
+
+enum xrt_status xrt_registers_read_for(const struct xrt_arch *arch, int32_t tid,
+                                       struct xrt_registers *out)
+{
     if (!arch)
         return XRT_UNSUPPORTED_ARCHITECTURE;
     if (!out)
         return XRT_INVALID_ARGUMENT;
     unsigned char raw[XRT_GPR_BYTES_MAX];
+    memset(raw, 0, sizeof(raw));
     const enum xrt_status status = ptrace_read(NULL, tid, arch, raw, arch->kernel_gpr_bytes);
     if (status != XRT_OK)
         return status;
     const struct xrt_abi_id abi = xrt_arch_abi(arch);
-    return xrt_registers_decode(&abi, raw, arch->kernel_gpr_bytes, out);
+    const enum xrt_status decoded = xrt_registers_decode(&abi, raw, arch->kernel_gpr_bytes, out);
+    if (decoded != XRT_OK)
+        return decoded;
+#if defined(__x86_64__) && !defined(__ILP32__)
+    if (arch->machine == XRT_I386)
+        i386_gs_base(tid, out);
+#endif
+    return XRT_OK;
 }
 
-enum xrt_status xrt_register_write_result(int32_t tid, const char *name, size_t length,
-                                          uint64_t value, struct xrt_reg_io *io,
-                                          struct xrt_mutation_result *out)
+enum xrt_status xrt_registers_read(int32_t tid, struct xrt_registers *out)
+{
+    return xrt_registers_read_for(xrt_arch_native(), tid, out);
+}
+
+enum xrt_status xrt_register_write_result_for(const struct xrt_arch *arch, int32_t tid,
+                                              const char *name, size_t length, uint64_t value,
+                                              struct xrt_reg_io *io,
+                                              struct xrt_mutation_result *out)
 {
     if (out) {
         out->issued = 0;
         out->confirmed = 0;
     }
-    const struct xrt_arch *arch = xrt_arch_native();
     if (!arch)
         return XRT_UNSUPPORTED_ARCHITECTURE;
     if (!name || !out)
@@ -219,15 +291,21 @@ enum xrt_status xrt_register_write_result(int32_t tid, const char *name, size_t 
     return xrt_registers_mutate(arch, io, tid, raw, out);
 }
 
+enum xrt_status xrt_register_write_result(int32_t tid, const char *name, size_t length,
+                                          uint64_t value, struct xrt_reg_io *io,
+                                          struct xrt_mutation_result *out)
+{
+    return xrt_register_write_result_for(xrt_arch_native(), tid, name, length, value, io, out);
+}
+
 enum xrt_status xrt_register_write(int32_t tid, const char *name, size_t length, uint64_t value)
 {
     struct xrt_mutation_result result = {0};
     return xrt_register_write_result(tid, name, length, value, NULL, &result);
 }
 
-enum xrt_status xrt_register_write_pc(int32_t tid, uint64_t pc)
+enum xrt_status xrt_register_write_pc_for(const struct xrt_arch *arch, int32_t tid, uint64_t pc)
 {
-    const struct xrt_arch *arch = xrt_arch_native();
     if (!arch)
         return XRT_UNSUPPORTED_ARCHITECTURE;
     if (arch->control_kind != XRT_CONTROL_SINGLE_PC)
@@ -235,17 +313,23 @@ enum xrt_status xrt_register_write_pc(int32_t tid, uint64_t pc)
     const struct xrt_register_desc *reg = xrt_arch_role(arch, XRT_ROLE_PC);
     if (!reg || !reg->name)
         return XRT_UNSUPPORTED_CONTROL;
-    return xrt_register_write(tid, reg->name, strlen(reg->name), pc);
+    return xrt_register_write_result_for(arch, tid, reg->name, strlen(reg->name), pc, NULL,
+                                         &(struct xrt_mutation_result){0});
 }
 
-enum xrt_status xrt_control_write(int32_t tid, const struct xrt_control_request *request,
-                                  struct xrt_reg_io *io, struct xrt_mutation_result *out)
+enum xrt_status xrt_register_write_pc(int32_t tid, uint64_t pc)
+{
+    return xrt_register_write_pc_for(xrt_arch_native(), tid, pc);
+}
+
+enum xrt_status xrt_control_write_for(const struct xrt_arch *arch, int32_t tid,
+                                      const struct xrt_control_request *request,
+                                      struct xrt_reg_io *io, struct xrt_mutation_result *out)
 {
     if (out) {
         out->issued = 0;
         out->confirmed = 0;
     }
-    const struct xrt_arch *arch = xrt_arch_native();
     if (!arch)
         return XRT_UNSUPPORTED_ARCHITECTURE;
     if (!request || !out)
@@ -265,4 +349,10 @@ enum xrt_status xrt_control_write(int32_t tid, const struct xrt_control_request 
     if (poked != XRT_OK)
         return poked;
     return xrt_registers_mutate(arch, io, tid, raw, out);
+}
+
+enum xrt_status xrt_control_write(int32_t tid, const struct xrt_control_request *request,
+                                  struct xrt_reg_io *io, struct xrt_mutation_result *out)
+{
+    return xrt_control_write_for(xrt_arch_native(), tid, request, io, out);
 }

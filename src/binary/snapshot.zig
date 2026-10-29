@@ -209,6 +209,15 @@ const Stamp = struct { device: u64, inode: u64, size: i64, mtime: [2]i64, ctime:
 const Shared = struct { stamp: Stamp, offset: u64, bytes: Bytes, holders: usize, sweep_bytes: usize };
 var store_lock: std.atomic.Mutex = .unlocked;
 var store: std.ArrayList(Shared) = .empty;
+/// Inodes for images that exist only in target memory. Zero is a real
+/// anonymous inode, so the counter starts at one under the store lock.
+var anonymous_seq: u64 = 0;
+const memory_mark = memory: {
+    var out: [36]u8 = @splat(0);
+    const text = "target-memory-image";
+    @memcpy(out[0..text.len], text);
+    break :memory out;
+};
 fn lockStore() void {
     while (!store_lock.tryLock()) std.atomic.spinLoopHint();
 }
@@ -395,6 +404,31 @@ fn readRangeFor(fd: c_int, file_offset: u64, size: usize, limit: usize, cancel: 
     // Another thread may have read the same version meanwhile: keep theirs.
     if (held(key, file_offset, size)) |first| return first;
     try store.append(std.heap.page_allocator, .{ .stamp = key, .offset = file_offset, .bytes = bytes, .holders = 1, .sweep_bytes = swept_bytes });
+    owned = true;
+    return bytes;
+}
+/// A private image with no file. Each call is its own store entry, so two
+/// processes that publish the same bytes do not share a mapping. `free`
+/// releases the reservation.
+pub fn copyAnonymous(src: []const u8) !Bytes {
+    if (src.len == 0) return error.BinaryUnavailable;
+    if (src.len > per_image_limit) return error.BinarySnapshotLimit;
+    const charged = try reserve(src.len);
+    var owned = false;
+    defer if (!owned) release(charged);
+    const ptr = c.mmap(null, src.len, c.PROT_READ | c.PROT_WRITE, c.MAP_PRIVATE | c.MAP_ANONYMOUS, -1, 0);
+    if (ptr == std.c.MAP_FAILED) return error.OutOfMemory;
+    const bytes: Bytes = @as([*]align(std.heap.page_size_min) u8, @ptrCast(@alignCast(ptr.?)))[0..src.len];
+    defer if (!owned) {
+        _ = c.munmap(bytes.ptr, bytes.len);
+    };
+    @memcpy(bytes, src);
+    if (c.mprotect(bytes.ptr, src.len, c.PROT_READ) != 0) return error.BinaryUnavailable;
+    lockStore();
+    defer store_lock.unlock();
+    anonymous_seq += 1;
+    const key: Stamp = .{ .device = 0, .inode = anonymous_seq, .size = @intCast(src.len), .mtime = .{ 0, 0 }, .ctime = .{ 0, 0 }, .remote_boot = memory_mark };
+    try store.append(std.heap.page_allocator, .{ .stamp = key, .offset = 0, .bytes = bytes, .holders = 1, .sweep_bytes = 0 });
     owned = true;
     return bytes;
 }
@@ -745,4 +779,18 @@ test "compressed debug refusal handles saturated declarations and long paths" {
     try std.testing.expectEqual(max_limit / mib, Refusal.imageOption(std.math.maxInt(u64)));
     const large = Refusal{ .size = 256 * mib, .limit = 0, .which = .sweep, .derived = true };
     try std.testing.expect(std.mem.indexOf(u8, large.write(&buffer, &path), "--image-total-limit") != null);
+}
+
+test "anonymous image copy is released" {
+    const start = used();
+    try std.testing.expectError(error.BinaryUnavailable, copyAnonymous(""));
+    const first = try copyAnonymous("\x7fELF");
+    const second = try copyAnonymous("\x7fELF");
+    try std.testing.expect(std.mem.eql(u8, first, "\x7fELF"));
+    try std.testing.expect(first.ptr != second.ptr);
+    try std.testing.expectEqual(start + 8, used());
+    free(first);
+    try std.testing.expectEqual(start + 4, used());
+    free(second);
+    try std.testing.expectEqual(start, used());
 }
