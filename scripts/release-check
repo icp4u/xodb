@@ -43,6 +43,7 @@ COVERS = (
     (('tests/command-compare.py',), ('command-compare-selftest',)),
     (('src/look.zig', 'src/layout_snapshot.zig', 'src/mcp/server.zig', 'src/platform/*', 'src/render/font.zig', 'tests/small-window-gui.py'), ('gui-small-window',)),
     (('src/render/vulkan.zig', 'src/render/recovery.zig', 'src/platform/*', 'tests/vulkan-scale-recovery.py', 'tests/vulkan-fault.c'), ('vulkan-scale-recovery',)),
+    (('src/main.zig', 'src/render/vulkan.zig', 'src/platform/*', 'tests/vulkan-early-exit.*', 'tests/vulkan-fault.c'), ('vulkan-early-exit',)),
     (('src/look.zig', 'src/layout_snapshot.zig', 'tests/overview-small-gui.py'), ('gui-overview-small*', 'gui-overview-layout')),
     (('src/ui/overview/graph_table.zig', 'src/ui/overview/galaxy_model.zig', 'src/mcp/graph.zig'), ('gui-graph-table', 'redot-galaxy-gui')),
     (('src/semq/adapter*', 'scripts/semq/c01_to_xsg.py', 'tests/semq/test_adapter.py'), ('semq-adapter',)),
@@ -166,7 +167,7 @@ COVERS = (
     (('tests/x11-gate.c',), ('gui-x11',)),
     (('src/startup_phases.zig',), ('platform-null', 'platform-cocoa*', 'platform-x11', 'log-levels', 'gui-log-levels', 'gui-x11')),
     (('src/runtime/gdb*', 'src/runtime/xrt_gdbremote.h', 'src/runtime/host_compat.h', 'src/model/gdb_images.zig', 'src/mcp/module_list.zig'),
-     ('gdb-debugserver*', 'macos-debugserver')),
+     ('gdb-debugserver*', 'macos-debugserver', 'kgdb-stub')),
     (('scripts/release-check',), ('release-runner',)),
     (('scripts/deps', 'tools/deps/*', 'tests/deps-selftest.py'), ('deps', 'deps-selftest')),
     (('scripts/generate-syscall-tables', 'src/profile/syscalls_generic.zig',
@@ -199,7 +200,7 @@ SERIAL = {
 
 # GUI steps that are never retried: they inject faults or race the renderer,
 # so one failure in several runs is the defect they exist to catch.
-NO_RETRY = {'scene3d-faults', 'vulkan-faults', 'vulkan-enumeration', 'vulkan-device', 'vulkan-scale-recovery', 'hidden-window', 'acquire-timeout', 'fence-timeout', 'wayland-read-race'}
+NO_RETRY = {'scene3d-faults', 'vulkan-faults', 'vulkan-enumeration', 'vulkan-device', 'vulkan-scale-recovery', 'vulkan-early-exit', 'hidden-window', 'acquire-timeout', 'fence-timeout', 'wayland-read-race'}
 
 # Host and gui steps (name globs) that run in `periodic` (live) or
 # `periodic-gui` (gui) instead, with the same commands: soaks, stress and
@@ -305,6 +306,7 @@ AGENT_INELIGIBLE = {
     'runtime-cores': 'reads ELF cores in-process; the C agent is not a core reader',
     'gdb-debugserver': 'GDB remote protocol, not the C agent',
     'gdb-debugserver-deadline': 'GDB remote protocol, not the C agent',
+    'kgdb-stub': 'KGDB remote protocol, not the C agent',
     'gdb-lldb-fuzz': 'GDB remote packet fuzz, not a live C agent target',
     'macos-native': 'macOS debugserver over ssh, not the Linux C agent',
     'macos-bootstrap': 'macOS debugserver over ssh, not the Linux C agent',
@@ -829,6 +831,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                       '--skip', 'truncated-packet'], 60))
         steps.append(('gdb-debugserver-deadline', [sys.executable, '-B', 'tests/gdb-debugserver.py', '--work', '.work/gdb-debugserver-deadline',
                       '--cases', 'truncated-packet'], 60))
+        steps.append(('kgdb-stub', ['zig-out/bin/xodb-gdb-model-test', '--kgdb'], 60))
         for remote in (False, True):
             label = 'unwind-return-address' + ('-agent' if remote else '')
             steps.append((label, [sys.executable, '-B', 'tests/unwind-return-address.py', '--work', '.work/' + label,
@@ -1092,6 +1095,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                       'start-memory-no-device-local', 'partial-vkCreateFramebuffer', 'poison-vkCreateSwapchainKHR',
                       'frame-vkQueuePresentKHR-lost', 'repeat-init-fails-late', 'resize-real-output'], 600))
         for name, args in (
+            ('vulkan-early-exit', ['tests/vulkan-early-exit.py']),
             ('vulkan-enumeration', ['tests/vulkan-enumeration.py']),
             ('vulkan-device', ['tests/vulkan-device.py']),
             ('gui-themes', ['tests/themes.py']),

@@ -36,6 +36,8 @@ try:
           sum(g['count'] for g in result['groups']) == result['task_count'] and not result['truncated'])
     seq = result['sequence']
     check('non-atomic observation is explicit', result['atomic_snapshot'] is False)
+    check('all-denied census has an explicit top-level reason', result['reason'] ==
+          ('StackAccessDenied' if result['denied'] and result['denied'] == result['task_count'] - result['vanished'] else None))
     for group in result['groups']:
         members = client.inspect('get_kernel_stacks', refresh=False, sequence=seq, group=group['id'])
         check('group membership stays in owned scope', members['member_count'] == group['count'] and
@@ -54,6 +56,17 @@ try:
     check('explicit demand refreshes', refreshed['sequence'] > seq)
     if '--plant' in sys.argv:
         check('planted wrong scope must fail', refreshed['scope_pid'] == -1)
+finally:
+    client.close()
+
+import subprocess
+gone = subprocess.Popen(['true'])
+gone.wait()
+client = Client('observe', executable=None, options=['--overview', '--kernel-pid', str(gone.pid)])
+try:
+    result = until(lambda: client.inspect('get_kernel_stacks'), lambda r: r.get('status') == 'ready')
+    check('missing scoped process is typed, not a vanished task', result['reason'] == 'ScopedProcessNotFound' and
+          result['task_count'] == 0 and result['groups'] == [])
 finally:
     client.close()
 

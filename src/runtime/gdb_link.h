@@ -42,4 +42,7 @@ enum xrt_status xrt_gdb_exchange(struct xrt_gdb_link *, const void *, size_t,
 enum xrt_status xrt_gdb_exchange_prefix(struct xrt_gdb_link *, const void *, size_t,
                                         void *, size_t, size_t *);
 enum xrt_status xrt_gdb_interrupt(struct xrt_gdb_link *);
+/* kgdboc ignores 0x03 while the kernel runs. On a tty this sends a line break
+ * and then g (SysRq-G); any other stream is refused. */
+enum xrt_status xrt_gdb_interrupt_break(struct xrt_gdb_link *);
 #endif

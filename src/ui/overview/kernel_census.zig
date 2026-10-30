@@ -25,7 +25,7 @@ pub fn render(v: anytype, ctx: draw.Ctx, rect: draw.Rect) !void {
         if (cache.job != null) " · refreshing" else "",
     });
     try ctx.textFit(r.x, r.y + 26, r.w, heading, ctx.p.dim);
-    try ctx.textFit(r.x, r.y + 52, r.w, if (s.denied > 0) "Denied stacks need root/access." else "Sampled, not an atomic stop. No attach.", ctx.p.dim);
+    try ctx.textFit(r.x, r.y + 52, r.w, if (s.scope_missing) "The --kernel-pid process was not found." else if (s.denied > 0) "Denied stacks need root/access." else "Sampled, not an atomic stop. No attach.", ctx.p.dim);
     try ctx.textFit(r.x, r.y + 74, r.w, "User stack: stopped debugger thread only.", ctx.p.dim);
     var line: usize = 0;
     const first = &v.scroll[@intFromEnum(@TypeOf(v.panel).kernel_stacks)];

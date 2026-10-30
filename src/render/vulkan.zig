@@ -1458,6 +1458,7 @@ var early: Early = .{};
 /// with the compositor's node from window.earlyDisplayGpu. The loader
 /// variables are set here and cleared by the thread once its vkCreateInstance
 /// returns (earlyRestore); launches wait for that in child_env.settle.
+/// The caller must defer dropEarly for exits before Renderer.init takes it.
 pub fn startEarly(display: ?select.Node) void {
     if (early.thread != null) return;
     early.display = display;
@@ -1485,6 +1486,16 @@ fn earlyRun() void {
         // Join publishes the error to the GUI's normal init/recovery owner.
         early.failure = err;
     };
+}
+/// Dispose of an unclaimed early renderer before the process leaves main.
+/// takeEarly clears the thread when ownership transfers, making this a no-op
+/// after normal initialization. prepare already cleans up on failure; deinit
+/// also resets the renderer, so that path is safe to dispose here as well.
+pub fn dropEarly() void {
+    const thread = early.thread orelse return;
+    thread.join();
+    early.renderer.deinit();
+    early = .{};
 }
 fn takeEarly() !?Renderer {
     const thread = early.thread orelse return null;

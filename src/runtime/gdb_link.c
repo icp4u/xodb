@@ -15,6 +15,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/un.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -64,7 +66,7 @@ static void endpoint_notice(int fd)
             const struct in6_addr *a = &((const struct sockaddr_in6 *)&peer)->sin6_addr;
             loopback = IN6_IS_ADDR_LOOPBACK(a) ||
                 (IN6_IS_ADDR_V4MAPPED(a) && a->s6_addr[12] == 127);
-        }
+        } else if (peer.ss_family == AF_UNIX) loopback = true;
     }
     if (!loopback)
         xrt_log(XRT_LOG_WARN, XRT_LOG_RUNTIME, "xodb: GDB connection is non-loopback and has no encryption or authentication; use a trusted connection or SSH port forward.\n");
@@ -171,6 +173,7 @@ static enum xrt_status write_bytes(struct xrt_gdb_link *l, const void *data,
         if (xrt_cancel_requested(l->cancel)) return cancelled(l);
         if (expired(l)) return operation_timeout(l);
         ssize_t n = send(l->fd, p + at, size - at, MSG_NOSIGNAL);
+        if (n < 0 && errno == ENOTSOCK) n = write(l->fd, p + at, size - at);
         if (n > 0) {
             at += (size_t)n; l->written += (size_t)n;
             if (mutation) l->mutation_written += (size_t)n;
@@ -199,12 +202,124 @@ enum xrt_status xrt_gdb_adopt(struct xrt_gdb_link *l, int fd, struct xrt_cancel 
     if (xrt_cancel_requested(cancel)) return cancelled(l);
     return XRT_OK;
 }
+static int serial_token(const char *text, size_t n, speed_t *speed, int *is_break)
+{
+    *is_break = 0;
+    if (n == 5 && !memcmp(text, "break", 5)) { *is_break = 1; return 1; }
+    if (!n) return 0;
+    unsigned value = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (text[i] < '0' || text[i] > '9' || value > 1000000u) return 0;
+        value = value * 10u + (unsigned)(text[i] - '0');
+    }
+    static const struct { unsigned value; speed_t bits; } table[] = {
+        {9600, B9600}, {19200, B19200}, {38400, B38400}, {57600, B57600},
+        {115200, B115200}, {230400, B230400},
+#ifdef B460800
+        {460800, B460800},
+#endif
+#ifdef B921600
+        {921600, B921600},
+#endif
+    };
+    for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); ++i)
+        if (table[i].value == value) { *speed = table[i].bits; return 1; }
+    return 0;
+}
+static enum xrt_status connect_unix(struct xrt_gdb_link *l, const char *path,
+                                    struct xrt_cancel *cancel)
+{
+    struct sockaddr_un addr;
+    size_t n = path ? strlen(path) : 0;
+    if (!n || path[0] != '/' || n >= sizeof(addr.sun_path)) return XRT_INVALID_ARGUMENT;
+    int fd = xrt_host_socket(AF_UNIX, SOCK_STREAM, 0, 1);
+    if (fd < 0) return fail(l, XRT_TRANSPORT_FAILED, "GDB UNIX socket connection failed");
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    memcpy(addr.sun_path, path, n);
+    const uint64_t deadline = deadline_for(l, now() + TIMEOUT_NS);
+    int result = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    int connected = result == 0;
+    if (!connected && errno == EINPROGRESS && ready(l, fd, POLLOUT, deadline) > 0) {
+        int error = 0; socklen_t size = sizeof(error);
+        connected = !getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) && !error;
+    }
+    if (!connected) {
+        close(fd);
+        if (xrt_cancel_requested(cancel)) return cancelled(l);
+        if (expired(l)) return operation_timeout(l);
+        return fail(l, XRT_TRANSPORT_FAILED, "GDB UNIX socket connection failed");
+    }
+    l->fd = fd;
+    endpoint_notice(l->fd);
+    return XRT_OK;
+}
+static enum xrt_status connect_serial(struct xrt_gdb_link *l, const char *spec)
+{
+    struct sockaddr_un space;
+    const char *comma = strchr(spec, ',');
+    size_t path_len = comma ? (size_t)(comma - spec) : strlen(spec);
+    const char *token1 = NULL, *token2 = NULL;
+    size_t n1 = 0, n2 = 0;
+    if (comma) {
+        token1 = comma + 1;
+        const char *comma2 = strchr(token1, ',');
+        n1 = comma2 ? (size_t)(comma2 - token1) : strlen(token1);
+        if (comma2) {
+            token2 = comma2 + 1;
+            if (strchr(token2, ',')) return XRT_INVALID_ARGUMENT;
+            n2 = strlen(token2);
+        }
+    }
+    if (!path_len || spec[0] != '/' || path_len >= sizeof(space.sun_path)) return XRT_INVALID_ARGUMENT;
+    speed_t speed = B115200;
+    int send_break = 0;
+    if (token1 && !serial_token(token1, n1, &speed, &send_break)) return XRT_INVALID_ARGUMENT;
+    if (token2) {
+        speed_t extra = speed;
+        int second_break = 0;
+        if (send_break || !serial_token(token2, n2, &extra, &second_break) || !second_break)
+            return XRT_INVALID_ARGUMENT;
+        send_break = 1;
+    }
+    char device[sizeof(space.sun_path)];
+    memcpy(device, spec, path_len);
+    device[path_len] = 0;
+    int fd = open(device, O_RDWR | O_NOCTTY | O_CLOEXEC);
+    if (fd < 0) return fail(l, XRT_TRANSPORT_FAILED, "GDB serial port open failed");
+    struct termios raw;
+    if (tcgetattr(fd, &raw)) { close(fd); return fail(l, XRT_TRANSPORT_FAILED, "GDB serial port open failed"); }
+    cfmakeraw(&raw);
+    raw.c_cflag &= ~(tcflag_t)(CSIZE | PARENB);
+    raw.c_cflag |= CS8 | CLOCAL | CREAD;
+    if (cfsetispeed(&raw, speed) || cfsetospeed(&raw, speed) || tcsetattr(fd, TCSANOW, &raw)) {
+        close(fd); return fail(l, XRT_TRANSPORT_FAILED, "GDB serial port open failed");
+    }
+    if (send_break) {
+        ssize_t wrote = 0;
+        if (tcsendbreak(fd, 0)) { close(fd); return fail(l, XRT_TRANSPORT_FAILED, "GDB serial port open failed"); }
+        while (wrote < 1) {
+            ssize_t n = write(fd, "g", 1);
+            if (n < 0 && errno == EINTR) continue;
+            if (n != 1) { close(fd); return fail(l, XRT_TRANSPORT_FAILED, "GDB serial port open failed"); }
+            wrote = 1;
+        }
+        if (tcdrain(fd)) { close(fd); return fail(l, XRT_TRANSPORT_FAILED, "GDB serial port open failed"); }
+    }
+    /* xrt_host_flags closes fd when the flag update fails. */
+    l->fd = xrt_host_flags(fd, 1);
+    if (l->fd < 0) return fail(l, XRT_TRANSPORT_FAILED, "GDB serial port open failed");
+    return XRT_OK;
+}
 enum xrt_status xrt_gdb_connect(struct xrt_gdb_link *l, const char *endpoint, struct xrt_cancel *cancel)
 {
     if (!l || !endpoint) return XRT_INVALID_ARGUMENT;
     *l = (struct xrt_gdb_link){.fd = -1, .packet_size = 1024, .cancel = cancel,
         .operation_deadline_ns = now() + XRT_GDB_OPEN_NS};
     if (xrt_cancel_requested(cancel)) return cancelled(l);
+    if (!strncmp(endpoint, "unix:", 5)) return connect_unix(l, endpoint + 5, cancel);
+    if (!strncmp(endpoint, "serial:", 7)) return connect_serial(l, endpoint + 7);
+    if (!strncmp(endpoint, "tcp:", 4)) endpoint += 4;
     char host[256], service[6];
     const char *port, *start = endpoint, *end;
     if (*start == '[') {
@@ -312,6 +427,7 @@ static enum xrt_status discard(struct xrt_gdb_link *l, void *out, size_t cap, si
             return fail(l, XRT_TRANSPORT_FAILED, "GDB response failed or timed out");
         }
         ssize_t n = recv(l->fd, l->rx, sizeof(l->rx), 0);
+        if (n < 0 && errno == ENOTSOCK) n = read(l->fd, l->rx, sizeof(l->rx));
         if (n > 0) { l->received = (size_t)n; continue; }
         if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
         return fail(l, XRT_TRANSPORT_FAILED, "GDB peer closed the connection");
@@ -385,6 +501,8 @@ static enum xrt_status receive(struct xrt_gdb_link *l, void *out, size_t cap,
         if (available <= 0)
             return fail(l, XRT_TRANSPORT_FAILED, "GDB response failed or timed out");
         ssize_t n = recv(l->fd, l->rx + l->received, sizeof(l->rx) - l->received, 0);
+        if (n < 0 && errno == ENOTSOCK)
+            n = read(l->fd, l->rx + l->received, sizeof(l->rx) - l->received);
         if (n > 0) { l->received += (size_t)n; continue; }
         if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
         return fail(l, XRT_TRANSPORT_FAILED, "GDB peer closed the connection");
@@ -416,4 +534,11 @@ enum xrt_status xrt_gdb_interrupt(struct xrt_gdb_link *l)
 {
     if (!l) return XRT_INVALID_ARGUMENT;
     return write_bytes(l, "\003", 1, now() + TIMEOUT_NS, true);
+}
+enum xrt_status xrt_gdb_interrupt_break(struct xrt_gdb_link *l)
+{
+    if (!l || l->fd < 0) return XRT_INVALID_ARGUMENT;
+    if (!isatty(l->fd)) return XRT_UNSUPPORTED_CONTROL;
+    if (tcsendbreak(l->fd, 0)) return fail(l, XRT_TRANSPORT_FAILED, "GDB serial line break failed");
+    return write_bytes(l, "g", 1, now() + TIMEOUT_NS, true);
 }

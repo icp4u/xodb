@@ -143,7 +143,7 @@ pub const Cache = struct {
             self.pid = snap.pid;
             self.epoch = snap.image_epoch;
         }
-        if (session.target.gdbRemoteInfo()) |gdb| if (gdb.os == .darwin) {
+        if (session.target.gdbRemoteInfo()) |gdb| if (gdb.os == .darwin or gdb.thread_info == .available) {
             self.info = .{ .kind = .unavailable };
             if (snap.state != .stopped or self.remote_generation == snap.generation) return;
             const threads = session.target.threadSlice();

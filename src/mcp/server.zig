@@ -1154,6 +1154,31 @@ test "layout is an observer publication even without a target or GUI" {
     }
 }
 
+test "kernel census publishes an all-denied reason without losing task metadata" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const census = @import("../model/kernel_census.zig");
+    var cache: census.Cache = .{};
+    defer cache.deinit();
+    const args = (try std.json.parseFromSlice(Value, a, "{\"refresh\":false}", .{})).value;
+    const cold = try @import("kernel_census.zig").call(a, &cache, args, false);
+    try std.testing.expect(cold.object.get("reason").? == .null);
+    cache.current = census.Snapshot.init();
+    const s = &cache.current.?;
+    const empty = try @import("kernel_census.zig").call(a, &cache, args, false);
+    try std.testing.expect(empty.object.get("reason").? == .null);
+    try s.add(.{ .pid = 42, .tid = 42, .comm = "owned" }, .denied, "");
+    const denied = try @import("kernel_census.zig").call(a, &cache, args, false);
+    try std.testing.expectEqualStrings("StackAccessDenied", denied.object.get("reason").?.string);
+    try std.testing.expectEqualStrings("ready", denied.object.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 1), denied.object.get("task_count").?.integer);
+    try std.testing.expectEqualStrings("denied", denied.object.get("groups").?.array.items[0].object.get("status").?.string);
+    try s.add(.{ .pid = 42, .tid = 43 }, .empty, "");
+    const mixed = try @import("kernel_census.zig").call(a, &cache, args, false);
+    try std.testing.expect(mixed.object.get("reason").? == .null);
+}
+
 test "tool replies preserve numeric fields and share exact structured and text results" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

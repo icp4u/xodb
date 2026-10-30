@@ -63,6 +63,10 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
     }
     // Everything below logs through log.zig and never sees its options.
     const args = log.init(try a.dupe([:0]const u8, given), takesValue);
+    // Overview argument errors/help and debugger setup failures can return
+    // before Renderer.init adopts the early worker. Join before process exit
+    // (and loader/ICD destructors), on successful returns as well as errors.
+    defer if (comptime build_options.gui) @import("render/vulkan.zig").dropEarly();
     // Vulkan device choice applies to every window; the list needs no target.
     if (comptime build_options.gui) for (args[1..], 1..) |arg, k| {
         if (std.mem.eql(u8, arg, "--")) break;
@@ -114,6 +118,7 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
     var follow_forks = false;
     var process_limit: usize = 32;
     var attach: ?i32 = null;
+    var kernel_pid: ?i32 = null;
     var hide_wine_threads: ?bool = null;
     var expected_start: ?u64 = null;
     var start_profile = false;
@@ -218,7 +223,8 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
                 \\--follow-forks follows x86-64 process creation; --process-limit N bounds retained processes (1..1024, default 32).
                 \\O opens process selection; U opens the Redot/Godot scene tree and inspector (local launches).
                 \\MCP process_id defaults to the original process regardless of GUI selection.
-                \\--gdb-remote HOST:PORT connects to an existing all-stop gdbserver, QEMU or Apple debugserver target.
+                \\--gdb-remote ENDPOINT connects to an existing all-stop gdbserver, QEMU, Apple debugserver or Linux KGDB target.
+                \\  ENDPOINT is [tcp:]HOST:PORT, unix:ABS_PATH or serial:ABS_PATH[,BAUD][,break] (raw 8N1; docs/KGDB.md).
                 \\--redot-debugger adds a private loopback scene-debugger peer to a local owned Redot/Godot launch.
                 \\--agent-scope observe|control|mutate limits MCP access (default: observe).
                 \\--redact hides home paths, user and host names, and addresses outside loopback/documentation ranges in the GUI,
@@ -257,6 +263,7 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
                 \\  overlays such as MangoHud, OBS capture): slightly faster startup; layer variables you set win.
                 \\--lsof-top runs the terminal open-file and fd activity view (--lsof-top --help; docs/LSOF_TOP.md).
                 \\--overview opens the system overview (no target); xodb --overview --help lists its options.
+                \\--kernel-pid PID scopes get_kernel_stacks to this host process, independently of the debug target.
                 \\--fetch prints a fastfetch-style card of this machine and exits (--fetch --help; docs/FETCH.md).
                 \\--burrito listens to 2.4 GHz and the Wi-Fi link, receive-only: is it the microwave? (--burrito --help; docs/RADIO.md).
                 \\Graph/galaxy default: LIVE SYSCALL TRACING · ~11% host syscall overhead · E to stop
@@ -277,9 +284,13 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
         } else if (std.mem.eql(u8, arg, "--fetch-source")) fetch_source = true else if (std.mem.eql(u8, arg, "--resolve-capture-symbols")) reanalyze = true else if (std.mem.eql(u8, arg, "--follow-forks")) follow_forks = true else if (std.mem.eql(u8, arg, "--no-ghidra-prestart")) no_ghidra_prestart = true else if (std.mem.eql(u8, arg, "--no-vk-layers")) {} else if (std.mem.eql(u8, arg, "--headless")) headless = true else if (std.mem.eql(u8, arg, "--mcp")) mcp = true else if (std.mem.eql(u8, arg, "--redact")) redact = true else if (std.mem.eql(u8, arg, "--")) {
             launch = args[i + 1 ..];
             break;
-        } else if (named(&value_options, arg)) {
+        } else if (named(&value_options, arg) or std.mem.eql(u8, arg, "--kernel-pid")) {
             i += 1;
             if (i == args.len) return error.MissingArgument;
+            if (std.mem.eql(u8, arg, "--kernel-pid")) {
+                kernel_pid = std.fmt.parseInt(i32, args[i], 10) catch return error.InvalidKernelPid;
+                if (kernel_pid.? <= 0) return error.InvalidKernelPid;
+            }
             if (std.mem.eql(u8, arg, "--wine-threads")) hide_wine_threads = if (std.mem.eql(u8, args[i], "hide")) true else if (std.mem.eql(u8, args[i], "show")) false else return error.InvalidWineThreadVisibility;
             if (std.mem.eql(u8, arg, "--observe-recipe")) {
                 observation_recipe = args[i];
@@ -628,6 +639,7 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
     // --redact: the system tools (processes, connections, fds, memory maps)
     // also apply the overview's own rules: other accounts, command lines.
     if (redact) (server.overview_shared orelse &server.overview).redact = true;
+    (server.overview_shared orelse &server.overview).kernel_census.pid = kernel_pid;
     if (listen != null) {
         server.input_fd = connection.fd;
         server.output_fd = connection.fd;

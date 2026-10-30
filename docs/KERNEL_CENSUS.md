@@ -31,6 +31,16 @@ the census visits all visible process task directories.
 
 `get_kernel_stacks` works from overview observers and debugger sessions. It
 always describes the **debugger host**, not a runtime-agent machine.
+`--kernel-pid PID` also works in debugger sessions and scopes this host census,
+not the debug target. The same scope applies to stdio and shared-session peers.
+A completed census whose every readable task (tasks that exited mid-scan aside)
+had its stack denied reports top-level
+`reason: "StackAccessDenied"`. Its status still describes the ready task census:
+task metadata, denied groups and pagination remain available. Empty and mixed
+censuses have no all-denied reason; inspect individual group statuses and counts.
+A `--kernel-pid` process that does not exist when a census starts reports
+`reason: "ScopedProcessNotFound"` with no tasks; one that exits mid-scan shows
+its threads as vanished.
 
 - `refresh` defaults to true: request a fresh census when the cadence allows.
   False only reads the cache, and does not start or renew work.

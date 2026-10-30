@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Fast GUI lane: early Vulkan workers are joined on every normal exit path.
+
+The preload barrier proves the worker is inside vkCreateInstance before the
+owner can parse an invalid overview argument. No sleeps or timing thresholds
+decide correctness. The subprocess timeout is only a deadlock ceiling.
+"""
+import argparse
+import importlib.util
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import subprocess
+import time
+
+os.umask(0o022)
+root = Path(__file__).resolve().parents[1]
+os.chdir(root)
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('binary', nargs='?', default='zig-out/bin/xodb')
+args = parser.parse_args()
+binary = str(Path(args.binary).resolve())
+spec = importlib.util.spec_from_file_location('display', root / 'tests/helpers/display.py')
+display = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(display)
+display.WORK = str(root / '.work' / ('vke-' + str(time.time_ns())[-9:]))
+d = display.Display('exit')
+results = []
+started = time.monotonic()
+try:
+    shim = Path(d.dir) / 'early.so'
+    accounting = Path(d.dir) / 'fault.so'
+    for source, output in (('tests/vulkan-early-exit.c', shim), ('tests/vulkan-fault.c', accounting)):
+        subprocess.run(['cc', '-shared', '-fPIC', '-Wall', '-Wextra', '-Werror',
+                        source, '-ldl', '-pthread', '-o', str(output)], check=True, timeout=30)
+    # name, arguments, return code, exact error, worker expected, faults
+    cases = [
+        ('overview-bad-panel', ['--overview', '--panel', 'test-invalid-panel'], 1, 'UnknownOverviewPanel', True, ''),
+        ('overview-help', ['--overview', '--help'], 0, None, True, ''),
+        ('overview-replay-missing', ['--overview', '--replay', str(Path(d.dir) / 'missing.json')], 1, 'ReplayOpenFailed', True, ''),
+        ('debugger-core-missing', ['--core', str(Path(d.dir) / 'missing.core')], 1,
+         'CoreFileUnavailable' if platform.machine() == 'x86_64' else 'UnsupportedCoreArchitecture', True, ''),
+        ('prepare-instance-failed', ['--overview', '--panel', 'test-invalid-panel'], 1, 'UnknownOverviewPanel', True, 'fail=vkCreateInstance@1x*:oodm'),
+        ('prepare-pass-failed', ['--overview', '--help'], 0, None, True, 'fail=vkCreateRenderPass@1x*:oodm'),
+        ('adopt-debugger', ['--frames', '1'], 0, None, True, ''),
+        ('adopt-overview', ['--overview', '--frames', '1'], 0, None, True, ''),
+        # The separate headless parser rejects the GUI-only option itself.
+        ('headless-bad-panel', ['--overview', '--headless', '--panel', 'test-invalid-panel'], 1, 'OverviewOptionConflict', False, ''),
+        ('debugger-help', ['--help'], 0, None, False, ''),
+        ('debugger-bad-arg', ['--test-invalid-option'], 1, 'UnknownArgument', False, ''),
+        # --version is not a supported option; it must fail before spawning.
+        ('debugger-version', ['--version'], 1, 'UnknownArgument', False, ''),
+    ]
+    for name, argv, code, error, worker, faults in cases:
+        env = dict(d.env, LD_PRELOAD=f'{shim}:{accounting}', XODB_TEST_EARLY_EXIT='1', XODB_VKFAULT=faults)
+        before = time.monotonic()
+        proc = subprocess.run([binary, *argv], env=env, capture_output=True, timeout=30)
+        text = (proc.stdout + proc.stderr).decode(errors='replace')
+        (Path(d.dir) / f'{name}.log').write_text(text)
+        rows = re.findall(r'^vkearly: (.*)$', text, re.M)
+        early = json.loads(rows[0]) if len(rows) == 1 else None
+        rows = re.findall(r'^vkfault: summary (.*)$', text, re.M)
+        counts = json.loads(rows[0]) if len(rows) == 1 else None
+        result = dict(name=name, seconds=time.monotonic()-before, returncode=proc.returncode,
+                      worker=early, accounting=counts)
+        results.append(result)
+        print(json.dumps(result), flush=True)
+        assert proc.returncode == code, (name, code, proc.returncode, text)
+        assert early == dict.fromkeys(('claimed', 'entered', 'finished', 'joined'), int(worker)), (name, early)
+        assert not re.search(r'Segmentation fault|panic|reached unreachable', text), (name, text)
+        if error:
+            assert f'error: {error}' in text.splitlines(), (name, text)
+        assert counts is not None, (name, 'missing lifetime summary', text)
+        assert counts['live_at_exit'] == counts['leaks'] == counts['violations'] == counts['dirty_retirements'] == 0, (name, counts)
+        assert counts['created'] == counts['destroyed'], (name, counts)
+        allocation = counts['allocations']
+        assert allocation['live_bytes'] == allocation['leaked_bytes'] == 0, (name, allocation)
+        assert allocation['allocated_bytes'] == allocation['freed_bytes'], (name, allocation)
+        if worker and not faults:
+            assert counts['created']['instance'] > 0 and counts['created']['device'] > 0, (name, counts)
+        if faults:
+            function = faults.split('=')[1].split('@')[0]
+            assert counts['calls'][function][1] > 0, (name, 'fault was not reached', counts)
+        if not worker:
+            assert not any(counts['created'].values()), (name, counts)
+finally:
+    (Path(d.dir) / 'results.json').write_text(json.dumps(dict(seconds=time.monotonic()-started, cases=results), indent=2)+'\n')
+    d.close()
+    print(d.dir, flush=True)

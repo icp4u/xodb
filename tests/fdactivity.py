@@ -61,6 +61,9 @@ def sampled(fn, predicate, label):
             sequences=len(sequences), target_samples=len(fresh), latest=value))
         time.sleep(.04)
 
+class FdSnapshotChanged(Exception):
+    pass
+
 def cache(peer, name, **args):
     deadline = time.monotonic() + 5
     while True:
@@ -68,6 +71,8 @@ def cache(peer, name, **args):
         if not reply.get('error') and not reply['result'].get('isError'):
             return reply['result']['structuredContent']
         message = reply.get('result', {}).get('content', [{}])[0].get('text')
+        if message == 'FdSnapshotChanged':
+            raise FdSnapshotChanged(reply)
         assert message == 'FdCacheBusy' and time.monotonic() < deadline, reply
         time.sleep(.003)
 
@@ -207,15 +212,38 @@ try:
     check('new event records invalidate earlier pagination sequences', paged['sequence'] != measured['sequence'])
     cache(first, 'start_fd_events', **start_args)
     stable = None
-    for _ in range(20):
+    completed, retries, planted_change = 0, 0, False
+    event_evidence = ('capture_generation', 'state', 'running', 'drain_pending', 'start_ticks', 'started_ns', 'flags', 'lost',
+                      'unpaired', 'invalid', 'dropped_rows', 'threads', 'ring_bytes', 'matches_in_cache', 'rows')
+    deadline = time.monotonic() + 90  # ceiling for service/recovery, not a timing oracle
+    while completed < 20:
+        assert time.monotonic() < deadline, ('stable event pagination', completed, retries)
         page1 = cache(second, 'get_fd_activity', **dict(event_args, limit=500))
         time.sleep(.015)  # crosses at least one idle owner drain
-        page2 = cache(second, 'get_fd_activity', **dict(event_args, limit=500, offset=page1['next_offset'], sequence=page1['sequence']))
+        # Exercise recovery every run with the already-proven stale sequence.
+        # A real drain may replace the publication between either pair of reads.
+        sequence = page1['sequence'] if planted_change else measured['sequence']
+        try:
+            page2 = cache(second, 'get_fd_activity', **dict(event_args, limit=500, offset=page1['next_offset'], sequence=sequence))
+        except FdSnapshotChanged:
+            if planted_change:
+                # Idle drains must not invalidate pages: a real restart needs
+                # changed capture evidence, or the retry would hide that bug.
+                again = cache(second, 'get_fd_activity', **dict(event_args, limit=500))
+                assert any(page1.get(k) != again.get(k) for k in event_evidence), \
+                    ('event sequence changed without new evidence', page1['sequence'], again['sequence'])
+            planted_change = True
+            retries += 1
+            continue  # restart page one; never combine different publications
+        assert planted_change, 'planted stale sequence was unexpectedly accepted'
         combined = page1['rows'] + page2['rows']
         assert len(combined) == page1['matches_in_cache'] and page2['next_offset'] is None
         assert len({r['fd'] for r in combined}) == len(combined)
         assert all(next(r for r in combined if r['fd'] == n)['write_bytes'] == 1 for n in range(1000, 1600))
         stable = page1['sequence']
+        completed += 1
+    check('changed event publication restarts pagination from page one', planted_change and retries > 0)
+    print('pagination progress', dict(completed=completed, snapshot_retries=retries), flush=True)
     check('20/20 idle captures paginate beyond 500 rows with exact bytes', stable is not None and paged['lost'] == 0 and not paged['possible_loss'] and paged['loss_accounting_available'])
     # Observer reads cannot refresh the 3s authorization window.
     expired = until(lambda: cache(second, 'get_fd_activity', **event_args), lambda r: not r['running'], 'event demand expiry despite observer reads', 5)

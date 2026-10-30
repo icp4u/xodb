@@ -20,7 +20,8 @@ connection are unsupported.
 
 The endpoint accepts a DNS name, IPv4 address, or bracketed IPv6 address plus
 port. TCP has no authentication or encryption: use a trusted connection or an
-SSH port forward. A non-loopback connection prints a notice on stderr. Serial and pipe transports are not implemented.
+SSH port forward. A non-loopback connection prints a notice on stderr. `unix:ABS_PATH` and
+`serial:ABS_PATH[,BAUD][,break]` endpoints and Linux KGDB stubs are described in [KGDB.md](KGDB.md).
 
 ## Available operations
 

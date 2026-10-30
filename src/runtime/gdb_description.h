@@ -27,6 +27,9 @@ enum xrt_status xrt_gdb_description_parse(struct xrt_gdb_description *,
 enum xrt_status xrt_gdb_description_parse_for(struct xrt_gdb_description *,
                                               const char *, size_t,
                                               xrt_gdb_annex, void *, const char *fallback);
+/* hex_len is the g-packet character count. 156, 788 and 548 byte replies
+ * select the built-in x86-64, aarch64 and loongarch64 layouts. */
+enum xrt_status xrt_gdb_description_builtin(struct xrt_gdb_description *, size_t hex_len);
 const struct xrt_gdb_register *xrt_gdb_description_register(
     const struct xrt_gdb_description *, const struct xrt_register_desc *);
 enum xrt_status xrt_gdb_description_decode(const struct xrt_gdb_description *,

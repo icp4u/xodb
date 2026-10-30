@@ -145,6 +145,14 @@ static void scheduler(void)
     const struct xrt_fdscan_options scoped = {.proc = root, .include_self = 1,
         .budget_ms = 1, .pids = scope, .pid_count = 3};
     CHECK(xrt_fdscan_create(&scoped, &s) == XRT_OK);
+    for (unsigned i = 0; i < 12; i++) {
+        s->window = 1; /* hold the smallest window across every adaptive turn */
+        CHECK(poll_one(s, 2) == (i % 2 ? 800 : 100));
+    }
+    xrt_fdscan_destroy(s);
+    puts("PASS one-PID windows advance and wrap past duplicate scoped PIDs without demand");
+
+    CHECK(xrt_fdscan_create(&scoped, &s) == XRT_OK);
     const int32_t scoped_demand[] = {900, 100, 800};
     CHECK(xrt_fdscan_interest(s, scoped_demand, 3, 0) == XRT_OK);
     CHECK(poll_one(s, 2) == 100);

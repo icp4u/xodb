@@ -264,6 +264,96 @@ static int hex(unsigned c)
     if (c >= 'A' && c <= 'F') return (int)(c - 'A' + 10);
     return -1;
 }
+static enum xrt_status layout_error(struct xrt_gdb_description *d, const char *why)
+{
+    snprintf(d->reason, sizeof(d->reason), "%s", why);
+    return XRT_REGISTER_UNAVAILABLE;
+}
+static enum xrt_status add_builtin(struct xrt_gdb_description *d, const char *name, uint32_t bytes)
+{
+    if (d->count == XRT_GDB_REGISTERS_MAX || strlen(name) >= sizeof(d->registers[0].name))
+        return layout_error(d, "KGDB register packet does not match a built-in layout");
+    struct xrt_gdb_register *r = &d->registers[d->count];
+    memset(r, 0, sizeof(*r));
+    memcpy(r->name, name, strlen(name) + 1);
+    r->number = d->count;
+    r->offset = d->register_bytes;
+    r->bytes = bytes;
+    d->register_bytes += bytes;
+    d->next_number = ++d->count;
+    return XRT_OK;
+}
+static enum xrt_status finish_builtin(struct xrt_gdb_description *d, const char *architecture,
+                                      uint16_t machine, size_t expect)
+{
+    if (d->register_bytes != expect)
+        return layout_error(d, "KGDB register packet does not match a built-in layout");
+    snprintf(d->architecture, sizeof(d->architecture), "%s", architecture);
+    d->arch = xrt_arch_get(machine);
+    if (!d->arch) return layout_error(d, "KGDB register packet does not match a built-in layout");
+    const struct xrt_register_desc *pc = xrt_arch_role(d->arch, XRT_ROLE_PC);
+    const struct xrt_register_desc *sp = xrt_arch_role(d->arch, XRT_ROLE_SP);
+    if (!pc || !sp || !xrt_gdb_description_register(d, pc) || !xrt_gdb_description_register(d, sp))
+        return layout_error(d, "KGDB register packet does not match a built-in layout");
+    return XRT_OK;
+}
+enum xrt_status xrt_gdb_description_builtin(struct xrt_gdb_description *d, size_t hex_len)
+{
+    if (!d) return XRT_INVALID_ARGUMENT;
+    *d = (struct xrt_gdb_description){0};
+    if (!hex_len || hex_len % 2)
+        return layout_error(d, "KGDB register packet does not match a built-in layout");
+    size_t bytes = hex_len / 2;
+    enum xrt_status status = XRT_OK;
+    char name[16];
+    if (bytes == 156) {
+        static const char *gpr[] = {
+            "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+            "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip"};
+        static const char *tail[] = {"eflags", "cs", "ss", "ds", "es"};
+        for (size_t i = 0; i < sizeof(gpr) / sizeof(gpr[0]) && status == XRT_OK; ++i)
+            status = add_builtin(d, gpr[i], 8);
+        for (size_t i = 0; i < sizeof(tail) / sizeof(tail[0]) && status == XRT_OK; ++i)
+            status = add_builtin(d, tail[i], 4);
+        return status == XRT_OK ? finish_builtin(d, "i386:x86-64", XRT_X86_64, 156) : status;
+    }
+    if (bytes == 788) {
+        for (int i = 0; i < 31 && status == XRT_OK; ++i) {
+            snprintf(name, sizeof(name), "x%d", i);
+            status = add_builtin(d, name, 8);
+        }
+        if (status == XRT_OK) status = add_builtin(d, "sp", 8);
+        if (status == XRT_OK) status = add_builtin(d, "pc", 8);
+        if (status == XRT_OK) status = add_builtin(d, "cpsr", 4);
+        for (int i = 0; i < 32 && status == XRT_OK; ++i) {
+            snprintf(name, sizeof(name), "v%d", i);
+            status = add_builtin(d, name, 16);
+        }
+        if (status == XRT_OK) status = add_builtin(d, "fpsr", 4);
+        if (status == XRT_OK) status = add_builtin(d, "fpcr", 4);
+        return status == XRT_OK ? finish_builtin(d, "aarch64", XRT_AARCH64, 788) : status;
+    }
+    if (bytes == 548) {
+        for (int i = 0; i < 32 && status == XRT_OK; ++i) {
+            snprintf(name, sizeof(name), "r%d", i);
+            status = add_builtin(d, name, 8);
+        }
+        if (status == XRT_OK) status = add_builtin(d, "orig_a0", 8);
+        if (status == XRT_OK) status = add_builtin(d, "pc", 8);
+        if (status == XRT_OK) status = add_builtin(d, "badv", 8);
+        for (int i = 0; i < 32 && status == XRT_OK; ++i) {
+            snprintf(name, sizeof(name), "f%d", i);
+            status = add_builtin(d, name, 8);
+        }
+        for (int i = 0; i < 8 && status == XRT_OK; ++i) {
+            snprintf(name, sizeof(name), "fcc%d", i);
+            status = add_builtin(d, name, 1);
+        }
+        if (status == XRT_OK) status = add_builtin(d, "fcsr", 4);
+        return status == XRT_OK ? finish_builtin(d, "loongarch64", XRT_LOONGARCH, 548) : status;
+    }
+    return layout_error(d, "KGDB register packet does not match a built-in layout");
+}
 enum xrt_status xrt_gdb_description_decode(const struct xrt_gdb_description *d,
                                             const uint8_t *text, size_t size,
                                             struct xrt_registers *out)

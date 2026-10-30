@@ -37,6 +37,7 @@ struct xrt_gdb {
     char *bank;
     int32_t bank_tid, watch_tid; /* watch_tid stopped before its watched access. */
     uint8_t watch_capacity;
+    bool kernel; /* No target.xml: built-in layouts and classic c/s packets. */
 };
 static enum xrt_status problem(struct xrt_gdb *g, enum xrt_status status, const char *reason)
 {
@@ -140,6 +141,19 @@ static bool thread_id(const char *text, size_t length, uint64_t *pid, uint64_t *
     }
     return hexadecimal(text, length, tid) && *tid && *tid <= UINT32_MAX && *pid <= UINT32_MAX;
 }
+/* A negative KGDB id is a per-CPU shadow (CPU 0 is -2). Snapshots reject a
+ * non-positive tid, so the local id is a positive alias of that magnitude. */
+static int32_t kernel_local(uint64_t tid)
+{
+    if (!tid || tid > UINT32_MAX) return 0;
+    if (tid <= (uint64_t)INT32_MAX) return (int32_t)tid;
+    int32_t signed_id = (int32_t)tid;
+    if (signed_id >= -1 || signed_id == INT32_MIN) return 0;
+    uint32_t magnitude = (uint32_t)(-(int64_t)signed_id);
+    if (!magnitude || magnitude > 4096 || (uint32_t)0x60000000u + magnitude > (uint32_t)INT32_MAX)
+        return 0;
+    return (int32_t)(0x60000000u + magnitude);
+}
 static enum xrt_status remember_thread(struct xrt_gdb *g, struct xrt_target *t,
                                        uint64_t pid, uint64_t tid, int32_t *local)
 {
@@ -152,10 +166,17 @@ static enum xrt_status remember_thread(struct xrt_gdb *g, struct xrt_target *t,
             return xrt_thread_index(t, *local) >= 0 ? XRT_OK : xrt_add_thread(t, *local, false);
         }
     if (g->thread_count == XRT_MAX_THREADS) return XRT_TOO_MANY_THREADS;
-    int32_t id = tid <= INT_MAX ? (int32_t)tid : 1;
-    while (thread_index(g, id) >= 0) {
-        if (id == INT_MAX) return XRT_TOO_MANY_THREADS;
-        ++id;
+    int32_t id;
+    if (g->kernel) {
+        id = kernel_local(tid);
+        if (!id || thread_index(g, id) >= 0)
+            return problem(g, XRT_PROTOCOL_ERROR, "KGDB thread id is not a task or a per-CPU shadow");
+    } else {
+        id = tid <= INT_MAX ? (int32_t)tid : 1;
+        while (thread_index(g, id) >= 0) {
+            if (id == INT_MAX) return XRT_TOO_MANY_THREADS;
+            ++id;
+        }
     }
     g->threads[g->thread_count++] = (struct remote_thread){pid, tid, id};
     enum xrt_status status = xrt_add_thread(t, id, false);
@@ -215,7 +236,9 @@ static enum xrt_status threads(struct xrt_gdb *g, struct xrt_target *t)
         }
         status = query(g, "qsThreadInfo"); if (status != XRT_OK) return status;
     }
-    if (g->length != 1 || g->reply[0] != 'l') return XRT_PROTOCOL_ERROR;
+    /* kgdb ends the list with an empty reply rather than "l". */
+    if (!(g->length == 1 && g->reply[0] == 'l') && !(g->kernel && !g->length))
+        return XRT_PROTOCOL_ERROR;
     size_t kept = 0;
     for (size_t i = 0; i < g->thread_count; ++i) {
         bool found = false;
@@ -293,6 +316,55 @@ static enum xrt_status refresh_thread_info(struct xrt_gdb *g)
         }
     }
     g->info.supported |= XRT_GDB_CAP_THREAD_INFO;
+    return XRT_OK;
+}
+static enum xrt_status kernel_names(struct xrt_gdb *g)
+{
+    if (!g->kernel) return XRT_OK;
+    g->thread_info_count = 0;
+    bool any = false;
+    for (size_t i = 0; i < g->thread_count; ++i) {
+        char id[40], command[80];
+        format_thread(g, &g->threads[i], id, sizeof(id));
+        snprintf(command, sizeof(command), "qThreadExtraInfo,%s", id);
+        enum xrt_status status = query(g, command);
+        if (status != XRT_OK) return status;
+        if (!g->length || g->reply[0] == 'E') continue;
+        if (g->length % 2 || g->length / 2 >= sizeof(g->thread_info[0].name)) {
+            g->thread_info_count = 0;
+            g->info.failed |= XRT_GDB_CAP_THREAD_INFO;
+            return XRT_OK;
+        }
+        char decoded[128];
+        size_t n = g->length / 2;
+        bool bad = false;
+        for (size_t b = 0; b < n && !bad; ++b) {
+            int hi = hex(g->reply[2 * b]), lo = hex(g->reply[2 * b + 1]);
+            unsigned char c;
+            if (hi < 0 || lo < 0) { bad = true; break; }
+            c = (unsigned char)(hi * 16 + lo);
+            /* kgdb sends the 16-byte comm with its NUL padding. */
+            if (!c) { n = b; break; }
+            if (c < 0x20 || c > 0x7e) bad = true;
+            else decoded[b] = (char)c;
+        }
+        if (bad) {
+            g->thread_info_count = 0;
+            g->info.failed |= XRT_GDB_CAP_THREAD_INFO;
+            return XRT_OK;
+        }
+        struct xrt_gdb_thread_info *info = &g->thread_info[g->thread_info_count++];
+        memset(info, 0, sizeof(*info));
+        info->remote_tid = g->threads[i].tid;
+        info->has_name = true;
+        memcpy(info->name, decoded, n);
+        info->name[n] = 0;
+        any = true;
+    }
+    if (any) {
+        g->info.supported |= XRT_GDB_CAP_THREAD_INFO;
+        g->info.unsupported &= ~XRT_GDB_CAP_THREAD_INFO;
+    }
     return XRT_OK;
 }
 static enum xrt_status annex(void *ctx, const char *name, char **out, size_t *size)
@@ -609,9 +681,22 @@ static bool publish_watch(struct xrt_gdb *g, struct xrt_target *t, int32_t tid,
 static enum xrt_status send_run(struct xrt_gdb *g, struct xrt_target *t,
                                  int32_t tid, bool step)
 {
-    if (step && !g->vcont_step)
-        return problem(g, XRT_UNSUPPORTED_CONTROL, "GDB stub does not support vCont;s");
     char command[96], id[40];
+    if (g->kernel) {
+        if (g->pending_signal)
+            return problem(g, XRT_UNSUPPORTED_CONTROL, "KGDB cannot deliver a signal; suppress it before resuming");
+        int index = thread_index(g, tid);
+        if (index < 0) return XRT_UNKNOWN_THREAD;
+        format_thread(g, &g->threads[index], id, sizeof(id));
+        char select[48];
+        snprintf(select, sizeof(select), "Hc%s", step ? id : "0");
+        enum xrt_status selected = ok(g, select, step ? "KGDB step thread selection unavailable" :
+                                      "KGDB continue thread selection unavailable");
+        if (selected != XRT_OK) return selected;
+        snprintf(command, sizeof(command), "%s", step ? "s" : "c");
+    } else if (step && !g->vcont_step)
+        return problem(g, XRT_UNSUPPORTED_CONTROL, "GDB stub does not support vCont;s");
+    else {
     int index = thread_index(g, tid);
     if (index < 0) return XRT_UNKNOWN_THREAD;
     format_thread(g, &g->threads[index], id, sizeof(id));
@@ -628,6 +713,7 @@ static enum xrt_status send_run(struct xrt_gdb *g, struct xrt_target *t,
         }
     } else if (step) snprintf(command, sizeof(command), "vCont;s:%s", id);
     else snprintf(command, sizeof(command), "%s", g->vcont_continue ? "vCont;c" : "c");
+    }
     ++t->generation;
     enum xrt_status status = xrt_gdb_send(&g->link, command, strlen(command));
     if (status != XRT_OK) return problem(g, status, g->link.reason);
@@ -643,7 +729,7 @@ static enum xrt_status send_run(struct xrt_gdb *g, struct xrt_target *t,
 }
 static enum xrt_status admit_step(struct xrt_gdb *g, struct xrt_target *t, uint64_t pc)
 {
-    if (!g->vcont_step) return problem(g, XRT_UNSUPPORTED_CONTROL, "GDB stub does not support vCont;s");
+    if (!g->vcont_step && !g->kernel) return problem(g, XRT_UNSUPPORTED_CONTROL, "GDB stub does not support vCont;s");
     if (t->arch->machine == XRT_AARCH64) {
         uint8_t bytes[4]; size_t count;
         enum xrt_status status = read_memory(g, t, pc, bytes, sizeof(bytes), &count);
@@ -665,6 +751,8 @@ static enum xrt_status resume(struct xrt_gdb *g, struct xrt_target *t, int32_t t
     enum xrt_status status;
     int i = xrt_thread_index(t, tid);
     if (i < 0) return XRT_UNKNOWN_THREAD;
+    if (step && g->kernel && tid != g->info.stop_tid)
+        return problem(g, XRT_UNSUPPORTED_CONTROL, "KGDB steps only the CPU that entered the debugger");
     struct xrt_registers regs; uint64_t pc;
     status = registers(g, t, tid, &regs);
     if (status != XRT_OK || xrt_registers_pc(&regs, &pc) != XRT_OK)
@@ -830,6 +918,8 @@ static enum xrt_status publish_stop(struct xrt_gdb *g, struct xrt_target *t,
     if (status != XRT_OK) return status;
     status = refresh_thread_info(g);
     if (status != XRT_OK) return status;
+    status = kernel_names(g);
+    if (status != XRT_OK) return status;
     if (has_thread) {
         if (g->info.supported & XRT_GDB_CAP_THREADS) {
             for (size_t i = 0; i < g->thread_count; ++i)
@@ -856,7 +946,8 @@ static enum xrt_status publish_stop(struct xrt_gdb *g, struct xrt_target *t,
         reason = XRT_STOP_EXCEPTION;
     if (!initial && stepping && signal == 5) reason = XRT_STOP_SINGLE_STEP;
     if (!initial && g->interrupt &&
-        (signal == 2 || (g->host.os == XRT_GDB_OS_DARWIN && signal == 17 /* its SIGSTOP */))) {
+        (signal == 2 || (g->host.os == XRT_GDB_OS_DARWIN && signal == 17 /* its SIGSTOP */) ||
+         (g->kernel && signal == 5 && !stepping) /* SysRq-G enters with SIGTRAP */)) {
         reason = XRT_STOP_INTERRUPT;
         g->info.supported |= XRT_GDB_CAP_INTERRUPT;
         g->info.failed &= ~XRT_GDB_CAP_INTERRUPT;
@@ -865,21 +956,39 @@ static enum xrt_status publish_stop(struct xrt_gdb *g, struct xrt_target *t,
     bool pass_sigchld = false;
     if (reason == XRT_STOP_SIGNAL) {
         int native = target_signal(g, signal);
-        if (!native && signal) {
+        if (g->kernel) {
+            t->threads[index].signal = native;
+            g->pending_signal = 0;
+            g->unmapped_signal = false;
+        } else if (!native && signal) {
             g->pending_signal = signal; g->signal_tid = tid; g->unmapped_signal = true;
             t->threads[index].reason = XRT_STOP_SIGNAL;
             event(t, XRT_EVENT_STOP, tid, signal);
             return problem(g, XRT_UNSUPPORTED_CONTROL, "GDB signal has no host display mapping; explicit suppression is required to resume");
-        }
+        } else {
         t->threads[index].signal = native; g->pending_signal = signal; g->signal_tid = tid;
         /* Not during a step: resuming here would turn the step into a run. */
         pass_sigchld = g->host.os == XRT_GDB_OS_DARWIN && native == 20 && !stepping;
+        }
     }
     if (g->watch_tid && thread_index(g, g->watch_tid) < 0) g->watch_tid = 0;
     struct xrt_registers regs; uint64_t pc = 0; bool known_pc = false;
     status = registers(g, t, tid, &regs);
     if (g->link.failed) return status;
     if (status == XRT_OK && xrt_registers_pc(&regs, &pc) == XRT_OK) known_pc = true;
+    /* x86 kgdb reports the address after int3. Rewind onto our breakpoint
+     * (gdb's decr_pc_after_break) so resume steps over it, not into it. */
+    if (g->kernel && !initial && signal == 5 && known_pc && pc && !stepping &&
+        t->arch->machine == XRT_X86_64)
+        for (size_t i = 0; i < t->breakpoint_count; ++i) {
+            const struct xrt_breakpoint *bp = &t->breakpoints[i];
+            if (!bp->pending && bp->patched && bp->enabled && bp->address == pc - 1) {
+                status = write_register(g, t, tid, "rip", 3, pc - 1, NULL);
+                if (status != XRT_OK) return status;
+                --pc;
+                break;
+            }
+        }
     if (!initial && signal == 5 && known_pc) for (size_t i = 0; i < t->breakpoint_count; ++i) {
         struct xrt_breakpoint *bp = &t->breakpoints[i];
         if (!bp->pending && bp->patched && bp->enabled && bp->address == pc) {
@@ -959,14 +1068,25 @@ static enum xrt_status poll_stop(struct xrt_gdb *g, struct xrt_target *t, bool w
     }
     free(saved); return status;
 }
+static enum xrt_status interrupt(struct xrt_gdb *g)
+{
+    if (!g->kernel) return xrt_gdb_interrupt(&g->link);
+    enum xrt_status status = xrt_gdb_interrupt_break(&g->link);
+    if (status == XRT_UNSUPPORTED_CONTROL)
+        return problem(g, status, "KGDB ignores interrupts on this endpoint; enter with SysRq-G on the target or use serial:PATH,break");
+    return status;
+}
 static enum xrt_status detach(struct xrt_gdb *g, struct xrt_target *t)
 {
     if (!t->pid || t->state == XRT_EXITED || t->state == XRT_IDLE) return XRT_OK;
     if (t->state == XRT_RUNNING) {
-        enum xrt_status status = xrt_gdb_interrupt(&g->link);
-        if (status != XRT_OK) return status;
-        g->interrupt = true;
-        status = poll_stop(g, t, true);
+        enum xrt_status status = interrupt(g);
+        if (status == XRT_OK) {
+            g->interrupt = true;
+            status = poll_stop(g, t, true);
+        }
+        if (status != XRT_OK && g->kernel && t->breakpoint_count)
+            xrt_log(XRT_LOG_WARN, XRT_LOG_RUNTIME, "xodb: KGDB kernel is running with xodb breakpoints still planted; enter the debugger and detach to remove them.\n");
         if (status != XRT_OK) return status;
     }
     enum xrt_status status = cleanup_plant(g, t);
@@ -1055,10 +1175,7 @@ static enum xrt_status open_connection(const char *endpoint, int fd, int32_t att
     bool noack = feature((char *)g->reply, "QStartNoAckMode+");
     bool nonstop = feature((char *)g->reply, "QNonStop+");
     g->native_signals = feature((char *)g->reply, "native-signals+");
-    if (!feature((char *)g->reply, "qXfer:features:read+")) {
-        status = problem(g, XRT_REGISTER_UNAVAILABLE, "GDB stub lacks qXfer:features:read target.xml");
-        goto fail;
-    }
+    if (!feature((char *)g->reply, "qXfer:features:read+")) g->kernel = true;
     for (char *p = (char *)g->reply; *p;) {
         char *end = strchr(p, ';'); if (!end) end = p + strlen(p);
         if ((size_t)(end - p) >= 11 && !memcmp(p, "PacketSize=", 11)) {
@@ -1147,17 +1264,32 @@ static enum xrt_status open_connection(const char *endpoint, int fd, int32_t att
         if (!initial_stop) { status = XRT_OUT_OF_MEMORY; goto fail; }
         memcpy(initial_stop, g->reply, initial_size);
     }
-    char *xml = NULL; size_t size = 0;
-    status = annex(g, "target.xml", &xml, &size);
-    /* debugserver's target.xml names no architecture; its Mach CPU type does. */
-    const char *fallback = g->host.os == XRT_GDB_OS_DARWIN &&
-        g->host.cputype == UINT32_C(0x0100000c) ? "aarch64" : NULL;
-    if (status == XRT_OK)
-        status = xrt_gdb_description_parse_for(&g->description, xml, size, annex, g, fallback);
-    free(xml);
+    if (g->kernel) {
+        status = query(g, "g");
+        if (status != XRT_OK) goto fail;
+        for (size_t i = 0; i < g->length; ++i) if (hex(g->reply[i]) < 0) {
+            status = problem(g, XRT_PROTOCOL_ERROR, "KGDB register packet is not hexadecimal");
+            goto fail;
+        }
+        status = xrt_gdb_description_builtin(&g->description, g->length);
+    } else {
+        char *xml = NULL; size_t size = 0;
+        status = annex(g, "target.xml", &xml, &size);
+        /* debugserver's target.xml names no architecture; its Mach CPU type does. */
+        const char *fallback = g->host.os == XRT_GDB_OS_DARWIN &&
+            g->host.cputype == UINT32_C(0x0100000c) ? "aarch64" : NULL;
+        if (status == XRT_OK)
+            status = xrt_gdb_description_parse_for(&g->description, xml, size, annex, g, fallback);
+        free(xml);
+    }
     if (status != XRT_OK) {
         if (g->description.reason[0]) snprintf(g->info.reason, sizeof(g->info.reason), "%s", g->description.reason);
         goto fail;
+    }
+    if (g->kernel) {
+        g->info.attached = 1;
+        g->info.supported |= XRT_GDB_CAP_STEP;
+        g->info.unsupported &= ~XRT_GDB_CAP_STEP;
     }
     t->arch = g->description.arch; t->identity_admitted = 1;
     snprintf(g->info.architecture, sizeof(g->info.architecture), "%s", g->description.architecture);
@@ -1229,7 +1361,7 @@ enum xrt_status xrt_gdb_call(struct xrt_gdb *g, struct xrt_target *t, const stru
     if (call->op == XRT_RPC_INTERRUPT) {
         if (t->state != XRT_RUNNING) return XRT_OK;
         ++t->generation;
-        enum xrt_status status = xrt_gdb_interrupt(&g->link);
+        enum xrt_status status = interrupt(g);
         if (status == XRT_OK) g->interrupt = true;
         return status;
     }
@@ -1354,7 +1486,9 @@ enum xrt_status xrt_gdb_call(struct xrt_gdb *g, struct xrt_target *t, const stru
     case XRT_RPC_WATCH_REMOVE:
     case XRT_RPC_WATCH_CAPACITY: {
         if (!g->watch_capacity)
-            return problem(g, XRT_UNSUPPORTED_CONTROL, "GDB hardware watchpoints are unsupported by this client");
+            return problem(g, XRT_UNSUPPORTED_CONTROL, g->kernel ?
+                "KGDB hardware watchpoints are not available from this client" :
+                "GDB hardware watchpoints are unsupported by this client");
         if (t->state != XRT_STOPPED) return XRT_NOT_STOPPED;
         if (call->op == XRT_RPC_WATCH_CAPACITY) {
             if (call->value) *call->value = g->watch_capacity;

@@ -44,6 +44,8 @@ pub const Snapshot = struct {
     vanished: usize = 0,
     unreadable: usize = 0,
     truncated: bool = false,
+    /// The --kernel-pid process did not exist when the census started.
+    scope_missing: bool = false,
     text_bytes: usize = 0,
     failure: ?[]const u8 = null,
 
@@ -52,6 +54,12 @@ pub const Snapshot = struct {
     }
     pub fn deinit(self: *Snapshot) void {
         self.arena.deinit();
+    }
+    /// A collected task list is still useful even when no stack was accessible.
+    pub fn stackAccessReason(self: *const Snapshot) ?[]const u8 {
+        if (self.scope_missing) return "ScopedProcessNotFound";
+        // Tasks that exited mid-scan were never refused; they must not hide the denial.
+        return if (self.denied > 0 and self.denied == self.tasks.items.len - self.vanished) "StackAccessDenied" else null;
     }
     fn save(self: *Snapshot, value: []const u8) ![]const u8 {
         if (value.len > max_text - self.text_bytes) return error.CensusTextLimit;
@@ -127,6 +135,27 @@ pub fn now() u64 {
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+test "kernel census all-denied reason excludes empty and mixed snapshots" {
+    var s = Snapshot.init();
+    defer s.deinit();
+    try std.testing.expect(s.stackAccessReason() == null);
+    try s.add(.{ .pid = 42, .tid = 42 }, .denied, "");
+    try s.add(.{ .pid = 42, .tid = 43 }, .denied, "");
+    try std.testing.expectEqualStrings("StackAccessDenied", s.stackAccessReason().?);
+    try s.add(.{ .pid = 42, .tid = 45 }, .vanished, "");
+    try std.testing.expectEqualStrings("StackAccessDenied", s.stackAccessReason().?);
+    try s.add(.{ .pid = 42, .tid = 44 }, .ready, "pipe_read+0x1/0x10\n");
+    try std.testing.expect(s.stackAccessReason() == null);
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var proc = try Dir.open("/proc");
+    defer proc.close();
+    var stop = std.atomic.Value(bool).init(false);
+    var missing = try collect(proc, std.math.maxInt(i32) - 1, &stop);
+    defer missing.deinit();
+    try std.testing.expectEqual(@as(usize, 0), missing.tasks.items.len);
+    try std.testing.expectEqualStrings("ScopedProcessNotFound", missing.stackAccessReason().?);
 }
 
 fn ioError() anyerror {
@@ -334,7 +363,17 @@ pub fn collect(root: Dir, pid: ?i32, stop: *const std.atomic.Value(bool)) !Snaps
     return s;
 }
 fn collectInto(s: *Snapshot, root: Dir, pid: ?i32, stop: *const std.atomic.Value(bool), deadline: u64) !void {
-    if (pid) |id| return process(s, root, id, stop, deadline);
+    if (pid) |id| {
+        // A missing scoped process is not a vanished task: report it, invent none.
+        var name: [32]u8 = undefined;
+        if (root.openDir(try std.fmt.bufPrint(&name, "{d}/task", .{id}))) |dir| {
+            dir.close();
+        } else |err| if (statusFor(err) == .vanished) {
+            s.scope_missing = true;
+            return;
+        }
+        return process(s, root, id, stop, deadline);
+    }
     var it = try root.iterate();
     defer it.deinit();
     while (try it.next()) |entry| {

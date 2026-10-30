@@ -16,8 +16,44 @@ static enum xrt_status annex(void *ctx, const char *name, char **text, size_t *s
     *size = strlen(s); *text = malloc(*size); assert(*text); memcpy(*text, s, *size);
     return XRT_OK;
 }
+static void plant(char *text, unsigned offset, uint64_t value)
+{
+    static const char digits[] = "0123456789abcdef";
+    for (unsigned i = 0; i < 8; ++i) {
+        unsigned byte = (unsigned)((value >> (8 * i)) & 255u);
+        text[2 * (offset + i)] = digits[byte >> 4];
+        text[2 * (offset + i) + 1] = digits[byte & 15];
+    }
+}
+static void builtin_layout(void)
+{
+    struct xrt_gdb_description *d = calloc(1, sizeof(*d));
+    assert(d);
+    assert(xrt_gdb_description_builtin(d, 156 * 2) == XRT_OK);
+    assert(d->arch && d->arch->machine == XRT_X86_64 && d->register_bytes == 156);
+    char bank[314];
+    memset(bank, '0', 312);
+    plant(bank, 128, 0x401000);
+    struct xrt_registers regs;
+    uint64_t pc = 0;
+    assert(xrt_gdb_description_decode(d, (const uint8_t *)bank, 156 * 2, &regs) == XRT_OK);
+    assert(xrt_registers_pc(&regs, &pc) == XRT_OK && pc == 0x401000);
+    assert(xrt_gdb_description_builtin(d, 10) != XRT_OK);
+    assert(xrt_gdb_description_builtin(d, 157 * 2) != XRT_OK);
+    assert(xrt_gdb_description_builtin(d, 788 * 2) == XRT_OK);
+    assert(d->arch && d->arch->machine == XRT_AARCH64 && d->register_bytes == 788);
+    /* AArch64 flags are named cpsr, as in GDB's own description. */
+    const struct xrt_register_desc *flags = xrt_arch_register(XRT_AARCH64, "pstate", 6);
+    assert(flags && xrt_gdb_description_register(d, flags));
+    assert(xrt_gdb_description_builtin(d, 548 * 2) == XRT_OK);
+    assert(d->arch && d->arch->machine == XRT_LOONGARCH && d->register_bytes == 548);
+    assert(xrt_gdb_description_builtin(d, 0) != XRT_OK);
+    assert(xrt_gdb_description_builtin(d, 1) != XRT_OK);
+    free(d);
+}
 int main(void)
 {
+    builtin_layout();
     struct xrt_gdb_description *d = calloc(1, sizeof(*d)); assert(d);
     assert(xrt_gdb_description_parse(d, valid, strlen(valid), NULL, NULL) == XRT_OK);
     assert(d->count == 3 && d->register_bytes == 20);

@@ -166,6 +166,13 @@ enum xrt_status xrt_fdscan_create(const struct xrt_fdscan_options *options, stru
             goto oom;
         memcpy(s->pids, s->o.pids, s->o.pid_count * sizeof(*s->pids));
         qsort(s->pids, s->o.pid_count, sizeof(*s->pids), by_pid);
+        /* The resume cursor names a PID, not a list position. Duplicate scope
+         * entries must not send a one-process window back to the same PID. */
+        uint32_t unique = 0;
+        for (uint32_t i = 0; i < s->o.pid_count; i++)
+            if (!unique || s->pids[i] != s->pids[unique - 1])
+                s->pids[unique++] = s->pids[i];
+        s->o.pid_count = unique;
     }
     s->o.pids = NULL;
     for (int i = 0; i < 2; i++) {

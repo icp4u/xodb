@@ -24,6 +24,7 @@ pub fn call(a: std.mem.Allocator, cache: *census.Cache, args: Value, hidden: boo
     const snapshot = if (cache.current) |*s| s else return wire.value(a, .{
         .status = if (cache.failure != null) "unavailable" else "pending",
         .failure = cache.failure,
+        .reason = @as(?[]const u8, null),
         .sequence = cache.sequence,
         .pending = cache.job != null,
         .scope_pid = cache.pid,
@@ -69,6 +70,7 @@ pub fn call(a: std.mem.Allocator, cache: *census.Cache, args: Value, hidden: boo
         .atomic_snapshot = false,
         .truncated = snapshot.truncated,
         .failure = snapshot.failure,
+        .reason = snapshot.stackAccessReason(),
         .task_count = snapshot.tasks.items.len,
         .group_count = snapshot.groups.items.len,
         .denied = snapshot.denied,
