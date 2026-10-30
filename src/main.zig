@@ -20,7 +20,7 @@ fn imageBudgetError(err: anyerror, option: []const u8, value: []const u8) anyerr
 }
 /// The debugger options that are followed by a value. The parser in main and
 /// log.init share the list, so a value is never read as an option.
-const value_options = [_][]const u8{ "--language-off", "--wine-threads", "--observe-recipe", "--observation-out", "--open-observation", "--browse-observation", "--observation-threshold-ns", "--static-analysis", "--decompile", "--function", "--gdb-remote", "--runtime-agent", "--runtime-ssh", "--ssh-config", "--allocation-helper", "--process-limit", "--core", "--exe", "--debug-dir", "--source-map", "--connect", "--ssh", "--remote-xodb", "--session-socket", "--listen", "--config", "--source", "--font", "--theme", "--ui-scale", "--platform", "--expected-start-ticks", "--attach", "--frames", "--vk-device", "--agent-scope", "--break", "--record", "--profile-duration", "--profile-hz", "--profile-out", "--capture-out", "--open-frames", "--open-profile", "--compare-capture", "--open-capture", "--open-pcap", "--live-capture", "--capture-tool", "--capture-ring-bytes", "--tls-key-log", "--open-mitmproxy", "--symbols", "--debug-file", "--image-limit", "--image-total-limit" };
+const value_options = [_][]const u8{ "--language-off", "--wine-threads", "--observe-recipe", "--observation-out", "--open-observation", "--browse-observation", "--observation-threshold-ns", "--static-analysis", "--decompile", "--function", "--gdb-remote", "--runtime-agent", "--runtime-ssh", "--ssh-config", "--allocation-helper", "--process-limit", "--core", "--exe", "--vmlinux", "--modules", "--debug-dir", "--source-map", "--connect", "--ssh", "--remote-xodb", "--session-socket", "--listen", "--config", "--source", "--font", "--theme", "--ui-scale", "--platform", "--expected-start-ticks", "--attach", "--frames", "--vk-device", "--agent-scope", "--break", "--record", "--profile-duration", "--profile-hz", "--profile-out", "--capture-out", "--open-frames", "--open-profile", "--compare-capture", "--open-capture", "--open-pcap", "--live-capture", "--capture-tool", "--capture-ring-bytes", "--tls-key-log", "--open-mitmproxy", "--symbols", "--debug-file", "--image-limit", "--image-total-limit" };
 fn named(names: []const []const u8, arg: []const u8) bool {
     for (names) |name| if (std.mem.eql(u8, arg, name)) return true;
     return false;
@@ -145,6 +145,8 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
     var capture_out: ?[:0]const u8 = null;
     var core_file: ?[:0]const u8 = null;
     var core_executable: ?[:0]const u8 = null;
+    var vmlinux: ?[:0]const u8 = null;
+    var modules_dir: ?[:0]const u8 = null;
     var open_capture: ?[:0]const u8 = null;
     var open_pcap: ?[:0]const u8 = null;
     var live_capture: ?[:0]const u8 = null;
@@ -238,6 +240,7 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
                 \\--profile-out FILE saves the full CPU aggregate as Speedscope JSON at shutdown (new file).
                 \\--capture-out FILE saves a native archive at shutdown (new file, no durability sync).
                 \\--core FILE opens a read-only x86-64 ELF core; --exe FILE supplies a matching moved executable.
+                \\--vmlinux FILE with --core opens a kdump vmcore or an ELF guest dump as a kernel target (docs/KGDB.md).
                 \\With --gdb-remote, --exe may supply its fixed-address ELF when the stub cannot list images.
                 \\--open-frames FILE opens logical-frame JSONL or a saved .xof bundle.
                 \\--open-profile FILE opens an imported simpleperf JSON profile (see scripts/import-simpleperf).
@@ -278,6 +281,8 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
                 \\  semq, overview, redot, profile. XODB_LOG takes the same value; the option wins.
                 \\--log-file FILE appends these lines to FILE (created 0600) and leaves stderr quiet; XODB_LOG_FILE=FILE
                 \\  does the same, and is how the processes xodb starts are given the file.
+                \\--vmlinux FILE loads that kernel image for a KGDB target and measures the KASLR slide.
+                \\--modules DIR is a directory of kernel objects named beside that image.
                 \\
             , .{});
             return;
@@ -314,6 +319,8 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
             if (std.mem.eql(u8, arg, "--process-limit")) process_limit = try std.fmt.parseInt(usize, args[i], 10);
             if (std.mem.eql(u8, arg, "--core")) core_file = args[i];
             if (std.mem.eql(u8, arg, "--exe")) core_executable = args[i];
+            if (std.mem.eql(u8, arg, "--vmlinux")) vmlinux = args[i];
+            if (std.mem.eql(u8, arg, "--modules")) modules_dir = args[i];
             if (std.mem.eql(u8, arg, "--connect")) connect = args[i];
             if (std.mem.eql(u8, arg, "--ssh")) ssh = args[i];
             if (std.mem.eql(u8, arg, "--remote-xodb")) remote_xodb = args[i];
@@ -378,6 +385,9 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
     if (process_limit == 0 or process_limit > @import("model/process_tree.zig").maximum) return error.InvalidProcessLimit;
     if ((follow_forks or process_limit != 32) and (core_file != null or open_capture != null or open_profile != null or connect != null or ssh != null)) return error.ProcessOptionsRequireLocalLiveTarget;
     if (core_executable != null and core_file == null and gdb_remote == null) return error.ExecutableRequiresCoreOrGdbRemote;
+    if (vmlinux != null and gdb_remote == null and core_file == null) return error.VmlinuxRequiresGdbRemote;
+    if (vmlinux != null and core_executable != null) return error.VmlinuxConflictsWithExecutable;
+    if (modules_dir != null and vmlinux == null) return error.ModulesDirRequiresVmlinux;
     if (core_file != null and (attach != null or launch.len > 0 or open_profile != null or open_capture != null or connect != null or ssh != null or initial_breakpoint_count != 0 or profile_out != null or capture_out != null or record_path != null or symbols != null or reanalyze)) return error.CoreOptionConflict;
     if (open_frames != null and (open_profile != null or connect != null or ssh != null or observation_recipe != null or open_observation != null or browse_observation != null)) return error.FrameOptionConflict;
     if (open_profile != null and (open_capture != null or attach != null or launch.len > 0 or initial_breakpoint_count != 0 or source != null or symbols != null or reanalyze or connect != null or ssh != null or capture_out != null or profile_out != null or record_path != null)) return error.ImportOptionConflict;
@@ -508,9 +518,11 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
         launch = redot_launch.items;
         log.info(.redot, "xodb: Redot/Godot scene debugger listening on private loopback port {d}; waiting for owned pid\n", .{port});
     }
-    if (gdb_remote != null) {
-        session.gdb_map.symbols.executable = core_executable;
-        session.modules.gdb_executable = core_executable;
+    if (gdb_remote != null or (core_file != null and vmlinux != null)) {
+        session.gdb_map.symbols.executable = vmlinux orelse core_executable;
+        session.modules.gdb_executable = vmlinux orelse core_executable;
+        session.modules.measure_kernel_slide = vmlinux != null;
+        session.modules.modules_dir = modules_dir;
     }
     session.static_analysis.toolchain_dir = static_analysis;
     session.static_analysis.warmup_enabled = ghidra_prestart;
@@ -788,9 +800,11 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
                 session.profile_defaults = preferences.profile.config();
                 session.allocation_defaults = preferences.allocations;
                 session.allocation_helper = allocation_helper;
-                if (gdb_remote != null) {
-                    session.gdb_map.symbols.executable = core_executable;
-                    session.modules.gdb_executable = core_executable;
+                if (gdb_remote != null or (core_file != null and vmlinux != null)) {
+                    session.gdb_map.symbols.executable = vmlinux orelse core_executable;
+                    session.modules.gdb_executable = vmlinux orelse core_executable;
+                    session.modules.measure_kernel_slide = vmlinux != null;
+                    session.modules.modules_dir = modules_dir;
                 }
                 session.static_analysis.toolchain_dir = static_analysis;
                 session.static_analysis.warmup_enabled = ghidra_prestart;

@@ -29,7 +29,7 @@ struct xrt_gdb_info {
     /* Last causal stop, cached without IO. Signal delivery differs from Mach
      * exception reporting, even when debugserver also supplies a signal byte. */
     int32_t stop_tid;
-    bool has_exception, has_fault, pending_delivery, regions_cut;
+    bool has_exception, has_fault, pending_delivery, regions_cut, kernel;
     uint32_t exception_count;
     uint64_t exception_type, exception_codes[4], fault_address;
 };

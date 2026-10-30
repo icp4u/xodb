@@ -272,6 +272,8 @@ pub const GdbRemoteInfo = struct {
     register_writes: GdbAvailability,
     interrupt: GdbAvailability,
     last_reason: []const u8,
+    /// True when the stub is a kernel debugger: no target description was offered.
+    kernel: bool = false,
 };
 fn gdbListStatus(status: rt.enum_xrt_status) !void {
     return switch (status) {
@@ -368,6 +370,7 @@ pub const Target = struct {
             .register_writes = gdbAvailability(cache.*, rt.XRT_GDB_CAP_REGISTER_WRITE),
             .interrupt = gdbAvailability(cache.*, rt.XRT_GDB_CAP_INTERRUPT),
             .last_reason = std.mem.sliceTo(&cache.reason, 0),
+            .kernel = cache.kernel,
         };
     }
     pub fn gdbThreadInfo(self: *const Target, tid: i32) !rt.struct_xrt_gdb_thread_info {

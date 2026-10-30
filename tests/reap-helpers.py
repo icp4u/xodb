@@ -13,7 +13,6 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-os.environ.pop('XODB_TEST_RUNTIME_AGENT', None)
 os.environ.pop('XODB_RUNTIME_AGENT', None)
 
 from client import Client

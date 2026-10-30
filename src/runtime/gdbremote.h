@@ -14,6 +14,8 @@ enum xrt_status xrt_gdb_open_fd(int, int32_t attach_pid, struct xrt_target *,
                                 struct xrt_gdb **, struct xrt_cancel *);
 enum xrt_status xrt_gdb_call(struct xrt_gdb *, struct xrt_target *, const struct xrt_call *);
 enum xrt_status xrt_gdb_health(const struct xrt_gdb *);
+/* Kernel mode keeps a failed link open so one later detach can still send D. */
+bool xrt_gdb_detach_holds_link(const struct xrt_gdb *);
 /* True only after an actual D/OK exchange, not an idle/exited no-op detach. */
 bool xrt_gdb_detach_confirmed(const struct xrt_gdb *);
 void xrt_gdb_info(const struct xrt_gdb *, struct xrt_gdb_info *);

@@ -9,6 +9,11 @@ const snapshot = @import("../binary/snapshot.zig");
 const mapped_file = @import("../binary/mapped_file.zig");
 const pe = @import("pe_images.zig");
 const DebugInfo = @import("../debug/info.zig").Image;
+const kernel_aware = @import("kernel_aware.zig");
+const kernel_image = @import("kernel_image.zig");
+const kernel_orc = @import("kernel_orc.zig");
+const loc = @import("../debug/location.zig");
+const arch_mod = @import("../target/arch.zig");
 // Process-wide, so exec/fork ownership changes cannot restart a burst.
 const BudgetThrottle = struct {
     next: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -78,6 +83,15 @@ pub const Module = struct {
     preparing_full: bool = false,
     immutable: bool = false,
     explicit_gdb: bool = false,
+    /// vmlinux or a kernel object. User images stay false.
+    kernel: bool = false,
+    /// ET_REL object. Only `.text` symbols are placed, at `kernel_text`.
+    kernel_reloc: bool = false,
+    text_section: u32 = 0,
+    kernel_text: u64 = 0,
+    orc_base: u64 = 0,
+    orc_ips: []i32 = &.{},
+    orc_entries: []u8 = &.{},
     file_source: mapped_file.Source = .unopened,
     pub fn debugInfo(self: *Module) !*DebugInfo {
         if (self.debug == null) {
@@ -215,8 +229,26 @@ pub const Modules = struct {
     core_ids: std.StringHashMapUnmanaged(union(enum) { id: []const u8, failure: anyerror }) = .empty,
     core_executable: ?struct { path: [:0]u8, id: []u8 } = null,
     /// Borrowed argv storage. Used only when a Linux GDB stub cannot list its
-    /// images and the user supplied a fixed-address ELF with --exe.
+    /// images and the user supplied a fixed-address ELF with --exe, or a
+    /// kernel image with --vmlinux.
     gdb_executable: ?[:0]const u8 = null,
+    /// `--vmlinux` measures a KASLR slide. `--exe` leaves link addresses as they are.
+    measure_kernel_slide: bool = false,
+    /// Directory of `.ko` files named by the running kernel. Borrowed from argv.
+    modules_dir: ?[:0]const u8 = null,
+    kernel_facts: ?kernel_aware.Facts = null,
+    kernel_pac_mask: ?u64 = null,
+    kernel_cpu: ?u32 = null,
+    kernel_stop_tid: i32 = 0,
+    kernel_generation: ?u64 = null,
+    percpu_offsets: []u64 = &.{},
+    kernel_tasks: []kernel_aware.TaskRow = &.{},
+    kernel_current: []u64 = &.{},
+    kernel_sig: u64 = 0,
+    kernel_lists: bool = false,
+    kernel_note: [96]u8 = @splat(0),
+    kernel_note_len: usize = 0,
+    ret_from_fork: ?u64 = null,
     allocator: std.mem.Allocator,
     regions: std.ArrayList(Region) = .empty,
     loaded: std.ArrayList(*Module) = .empty,
@@ -333,16 +365,34 @@ pub const Modules = struct {
         }
         for (self.regions.items) |r| self.allocator.free(r.path);
         self.regions.deinit(self.allocator);
-        for ([_][]*Module{ self.loaded.items, self.type_images.items }) |items| for (items) |m| {
-            if (m.layouts.go_value) |layout| m.debug_allocator.destroy(layout);
-            if (m.layouts.go_map) |layout| m.debug_allocator.destroy(layout);
-            if (m.debug) |*info| info.deinit();
-            if (m.owns_mapping) snapshot.free(m.mapping);
-            self.allocator.free(m.path);
-            self.allocator.destroy(m);
-        };
+        for ([_][]*Module{ self.loaded.items, self.type_images.items }) |items| for (items) |m| self.releaseModule(m);
         self.loaded.deinit(self.allocator);
         self.type_images.deinit(self.allocator);
+        if (self.percpu_offsets.len != 0) self.allocator.free(self.percpu_offsets);
+        if (self.kernel_tasks.len != 0) self.allocator.free(self.kernel_tasks);
+        if (self.kernel_current.len != 0) self.allocator.free(self.kernel_current);
+    }
+    fn releaseModule(self: *Modules, m: *Module) void {
+        if (m.orc_ips.len != 0) self.allocator.free(m.orc_ips);
+        if (m.orc_entries.len != 0) self.allocator.free(m.orc_entries);
+        if (m.layouts.go_value) |layout| m.debug_allocator.destroy(layout);
+        if (m.layouts.go_map) |layout| m.debug_allocator.destroy(layout);
+        if (m.debug) |*info| info.deinit();
+        if (m.owns_mapping) snapshot.free(m.mapping);
+        self.allocator.free(m.path);
+        self.allocator.destroy(m);
+    }
+    pub fn fromKernelCore(self: *Modules, target: anytype) !void {
+        const core = if (target.core) |*found| found else return error.CoreFileUnavailable;
+        self.core_source = core;
+        self.immutable = true;
+        const name = self.gdb_executable orelse return error.GdbExecutableUnavailable;
+        try self.fromGdbExecutable(name, @intFromEnum(elf.Machine.x86_64), target);
+        self.owner_target = target.handle;
+        if (core.vmcore.len != 0) if (kernel_aware.vmcoreInfo(core.vmcore)) |parsed| {
+            if (parsed.kernel_pac_mask) |mask| self.kernel_pac_mask = mask;
+        } else |_| {};
+        self.refreshKernel(target);
     }
     pub fn fromCore(self: *Modules, core: *const @import("../binary/core.zig").Core, executable: ?[]const u8) !void {
         self.core_source = core;
@@ -400,6 +450,99 @@ pub const Modules = struct {
             break;
         };
     }
+    /// Smallest KASLR step this image's machine is known to use. x86-64 and
+    /// aarch64 kernels are aligned to 2 MiB. Other machines use 64 KiB, which
+    /// still finds a coarser slide and matches loongarch.
+    pub fn kernelSlideStep(machine: elf.Machine) u64 {
+        return switch (machine) {
+            .x86_64, .aarch64 => 0x200000,
+            else => 0x10000,
+        };
+    }
+    fn bannerAt(memory: anytype, address: u64, banner: []const u8) bool {
+        var buf: [128]u8 = undefined;
+        if (banner.len == 0 or banner.len > buf.len) return false;
+        const n = memory.read(address, buf[0..banner.len]) catch return false;
+        return n == banner.len and std.mem.eql(u8, buf[0..banner.len], banner);
+    }
+    /// Slide such that `linux_banner` in target memory matches the image.
+    /// Zero is the link address. Any other slide is a multiple of `step` that
+    /// puts one stopped program counter inside the image. Two different slides
+    /// that both match are refused.
+    pub fn kernelSlide(link_lo: u64, span: u64, banner_link: u64, banner: []const u8, pcs: []const u64, step: u64, memory: anytype) !u64 {
+        if (banner.len < 24 or span == 0 or step == 0 or link_lo > banner_link or banner_link - link_lo >= span) return error.KernelBannerMissing;
+        // A kernel that relocates by copying (LoongArch) leaves its loaded image,
+        // banner included, at the link address. A slid match is the live copy.
+        const at_link = bannerAt(memory, banner_link, banner);
+        var found: ?u64 = null;
+        // Every candidate is a multiple of `step`, so the thread PCs nominate
+        // the same slides. Read each banner candidate once.
+        var tried: [1024]u64 = undefined;
+        var tried_n: usize = 0;
+        for (pcs) |pc| {
+            if (pc < link_lo) continue;
+            var offset = (pc - link_lo) % step;
+            while (offset < span) {
+                if (std.math.add(u64, link_lo, offset)) |link_pc| {
+                    const seen = pc >= link_pc and for (tried[0..tried_n]) |old| {
+                        if (old == pc - link_pc) break true;
+                    } else false;
+                    if (pc >= link_pc and pc - link_pc != 0 and !seen) {
+                        if (tried_n < tried.len) {
+                            tried[tried_n] = pc - link_pc;
+                            tried_n += 1;
+                        }
+                        if (std.math.add(u64, banner_link, pc - link_pc)) |runtime| {
+                            if (bannerAt(memory, runtime, banner)) {
+                                const slide = pc - link_pc;
+                                if (found) |old| {
+                                    if (old != slide) return error.KernelSlideAmbiguous;
+                                } else found = slide;
+                            }
+                        } else |_| {}
+                    }
+                } else |_| {}
+                if (offset > std.math.maxInt(u64) - step) break;
+                offset += step;
+            }
+        }
+        if (found == null and at_link) found = 0;
+        return found orelse error.KernelSlideNotFound;
+    }
+    test "kernel slide is the banner match on a stopped program counter" {
+        const banner = "Linux version synthetic banner!!";
+        const Mem = struct {
+            slots: [2]struct { at: u64 = 0, bytes: []const u8 = &.{} },
+            fn read(self: @This(), address: u64, dest: []u8) !usize {
+                for (self.slots) |slot| {
+                    if (slot.bytes.len == 0 or address < slot.at or address - slot.at >= slot.bytes.len) continue;
+                    const n = @min(dest.len, slot.bytes.len - (address - slot.at));
+                    @memcpy(dest[0..n], slot.bytes[address - slot.at ..][0..n]);
+                    return n;
+                }
+                return error.UnmappedAddress;
+            }
+        };
+        const step = kernelSlideStep(.x86_64);
+        const link_lo: u64 = 0x10000000;
+        const span: u64 = 0x400000;
+        const banner_link: u64 = link_lo + 0x1000;
+        const pcs = [_]u64{link_lo + 0x100 + step};
+        const slid = Mem{ .slots = .{ .{ .at = banner_link + step, .bytes = banner }, .{} } };
+        try std.testing.expectEqual(step, try kernelSlide(link_lo, span, banner_link, banner, &pcs, step, slid));
+        const zero = Mem{ .slots = .{ .{ .at = banner_link, .bytes = banner }, .{} } };
+        try std.testing.expectEqual(@as(u64, 0), try kernelSlide(link_lo, span, banner_link, banner, &.{}, step, zero));
+        const neither = Mem{ .slots = .{ .{}, .{} } };
+        try std.testing.expectError(error.KernelSlideNotFound, kernelSlide(link_lo, span, banner_link, banner, &pcs, step, neither));
+        const both = Mem{ .slots = .{ .{ .at = banner_link, .bytes = banner }, .{ .at = banner_link + step, .bytes = banner } } };
+        try std.testing.expectEqual(step, try kernelSlide(link_lo, span, banner_link, banner, &pcs, step, both));
+        const pcs2 = [_]u64{ link_lo + 0x100 + step, link_lo + 0x100 + 2 * step };
+        const two = Mem{ .slots = .{ .{ .at = banner_link + step, .bytes = banner }, .{ .at = banner_link + 2 * step, .bytes = banner } } };
+        try std.testing.expectError(error.KernelSlideAmbiguous, kernelSlide(link_lo, span, banner_link, banner, &pcs2, step, two));
+        try std.testing.expectError(error.KernelBannerMissing, kernelSlide(link_lo, span, banner_link, "short", &pcs, step, slid));
+        try std.testing.expectEqual(@as(u64, 0x200000), kernelSlideStep(.aarch64));
+        try std.testing.expectEqual(@as(u64, 0x10000), kernelSlideStep(.loongarch));
+    }
     pub fn fromGdbExecutable(self: *Modules, name: []const u8, machine: u16, target: anytype) !void {
         if (self.loaded.items.len != 0) return;
         const name_z = try self.allocator.dupeZ(u8, name);
@@ -418,8 +561,47 @@ pub const Modules = struct {
             stat.st_mtim.tv_sec != after.st_mtim.tv_sec or stat.st_mtim.tv_nsec != after.st_mtim.tv_nsec or
             stat.st_ctim.tv_sec != after.st_ctim.tv_sec or stat.st_ctim.tv_nsec != after.st_ctim.tv_nsec) return error.BinaryChangedDuringRead;
         const image = try elf.Image.parse(mapped);
-        if (image.header.type != .executable) return error.GdbExecutablePositionIndependentUnsupported;
+        // arm64 and loongarch64 link vmlinux as ET_DYN at a fixed kernel address.
+        const kernel_pie = self.measure_kernel_slide and image.header.type == .shared;
+        if (image.header.type != .executable and !kernel_pie) return error.GdbExecutablePositionIndependentUnsupported;
         if (@intFromEnum(image.header.machine) != machine) return error.UnsupportedArchitecture;
+        var link_lo: u64 = std.math.maxInt(u64);
+        var link_hi: u64 = 0;
+        for (0..image.header.segment_count) |i| {
+            const segment = try image.segment(@intCast(i));
+            if (segment.type != .load or segment.mem_size == 0) continue;
+            link_lo = @min(link_lo, segment.vaddr);
+            link_hi = @max(link_hi, std.math.add(u64, segment.vaddr, segment.mem_size) catch return error.InvalidAddress);
+        }
+        if (link_lo == std.math.maxInt(u64) or link_lo >= link_hi) return error.NoLoadSegment;
+        var slide: u64 = 0;
+        if (self.measure_kernel_slide) {
+            const banner_sym = image.findSymbol("linux_banner") orelse return error.KernelBannerMissing;
+            if (!banner_sym.hasAddress() or banner_sym.size < 24) return error.KernelBannerMissing;
+            const banner_file = image.fileOffset(banner_sym.value) orelse return error.KernelBannerMissing;
+            const banner_len: usize = @intCast(@min(banner_sym.size, 128));
+            if (banner_file >= mapped.len or banner_len > mapped.len - @as(usize, @intCast(banner_file))) return error.KernelBannerMissing;
+            var banner = mapped[@intCast(banner_file)..][0..banner_len];
+            if (banner[banner.len - 1] == 0) banner = banner[0 .. banner.len - 1];
+            if (banner.len < 24) return error.KernelBannerMissing;
+            var pcs: [64]u64 = undefined;
+            var npc: usize = 0;
+            for (target.threadSlice()) |thread| {
+                if (npc == pcs.len) break;
+                const regs = target.registers(thread.tid) catch continue;
+                var pc: u64 = undefined;
+                runtime_api.check(rt.xrt_registers_pc(&regs.raw, &pc)) catch continue;
+                pcs[npc] = pc;
+                npc += 1;
+            }
+            const Reader = struct {
+                target: @TypeOf(target),
+                fn read(reader: @This(), address: u64, dest: []u8) !usize {
+                    return reader.target.readMemory(address, dest);
+                }
+            };
+            slide = try kernelSlide(link_lo, link_hi - link_lo, banner_sym.value, banner, pcs[0..npc], kernelSlideStep(image.header.machine), Reader{ .target = target });
+        }
         // The stub cannot name its image. A rebuild can keep every code byte
         // and still change its DWARF, so the loaded GNU build ID must match.
         if (image.buildId()) |id| {
@@ -428,7 +610,7 @@ pub const Modules = struct {
             // target memory; only the entry check then guards, as without one.
             const address: ?u64 = for (0..image.header.segment_count) |i| {
                 const segment = try image.segment(@intCast(i));
-                if (segment.type == .load and note_at >= segment.offset and note_at - segment.offset + id.len <= segment.file_size) break segment.vaddr + (note_at - segment.offset);
+                if (segment.type == .load and note_at >= segment.offset and note_at - segment.offset + id.len <= segment.file_size) break std.math.add(u64, segment.vaddr + (note_at - segment.offset), slide) catch return error.InvalidAddress;
             } else null;
             var loaded: [64]u8 = undefined;
             if (address) |note| if (id.len > loaded.len or try target.readMemory(note, loaded[0..id.len]) != id.len or
@@ -450,16 +632,17 @@ pub const Modules = struct {
         for (0..image.header.segment_count) |i| {
             const segment = try image.segment(@intCast(i));
             if (segment.type != .load) continue;
-            start = @min(start, segment.vaddr);
-            end = @max(end, std.math.add(u64, segment.vaddr, segment.mem_size) catch return error.InvalidAddress);
+            const runtime_vaddr = std.math.add(u64, segment.vaddr, slide) catch return error.InvalidAddress;
+            start = @min(start, runtime_vaddr);
+            end = @max(end, std.math.add(u64, runtime_vaddr, segment.mem_size) catch return error.InvalidAddress);
             if (segment.file_size == 0) continue;
-            const file_end = std.math.add(u64, segment.vaddr, segment.file_size) catch return error.InvalidAddress;
+            const file_end = std.math.add(u64, runtime_vaddr, segment.file_size) catch return error.InvalidAddress;
             var permissions: [4]u8 = "---p".*;
             if (segment.flags & elf.pf.r != 0) permissions[0] = 'r';
             if (segment.flags & elf.pf.w != 0) permissions[1] = 'w';
             if (segment.flags & elf.pf.x != 0) permissions[2] = 'x';
             try self.regions.append(self.allocator, .{
-                .start = segment.vaddr,
+                .start = runtime_vaddr,
                 .end = file_end,
                 .offset = segment.offset,
                 .inode = inode,
@@ -481,18 +664,477 @@ pub const Modules = struct {
             .device_minor = 0,
             .path = path,
             .image = image,
-            .bias = 0,
+            .bias = slide,
             .start = start,
             .end = end,
             .mapping = mapped,
             .immutable = true,
             .explicit_gdb = true,
+            .kernel = self.measure_kernel_slide,
             .file_source = .host_path,
         };
         try self.loaded.append(self.allocator, module);
         self.next_id += 1;
         self.snapshot_bytes += mapped.len;
         self.maps_revision +|= 1;
+        if (module.kernel) self.attachOrc(module, slide);
+    }
+    fn attachOrc(self: *Modules, module: *Module, slide: u64) void {
+        const copied = kernel_image.copyOrc(self.allocator, &module.image, slide) catch return;
+        const table = copied orelse return;
+        module.orc_base = table.base;
+        module.orc_ips = table.ips;
+        module.orc_entries = table.entries;
+    }
+    fn noteKernel(self: *Modules, text: []const u8) void {
+        const n = @min(text.len, self.kernel_note.len - 1);
+        @memcpy(self.kernel_note[0..n], text[0..n]);
+        self.kernel_note[n] = 0;
+        self.kernel_note_len = n;
+    }
+    fn kernelModuleAt(self: *const Modules, address: u64) ?*Module {
+        var best: ?*Module = null;
+        var span: u64 = std.math.maxInt(u64);
+        for (self.loaded.items) |module| {
+            if (!module.kernel or address < module.start or address >= module.end) continue;
+            const size = module.end - module.start;
+            if (size < span) {
+                best = module;
+                span = size;
+            }
+        }
+        return best;
+    }
+    fn replaceSlice(self: *Modules, comptime T: type, slot: *[]T, next: []T) void {
+        if (slot.len != 0) self.allocator.free(slot.*);
+        slot.* = next;
+    }
+    /// Names, tasks, and kernel objects for this stop. A missing type or a
+    /// missing object is a note; symbols and call frames still unwind.
+    pub fn refreshKernel(self: *Modules, target: anytype) void {
+        if (!self.measure_kernel_slide or self.loaded.items.len == 0) return;
+        const vmlinux = self.loaded.items[0];
+        if (!vmlinux.kernel) return;
+        // One walk per stop: a snapshot poll must not re-read every task.
+        const generation = target.snapshot().generation;
+        if (self.kernel_generation == generation) return;
+        self.kernel_generation = generation;
+        self.noteStoppedCpu();
+        if (self.kernel_cpu == null) for (target.threadSlice()) |thread| {
+            if (kernel_aware.shadowCpuLocal(thread.tid)) |cpu| {
+                self.kernel_cpu = cpu;
+                break;
+            }
+        };
+        const Reader = struct {
+            target: @TypeOf(target),
+            pub fn read(reader: @This(), address: u64, dest: []u8) !usize {
+                return reader.target.readMemory(address, dest);
+            }
+        };
+        const reader = Reader{ .target = target };
+        self.ensureFacts(vmlinux);
+        self.readPac(vmlinux, reader);
+        self.readPercpu(vmlinux, reader);
+        self.rememberFork(vmlinux);
+        self.readTasks(vmlinux, reader);
+        if (self.kernel_cpu == null) if (self.taskByTid(self.kernel_stop_tid)) |task| {
+            self.kernel_cpu = task.cpu;
+        };
+        self.readObjects(vmlinux, reader);
+    }
+    fn noteStoppedCpu(self: *Modules) void {
+        const handle = self.owner_target orelse return;
+        var info: rt.struct_xrt_gdb_info = undefined;
+        runtime_api.check(rt.xrt_target_gdb_info(handle, &info)) catch return;
+        self.kernel_cpu = kernel_aware.shadowCpuLocal(info.stop_tid);
+        self.kernel_stop_tid = info.stop_tid;
+    }
+    fn ensureFacts(self: *Modules, module: *Module) void {
+        if (self.kernel_facts != null) return;
+        const dwarf = if (module.debugInfo() catch null) |debug| debug.dwarf else null;
+        self.kernel_facts = kernel_image.factsFromImage(&module.image, dwarf, 1 << 28) catch |err| {
+            self.noteKernel(@errorName(err));
+            return;
+        };
+    }
+    fn readWord(memory: anytype, address: u64) !u64 {
+        return readScalar(memory, address, 8);
+    }
+    fn readScalar(memory: anytype, address: u64, size: u64) !u64 {
+        const width: usize = if (size == 4) 4 else if (size == 8 or size == 0) 8 else return error.KernelMemory;
+        var buf: [8]u8 = undefined;
+        const n = memory.read(address, buf[0..width]) catch return error.KernelMemory;
+        if (n != width) return error.KernelMemory;
+        if (width == 4) return std.mem.readInt(u32, buf[0..4], .little);
+        return std.mem.readInt(u64, buf[0..8], .little);
+    }
+    fn readPac(self: *Modules, module: *Module, memory: anytype) void {
+        // Only arm64 publishes a PAC mask; elsewhere this read repeats every stop.
+        if (self.kernel_pac_mask != null or module.image.header.machine != .aarch64) return;
+        const data = module.symbols().findSymbol("vmcoreinfo_data") orelse return;
+        const size = module.symbols().findSymbol("vmcoreinfo_size") orelse return;
+        if (!data.hasAddress() or !size.hasAddress()) return;
+        const data_at = module.runtimeAddress(data.value) catch return;
+        const size_at = module.runtimeAddress(size.value) catch return;
+        const page = readWord(memory, data_at) catch return;
+        const bytes = readScalar(memory, size_at, size.size) catch return;
+        if (bytes == 0 or bytes > 4096) return;
+        var text: [4096]u8 = undefined;
+        const n = memory.read(page, text[0..@intCast(bytes)]) catch return;
+        if (n != bytes) return;
+        const parsed = kernel_aware.vmcoreInfo(text[0..@intCast(bytes)]) catch return;
+        if (parsed.kernel_pac_mask) |mask| self.kernel_pac_mask = mask;
+    }
+    fn readPercpu(self: *Modules, module: *Module, memory: anytype) void {
+        if (self.percpu_offsets.len != 0) return;
+        const symbol = module.symbols().findSymbol("__per_cpu_offset") orelse return;
+        if (!symbol.hasAddress() or symbol.size < 8 or symbol.size % 8 != 0) return;
+        // usize: @min with 4096 narrows to u13, and count * 8 overflows from 1024 CPUs.
+        const count: usize = @intCast(@min(symbol.size / 8, 4096));
+        const percpu_at = module.runtimeAddress(symbol.value) catch return;
+        const raw = self.allocator.alloc(u8, count * 8) catch return;
+        defer self.allocator.free(raw);
+        const n = memory.read(percpu_at, raw) catch return;
+        if (n != raw.len) return;
+        const slots = self.allocator.alloc(u64, count) catch return;
+        for (slots, 0..) |*word, index| word.* = std.mem.readInt(u64, raw[index * 8 ..][0..8], .little);
+        self.percpu_offsets = slots;
+    }
+    fn rememberFork(self: *Modules, module: *Module) void {
+        if (self.ret_from_fork != null) return;
+        const symbol = module.symbols().findSymbol("ret_from_fork_asm") orelse return;
+        if (!symbol.hasAddress()) return;
+        self.ret_from_fork = module.runtimeAddress(symbol.value) catch null;
+    }
+    fn readTasks(self: *Modules, module: *Module, memory: anytype) void {
+        const facts = self.kernel_facts orelse return;
+        const symbol = module.symbols().findSymbol("init_task") orelse return;
+        if (!symbol.hasAddress()) return;
+        const task_base = module.runtimeAddress(symbol.value) catch return;
+        const rows = self.allocator.alloc(kernel_aware.TaskRow, 1024) catch return;
+        const n = kernel_aware.walkTasks(memory, task_base, facts, rows) catch {
+            self.allocator.free(rows);
+            return;
+        };
+        // The live slice must own its allocation. A tail of `rows` is the same block.
+        const kept = if (n == rows.len) rows else self.allocator.dupe(kernel_aware.TaskRow, rows[0..n]) catch {
+            self.allocator.free(rows);
+            return;
+        };
+        if (n != rows.len) self.allocator.free(rows);
+        self.replaceSlice(kernel_aware.TaskRow, &self.kernel_tasks, kept);
+        self.readCurrent(module, memory);
+    }
+    fn readCurrent(self: *Modules, module: *Module, memory: anytype) void {
+        const symbol = module.symbols().findSymbol("current_task") orelse return;
+        const cpus: u32 = if (self.percpu_offsets.len != 0) @intCast(@min(self.percpu_offsets.len, 256)) else 1;
+        const slots = self.allocator.alloc(u64, cpus) catch return;
+        @memset(slots, 0);
+        var cpu: u32 = 0;
+        while (cpu < cpus) : (cpu += 1) {
+            const slot = self.percpuRuntime(module, symbol.value, cpu) catch continue;
+            slots[cpu] = readWord(memory, slot) catch 0;
+        }
+        self.replaceSlice(u64, &self.kernel_current, slots);
+    }
+    fn percpuRuntime(self: *const Modules, module: *const Module, value: u64, cpu: u32) !u64 {
+        if (self.percpu_offsets.len != 0) return kernel_aware.perCpuAddress(self.percpu_offsets, cpu, value);
+        if (cpu == 0) return module.runtimeAddress(value);
+        return error.PerCpuOffsetUnavailable;
+    }
+    fn readObjects(self: *Modules, module: *Module, memory: anytype) void {
+        const facts = self.kernel_facts orelse return;
+        const head_sym = module.symbols().findSymbol("modules") orelse return;
+        if (!head_sym.hasAddress()) return;
+        const head = module.runtimeAddress(head_sym.value) catch return;
+        const rows = self.allocator.alloc(kernel_aware.ModuleRow, 512) catch return;
+        defer self.allocator.free(rows);
+        const n = kernel_aware.walkModules(memory, head, facts, rows) catch return;
+        var hasher = std.hash.Wyhash.init(0);
+        for (rows[0..n]) |row| {
+            hasher.update(std.mem.asBytes(&row.text));
+            hasher.update(std.mem.asBytes(&row.text_size));
+            hasher.update(row.name[0..row.name_len]);
+        }
+        const sig = hasher.final();
+        if (self.kernel_lists and sig == self.kernel_sig) return;
+        self.dropRelocated();
+        for (rows[0..n]) |row| {
+            if (row.state != 0 or row.text == 0 or row.text_size == 0) continue;
+            self.loadObject(module, row) catch |err| self.noteKernel(@errorName(err));
+        }
+        self.kernel_sig = sig;
+        self.kernel_lists = true;
+    }
+    fn dropRelocated(self: *Modules) void {
+        var index: usize = 0;
+        while (index < self.loaded.items.len) {
+            const module = self.loaded.items[index];
+            if (!module.kernel_reloc) {
+                index += 1;
+                continue;
+            }
+            if (module.owns_mapping) self.snapshot_bytes -|= module.mapping.len;
+            self.releaseModule(module);
+            _ = self.loaded.orderedRemove(index);
+        }
+    }
+    fn loadObject(self: *Modules, vmlinux: *Module, row: kernel_aware.ModuleRow) !void {
+        const root = self.modules_dir orelse return;
+        const name = row.name[0..row.name_len];
+        if (name.len == 0 or name.len > 48 or std.mem.indexOfScalar(u8, name, '/') != null) return;
+        var want: [64]u8 = undefined;
+        const file = std.fmt.bufPrint(&want, "{s}.ko", .{name}) catch return;
+        const path = self.findObject(root, file) orelse {
+            var note: [80]u8 = undefined;
+            self.noteKernel(std.fmt.bufPrint(&note, "module {s} has no object", .{name}) catch "module has no object");
+            return;
+        };
+        defer self.allocator.free(path);
+        const fd = c.open(path.ptr, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK);
+        if (fd < 0) return;
+        defer _ = c.close(fd);
+        var stat: c.struct_stat = undefined;
+        if (c.fstat(fd, &stat) != 0 or stat.st_size <= 0) return;
+        const mapped = try snapshot.readRange(fd, 0, std.math.cast(usize, stat.st_size) orelse return error.BinarySnapshotLimit, snapshot.per_image_limit, null);
+        errdefer snapshot.free(mapped);
+        const image = try elf.Image.parse(mapped);
+        if (image.header.type != .relocatable or image.header.machine != vmlinux.image.header.machine) {
+            snapshot.free(mapped);
+            return;
+        }
+        if (row.build_id_len > 0) {
+            const id = image.buildId() orelse &.{};
+            if (!kernel_aware.buildIdMatches(id, row.build_id[0..row.build_id_len])) {
+                snapshot.free(mapped);
+                var note: [80]u8 = undefined;
+                self.noteKernel(std.fmt.bufPrint(&note, "module {s} build id differs", .{name}) catch "module build id differs");
+                return;
+            }
+        }
+        const text = kernel_image.textSection(&image) orelse {
+            snapshot.free(mapped);
+            return;
+        };
+        const end = std.math.add(u64, row.text, row.text_size) catch return error.InvalidAddress;
+        var label: [64]u8 = undefined;
+        const shown = std.fmt.bufPrint(&label, "kernel/{s}.ko", .{name}) catch return error.InvalidAddress;
+        const module = try self.allocator.create(Module);
+        errdefer self.allocator.destroy(module);
+        const owned_path = try self.allocator.dupeZ(u8, shown);
+        errdefer self.allocator.free(owned_path);
+        module.* = .{
+            .id = self.next_id,
+            .inode = @intCast(stat.st_ino),
+            .device_major = 0,
+            .device_minor = 0,
+            .path = owned_path,
+            .image = image,
+            .bias = 0,
+            .start = row.text,
+            .end = end,
+            .mapping = mapped,
+            .immutable = true,
+            .explicit_gdb = true,
+            .kernel = true,
+            .kernel_reloc = true,
+            .text_section = text,
+            .kernel_text = row.text,
+            .file_source = .host_path,
+        };
+        try self.loaded.append(self.allocator, module);
+        self.next_id += 1;
+        self.snapshot_bytes += mapped.len;
+    }
+    fn findObject(self: *Modules, root: [:0]const u8, file: []const u8) ?[:0]u8 {
+        var budget: u32 = 4096;
+        return self.walkObjects(root, file, 0, &budget);
+    }
+    fn walkObjects(self: *Modules, root: []const u8, file: []const u8, depth: u8, budget: *u32) ?[:0]u8 {
+        if (depth == 6 or budget.* == 0) return null;
+        var buf: [4096]u8 = undefined;
+        const opened = std.fmt.bufPrintZ(&buf, "{s}", .{root}) catch return null;
+        const dir = c.opendir(opened.ptr) orelse return null;
+        defer _ = c.closedir(dir);
+        while (c.readdir(dir)) |entry| {
+            if (budget.* == 0) return null;
+            budget.* -= 1;
+            const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&entry.*.d_name)), 0);
+            if (name.len == 0 or name[0] == '.') continue;
+            const child = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ root, name }) catch continue;
+            if (std.mem.eql(u8, name, file) and entry.*.d_type != 4) return self.allocator.dupeZ(u8, child) catch null;
+            if (entry.*.d_type == 4 or entry.*.d_type == 0) {
+                if (self.walkObjects(child, file, depth + 1, budget)) |found| return found;
+            }
+        }
+        return null;
+    }
+    fn taskByTid(self: *const Modules, tid: i32) ?kernel_aware.TaskRow {
+        if (kernel_aware.shadowCpuLocal(tid)) |cpu| {
+            if (cpu < self.kernel_current.len and self.kernel_current[cpu] != 0) {
+                const address = self.kernel_current[cpu];
+                for (self.kernel_tasks) |task| if (task.address == address) return task;
+            }
+            for (self.kernel_tasks) |task| if (task.cpu == cpu) return task;
+        }
+        for (self.kernel_tasks) |task| if (task.pid == tid) return task;
+        return null;
+    }
+    pub fn kernelThreadName(self: *const Modules, tid: i32, buf: *[128]u8) bool {
+        const task = self.taskByTid(tid) orelse return false;
+        const comm = task.comm[0..task.comm_len];
+        const head = std.fmt.bufPrint(buf, "{s} pid={d}", .{ comm, task.pid }) catch return false;
+        var used = head.len;
+        if (task.state) |state| {
+            const more = std.fmt.bufPrint(buf[used..], " state={d}", .{state}) catch return false;
+            used += more.len;
+        }
+        if (task.cpu) |cpu| {
+            const more = std.fmt.bufPrint(buf[used..], " cpu={d}", .{cpu}) catch return false;
+            used += more.len;
+        }
+        if (used >= buf.len) return false;
+        buf[used] = 0;
+        return true;
+    }
+    fn percpuValue(module: *const Module, symbol: elf.Symbol) ?u64 {
+        if (!module.kernel or module.kernel_reloc) return null;
+        const section = switch (symbol.placement) {
+            .section => |index| index,
+            else => return null,
+        };
+        const named = module.image.section(section) catch return null;
+        if (!std.mem.eql(u8, named.name, ".data..percpu")) return null;
+        // x86-64 links per-CPU data from zero; arm64 at a real, slid address.
+        if (named.addr == 0) return symbol.value;
+        return module.runtimeAddress(symbol.value) catch null;
+    }
+    fn kernelSymbol(self: *Modules, name: []const u8) !?Symbol {
+        for (self.loaded.items) |module| {
+            if (!module.kernel) continue;
+            const symbol = module.symbols().findSymbol(name) orelse continue;
+            if (module.kernel_reloc) {
+                const section = switch (symbol.placement) {
+                    .section => |index| index,
+                    else => continue,
+                };
+                const address = kernel_aware.textSymbol(section, module.text_section, module.kernel_text, symbol.value) orelse continue;
+                return publishedSymbol(module.image.header.machine, module.id, symbol, address);
+            }
+            if (percpuValue(module, symbol)) |value| {
+                const cpu = self.kernel_cpu orelse return error.PerCpuNeedsCpu;
+                const address = try self.percpuRuntime(module, value, cpu);
+                return publishedSymbol(module.image.header.machine, module.id, symbol, address);
+            }
+            if (symbol.hasAddress()) return publishedSymbol(module.image.header.machine, module.id, symbol, try module.runtimeAddress(symbol.value));
+        }
+        return null;
+    }
+    fn relocSymbolAt(module: *Module, address: u64) !Symbol {
+        if (address < module.kernel_text) return error.SymbolNotFound;
+        const located = module.symbols().symbolAt(address - module.kernel_text) orelse return error.SymbolNotFound;
+        const section = switch (located.symbol.placement) {
+            .section => |index| index,
+            else => return error.SymbolNotFound,
+        };
+        const placed = kernel_aware.textSymbol(section, module.text_section, module.kernel_text, located.symbol.value) orelse return error.SymbolNotFound;
+        var found = publishedSymbol(module.image.header.machine, module.id, located.symbol, placed);
+        found.offset = address - placed;
+        return found;
+    }
+    pub const Recovered = enum { instruction, return_address };
+    pub fn recoverKernel(self: *Modules, tid: i32, registers: *loc.RegisterSet, arch_: arch_mod.Arch, memory: anytype) !Recovered {
+        const facts = self.kernel_facts orelse return error.KernelTypeInfoUnavailable;
+        const task = self.taskByTid(tid) orelse return error.KernelTaskLayoutUnavailable;
+        if (arch_ == .x86_64) {
+            const sp_off = facts.thread_sp orelse return error.KernelTaskLayoutUnavailable;
+            const ret_off = facts.saved_ret orelse return error.KernelTaskLayoutUnavailable;
+            const bp_off = facts.saved_bp orelse return error.KernelTaskLayoutUnavailable;
+            const thread_sp = try readWord(memory, task.address + sp_off);
+            const frame_bp = try readWord(memory, thread_sp + bp_off);
+            const ret = try readWord(memory, thread_sp + ret_off);
+            const saved = try kernel_aware.sleepingX86(thread_sp, ret_off, frame_bp, ret);
+            putReg(registers, arch_.pc(), saved.ip);
+            putReg(registers, arch_.sp(), saved.sp);
+            putReg(registers, arch_.ra(), saved.ip);
+            putReg(registers, frameSlot(arch_), saved.bp);
+            if (self.ret_from_fork) |fork| if (saved.ip == fork) return .instruction;
+            return .return_address;
+        }
+        if (arch_ == .aarch64) {
+            const pc_off = facts.arm_pc orelse return error.KernelTaskLayoutUnavailable;
+            const sp_off = facts.arm_sp orelse return error.KernelTaskLayoutUnavailable;
+            const fp_off = facts.arm_fp orelse return error.KernelTaskLayoutUnavailable;
+            const ip = try readWord(memory, task.address + pc_off);
+            const sp = try readWord(memory, task.address + sp_off);
+            const fp = try readWord(memory, task.address + fp_off);
+            if (ip == 0) return error.KernelTaskLayoutUnavailable;
+            putReg(registers, arch_.pc(), ip);
+            putReg(registers, arch_.sp(), sp);
+            putReg(registers, arch_.ra(), ip);
+            putReg(registers, frameSlot(arch_), fp);
+            return .instruction;
+        }
+        return error.KernelTaskLayoutUnavailable;
+    }
+    pub fn kernelUnwind(self: *Modules, arch_: arch_mod.Arch, lookup_pc: u64, registers: loc.RegisterSet, memory: anytype) !@import("../debug/info.zig").Unwind {
+        const module = self.kernelModuleAt(lookup_pc) orelse return error.UnmappedAddress;
+        if (arch_ == .x86_64 and module.orc_ips.len != 0) {
+            if (kernel_orc.entryAt(module.orc_base, module.orc_ips, module.orc_entries, lookup_pc)) |entry| {
+                if (entry.type != .undefined and entry.type != .end_of_stack) {
+                    const next = try kernel_orc.step(entry, orcRegs(arch_, registers), self.kernelPt(), memory);
+                    var caller = registers;
+                    putReg(&caller, arch_.pc(), next.ip);
+                    putReg(&caller, arch_.sp(), next.sp);
+                    putReg(&caller, arch_.ra(), next.ip);
+                    putReg(&caller, frameSlot(arch_), next.bp);
+                    return .{ .cfa = next.sp, .caller = caller, .method = .orc };
+                }
+            }
+        }
+        // An ORC kernel keeps no frame pointer: a module frame there must stop,
+        // not follow whatever rbp holds into another stack.
+        if (arch_ == .x86_64 and module.kernel_reloc and self.loaded.items.len != 0 and
+            self.loaded.items[0].orc_ips.len != 0) return error.KernelModuleOrcUnavailable;
+        const bp_index = frameSlot(arch_);
+        const bp = if (bp_index < registers.len) registers[bp_index] orelse return error.KernelFrame else return error.KernelFrame;
+        var frame = try kernel_aware.framePointer(memory, bp);
+        if (arch_ == .aarch64) frame.ip = try kernel_aware.stripKernelPac(frame.ip, self.kernel_pac_mask);
+        var caller = registers;
+        putReg(&caller, arch_.pc(), frame.ip);
+        putReg(&caller, arch_.sp(), frame.sp);
+        putReg(&caller, arch_.ra(), frame.ip);
+        putReg(&caller, bp_index, frame.bp);
+        return .{ .cfa = frame.sp, .caller = caller, .method = .frame_pointer };
+    }
+    fn kernelPt(self: *const Modules) ?kernel_orc.Pt {
+        const facts = self.kernel_facts orelse return null;
+        return .{
+            .size = facts.pt_size orelse return null,
+            .ip = facts.pt_ip orelse return null,
+            .sp = facts.pt_sp orelse return null,
+        };
+    }
+    fn putReg(set: *loc.RegisterSet, index: usize, value: u64) void {
+        if (index < set.len) set[index] = value;
+    }
+    fn frameSlot(arch_: arch_mod.Arch) usize {
+        return switch (arch_) {
+            .x86_64 => arch_.registerNumber("rbp") orelse 6,
+            .aarch64 => arch_.registerNumber("x29") orelse 29,
+            else => arch_.sp(),
+        };
+    }
+    fn orcRegs(arch_: arch_mod.Arch, registers: loc.RegisterSet) kernel_orc.Regs {
+        const ip_i = arch_.pc();
+        const sp_i = arch_.sp();
+        const bp_i = frameSlot(arch_);
+        return .{
+            .ip = if (ip_i < registers.len) registers[ip_i] orelse 0 else 0,
+            .sp = if (sp_i < registers.len) registers[sp_i] orelse 0 else 0,
+            .bp = if (bp_i < registers.len) registers[bp_i] orelse 0 else 0,
+        };
     }
     fn coreId(self: *Modules, path: []const u8) ![]const u8 {
         if (self.core_ids.get(path)) |value| return switch (value) {
@@ -1381,6 +2023,7 @@ pub const Modules = struct {
     }
     /// Match both mapped identity and placement without opening a target file.
     pub fn cachedAt(self: *Modules, address: u64) !*Module {
+        if (self.kernelModuleAt(address)) |module| return module;
         for (self.regions.items) |region| if (address >= region.start and address < region.end) {
             for (self.loaded.items) |module| if (module.explicit_gdb and address >= module.start and address < module.end) return module;
             const module = self.cachedRange(region, false) orelse return error.DebugMetadataNotLoaded;
@@ -1422,6 +2065,7 @@ pub const Modules = struct {
     /// bounded worker; Session.stack retries one full load when that frame
     /// does not cover the PC and the symbol view has .debug_frame.
     pub fn prefersUnwindMetadata(self: *Modules, address: u64) !bool {
+        if (self.kernelModuleAt(address) != null) return false;
         if (self.immutable or self.target == null) return false;
         const remote = rt.xrt_target_is_remote(self.target);
         for (self.regions.items) |region| {
@@ -2053,6 +2697,7 @@ pub const Modules = struct {
         n.* += 1;
     }
     fn symbolLookup(self: *Modules, name: []const u8, automatic: bool, fallback: bool, intent: SymbolIntent, cursor: *SymbolCursor) !Symbol {
+        if (self.measure_kernel_slide) if (try self.kernelSymbol(name)) |found| return found;
         var failure = cursor.failure;
         defer cursor.failure = failure;
         var classified: usize = 0;
@@ -2066,8 +2711,10 @@ pub const Modules = struct {
                 if (r.inode != module.inode or r.device_major != module.device_major or
                     r.device_minor != module.device_minor or !std.mem.eql(u8, r.path, module.path)) continue;
                 if (module.explicit_gdb) {
+                    // A relocatable object has no single bias. kernelSymbol places `.text` only.
+                    if (module.kernel_reloc) continue :regions;
                     if (module.symbols().findSymbol(name)) |symbol| {
-                        if (symbol.hasAddress()) return publishedSymbol(module.image.header.machine, module.id, symbol, symbol.value);
+                        if (symbol.hasAddress()) return publishedSymbol(module.image.header.machine, module.id, symbol, try module.runtimeAddress(symbol.value));
                     } else if (module.file_offset == 0) noteSymbolMiss(&missed, &missed_n, r);
                     continue :regions;
                 }
@@ -2513,6 +3160,7 @@ pub const Modules = struct {
     pub fn symbolAt(self: *Modules, address: u64) !Symbol {
         if (self.peAt(address)) |entry| return self.peSymbolAt(entry, address) else |err| if (err != error.NotPe) return err;
         const module = try self.at(address);
+        if (module.kernel_reloc) return @This().relocSymbolAt(module, address);
         const symbol = module.symbols().symbolAt(try module.linkAddress(address)) orelse return error.SymbolNotFound;
         var found = publishedSymbol(module.image.header.machine, module.id, symbol.symbol, try module.runtimeAddress(symbol.symbol.value));
         found.offset = symbol.offset;

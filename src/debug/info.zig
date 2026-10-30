@@ -20,7 +20,7 @@ pub const Local = struct {
 };
 /// `outermost`: CFI marks the return address undefined (DW_CFA_undefined),
 /// the DWARF end-of-stack convention (glibc _start and clone3).
-pub const Unwind = struct { cfa: u64, caller: loc.RegisterSet, method: enum { eh_frame, debug_frame, frame_pointer, windows_unwind, windows_leaf, windows_epilog, macho_compact }, outermost: bool = false };
+pub const Unwind = struct { cfa: u64, caller: loc.RegisterSet, method: enum { eh_frame, debug_frame, frame_pointer, orc, windows_unwind, windows_leaf, windows_epilog, macho_compact }, outermost: bool = false };
 const Unit = struct { die: c.Dwarf_Die, kind: u8, split: ?c.Dwarf_Die = null, split_error: ?anyerror = null };
 pub const Inline = struct { name: []const u8, depth: usize, die_offset: u64, call_path: ?[]const u8 = null, call_line: ?u32 = null, call_column: ?u32 = null, decl_path: ?[]const u8 = null, decl_line: ?u32 = null };
 const unknown = eval.Type{ .name = "unknown", .kind = .unknown, .size = 0 };

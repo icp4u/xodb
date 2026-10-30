@@ -512,14 +512,15 @@ static void kgdb_put(char *bank, unsigned offset, uint64_t value)
         bank[2 * (offset + i) + 1] = digits[byte & 15];
     }
 }
-enum { KGDB_LIVE = 0, KGDB_SHORT = 1, KGDB_BADHEX = 2, KGDB_SERIAL = 3, KGDB_RUNNING = 4 };
+enum { KGDB_LIVE = 0, KGDB_SHORT = 1, KGDB_BADHEX = 2, KGDB_SERIAL = 3, KGDB_RUNNING = 4,
+       KGDB_MANY = 5, KGDB_BADSTOP = 6 };
 /* Mirrors Linux kgdb on the wire: ids without leading zero bytes, an empty
  * reply ending the thread list, NUL-padded comm names, no reply to 0x03 while
  * running, and on x86 the address after int3 as the stopped pc. */
 static void kgdb_serve(int fd, int mode)
 {
     struct kgdb_io io = {.fd = fd};
-    char request[1280], response[1280], last_hc[64], shadow_bank[313], task_bank[313];
+    char request[1280], response[16384], last_hc[64], shadow_bank[313], task_bank[313];
     char *selected = shadow_bank;
     int stopped_task = 0;
     unsigned long long breakpoint = 0;
@@ -537,9 +538,19 @@ static void kgdb_serve(int fd, int mode)
             _exit(2);
         response[0] = 0;
         if (!strcmp(request, "?")) strcpy(response, "S05");
-        else if (!strcmp(request, "qC")) strcpy(response, stopped_task ? "QC01" : "QCfffffffe");
-        else if (!strcmp(request, "qfThreadInfo")) strcpy(response, "mfffffffe,fffffffd,01");
-        else if (!strcmp(request, "qsThreadInfo")) response[0] = 0;
+        else if (!strcmp(request, "qC"))
+            strcpy(response, (mode == KGDB_MANY || stopped_task) ? "QC1" : "QCfffffffe");
+        else if (!strcmp(request, "qfThreadInfo")) {
+            if (mode == KGDB_MANY) {
+                char *p = response;
+                *p++ = 'm';
+                for (unsigned i = 1; i <= 1025; ++i) {
+                    if (i > 1) *p++ = ',';
+                    p += sprintf(p, "%x", i);
+                }
+                *p = 0;
+            } else strcpy(response, "mfffffffe,fffffffd,1");
+        } else if (!strcmp(request, "qsThreadInfo")) response[0] = 0;
         else if (!strcmp(request, "qThreadExtraInfo,fffffffe")) strcpy(response, "736861646f7743505530");
         else if (!strcmp(request, "qThreadExtraInfo,fffffffd")) strcpy(response, "736861646f7743505531");
         else if (!strcmp(request, "qThreadExtraInfo,1"))
@@ -559,7 +570,7 @@ static void kgdb_serve(int fd, int mode)
             strcpy(response, "OK");
         } else if (request[0] == 'm') {
             unsigned long long address; unsigned size;
-            /* x86 kgdb has no bound; more than 511 bytes overruns BUFMAX. */
+            /* x86 kgdb has no bound; more than 511 bytes overruns its buffer. */
             if (sscanf(request + 1, "%llx,%x", &address, &size) != 2 || !size || size > 511) _exit(6);
             (void)address;
             memset(response, '0', size * 2u);
@@ -570,7 +581,9 @@ static void kgdb_serve(int fd, int mode)
         } else if (!strncmp(request, "z0,", 3)) {
             breakpoint = 0;
             strcpy(response, "OK");
-        } else if (!strcmp(request, "c")) {
+        } else if (!strncmp(request, "Z2,", 3) || !strncmp(request, "z2,", 3) ||
+                   !strncmp(request, "Z4,", 3) || !strncmp(request, "z4,", 3)) strcpy(response, "OK");
+        else if (!strcmp(request, "c")) {
             if (strcmp(last_hc, "0")) _exit(5);
             if (mode == KGDB_RUNNING) {
                 /* Nothing may follow on a running kernel: no 0x03, k or D. */
@@ -579,16 +592,25 @@ static void kgdb_serve(int fd, int mode)
                 if (poll(&p, 1, 2000) > 0 && read(fd, &b, 1) == 1) _exit(9);
                 _exit(0);
             }
+            if (mode == KGDB_BADSTOP) {
+                kgdb_reply(fd, "T");
+                got = kgdb_command(&io, request, sizeof request);
+                if (got > 0 && !strcmp(request, "D")) {
+                    kgdb_reply(fd, "OK");
+                    _exit(0);
+                }
+                _exit(9);
+            }
             if (breakpoint) {
                 kgdb_put(task_bank, 128, breakpoint + 1);
                 stopped_task = 1;
-                strcpy(response, "T05thread:01;");
+                strcpy(response, "T05thread:1;");
             } else strcpy(response, "T05thread:fffffffe;");
         } else if (!strcmp(request, "s")) {
             if (strcmp(last_hc, stopped_task ? "1" : "fffffffe")) _exit(4);
             if (breakpoint) _exit(8); /* Stepping onto its own int3. */
             kgdb_put(stopped_task ? task_bank : shadow_bank, 128, stopped_task ? 0x402004 : 0x401004);
-            strcpy(response, stopped_task ? "T05thread:01;" : "T05thread:fffffffe;");
+            strcpy(response, stopped_task ? "T05thread:1;" : "T05thread:fffffffe;");
         } else if (!strcmp(request, "D")) {
             kgdb_reply(fd, "OK");
             _exit(0);
@@ -642,6 +664,7 @@ static void kgdb_session(const char *endpoint, int exercise)
     struct xrt_gdb_info gdb;
     CHECK(xrt_target_gdb_info(target, &gdb) == XRT_OK);
     CHECK((gdb.supported & XRT_GDB_CAP_STEP) && !(gdb.unsupported & XRT_GDB_CAP_STEP));
+    CHECK(gdb.kernel);
     CHECK(!strcmp(gdb.architecture, "i386:x86-64"));
     struct xrt_target_view view;
     xrt_target_view(target, &view);
@@ -656,6 +679,8 @@ static void kgdb_session(const char *endpoint, int exercise)
     struct xrt_gdb_thread_info names;
     CHECK(xrt_target_gdb_thread_info(target, shadow, &names) == XRT_OK);
     CHECK(names.has_name && !strcmp(names.name, "shadowCPU0"));
+    CHECK(xrt_target_gdb_thread_info(target, shadow1, &names) == XRT_OK);
+    CHECK(names.has_name && !strcmp(names.name, "shadowCPU1"));
     CHECK(xrt_target_gdb_thread_info(target, task, &names) == XRT_OK);
     CHECK(names.has_name && !strcmp(names.name, "init"));
     struct xrt_registers regs;
@@ -668,6 +693,8 @@ static void kgdb_session(const char *endpoint, int exercise)
     CHECK(xrt_registers_value(&regs, "rsp", 3, &sp) == XRT_OK && sp == 0x7ffe1000);
     if (exercise) {
         uint64_t id = 0;
+        CHECK(xrt_target_watchpoint_set(target, 0x402000, 8, XRT_WATCH_WRITE, &id) == XRT_OK);
+        CHECK(xrt_target_watchpoint_set(target, 0x402000, 1, XRT_WATCH_EXECUTE, &id) == XRT_EXECUTION_WATCHPOINTS_UNSUPPORTED);
         CHECK(xrt_target_breakpoint_set(target, 0x402000, false, &id) == XRT_OK);
         CHECK(xrt_target_continue(target) == XRT_OK);
         CHECK(xrt_target_wait_stopped(target) == XRT_OK);
@@ -750,6 +777,23 @@ static void kgdb_checks(void)
     CHECK(xrt_target_continue(target) == XRT_OK);
     CHECK(xrt_target_interrupt(target) == XRT_UNSUPPORTED_CONTROL);
     CHECK(xrt_target_detach(target) == XRT_UNSUPPORTED_CONTROL);
+    (void)xrt_target_destroy(target);
+    kgdb_join(child, endpoint);
+    child = kgdb_unix(KGDB_MANY, endpoint, sizeof endpoint);
+    target = NULL;
+    CHECK(xrt_target_gdb_remote(endpoint, &target) == XRT_OK && target);
+    struct xrt_target_view view;
+    xrt_target_view(target, &view);
+    CHECK(view.thread_count == XRT_MAX_THREADS);
+    CHECK(xrt_target_detach(target) == XRT_OK);
+    CHECK(xrt_target_destroy(target) == XRT_OK);
+    kgdb_join(child, endpoint);
+    child = kgdb_unix(KGDB_BADSTOP, endpoint, sizeof endpoint);
+    target = NULL;
+    CHECK(xrt_target_gdb_remote(endpoint, &target) == XRT_OK && target);
+    CHECK(xrt_target_continue(target) == XRT_OK);
+    CHECK(xrt_target_wait_stopped(target) == XRT_PROTOCOL_ERROR);
+    CHECK(xrt_target_detach(target) == XRT_OK);
     (void)xrt_target_destroy(target);
     kgdb_join(child, endpoint);
     char abs_path[96];

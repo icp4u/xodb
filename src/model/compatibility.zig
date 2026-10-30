@@ -143,9 +143,20 @@ pub const Cache = struct {
             self.pid = snap.pid;
             self.epoch = snap.image_epoch;
         }
-        if (session.target.gdbRemoteInfo()) |gdb| if (gdb.os == .darwin or gdb.thread_info == .available) {
+        if (session.target.gdbRemoteInfo()) |gdb| if (gdb.kernel or gdb.os == .darwin or gdb.thread_info == .available) {
             self.info = .{ .kind = .unavailable };
-            if (snap.state != .stopped or self.remote_generation == snap.generation) return;
+            if (snap.state != .stopped) return;
+            if (session.modules.measure_kernel_slide) session.refreshMaps() catch {};
+            if (gdb.kernel) {
+                const known = session.target.threadSlice();
+                var unchanged = self.labels.items.len == known.len;
+                if (unchanged) {
+                    for (known, self.labels.items) |thread, row| {
+                        if (row.id != thread.id or row.tid != thread.tid or !row.readable) unchanged = false;
+                    }
+                }
+                if (unchanged) return;
+            } else if (self.remote_generation == snap.generation) return;
             const threads = session.target.threadSlice();
             self.labels.resize(std.heap.page_allocator, threads.len) catch return;
             for (threads, self.labels.items) |thread, *row| {
@@ -155,6 +166,10 @@ pub const Cache = struct {
                     safeName(&row.name, std.mem.sliceTo(&detail.name, 0));
                     row.readable = true;
                     row.possibly_truncated = detail.name_truncated;
+                }
+                if (session.modules.measure_kernel_slide and session.modules.kernelThreadName(thread.tid, &row.name)) {
+                    row.readable = true;
+                    row.possibly_truncated = false;
                 }
                 if (detail.has_dispatch_queue) row.dispatch_queue = detail.dispatch_queue;
             }

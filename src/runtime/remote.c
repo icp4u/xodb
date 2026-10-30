@@ -344,7 +344,11 @@ static enum xrt_status invoke(const struct xrt_target *target, const struct xrt_
     if (mutates(call->op)) discard_reads(c);
     if (xrt_cancel_requested(c->cancel)) return broken(c, XRT_REMOTE_CANCELLED);
     if (c->gdb) {
-        if (c->failed != XRT_OK) return c->failed;
+        const bool detach_op = call->op == XRT_RPC_DESTROY || call->op == XRT_RPC_DETACH ||
+            call->op == XRT_RPC_DETACH_FAMILY || call->op == XRT_RPC_CLOSE;
+        /* A kernel link that failed stays open for one best-effort D. */
+        if (c->failed != XRT_OK && !(detach_op && xrt_gdb_detach_holds_link(c->gdb)))
+            return c->failed;
         const uint64_t before = xrt_gdb_mutation_bytes(c->gdb);
         enum xrt_status status = xrt_gdb_call(c->gdb, t, call);
         if (xrt_cancel_requested(c->cancel)) {
@@ -356,7 +360,10 @@ static enum xrt_status invoke(const struct xrt_target *target, const struct xrt_
         if (status == XRT_PROTOCOL_ERROR || xrt_gdb_health(c->gdb) != XRT_OK) {
             const bool uncertain = before != xrt_gdb_mutation_bytes(c->gdb);
             ++t->generation;
-            (void)broken(c, status == XRT_PROTOCOL_ERROR ? status : XRT_TRANSPORT_FAILED);
+            if (xrt_gdb_detach_holds_link(c->gdb))
+                c->failed = status == XRT_PROTOCOL_ERROR ? status : XRT_TRANSPORT_FAILED;
+            else
+                (void)broken(c, status == XRT_PROTOCOL_ERROR ? status : XRT_TRANSPORT_FAILED);
             if (uncertain) return XRT_REMOTE_OUTCOME_UNKNOWN;
         }
         return status;

@@ -66,7 +66,7 @@ const shn_common = 0xfff2;
 const shn_xindex = 0xffff;
 const pn_xnum = 0xffff;
 
-pub const Type = enum { executable, shared };
+pub const Type = enum { executable, shared, relocatable };
 pub const Machine = enum(u16) { i386 = 3, m68k = 4, ppc64 = 21, x86_64 = 62, aarch64 = 183, riscv = 243, loongarch = 258, _ };
 pub const SegmentType = enum(u32) { null = 0, load = 1, dynamic = 2, interp = 3, note = 4, shlib = 5, phdr = 6, tls = 7, gnu_eh_frame = 0x6474e550, gnu_stack = 0x6474e551, gnu_relro = 0x6474e552, gnu_property = 0x6474e553, _ };
 pub const SectionType = enum(u32) { null = 0, progbits = 1, symtab = 2, strtab = 3, rela = 4, hash = 5, dynamic = 6, note = 7, nobits = 8, rel = 9, shlib = 10, dynsym = 11, init_array = 14, fini_array = 15, preinit_array = 16, group = 17, symtab_shndx = 18, gnu_hash = 0x6ffffff6, gnu_verdef = 0x6ffffffd, gnu_verneed = 0x6ffffffe, gnu_versym = 0x6fffffff, _ };
@@ -88,6 +88,7 @@ pub const shf = struct {
 
 pub const Header = struct {
     /// ET_EXEC is `.executable` (fixed addresses). ET_DYN is `.shared`: a PIE or a shared object.
+    /// ET_REL is `.relocatable`: a kernel object, placed by the module's text base.
     type: Type,
     machine: Machine,
     os_abi: u8,
@@ -303,6 +304,7 @@ pub const Image = struct {
         if (f.endian != (if (machine == .m68k) std.builtin.Endian.big else .little)) return error.UnsupportedEncoding;
         if (bytes[6] != 1 or f.read(u32, bytes, 20) != 1) return error.UnsupportedVersion;
         const file_type: Type = switch (f.read(u16, bytes, 16)) {
+            1 => .relocatable,
             2 => .executable,
             3 => .shared,
             else => return error.UnsupportedType,
@@ -934,13 +936,15 @@ test "synthetic image: unsupported formats are rejected by name" {
         .{ .at = 6, .value = 0, .err = error.UnsupportedVersion },
         .{ .at = 20, .value = 2, .err = error.UnsupportedVersion },
         .{ .at = 18, .value = 8, .err = error.UnsupportedMachine },
-        .{ .at = 16, .value = 1, .err = error.UnsupportedType }, // ET_REL
         .{ .at = 16, .value = 4, .err = error.UnsupportedType }, // ET_CORE
     }) |case| {
         var s = Synthetic.init();
         s.buf[case.at] = case.value;
         try testing.expectError(case.err, Image.parse(&s.buf));
     }
+    var rel = Synthetic.init();
+    rel.buf[16] = 1;
+    try testing.expectEqual(Type.relocatable, (try Image.parse(&rel.buf)).header.type);
     try testing.expectError(error.NotElf, Image.parse(""));
     try testing.expectError(error.NotElf, Image.parse("\x7fEL"));
     try testing.expectError(error.Truncated, Image.parse(Synthetic.init().buf[0..63]));
@@ -1365,9 +1369,13 @@ test "fixtures: ELF32 i386 is a supported image" {
     try testing.expectEqual(std.builtin.Endian.little, image.format.endian);
 }
 
-test "fixtures: other object kinds are rejected by name" {
+test "fixtures: a relocatable object parses and a foreign encoding is rejected" {
+    const object = try fixture("reject-rel.o");
+    defer testing.allocator.free(object);
+    const image = try Image.parse(object);
+    try testing.expectEqual(Type.relocatable, image.header.type);
+    try testing.expect(image.sectionByName(".text") != null);
     inline for (.{
-        .{ "reject-rel.o", error.UnsupportedType },
         .{ "reject-ppc64be", error.UnsupportedEncoding },
     }) |case| {
         const bytes = try fixture(case[0]);

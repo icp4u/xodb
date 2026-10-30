@@ -26,7 +26,7 @@ ADDRESS_TYPES = {0, 1, 2, 10}  # NOTYPE, OBJECT, FUNC, GNU_IFUNC
 BIND_RANK = {1: 0, 10: 0, 2: 1, 0: 2}  # GLOBAL, GNU_UNIQUE, WEAK, LOCAL
 SYSTEM = ["/usr/lib/libc.so.6", "/usr/lib/ld-linux-x86-64.so.2", "/usr/lib/libstdc++.so.6", "/usr/bin/ld", os.path.join(ROOT, "zig-out", "bin", "xodb")]
 RUNNABLE = {"gcc-exec": "libfix.so", "gcc-pie": "libfix.so", "clang-pie": "libfix.so", "clang-lld-pie": "libfix-lld.so"}
-REJECTED = {"reject-rel.o", "reject-ppc64be", "reject-aarch64"}
+REJECTED = {"reject-ppc64be", "reject-aarch64"}
 
 failures = []
 
@@ -156,7 +156,7 @@ def compare(path, probes):
     if "error" in got:
         ident = header["Ident"]
         file_type = int(header["Type"].split("(")[1].rstrip(")"), 16)
-        why = "UnsupportedClass" if ident["Class"]["Value"] != 2 else "UnsupportedEncoding" if ident["DataEncoding"]["Value"] != 1 else "UnsupportedMachine" if header["Machine"]["Value"] != 62 else "UnsupportedType" if file_type not in (2, 3) else None
+        why = "UnsupportedClass" if ident["Class"]["Value"] != 2 else "UnsupportedEncoding" if ident["DataEncoding"]["Value"] != 1 else "UnsupportedMachine" if header["Machine"]["Value"] != 62 else "UnsupportedType" if file_type not in (1, 2, 3) else None
         if got["error"] != why:
             fail(path, f"rejected with {got['error']}, llvm-readelf implies {why}")
         elif name not in REJECTED and path.startswith(OUT):
@@ -167,7 +167,7 @@ def compare(path, probes):
 
     h = got["header"]
     pairs = [
-        ("type", {"executable": 2, "shared": 3}[h["type"]], int(header["Type"].split("(")[1].rstrip(")"), 16)),
+        ("type", {"executable": 2, "shared": 3, "relocatable": 1}[h["type"]], int(header["Type"].split("(")[1].rstrip(")"), 16)),
         ("machine", h["machine"], header["Machine"]["Value"]),
         ("os_abi", h["os_abi"], header["Ident"]["OS/ABI"]["Value"]),
         ("abi_version", h["abi_version"], header["Ident"]["ABIVersion"]),

@@ -41,15 +41,26 @@ for language,library in libraries.items():
     copies=[own/'one.so',own/'two.so']
     for dest in copies:shutil.copyfile(library,dest);dest.chmod(0o755)
     target=subprocess.Popen([str(exe),language,*map(str,copies)],env=dict(os.environ,PYTHONHOME=prefix),stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
-    messages=queue.Queue()
+    messages=queue.Queue();notes=[]
     def consume(stream):
         for line in stream:messages.put(line)
+    def consume_err(stream):
+        for line in stream:
+            if len(notes)<80:notes.append(line)
     threading.Thread(target=consume,args=(target.stdout,),daemon=True).start()
+    threading.Thread(target=consume_err,args=(target.stderr,),daemon=True).start()
     client=None;display=None
     try:
         oracle={};ready=0
         while ready<2 or len(oracle)<2:
-            line=messages.get(timeout=15)
+            try:line=messages.get(timeout=15)
+            except queue.Empty:
+                print('embedder silent',target.poll(),''.join(notes)[:2000],flush=True)
+                if target.poll() is None:
+                    for task in Path(f'/proc/{target.pid}/task').iterdir():
+                        wchan=Path(f'/proc/{target.pid}/task/{task.name}/wchan')
+                        print(task.name, wchan.read_text() if wchan.exists() else '', flush=True)
+                raise
             if line=='ready\n':ready+=1
             elif line.startswith('{'):
                 row=json.loads(line);oracle[row['name']]=row

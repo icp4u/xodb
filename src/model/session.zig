@@ -1035,7 +1035,7 @@ pub const Session = struct {
         if (self.target.snapshot().pid != 0 or self.offline or self.imported != null or self.profile != null) return error.ConflictingTargets;
         try self.target.openCore(path);
         self.modules.debug_files = self.symbolFiles();
-        try self.modules.fromCore(&self.target.core.?, executable);
+        if (self.modules.measure_kernel_slide) try self.modules.fromKernelCore(&self.target) else try self.modules.fromCore(&self.target.core.?, executable);
         self.maps_epoch = self.target.snapshot().image_epoch;
         self.maps_generation = self.target.snapshot().generation;
     }
@@ -1043,12 +1043,15 @@ pub const Session = struct {
         defer self.metadata.bind(self);
         if (self.target.gdbRemoteInfo()) |gdb| if (gdb.libraries == .unsupported) {
             const executable = self.modules.gdb_executable orelse return error.GdbLibrariesUnavailable;
-            if (self.target.snapshot().state == .stopped and self.modules.loaded.items.len == 0) {
-                self.modules.debug_files = self.symbolFiles();
+            if (self.target.snapshot().state == .stopped) {
                 self.modules.target = self.target.handle;
                 self.modules.owner_target = self.target.handle;
-                self.modules.beginStop(self.target.snapshot().generation);
-                try self.modules.fromGdbExecutable(executable, self.target.arch().descriptor().machine, &self.target);
+                if (self.modules.loaded.items.len == 0) {
+                    self.modules.debug_files = self.symbolFiles();
+                    self.modules.beginStop(self.target.snapshot().generation);
+                    try self.modules.fromGdbExecutable(executable, self.target.arch().descriptor().machine, &self.target);
+                }
+                if (self.modules.measure_kernel_slide) self.modules.refreshKernel(&self.target);
             }
             self.maps_epoch = self.target.snapshot().image_epoch;
             self.maps_generation = self.target.snapshot().generation;
@@ -2353,14 +2356,26 @@ pub const Session = struct {
             const slot = arch_.pc();
             // LoongArch csr_era and ppc64le nip have no DWARF number. The top
             // frame uses the kernel PC; a caller frame's PC is the return-address column.
-            const pc = if (slot < registers.len)
+            var pc = if (slot < registers.len)
                 registers[slot] orelse break
             else if (frames.items.len == 0)
                 linux.programCounter(raw_registers) catch break
             else
                 registers[arch_.ra()] orelse break;
+            var kernel_return = false;
+            if (pc == 0 and frames.items.len == 0 and self.modules.measure_kernel_slide) {
+                const StopReader = struct {
+                    session: *Session,
+                    pub fn read(reader: @This(), address: u64, dest: []u8) !usize {
+                        return reader.session.target.readMemory(address, dest);
+                    }
+                };
+                const kind = self.modules.recoverKernel(tid, &registers, arch_, StopReader{ .session = self }) catch break;
+                kernel_return = kind == .return_address;
+                pc = if (slot < registers.len) registers[slot] orelse break else break;
+            }
             if (pc == 0) break;
-            const lookup_pc = if (frames.items.len > 0 and !sigcontext_pc) self.target.arch().callerLookup(pc) orelse break else pc;
+            const lookup_pc = if ((frames.items.len > 0 or kernel_return) and !sigcontext_pc) self.target.arch().callerLookup(pc) orelse break else pc;
             sigcontext_pc = false;
             var frame = Frame{ .architecture = self.target.arch(), .tid = tid, .index = frames.items.len, .pc = pc, .lookup_pc = lookup_pc, .registers = registers };
             const remote = @import("../target/runtime.zig").c.xrt_target_is_remote(self.target.handle);
@@ -2434,6 +2449,20 @@ pub const Session = struct {
                         break :stack_walk;
                     }
                 };
+                if (module.kernel) {
+                    frame.module_id = module.id;
+                    const KernelReader = struct {
+                        session: *Session,
+                        pub fn read(reader: @This(), address: u64, dest: []u8) !usize {
+                            return reader.session.target.readMemory(address, dest);
+                        }
+                    };
+                    break :step self.modules.kernelUnwind(arch_, frame.lookup_pc, registers, KernelReader{ .session = self }) catch |err| {
+                        frame.diagnostic = @errorName(err);
+                        try frames.append(a, frame);
+                        break :stack_walk;
+                    };
+                }
                 module.debug_sweep = false;
                 frame.module_id = module.id;
                 frame.source = self.sourceAt(a, frame.lookup_pc) catch null;
