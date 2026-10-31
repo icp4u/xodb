@@ -39,6 +39,7 @@ fn waitExit(target: *linux.Target) !void {
 
 test "lifecycle: polling does not consume unrelated child exits" {
     try @import("../test_support.zig").requireLive();
+    // spawn-allow: test child reaped before the test returns
     const foreign = c.fork();
     if (foreign == 0) c._exit(42);
     try expect(foreign > 0);
@@ -63,6 +64,7 @@ test "lifecycle: polling and cleanup leave foreign trace stops untouched" {
         defer target.deinit();
         try target.launch(&.{ fixture, "sleep" });
         try target.continueExecution();
+        // spawn-allow: test child reaped before the test returns
         const foreign = c.fork();
         if (foreign == 0) {
             if (c.ptrace(c.PTRACE_TRACEME, @as(c_int, 0), @as(usize, 0), @as(usize, 0)) < 0) c._exit(125);
@@ -187,6 +189,7 @@ test "lifecycle: attaching after leader exit inspects surviving workers" {
     var name: [256]u8 = undefined;
     const path = try std.fmt.bufPrintZ(&name, ".work/attach-leader-{d}-{d}.txt", .{ c.getpid(), linux.now() });
     defer _ = c.unlink(path);
+    // spawn-allow: test child reaped before the test returns
     const pid = c.fork();
     if (pid == 0) {
         _ = c.execl(fixture, fixture, "leader-exit", path.ptr, @as(?[*:0]const u8, null));
@@ -215,6 +218,7 @@ test "lifecycle: attaching after leader exit inspects surviving workers" {
 test "lifecycle: attach during thread creation covers every surviving task" {
     try @import("../test_support.zig").requireLive();
     for (0..20) |_| {
+        // spawn-allow: test child reaped before the test returns
         const pid = c.fork();
         if (pid == 0) {
             _ = c.execl(fixture, fixture, "burst", @as(?[*:0]const u8, null));

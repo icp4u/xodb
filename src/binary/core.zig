@@ -1,10 +1,10 @@
-//! Linux x86-64 ELF cores. Metadata is retained; PT_LOAD bytes are read lazily
+//! Linux ELF cores for x86-64 and aarch64. Metadata is retained; PT_LOAD bytes are read lazily
 //! from the opened file. Omitted memory is unavailable, never implicit zeroes.
 const std = @import("std");
 const c = @import("../c.zig").api;
 pub const Segment = struct { start: u64, end: u64, offset: u64, stored: u64, flags: u32, phys: u64 = 0 };
 pub const Mapping = struct { start: u64, end: u64, offset: u64, path: []const u8 };
-pub const Thread = struct { tid: i32, signal: u16, regs: [27]u64, fp: ?[]const u8 = null, xstate: ?[]const u8 = null, signal_info: ?Signal = null };
+pub const Thread = struct { tid: i32, signal: u16, regs: [34]u64 = @splat(0), reg_words: u8 = 27, fp: ?[]const u8 = null, xstate: ?[]const u8 = null, signal_info: ?Signal = null };
 pub const Signal = struct { number: i32, code: i32, errno: i32, address: ?u64 = null };
 pub const Core = struct {
     arena: std.heap.ArenaAllocator,
@@ -35,6 +35,17 @@ pub const Core = struct {
     page_levels: u8 = 0,
     phys_base: ?u64 = null,
     stext: ?u64 = null,
+    /// ELF e_machine. 62 is x86-64. 183 is aarch64.
+    machine: u16 = 0,
+    /// From VMCOREINFO NUMBER(VA_BITS). Zero means the note did not say.
+    va_bits: u8 = 0,
+    /// Kernel virtual address minus its physical address, when the note has it.
+    kimage_voffset: ?u64 = null,
+    /// Segment indices ordered by physical address. Empty means scan.
+    phys_order: []u32 = &.{},
+    /// For each prefix of `phys_order`, the segment whose physical end reaches farthest.
+    /// A shorter segment can sit inside a longer one's physical range.
+    phys_reach: []u32 = &.{},
     pub fn open(a: std.mem.Allocator, path: []const u8) !Core {
         var self = Core{ .arena = std.heap.ArenaAllocator.init(a) };
         errdefer self.deinit();
@@ -51,7 +62,9 @@ pub const Core = struct {
         var header: [64]u8 = undefined;
         try self.exact(0, &header);
         if (!std.mem.eql(u8, header[0..4], "\x7fELF") or header[4] != 2 or header[5] != 1 or header[6] != 1 or u16le(&header, 16) != 4 or u32le(&header, 20) != 1) return error.UnsupportedCoreFormat;
-        if (u16le(&header, 18) != 62) return error.UnsupportedCoreArchitecture;
+        const machine = u16le(&header, 18);
+        if (machine != 62 and machine != 183) return error.UnsupportedCoreArchitecture;
+        self.machine = machine;
         // e_ehsize is not checked: QEMU's paged dump-guest-memory writes 8 there,
         // and readelf and GDB ignore it. The program-header size still has to fit.
         if (u16le(&header, 54) != 56) return error.InvalidCoreHeader;
@@ -96,12 +109,14 @@ pub const Core = struct {
             }
         }.less);
         for (note_blobs.items) |bytes| try self.walkNotes(bytes, .vmcore);
-        if (self.kernel and self.page_levels == 0) self.page_levels = 4;
+        if (self.kernel and self.page_levels == 0) self.page_levels = if (self.machine == 183) armLevels(if (self.va_bits == 0) 48 else self.va_bits) else 4;
+        if (!self.kernel) self.markKernelImage();
         try self.trimOverlaps();
         self.inferPageOffset();
         for (note_blobs.items) |bytes| try self.walkNotes(bytes, .rest);
         if (self.threads.items.len == 0) return error.CoreRegistersMissing;
         if (self.pid == 0) self.pid = if (self.kernel) if (self.noted_pid > 0) self.noted_pid else 1 else self.threads.items[0].tid;
+        try self.indexPhys();
         try self.unchanged();
         return self;
     }
@@ -189,7 +204,9 @@ pub const Core = struct {
             if (!core and !linux) continue;
             const a = self.arena.allocator();
             if (core and kind == 1) {
-                if (desc.len != 336) return error.InvalidCoreRegisters;
+                const words: usize = if (self.machine == 183) 34 else 27;
+                const expect: usize = if (self.machine == 183) 392 else 336;
+                if (desc.len != expect) return error.InvalidCoreRegisters;
                 if (self.threads.items.len >= 1024) return error.CoreThreadLimit;
                 const noted = @as(i32, @bitCast(u32le(desc, 32)));
                 const tid: i32 = if (self.kernel) blk: {
@@ -198,8 +215,8 @@ pub const Core = struct {
                 } else noted;
                 if (tid <= 0) return error.InvalidCoreRegisters;
                 for (self.threads.items) |t| if (t.tid == tid) return error.DuplicateCoreThread;
-                var value = Thread{ .tid = tid, .signal = u16le(desc, 12), .regs = undefined };
-                for (&value.regs, 0..) |*r, i| r.* = u64le(desc, 112 + i * 8);
+                var value = Thread{ .tid = tid, .signal = u16le(desc, 12), .reg_words = @intCast(words) };
+                for (value.regs[0..words], 0..) |*r, i| r.* = u64le(desc, 112 + i * 8);
                 try self.threads.append(a, value);
             } else if (core and kind == 3) {
                 if (desc.len != 136) return error.InvalidCoreProcessInfo;
@@ -334,6 +351,14 @@ pub const Core = struct {
     }
     const Located = union(enum) { bytes: struct { file: u64, n: usize }, hole, miss };
 
+fn markKernelImage(self: *Core) void {
+    if (self.segments.items.len == 0) return;
+    for (self.segments.items) |seg| if (seg.start >> 63 == 0) return;
+    // Every load is a kernel virtual address, as in a live kcore. There is no
+    // page-table root here, so the level stays zero and reads use the segments.
+    self.kernel = true;
+}
+
 fn takeVmcore(self: *Core, desc: []const u8) void {
     self.kernel = true;
     self.vmcore = desc;
@@ -351,6 +376,17 @@ fn takeVmcore(self: *Core, desc: []const u8) void {
             if (parseNum(line["NUMBER(phys_base)=".len..])) |n| self.phys_base = n;
         } else if (std.mem.startsWith(u8, line, "SYMBOL(_stext)=")) {
             if (parseHexKey(line["SYMBOL(_stext)=".len..])) |n| self.stext = n;
+        } else if (std.mem.startsWith(u8, line, "SYMBOL(swapper_pg_dir)=")) {
+            if (self.page_root == null) {
+                if (parseHexKey(line["SYMBOL(swapper_pg_dir)=".len..])) |n| self.page_root = n;
+            }
+        } else if (std.mem.startsWith(u8, line, "NUMBER(VA_BITS)=")) {
+            if (parseNum(line["NUMBER(VA_BITS)=".len..])) |n| if (n >= 39 and n <= 52) {
+                self.va_bits = @intCast(n);
+                if (self.page_levels == 0) self.page_levels = armLevels(self.va_bits);
+            };
+        } else if (std.mem.startsWith(u8, line, "NUMBER(kimage_voffset)=")) {
+            if (parseHexKey(line["NUMBER(kimage_voffset)=".len..])) |n| self.kimage_voffset = n;
         }
     }
 }
@@ -409,7 +445,16 @@ fn locate(self: *const Core, at: u64) Located {
     return .{ .bytes = .{ .file = segment.offset + off, .n = @intCast(segment.stored - off) } };
 }
 
+fn armLevels(va_bits: u8) u8 {
+    if (va_bits < 39) return 4;
+    const n: u8 = @intCast((@as(u16, va_bits) - 4) / 9);
+    if (n < 3) return 3;
+    if (n > 5) return 5;
+    return n;
+}
+
 fn translate(self: *const Core, virt: u64) ?u64 {
+    if (self.machine == 183) return self.translateArm(virt);
     const root = self.page_root orelse return null;
     const levels: u8 = if (self.page_levels == 5) 5 else if (self.page_levels == 4) 4 else return null;
     var table_pa: u64 = 0;
@@ -432,6 +477,38 @@ fn translate(self: *const Core, virt: u64) ?u64 {
     return null;
 }
 
+/// aarch64 stage-1, 4 KiB pages. A 52-bit virtual address uses a short top
+/// table. Descriptors use the type bits, not the x86 page-size bit. A 52-bit
+/// physical address stores its top two bits in descriptor bits 9:8.
+fn translateArm(self: *const Core, virt: u64) ?u64 {
+    const root = self.page_root orelse return null;
+    const levels: u8 = if (self.page_levels >= 3 and self.page_levels <= 5) self.page_levels else return null;
+    const va_bits: u16 = if (self.va_bits == 0) 48 else self.va_bits;
+    var table_pa: u64 = 0;
+    var level: u8 = 0;
+    while (level < levels) : (level += 1) {
+        const shift: u6 = @intCast(12 + @as(u16, 9) * @as(u16, levels - 1 - level));
+        if (va_bits <= shift) return null;
+        const span: u16 = va_bits - shift;
+        const bits: u6 = if (level == 0) @intCast(@min(span, 9)) else 9;
+        const index: u64 = (virt >> shift) & ((@as(u64, 1) << bits) - 1);
+        const pte: u64 = if (level == 0) self.pteAtRoot(root, index) orelse return null else self.u64Phys(std.math.add(u64, table_pa, index * 8) catch return null) orelse return null;
+        const kind = pte & 3;
+        if (kind == 0 or kind == 2) return null;
+        const last = level + 1 == levels;
+        const block = kind == 1;
+        if (last or block) {
+            if (last and kind != 3) return null;
+            const page_shift: u6 = if (block) shift else 12;
+            const page_mask = (@as(u64, 1) << page_shift) - 1;
+            const base = armPhys(pte, va_bits) & ~page_mask;
+            return base + (virt & page_mask);
+        }
+        table_pa = armPhys(pte, va_bits);
+    }
+    return null;
+}
+
 fn pteAtRoot(self: *const Core, root: u64, index: u64) ?u64 {
     const va = std.math.add(u64, root, index * 8) catch return null;
     if (self.u64Virt(va)) |word| return word;
@@ -441,22 +518,74 @@ fn pteAtRoot(self: *const Core, root: u64, index: u64) ?u64 {
 
 fn rootPhys(self: *const Core, root: u64) ?u64 {
     if (self.stext) |stext| if (root >= stext) if (self.physFromVirtual(stext)) |stext_phys| return root -% stext +% stext_phys;
+    if (self.kimage_voffset) |off| if (root >= off) return root -% off;
     const page = self.page_offset orelse return null;
     if (root < page) return null;
     return root - page;
 }
 
 fn physFromVirtual(self: *const Core, va: u64) ?u64 {
-    for (self.segments.items) |seg| {
-        if (va < seg.start or va >= seg.end) continue;
-        return seg.phys +% (va - seg.start);
+    var low: usize = 0;
+    var high = self.segments.items.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        if (self.segments.items[mid].end <= va) low = mid + 1 else high = mid;
     }
-    return null;
+    if (low == self.segments.items.len) return null;
+    const seg = self.segments.items[low];
+    if (va < seg.start or va >= seg.end) return null;
+    return seg.phys +% (va - seg.start);
+}
+
+fn indexPhys(self: *Core) !void {
+    const n = self.segments.items.len;
+    if (n == 0) return;
+    const order = try self.arena.allocator().alloc(u32, n);
+    for (order, 0..) |*slot, i| slot.* = @intCast(i);
+    std.mem.sort(u32, order, self.segments.items, struct {
+        fn less(segs: []const Segment, x: u32, y: u32) bool {
+            if (segs[x].phys == segs[y].phys) return segs[x].stored > segs[y].stored;
+            return segs[x].phys < segs[y].phys;
+        }
+    }.less);
+    const reach = try self.arena.allocator().alloc(u32, n);
+    var best: u32 = order[0];
+    var best_end: u64 = segmentEnd(self.segments.items[best]);
+    for (order, 0..) |idx, at| {
+        const end = segmentEnd(self.segments.items[idx]);
+        if (end > best_end) {
+            best = idx;
+            best_end = end;
+        }
+        reach[at] = best;
+    }
+    self.phys_order = order;
+    self.phys_reach = reach;
+}
+
+fn segmentEnd(seg: Segment) u64 {
+    return seg.phys +% seg.stored;
 }
 
 const PhysHit = struct { file: u64, n: usize };
 
 fn physBytes(self: *const Core, pa: u64) ?PhysHit {
+    if (self.phys_order.len != self.segments.items.len or self.phys_reach.len != self.phys_order.len) return self.physBytesLinear(pa);
+    var low: usize = 0;
+    var high = self.phys_order.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        if (self.segments.items[self.phys_order[mid]].phys <= pa) low = mid + 1 else high = mid;
+    }
+    if (low == 0) return null;
+    const seg = self.segments.items[self.phys_reach[low - 1]];
+    if (seg.stored == 0 or pa < seg.phys) return null;
+    const off = pa - seg.phys;
+    if (off >= seg.stored) return null;
+    return .{ .file = seg.offset + off, .n = @intCast(seg.stored - off) };
+}
+
+fn physBytesLinear(self: *const Core, pa: u64) ?PhysHit {
     for (self.segments.items) |seg| {
         if (seg.stored == 0 or pa < seg.phys) continue;
         const off = pa - seg.phys;
@@ -509,6 +638,12 @@ fn parseHexKey(raw: []const u8) ?u64 {
 }
 
 };
+fn armPhys(pte: u64, va_bits: u16) u64 {
+    if (va_bits <= 48) return pte & 0x0000fffffffff000;
+    const low = pte & 0x0003fffffffff000;
+    const high = (pte >> 8) & 3;
+    return low | (high << 50);
+}
 fn add(a: u64, b: u64) !u64 {
     return std.math.add(u64, a, b) catch error.InvalidCoreAddress;
 }
@@ -778,6 +913,101 @@ test "KGVM five level large page uses the page offset when the root is not mappe
     try std.testing.expectEqual(@as(u8, 0xab), byte[0]);
 }
 
+test "KGVM a nested physical segment does not hide the longer range" {
+    const a = std.testing.allocator;
+    var core = Core{ .arena = std.heap.ArenaAllocator.init(a) };
+    defer core.deinit();
+    const alloc = core.arena.allocator();
+    try core.segments.append(alloc, .{ .start = 0, .end = 0x2000, .offset = 0x1000, .stored = 0x2000, .flags = 6, .phys = 0x200000 });
+    try core.segments.append(alloc, .{ .start = 1, .end = 9, .offset = 0, .stored = 8, .flags = 5, .phys = 0x2000f0 });
+    try core.indexPhys();
+    const hit = core.physBytes(0x200100);
+    try std.testing.expect(hit != null);
+    try std.testing.expectEqual(@as(u64, 0x1100), hit.?.file);
+    try std.testing.expect(core.physBytes(0x300000) == null);
+}
+
+test "KGVM an arm64 core walks a 52-bit table and keeps a read-only table entry" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pages: [0x6000]u8 = @splat(0);
+    const virt: u64 = 0xffff800080001000;
+    const shifts = [_]u6{ 48, 39, 30, 21, 12 };
+    const next = [_]u64{ 0x2000, 0x3000, 0x4000, 0x5000, 0x6000 };
+    const va_bits: u16 = 52;
+    for (shifts, 0..) |shift, level| {
+        const span: u16 = va_bits - shift;
+        const bits: u6 = if (level == 0) @intCast(@min(span, 9)) else 9;
+        const index: usize = @intCast((virt >> shift) & ((@as(u64, 1) << bits) - 1));
+        const value: u64 = 3 | (1 << 7) | next[level];
+        std.mem.writeInt(u64, pages[level * 0x1000 + index * 8 ..][0..8], value, .little);
+    }
+    pages[0x5000] = 0x5a;
+    const file = try tmp.dir.createFile(std.testing.io, "arm-pages", .{ .read = true });
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, &pages);
+    var core = Core{ .arena = std.heap.ArenaAllocator.init(a) };
+    defer core.deinit();
+    core.fd = c.dup(file.handle);
+    try std.testing.expect(core.fd >= 0);
+    var stat: c.struct_stat = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.fstat(core.fd, &stat));
+    core.size = @intCast(stat.st_size);
+    core.modified = stat.st_mtim;
+    core.changed = stat.st_ctim;
+    core.kernel = true;
+    core.machine = 183;
+    core.va_bits = 52;
+    core.page_levels = 5;
+    core.page_root = 0xffff800081000000;
+    try core.segments.append(core.arena.allocator(), .{ .start = core.page_root.?, .end = core.page_root.? + 0x6000, .offset = 0, .stored = 0x6000, .flags = 5, .phys = 0x1000 });
+    try core.indexPhys();
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try core.read(virt, &byte));
+    try std.testing.expectEqual(@as(u8, 0x5a), byte[0]);
+    const high = armPhys(3 | (1 << 8) | 0x1000, 52);
+    try std.testing.expectEqual(@as(u64, (1 << 50) | 0x1000), high);
+}
+
+test "KGVM an arm64 crash note is 392 bytes and names aarch64" {
+    const a = std.testing.allocator;
+    var note: std.ArrayList(u8) = .empty;
+    defer note.deinit(a);
+    var regs: [392]u8 = @splat(0);
+    std.mem.writeInt(u32, regs[32..36], 1, .little);
+    std.mem.writeInt(u64, regs[112 + 32 * 8 ..][0..8], 0xffff8000810ee454, .little);
+    try pushNote(&note, a, "CORE\x00", 1, &regs);
+    const info = "SYMBOL(swapper_pg_dir)=ffff800081e9c000\nNUMBER(VA_BITS)=52\nNUMBER(kimage_voffset)=0xffff80003fe00000\nSYMBOL(_stext)=ffff800080010000\nNUMBER(KERNELPACMASK)=0xfff0000000000000\n";
+    try pushNote(&note, a, "VMCOREINFO\x00", 0, info);
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    var header = elfHeader(64, 2, 0, 0, 0);
+    std.mem.writeInt(u16, header[18..20], 183, .little);
+    try bytes.appendSlice(a, &header);
+    const note_off: u64 = 64 + 2 * 56;
+    try pushPhdr(&bytes, a, 4, 0, note_off, 0, 0, note.items.len, note.items.len);
+    try pushPhdr(&bytes, a, 1, 5, note_off + note.items.len, 0xffff800080000000, 0x40000000, 1, 1);
+    try bytes.appendSlice(a, note.items);
+    try bytes.append(a, 0x11);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "arm-core", .{ .read = true });
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, bytes.items);
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "arm-core", a);
+    defer a.free(path);
+    var core = try Core.open(a, path);
+    defer core.deinit();
+    try std.testing.expectEqual(@as(u16, 183), core.machine);
+    try std.testing.expectEqual(@as(u8, 52), core.va_bits);
+    try std.testing.expectEqual(@as(u8, 5), core.page_levels);
+    try std.testing.expectEqual(@as(u64, 0xffff800081e9c000), core.page_root.?);
+    try std.testing.expectEqual(@as(u64, 0xffff80003fe00000), core.kimage_voffset.?);
+    try std.testing.expectEqual(@as(u8, 34), core.threads.items[0].reg_words);
+    try std.testing.expectEqual(@as(u64, 0xffff8000810ee454), core.threads.items[0].regs[32]);
+}
+
 test "KGVM a user core still rejects overlapping segments and a saturated count uses the section header" {
     const a = std.testing.allocator;
     var note: std.ArrayList(u8) = .empty;
@@ -828,4 +1058,46 @@ test "KGVM a user core still rejects overlapping segments and a saturated count 
     const overlap_path = try tmp.dir.realPathFileAlloc(std.testing.io, "overlap", a);
     defer a.free(overlap_path);
     try std.testing.expectError(error.OverlappingCoreSegments, Core.open(a, overlap_path));
+}
+
+test "KGHANG a kernel-half core is a kernel image and a low mapping still rejects pid 0" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const openNote = struct {
+        fn open(alloc: std.mem.Allocator, dir: anytype, name: [:0]const u8, loads: []const u64) !Core {
+            var note: std.ArrayList(u8) = .empty;
+            defer note.deinit(alloc);
+            const zero = prstatus(0);
+            try pushNote(&note, alloc, "CORE\x00", 1, &zero);
+            const phnum: u16 = @intCast(loads.len + 1);
+            const note_off: u64 = 64 + @as(u64, phnum) * 56;
+            var bytes: std.ArrayList(u8) = .empty;
+            defer bytes.deinit(alloc);
+            const header = elfHeader(64, phnum, 0, 0, 0);
+            try bytes.appendSlice(alloc, &header);
+            try pushPhdr(&bytes, alloc, 4, 0, note_off, 0, 0, note.items.len, note.items.len);
+            const data_off = note_off + note.items.len;
+            for (loads) |vaddr| try pushPhdr(&bytes, alloc, 1, 5, data_off, vaddr, 0, 1, 1);
+            try bytes.appendSlice(alloc, note.items);
+            try bytes.append(alloc, 0x3c);
+            const out = try dir.createFile(std.testing.io, name, .{ .read = true });
+            defer out.close(std.testing.io);
+            try out.writeStreamingAll(std.testing.io, bytes.items);
+            const path = try dir.realPathFileAlloc(std.testing.io, name, alloc);
+            defer alloc.free(path);
+            return Core.open(alloc, path);
+        }
+    };
+    var core = try openNote.open(a, tmp.dir, "kernel-half", &.{0xffff888000001000});
+    defer core.deinit();
+    try std.testing.expect(core.kernel);
+    try std.testing.expectEqual(@as(u8, 0), core.page_levels);
+    try std.testing.expectEqual(@as(i32, 0x60000002), core.threads.items[0].tid);
+    try std.testing.expectEqual(@as(i32, 1), core.pid);
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try core.read(0xffff888000001000, &byte));
+    try std.testing.expectEqual(@as(u8, 0x3c), byte[0]);
+    try std.testing.expectError(error.InvalidCoreRegisters, openNote.open(a, tmp.dir, "user-zero", &.{0x400000}));
+    try std.testing.expectError(error.InvalidCoreRegisters, openNote.open(a, tmp.dir, "mixed-zero", &.{ 0x400000, 0xffff888000001000 }));
 }

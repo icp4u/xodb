@@ -239,7 +239,7 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
                 \\--profile-hz N sets its sampling rate from 1 to 1000 (default 99).
                 \\--profile-out FILE saves the full CPU aggregate as Speedscope JSON at shutdown (new file).
                 \\--capture-out FILE saves a native archive at shutdown (new file, no durability sync).
-                \\--core FILE opens a read-only x86-64 ELF core; --exe FILE supplies a matching moved executable.
+                \\--core FILE opens a read-only ELF core, x86-64 or aarch64; --exe FILE supplies a matching moved executable.
                 \\--vmlinux FILE with --core opens a kdump vmcore or an ELF guest dump as a kernel target (docs/KGDB.md).
                 \\With --gdb-remote, --exe may supply its fixed-address ELF when the stub cannot list images.
                 \\--open-frames FILE opens logical-frame JSONL or a saved .xof bundle.

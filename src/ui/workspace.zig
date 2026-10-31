@@ -137,7 +137,7 @@ pub const Workspace = struct {
     watch_hits: [64]?usize = @splat(null),
     prepared: debugger_view.Capture = .{},
     source_revision: u64 = 0,
-    presented: ?struct { generation: u64, tid: i32, frame: usize, browse: ?u64, source_revision: u64 } = null,
+    presented: ?struct { generation: u64, tid: i32, frame: usize, browse: ?u64, source_revision: u64, line: ?u32 } = null,
     presentation_status: [256]u8 = undefined,
     selected: usize = 0,
     split: f32 = 0.48,
@@ -1902,7 +1902,9 @@ pub const Workspace = struct {
         self.selected_frame = view.selected_frame;
         self.breakpoint_lines = view.breakpoint_lines;
         self.presentSource(view.source);
-        const key: @typeInfo(@FieldType(Workspace, "presented")).optional.child = .{ .generation = view.snapshot.generation, .tid = view.request.tid, .frame = view.selected_frame, .browse = view.request.browse_address, .source_revision = view.source.revision };
+        // The line is part of the key: a remote frame's source can arrive after
+        // its stop was first shown (metadata Pending), and then it scrolls once.
+        const key: @typeInfo(@FieldType(Workspace, "presented")).optional.child = .{ .generation = view.snapshot.generation, .tid = view.request.tid, .frame = view.selected_frame, .browse = view.request.browse_address, .source_revision = view.source.revision, .line = view.current_line };
         if (self.presented == null or !std.meta.eql(self.presented.?, key)) {
             if (view.current_line) |line| self.source_line = @intCast(line -| 6);
         }
@@ -2638,6 +2640,21 @@ pub const Workspace = struct {
 };
 
 const TimelineSource = @import("../model/profile_timeline.zig").Source;
+
+test "a current line that arrives after the stop scrolls the source once" {
+    var workspace = Workspace{};
+    defer workspace.deinit();
+    var view = debugger_view.Presentation{ .request = .{ .tid = 7 } };
+    view.snapshot.generation = 3;
+    workspace.presentDebugger(view); // stopped while the frame's metadata is Pending
+    try std.testing.expectEqual(@as(i32, 0), workspace.source_line);
+    view.current_line = 16;
+    workspace.presentDebugger(view);
+    try std.testing.expectEqual(@as(i32, 10), workspace.source_line);
+    workspace.source_line = 2; // the user's scroll survives an unchanged presentation
+    workspace.presentDebugger(view);
+    try std.testing.expectEqual(@as(i32, 2), workspace.source_line);
+}
 
 test "queued drag preserves release position and quit ends the batch" {
     var session = Session{ .id = 1 };

@@ -74,6 +74,7 @@ pub const Regs = struct {
     ip: u64,
     sp: u64,
     bp: u64,
+    ra: u64 = 0,
     ax: ?u64 = null,
     dx: ?u64 = null,
     di: ?u64 = null,
@@ -93,9 +94,21 @@ pub const Frame = struct {
     ip: u64,
     sp: u64,
     bp: u64,
+    ra: u64 = 0,
     outermost: bool = false,
     signal: bool = false,
 };
+
+/// Encode a runtime instruction so `find(base, ips, ip)` recovers it. The low
+/// 32 bits of `ip - base - index * 4` are stored; the round trip must be exact.
+/// A zero base only covers addresses in the signed 32-bit window.
+pub fn encodeIp(base: u64, index: usize, ip: u64) ?i32 {
+    const adjusted = ip -% base -% @as(u64, index *% 4);
+    const low: i32 = @bitCast(@as(u32, @truncate(adjusted)));
+    const back = base +% @as(u64, index *% 4) +% @as(u64, @bitCast(@as(i64, low)));
+    if (back != ip) return null;
+    return low;
+}
 
 fn readU64(memory: anytype, address: u64) !u64 {
     var buf: [8]u8 = undefined;
@@ -249,4 +262,123 @@ test "orc register step uses the image's pt_regs offsets" {
     try std.testing.expectEqual(@as(u64, 0xabc0), next.ip);
     try std.testing.expectEqual(@as(u64, 0x5000), next.sp);
     try std.testing.expectError(error.OrcPtRegsUnavailable, step(entry, .{ .ip = 0x1000, .sp = 0x2000, .bp = 0x1500 }, null, mem));
+}
+
+pub const Loong = struct {
+    sp_offset: i16,
+    fp_offset: i16,
+    ra_offset: i16,
+    sp_reg: u4,
+    fp_reg: u4,
+    ra_reg: u4,
+    type: u3,
+    signal: bool,
+};
+
+/// LoongArch packs three s16 offsets and a 16-bit register word.
+/// sp_reg, fp_reg and ra_reg are 4 bits; type is 3; signal is 1.
+pub fn decodeLoong(bytes: []const u8) ?Loong {
+    if (bytes.len < 8) return null;
+    const bits = std.mem.readInt(u16, bytes[6..8], .little);
+    return .{
+        .sp_offset = std.mem.readInt(i16, bytes[0..2], .little),
+        .fp_offset = std.mem.readInt(i16, bytes[2..4], .little),
+        .ra_offset = std.mem.readInt(i16, bytes[4..6], .little),
+        .sp_reg = @truncate(bits),
+        .fp_reg = @truncate(bits >> 4),
+        .ra_reg = @truncate(bits >> 8),
+        .type = @truncate(bits >> 12),
+        .signal = (bits >> 15) & 1 != 0,
+    };
+}
+
+/// One LoongArch call step. Register frames are refused so the walk stops
+/// instead of inventing a caller. `ORC_REG_SP` is 2, `ORC_REG_FP` is 3,
+/// `ORC_REG_PREV_SP` is 1, `ORC_REG_UNDEFINED` is 0. A call return is the
+/// word at `sp + ra_offset`, or `ra`. The stack walk subtracts one
+/// instruction from that address. A zero stack offset is the entry before
+/// the frame is allocated; only a move to a lower address is refused.
+pub fn stepLoong(entry: Loong, regs: Regs, memory: anytype) !Frame {
+    if (entry.type == 0 or entry.type == 1) return error.OrcEndOfStack;
+    if (entry.type != 2) return error.OrcUndefined;
+    var sp = regs.sp;
+    switch (entry.sp_reg) {
+        2 => sp = try addOffset(regs.sp, entry.sp_offset),
+        3 => sp = regs.bp,
+        else => return error.OrcRegisterUnavailable,
+    }
+    if (sp < regs.sp) return error.OrcStackDirection;
+    var fp = regs.bp;
+    switch (entry.fp_reg) {
+        0 => {},
+        1 => fp = try readU64(memory, try addOffset(sp, entry.fp_offset)),
+        else => return error.OrcRegisterUnavailable,
+    }
+    var ra = regs.ra;
+    const raw: u64 = switch (entry.ra_reg) {
+        1 => try readU64(memory, try addOffset(sp, entry.ra_offset)),
+        0 => blk: {
+            if (ra == 0 or ra == regs.ip) return error.OrcEndOfStack;
+            const taken = ra;
+            ra = 0;
+            break :blk taken;
+        },
+        else => return error.OrcRegisterUnavailable,
+    };
+    if (raw < 4) return error.OrcAddress;
+    return .{ .ip = raw, .sp = sp, .bp = fp, .ra = ra };
+}
+
+test "a module orc address round-trips through a zero base" {
+    const ip: u64 = 0xffffffffc0400061;
+    const low = encodeIp(0, 3, ip) orelse return error.OrcAddress;
+    const ips = [_]i32{ 0, 0, 0, low };
+    try std.testing.expectEqual(@as(?usize, 3), find(0, &ips, ip));
+    const at = @as(u64, 3 * 4) +% @as(u64, @bitCast(@as(i64, low)));
+    try std.testing.expectEqual(ip, at);
+    const high: u64 = 0xffff80000220c000;
+    try std.testing.expect(encodeIp(0, 0, high) == null);
+    const based = encodeIp(high, 1, high + 0x40) orelse return error.OrcAddress;
+    const table = [_]i32{ 0, based };
+    try std.testing.expectEqual(@as(?usize, 1), find(high, &table, high + 0x40));
+    try std.testing.expectEqual(@as(?usize, 0), find(high, &table, high + 0x18));
+}
+
+test "loongarch orc call reads the return word as the caller pc" {
+    var stack: [64]u8 = @splat(0);
+    std.mem.writeInt(u64, stack[32..][0..8], 0xffffffff80001234, .little);
+    std.mem.writeInt(u64, stack[24..][0..8], 0xffffffff80002000, .little);
+    const entry = decodeLoong(&[_]u8{
+        32, 0, // sp_offset +32
+        0xf8, 0xff, // fp_offset -8
+        0, 0, // ra_offset 0, word at the new sp
+        0x12, 0x21, // sp_reg=2, fp_reg=1, ra_reg=1, type=2
+    }) orelse return error.OrcUndefined;
+    const mem = struct {
+        bytes: []const u8,
+        fn read(self: @This(), address: u64, dest: []u8) !usize {
+            if (address > self.bytes.len or dest.len > self.bytes.len - address) return error.OrcMemory;
+            @memcpy(dest, self.bytes[@intCast(address)..][0..dest.len]);
+            return dest.len;
+        }
+    }{ .bytes = &stack };
+    const next = try stepLoong(entry, .{ .ip = 0x1000, .sp = 0, .bp = 0, .ra = 0x55 }, mem);
+    try std.testing.expectEqual(@as(u64, 0xffffffff80001234), next.ip);
+    try std.testing.expectEqual(@as(u64, 32), next.sp);
+    try std.testing.expectEqual(@as(u64, 0xffffffff80002000), next.bp);
+}
+
+test "loongarch orc entry with a zero stack offset returns through ra" {
+    const entry = Loong{ .sp_offset = 0, .fp_offset = 0, .ra_offset = 0, .sp_reg = 2, .fp_reg = 0, .ra_reg = 0, .type = 2, .signal = false };
+    const mem = struct {
+        fn read(_: @This(), _: u64, _: []u8) !usize {
+            return error.OrcMemory;
+        }
+    }{};
+    const next = try stepLoong(entry, .{ .ip = 0x1000, .sp = 0x2000, .bp = 0x1500, .ra = 0xffffffff80001234 }, mem);
+    try std.testing.expectEqual(@as(u64, 0xffffffff80001234), next.ip);
+    try std.testing.expectEqual(@as(u64, 0x2000), next.sp);
+    try std.testing.expectEqual(@as(u64, 0), next.ra);
+    const down = Loong{ .sp_offset = -8, .fp_offset = 0, .ra_offset = 0, .sp_reg = 2, .fp_reg = 0, .ra_reg = 0, .type = 2, .signal = false };
+    try std.testing.expectError(error.OrcStackDirection, stepLoong(down, .{ .ip = 0x1000, .sp = 0x2000, .bp = 0x1500, .ra = 0xffffffff80001234 }, mem));
 }

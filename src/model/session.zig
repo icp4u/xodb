@@ -2335,6 +2335,24 @@ pub const Session = struct {
     pub fn stack(self: *Session, a: std.mem.Allocator, tid: i32, limit: usize) ![]Frame {
         return self.stackDemand(a, tid, limit, false);
     }
+    /// The panicking CPU stops in __crash_kexec with no frame pointer. One
+    /// DWARF step is accepted; a frame-pointer result is the walk that failed.
+    fn crashCaller(self: *Session, a: std.mem.Allocator, module: *@import("modules.zig").Module, lookup_pc: u64, registers: loc.RegisterSet) !info.Unwind {
+        const debug = try module.debugInfo();
+        const link = try module.linkAddress(lookup_pc);
+        const arch_ = self.target.arch();
+        const unwound = try debug.unwind(a, link, .{
+            .registers = registers,
+            .load_bias = module.bias,
+            .address_bytes = arch_.addressBytes(),
+            .endian = arch_.endian(),
+            .insn_pac_mask = self.target.pacInsnMask(),
+            .user = self,
+            .read = readTarget,
+        });
+        if (unwound.method != .debug_frame and unwound.method != .eh_frame) return error.KernelFrame;
+        return unwound;
+    }
     fn stackDemand(self: *Session, a: std.mem.Allocator, tid: i32, limit: usize, unwind_only: bool) ![]Frame {
         defer self.modules.reportBudget();
         if (self.target.snapshot().state != .stopped) return error.NotStopped;
@@ -2390,9 +2408,11 @@ pub const Session = struct {
                 false
             else
                 self.modules.prefersUnwindMetadata(frame.lookup_pc) catch false;
+            var kernel_entry = false;
             if (if (metadata_only) self.modules.cachedSymbolAt(frame.lookup_pc) else self.modules.symbolAt(frame.lookup_pc)) |symbol| {
                 frame.symbol = symbol.name;
                 frame.module_id = symbol.module_id;
+                kernel_entry = frames.items.len == 0 and symbol.offset == 0;
             } else |_| {}
             const step: info.Unwind = step: {
                 // A remote caller downloads its library when classification
@@ -2457,7 +2477,14 @@ pub const Session = struct {
                             return reader.session.target.readMemory(address, dest);
                         }
                     };
-                    break :step self.modules.kernelUnwind(arch_, frame.lookup_pc, registers, KernelReader{ .session = self }) catch |err| {
+                    break :step self.modules.kernelUnwind(arch_, frame.lookup_pc, registers, KernelReader{ .session = self }, kernel_entry) catch |err| {
+                        if (err == error.KernelFrame) if (frame.symbol) |symbol| {
+                            if (std.mem.eql(u8, symbol, "__crash_kexec") or std.mem.eql(u8, symbol, "crash_kexec")) {
+                                if (self.crashCaller(a, module, frame.lookup_pc, registers)) |unwound| {
+                                    break :step unwound;
+                                } else |_| {}
+                            }
+                        };
                         frame.diagnostic = @errorName(err);
                         try frames.append(a, frame);
                         break :stack_walk;

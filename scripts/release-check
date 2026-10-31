@@ -179,6 +179,9 @@ COVERS = (
       'src/evidence/sockets.zig', 'src/mcp/evidence.zig', 'src/render/vulkan.zig', 'tests/redact.py'),
      ('redact', 'gui-redact')),
     (('src/*.zig', 'src/*.c', 'src/*.h', 'src/*.cc', 'src/*.inc', 'src/*/Makefile', 'build.zig'), ('deps',)),
+    (('scripts/spawn-lint', 'src/*.zig', 'src/*/*.zig', 'src/*/*/*.zig', 'src/*/*/*/*.zig',
+      'src/*.c', 'src/*/*.c', 'src/*/*/*.c', 'src/*/*/*/*.c', 'src/*.h', 'src/*/*.h', 'src/*/*/*.h', 'src/*/*/*/*.h'),
+     ('spawn-lint',)),
     (('scripts/abi-lint', 'tests/fixtures/abi-lint/*', 'build.zig', 'src/*.zig', 'src/*/*.zig', 'src/*/*/*.zig', 'src/*/*/*/*.zig'), ('abi-lint',)),
     (('docs/*', '*.md', 'packaging/*', 'scripts/package-source'), ('package-source',)),
 )
@@ -191,6 +194,7 @@ ALWAYS = ('deps', 'abi-lint', 'syscall-tables')
 # RSS, inject compositor/Vulkan timeouts, rank processes by CPU, make many
 # OCR passes with bounded waits, or read a pixel from the first frame.
 SERIAL = {
+    'vulkan-exit-soak',
     'gui-local-owner',
     'gui-gibson-live-flight',
     'vulkan-faults', 'hidden-window', 'acquire-timeout', 'fence-timeout', 'wayland-read-race', 'gui-themes', 'gui-ui-scale', 'gui-ui-sizing', 'gui-galaxy-scale', 'gui-galaxy-churn',
@@ -200,7 +204,11 @@ SERIAL = {
 
 # GUI steps that are never retried: they inject faults or race the renderer,
 # so one failure in several runs is the defect they exist to catch.
-NO_RETRY = {'scene3d-faults', 'vulkan-faults', 'vulkan-enumeration', 'vulkan-device', 'vulkan-scale-recovery', 'vulkan-early-exit', 'hidden-window', 'acquire-timeout', 'fence-timeout', 'wayland-read-race'}
+NO_RETRY = {'scene3d-faults', 'vulkan-faults', 'vulkan-enumeration', 'vulkan-device', 'vulkan-scale-recovery', 'vulkan-early-exit', 'vulkan-exit-soak', 'hidden-window', 'acquire-timeout', 'fence-timeout', 'wayland-read-race'}
+
+# Same class of cheap check as the tuple above. Kept out of that tuple's
+# neighborhood so the registration stays local to this step.
+ALWAYS = ALWAYS + ('spawn-lint',)
 
 # Host and gui steps (name globs) that run in `periodic` (live) or
 # `periodic-gui` (gui) instead, with the same commands: soaks, stress and
@@ -209,6 +217,7 @@ NO_RETRY = {'scene3d-faults', 'vulkan-faults', 'vulkan-enumeration', 'vulkan-dev
 # of the rest. host/gui/all keep a quicker check of each area. `affected`
 # still selects one of these when a test script it runs changes.
 PERIODIC = (
+    'vulkan-exit-soak',
     'kernel-census-lab',
     'gdscript-stack-file-slots-*',
     'gui-overview-small-matrix*',
@@ -334,6 +343,20 @@ AGENT_INELIGIBLE = {
     'runtime-host': 'names its own --runtime-agent binary, so the lane switch cannot reach it',
     'perl-path-component': 'the --component run is an in-process Perl path oracle and returns before the debugger starts',
 }
+# These steps reach the agent when their optional external runtime exists, but
+# deliberately exit before importing tests/client.py when it does not. Omit
+# only that un-routable variant; an installed runtime still gets agent coverage.
+AGENT_OPTIONAL = {
+    'ghidra-sidecar-real': 'real Ghidra is unavailable, so the optional harness exits before starting a debugger',
+    'ghidra-sidecar-lifetime': 'real Ghidra is unavailable, so the optional harness exits before starting a debugger',
+}
+
+
+def _real_ghidra_available():
+    home = os.environ.get('GHIDRA_HOME') or os.environ.get('XODB_GHIDRA_HOME')
+    return bool(home and (Path(home) / 'support/analyzeHeadless').is_file())
+
+
 # These scripts already run each case locally and then through the C agent.
 # A lane variant would only run the agent half twice.
 AGENT_BOTH_PATHS = {'repeated-break', 'mcp-precision', 'mcp-modules', 'macho-mcp', 'mcp-list-pages'}
@@ -503,6 +526,8 @@ def agent_fate(step):
         return 'twin', ''
     if step.kind == 'gui' or step.name.startswith('gui-'):
         return 'ineligible', 'GUI compositor path; the headless step covers the target transport'
+    if step.name in AGENT_OPTIONAL and not _real_ghidra_available():
+        return 'ineligible', AGENT_OPTIONAL[step.name]
     if step.name in AGENT_INELIGIBLE:
         return 'ineligible', AGENT_INELIGIBLE[step.name]
     script = _test_script(step)
@@ -646,6 +671,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append((name, [sys.executable, '-B', f'tests/{name}.py', '--work', '.work/' + name], 60))
     steps.append(('release-runner', [sys.executable, '-B', 'tests/release-runner.py'], 30))
     steps.append(('deps', [sys.executable, '-B', 'scripts/deps', 'check'], 30))
+    # Source text only: every tier, no build.
+    steps.append(('spawn-lint', [sys.executable, '-B', 'scripts/spawn-lint'], 30, dict(kind='build')))
     steps.append(('deps-selftest', [sys.executable, '-B', 'tests/deps-selftest.py'], 30))
     steps.append(('syscall-tables', [sys.executable, '-B', 'scripts/generate-syscall-tables', '--check'], 30))
     # Privacy: no tracked file may be a packet capture; fixtures are generated at run time.
@@ -1094,6 +1121,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                       'baseline', 'partial-vkCreateInstance', 'partial-vkCreateImage',
                       'start-memory-no-device-local', 'partial-vkCreateFramebuffer', 'poison-vkCreateSwapchainKHR',
                       'frame-vkQueuePresentKHR-lost', 'repeat-init-fails-late', 'resize-real-output'], 600))
+        steps.append(('vulkan-exit-soak', [sys.executable, '-B', 'tests/vulkan-exit-soak.py'], 300,
+                      dict(paths=['tests/vulkan-exit-soak.py', 'tests/vulkan-slow-fini.c'])))
         for name, args in (
             ('vulkan-early-exit', ['tests/vulkan-early-exit.py']),
             ('vulkan-enumeration', ['tests/vulkan-enumeration.py']),

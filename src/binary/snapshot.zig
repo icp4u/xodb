@@ -277,19 +277,25 @@ pub fn readSweepRange(fd: c_int, file_offset: u64, size: usize, limit: usize, ea
 /// memfd has a different inode on every open; that is not the sharing key.
 /// A boot ID separates remote filesystems and keeps local stat keys distinct.
 pub fn readRemoteRange(fd: c_int, file_offset: u64, size: usize, limit: usize, sweep: ?usize, identity: c.struct_xrt_file_identity, boot: ?[36]u8, completeness: Completeness) !Bytes {
+    // Reusing a retained projection avoids a second global reservation, but it
+    // never widens the current caller's per-image allowance.
+    if (size > limit) return error.BinarySnapshotLimit;
+    if (boot) |id| if (takeRemote(identity, id, file_offset, size, completeness)) |bytes| return bytes;
     const key: ?Stamp = if (boot) |id| .{ .device = identity.device, .inode = identity.inode, .size = identity.size, .mtime = .{ identity.mtime_sec, identity.mtime_ns }, .ctime = .{ identity.ctime_sec, identity.ctime_ns }, .remote_boot = id, .completeness = completeness } else null;
     return readRangeFor(fd, file_offset, size, limit, null, sweep, key);
 }
-fn remoteStamp(identity: c.struct_xrt_file_identity, boot: [36]u8) Stamp {
-    return .{ .device = identity.device, .inode = identity.inode, .size = identity.size, .mtime = .{ identity.mtime_sec, identity.mtime_ns }, .ctime = .{ identity.ctime_sec, identity.ctime_ns }, .remote_boot = boot, .completeness = .full };
+fn remoteStamp(identity: c.struct_xrt_file_identity, boot: [36]u8, completeness: Completeness) Stamp {
+    return .{ .device = identity.device, .inode = identity.inode, .size = identity.size, .mtime = .{ identity.mtime_sec, identity.mtime_ns }, .ctime = .{ identity.ctime_sec, identity.ctime_ns }, .remote_boot = boot, .completeness = completeness };
 }
 /// A holder of this remote version, or null when nobody holds that range.
-/// Does not read the descriptor and does not reserve.
-fn takeRemote(identity: c.struct_xrt_file_identity, boot: [36]u8, offset: u64, size: usize) ?Bytes {
+/// A complete file can satisfy a sections-only reader, but a sparse projection
+/// can never satisfy a complete-file reader. Does not read or reserve.
+fn takeRemote(identity: c.struct_xrt_file_identity, boot: [36]u8, offset: u64, size: usize, completeness: Completeness) ?Bytes {
     if (size == 0) return null;
     lockStore();
     defer store_lock.unlock();
-    return held(remoteStamp(identity, boot), offset, size);
+    return held(remoteStamp(identity, boot, completeness), offset, size) orelse
+        if (completeness == .sections) held(remoteStamp(identity, boot, .full), offset, size) else null;
 }
 fn copyIdentity(identity: *const runtime_c.struct_xrt_file_identity) c.struct_xrt_file_identity {
     return .{
@@ -302,15 +308,16 @@ fn copyIdentity(identity: *const runtime_c.struct_xrt_file_identity) c.struct_xr
         .ctime_ns = identity.ctime_ns,
     };
 }
-// One remote open on this thread. The callback retains a held whole-file ELF
-// so the body copy can be skipped. Anything else leaves the copy alone.
+// One remote open on this thread. The callback retains a held ELF projection
+// of the requested completeness so the body copy can be skipped.
 threadlocal var hold_boot: ?[36]u8 = null;
 threadlocal var hold_bytes: ?Bytes = null;
+threadlocal var hold_completeness: Completeness = .full;
 fn holdImage(identity: [*c]const runtime_c.struct_xrt_file_identity) callconv(.c) c_int {
     const boot = hold_boot orelse return 0;
     if (hold_bytes != null or identity == null or identity.*.size <= 0) return 0;
     const size = std.math.cast(usize, identity.*.size) orelse return 0;
-    const bytes = takeRemote(copyIdentity(identity), boot, 0, size) orelse return 0;
+    const bytes = takeRemote(copyIdentity(identity), boot, 0, size, hold_completeness) orelse return 0;
     if (bytes.len < 4 or !std.mem.eql(u8, bytes[0..4], "\x7fELF")) {
         free(bytes);
         return 0;
@@ -319,10 +326,11 @@ fn holdImage(identity: [*c]const runtime_c.struct_xrt_file_identity) callconv(.c
     return 1;
 }
 /// Install the pre-copy holder for `boot`. A null boot leaves the copy alone.
-pub fn beginRemoteHold(boot: ?[36]u8) void {
+pub fn beginRemoteHold(boot: ?[36]u8, completeness: Completeness) void {
     endRemoteHold();
     if (boot == null) return;
     hold_boot = boot;
+    hold_completeness = completeness;
     runtime_c.xrt_remote_set_held_image(holdImage);
 }
 /// Stop answering opens on this thread; a retained image stays claimable.
@@ -346,10 +354,13 @@ pub fn claimRemoteHold() ?Bytes {
 }
 /// Preflight may not charge a second copy of an already retained version.
 pub fn holdsRemote(identity: c.struct_xrt_file_identity, boot: ?[36]u8, size: u64, completeness: Completeness) bool {
-    const key: Stamp = .{ .device = identity.device, .inode = identity.inode, .size = identity.size, .mtime = .{ identity.mtime_sec, identity.mtime_ns }, .ctime = .{ identity.ctime_sec, identity.ctime_ns }, .remote_boot = boot orelse return false, .completeness = completeness };
+    const remote_boot = boot orelse return false;
+    const key = remoteStamp(identity, remote_boot, completeness);
+    const full = remoteStamp(identity, remote_boot, .full);
     lockStore();
     defer store_lock.unlock();
-    for (store.items) |item| if (item.offset == 0 and item.bytes.len == size and std.meta.eql(item.stamp, key)) return true;
+    for (store.items) |item| if (item.offset == 0 and item.bytes.len == size and
+        (std.meta.eql(item.stamp, key) or (completeness == .sections and std.meta.eql(item.stamp, full)))) return true;
     return false;
 }
 fn readRangeFor(fd: c_int, file_offset: u64, size: usize, limit: usize, cancel: ?*const std.atomic.Value(bool), sweep: ?usize, original: ?Stamp) !Bytes {
@@ -589,10 +600,13 @@ test "remote sealed images share original identity, not transport descriptors" {
     try std.testing.expectEqual(start + mib, used());
     try std.testing.expectEqual(@as(u8, 'z'), second[0]);
     try std.testing.expect(holdsRemote(identity, boot, mib, .full));
-    try std.testing.expect(!holdsRemote(identity, boot, mib, .sections));
+    try std.testing.expect(holdsRemote(identity, boot, mib, .sections));
     try std.testing.expect(!holdsRemote(identity, boot, mib, .types));
+    // A complete image satisfies a sections reader without another reserve.
+    const sections = try readRemoteRange(files[1], 0, mib, mib, null, identity, boot, .sections);
+    try std.testing.expectEqual(first.ptr, sections.ptr);
+    free(sections);
     // Different files, versions, boots and local namespaces must not alias.
-    try std.testing.expectError(error.BinarySnapshotLimit, readRemoteRange(files[1], 0, mib, mib, null, identity, boot, .sections));
     try std.testing.expectError(error.BinarySnapshotLimit, readRemoteRange(files[1], 0, mib, mib, null, other, boot, .full));
     var changed = identity;
     changed.mtime_sec += 1;
@@ -611,7 +625,7 @@ test "remote sealed images share original identity, not transport descriptors" {
     try std.testing.expectEqual(start, used());
 }
 
-test "a held whole-file ELF is claimed without a second reserve" {
+test "a held remote ELF projection is claimed without a second reserve" {
     const saved = .{ per_image_limit, total_limit };
     defer per_image_limit = saved[0];
     defer total_limit = saved[1];
@@ -628,7 +642,7 @@ test "a held whole-file ELF is claimed without a second reserve" {
     var plain_id: c.struct_xrt_file_identity = undefined;
     try std.testing.expectEqual(@as(c_uint, c.XRT_OK), c.xrt_file_identity(plain, &plain_id));
     const plain_bytes = try readRemoteRange(plain, 0, mib, mib, null, plain_id, boot, .full);
-    beginRemoteHold(boot);
+    beginRemoteHold(boot, .full);
     var plain_rt = std.mem.zeroes(runtime_c.struct_xrt_file_identity);
     plain_rt.device = plain_id.device;
     plain_rt.inode = plain_id.inode;
@@ -655,20 +669,20 @@ test "a held whole-file ELF is claimed without a second reserve" {
     var other = identity;
     other.inode +%= 1;
     const first = try readRemoteRange(elf, 0, mib, mib, null, identity, boot, .full);
-    const shared = takeRemote(identity, boot, 0, mib);
+    const shared = takeRemote(identity, boot, 0, mib, .full);
     try std.testing.expect(shared != null);
     try std.testing.expectEqual(first.ptr, shared.?.ptr);
     try std.testing.expectEqual(start + mib, used());
-    try std.testing.expect(takeRemote(other, boot, 0, mib) == null);
+    try std.testing.expect(takeRemote(other, boot, 0, mib, .full) == null);
     // A changed version or another boot is never handed back.
     var changed = identity;
     changed.mtime_ns +%= 1;
-    try std.testing.expect(takeRemote(changed, boot, 0, mib) == null);
+    try std.testing.expect(takeRemote(changed, boot, 0, mib, .full) == null);
     changed = identity;
     changed.ctime_sec +%= 1;
-    try std.testing.expect(takeRemote(changed, boot, 0, mib) == null);
-    try std.testing.expect(takeRemote(identity, "22222222-2222-2222-2222-222222222222".*, 0, mib) == null);
-    try std.testing.expect(takeRemote(identity, boot, 0, mib - 4096) == null);
+    try std.testing.expect(takeRemote(changed, boot, 0, mib, .full) == null);
+    try std.testing.expect(takeRemote(identity, "22222222-2222-2222-2222-222222222222".*, 0, mib, .full) == null);
+    try std.testing.expect(takeRemote(identity, boot, 0, mib - 4096, .full) == null);
     free(shared.?);
     var runtime_id = std.mem.zeroes(runtime_c.struct_xrt_file_identity);
     runtime_id.device = identity.device;
@@ -679,7 +693,7 @@ test "a held whole-file ELF is claimed without a second reserve" {
     runtime_id.ctime_sec = identity.ctime_sec;
     runtime_id.ctime_ns = identity.ctime_ns;
     try std.testing.expectEqual(@as(c_int, 0), holdImage(&runtime_id));
-    beginRemoteHold(boot);
+    beginRemoteHold(boot, .full);
     try std.testing.expectEqual(@as(c_int, 1), holdImage(&runtime_id));
     try std.testing.expectEqual(start + mib, used());
     const claimed = claimRemoteHold();
@@ -691,6 +705,21 @@ test "a held whole-file ELF is claimed without a second reserve" {
     free(first);
     try std.testing.expectEqual(@as(u8, 0x7f), claimed.?[0]);
     free(claimed.?);
+    try std.testing.expectEqual(start, used());
+
+    const projected = try readRemoteRange(elf, 0, mib, mib, null, identity, boot, .sections);
+    beginRemoteHold(boot, .full);
+    try std.testing.expectEqual(@as(c_int, 0), holdImage(&runtime_id));
+    endRemoteHold();
+    beginRemoteHold(boot, .sections);
+    try std.testing.expectEqual(@as(c_int, 1), holdImage(&runtime_id));
+    const claimed_projection = claimRemoteHold();
+    try std.testing.expect(claimed_projection != null);
+    try std.testing.expectEqual(projected.ptr, claimed_projection.?.ptr);
+    endRemoteHold();
+    free(projected);
+    try std.testing.expectEqual(@as(u8, 0x7f), claimed_projection.?[0]);
+    free(claimed_projection.?);
     try std.testing.expectEqual(start, used());
 }
 

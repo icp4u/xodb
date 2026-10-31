@@ -28,6 +28,7 @@ static int fork_owned(int32_t *pid, void *context)
 {
     pid_t child;
     (void)context;
+    /* spawn-allow: create callback of xrt_spawn_owned_helper */
     child = fork();
     if (child < 0)
         return errno ? errno : EAGAIN;

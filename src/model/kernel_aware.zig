@@ -32,6 +32,21 @@ pub const Facts = struct {
     pt_size: ?u32 = null,
     pt_ip: ?u32 = null,
     pt_sp: ?u32 = null,
+    /// `task_struct.stack`. The waiter scan covers 16 KiB from this base.
+    stack_off: ?u32 = null,
+    mutex_owner: ?u32 = null,
+    mutex_wait_list: ?u32 = null,
+    mutex_waiter_list: ?u32 = null,
+    mutex_waiter_task: ?u32 = null,
+    /// Set when `mutex` has `first_waiter` instead of an embedded wait list.
+    mutex_first_waiter: ?u32 = null,
+    rwsem_owner: ?u32 = null,
+    rwsem_wait_list: ?u32 = null,
+    rwsem_waiter_list: ?u32 = null,
+    rwsem_waiter_task: ?u32 = null,
+    rwsem_first_waiter: ?u32 = null,
+    /// `task_struct.blocked_on`, a mutex pointer set while `mutex_lock` sleeps.
+    task_blocked_on: ?u32 = null,
 };
 
 pub const Vmcore = struct {
@@ -118,6 +133,10 @@ pub const ModuleRow = struct {
     state: u32 = 0,
     text: u64 = 0,
     text_size: u32 = 0,
+    /// `mem[MOD_DATA].base`, `mem[MOD_RODATA].base`, `mem[MOD_RO_AFTER_INIT].base`.
+    data: u64 = 0,
+    rodata: u64 = 0,
+    ro_after: u64 = 0,
     build_id: [64]u8 = @splat(0),
     build_id_len: u8 = 0,
 };
@@ -167,6 +186,9 @@ pub fn walkModules(memory: anytype, head: u64, facts: Facts, out: []ModuleRow) !
         row.state = try readU32(memory, base + facts.state_off);
         row.text = try readU64(memory, base + facts.mem_off + facts.text_base);
         row.text_size = try readU32(memory, base + facts.mem_off + facts.text_size);
+        row.data = memBase(memory, base, facts, 1);
+        row.rodata = memBase(memory, base, facts, 2);
+        row.ro_after = memBase(memory, base, facts, 3);
         if (facts.build_id_off) |off| if (facts.build_id_len > 0) {
             const id_n: usize = @min(facts.build_id_len, row.build_id.len);
             try readAt(memory, base + off, row.build_id[0..id_n]);
@@ -188,6 +210,8 @@ pub const TaskRow = struct {
     comm_len: u8 = 0,
     state: ?u32 = null,
     cpu: ?u32 = null,
+    /// Thread id published for a core task. Zero means the row was not published.
+    pub_tid: i32 = 0,
 };
 
 pub fn walkTasks(memory: anytype, init_task: u64, facts: Facts, out: []TaskRow) !usize {
@@ -217,6 +241,255 @@ pub fn walkTasks(memory: anytype, init_task: u64, facts: Facts, out: []TaskRow) 
         base = next_base;
     }
     return n;
+}
+
+pub const WaitKind = enum { mutex, rwsem };
+
+pub const WaitEdge = struct {
+    waiter: u64,
+    lock: u64,
+    kind: WaitKind,
+    owner: u64,
+    owner_cpu: ?u32 = null,
+    /// An rwsem held for read: the readers are not tracked, so no owner is named.
+    readers: bool = false,
+};
+
+const LockLayout = struct {
+    owner: u32,
+    wait_list: u32,
+    waiter_list: u32,
+    waiter_task: u32,
+};
+
+const PointerLayout = struct {
+    owner: u32,
+    first_waiter: u32,
+    waiter_task: u32,
+};
+
+fn pointerLayout(owner: ?u32, first_waiter: ?u32, waiter_task: ?u32) ?PointerLayout {
+    return .{
+        .owner = owner orelse return null,
+        .first_waiter = first_waiter orelse return null,
+        .waiter_task = waiter_task orelse return null,
+    };
+}
+
+fn lockLayout(owner: ?u32, wait_list: ?u32, waiter_list: ?u32, waiter_task: ?u32) ?LockLayout {
+    return .{
+        .owner = owner orelse return null,
+        .wait_list = wait_list orelse return null,
+        .waiter_list = waiter_list orelse return null,
+        .waiter_task = waiter_task orelse return null,
+    };
+}
+
+const StackRange = struct { base: u64, end: u64 };
+
+fn inStack(ranges: []const StackRange, address: u64) bool {
+    for (ranges) |range| if (range.base != 0 and address >= range.base and address < range.end) return true;
+    return false;
+}
+
+/// Bit 1 is uninterruptible sleep. Bit 10 marks an idle task, which is not a lock waiter.
+fn isUninterruptible(state: u32) bool {
+    return (state & 0x2) != 0 and (state & 0x400) == 0;
+}
+
+fn knownTask(tasks: []const TaskRow, address: u64) bool {
+    for (tasks) |task| if (task.address == address) return true;
+    return false;
+}
+
+fn ownerCpu(current: []const u64, owner: u64) ?u32 {
+    for (current, 0..) |slot, index| if (slot == owner) return std.math.cast(u32, index) orelse null;
+    return null;
+}
+
+const stack_window: u64 = 16 * 1024;
+
+/// `list_head.next` is the first field. The lock's wait list is the one node
+/// that is not inside a task stack. Owner flags occupy the low three bits.
+fn findWait(memory: anytype, task: TaskRow, tasks: []const TaskRow, ranges: []const StackRange, stack: StackRange, layout: LockLayout, current: []const u64, kind: WaitKind) ?WaitEdge {
+    var chunk: [512]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset + 8 <= stack_window) {
+        const want: usize = @intCast(@min(@as(u64, chunk.len), stack_window - offset));
+        const n = memory.read(stack.base + offset, chunk[0..want]) catch break;
+        if (n < 8) break;
+        const usable = n - (n % 8);
+        var i: usize = 0;
+        while (i + 8 <= usable) : (i += 8) {
+            const word = std.mem.readInt(u64, chunk[i..][0..8], .little);
+            if (word != task.address) continue;
+            const addr = stack.base + offset + @as(u64, i);
+            if (addr < layout.waiter_task) continue;
+            const base = addr - layout.waiter_task;
+            if (base < stack.base) continue;
+            const list_at = base + layout.waiter_list;
+            if (list_at < stack.base or list_at + 8 > stack.end) continue;
+            const edge = closeWait(memory, task, tasks, ranges, list_at, layout, current, kind) orelse continue;
+            return edge;
+        }
+        if (n < want) break;
+        offset += @as(u64, n);
+    }
+    return null;
+}
+
+fn closeWait(memory: anytype, task: TaskRow, tasks: []const TaskRow, ranges: []const StackRange, list_at: u64, layout: LockLayout, current: []const u64, kind: WaitKind) ?WaitEdge {
+    var node = readU64(memory, list_at) catch return null;
+    var outside: ?u64 = null;
+    var closed = false;
+    var steps: usize = 0;
+    while (steps < 64) : (steps += 1) {
+        if (node == list_at) {
+            closed = true;
+            break;
+        }
+        if (node == 0 or node % 8 != 0) return null;
+        if (!inStack(ranges, node)) {
+            if (outside != null) return null;
+            outside = node;
+        }
+        node = readU64(memory, node) catch return null;
+    }
+    if (!closed) return null;
+    const head = outside orelse return null;
+    if (head < layout.wait_list) return null;
+    const lock = head - layout.wait_list;
+    const raw = readU64(memory, lock + layout.owner) catch return null;
+    // RWSEM_READER_OWNED: the owner word is only the last reader, not a holder.
+    if (kind == .rwsem and raw & 1 != 0) return .{ .waiter = task.address, .lock = lock, .kind = kind, .owner = 0, .readers = true };
+    const owner = raw & ~@as(u64, 7);
+    if (owner == 0 or owner == task.address or !knownTask(tasks, owner)) return null;
+    return .{
+        .waiter = task.address,
+        .lock = lock,
+        .kind = kind,
+        .owner = owner,
+        .owner_cpu = ownerCpu(current, owner),
+    };
+}
+
+/// The lock's `first_waiter` points at a waiter on this task's stack, and that
+/// waiter's task field is this task. Owner flags occupy the low three bits.
+fn edgeAt(memory: anytype, task: TaskRow, tasks: []const TaskRow, stack: StackRange, lock: u64, layout: PointerLayout, current: []const u64, kind: WaitKind) ?WaitEdge {
+    const first = readU64(memory, lock + layout.first_waiter) catch return null;
+    if (first == 0 or first % 8 != 0 or first < stack.base or first >= stack.end) return null;
+    const pointed_at = first + layout.waiter_task;
+    if (pointed_at < stack.base or pointed_at + 8 > stack.end) return null;
+    const pointed = readU64(memory, pointed_at) catch return null;
+    if (pointed != task.address) return null;
+    const raw = readU64(memory, lock + layout.owner) catch return null;
+    // RWSEM_READER_OWNED: the owner word is only the last reader, not a holder.
+    if (kind == .rwsem and raw & 1 != 0) return .{ .waiter = task.address, .lock = lock, .kind = kind, .owner = 0, .readers = true };
+    const owner = raw & ~@as(u64, 7);
+    if (owner == 0 or owner == task.address or !knownTask(tasks, owner)) return null;
+    return .{
+        .waiter = task.address,
+        .lock = lock,
+        .kind = kind,
+        .owner = owner,
+        .owner_cpu = ownerCpu(current, owner),
+    };
+}
+
+fn blockedEdge(memory: anytype, task: TaskRow, tasks: []const TaskRow, ranges: []const StackRange, stack: StackRange, blocked_off: u32, layout: PointerLayout, current: []const u64) ?WaitEdge {
+    const lock = readU64(memory, task.address + blocked_off) catch return null;
+    if (lock == 0 or lock % 8 != 0 or inStack(ranges, lock)) return null;
+    return edgeAt(memory, task, tasks, stack, lock, layout, current, .mutex);
+}
+
+/// A kernel pointer on the waiter stack whose `first_waiter` names that waiter.
+/// Used when the lock has no embedded wait list to walk back to.
+fn findByPointer(memory: anytype, task: TaskRow, tasks: []const TaskRow, ranges: []const StackRange, stack: StackRange, layout: PointerLayout, current: []const u64, kind: WaitKind) ?WaitEdge {
+    var chunk: [512]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset + 8 <= stack_window) {
+        const want: usize = @intCast(@min(@as(u64, chunk.len), stack_window - offset));
+        const n = memory.read(stack.base + offset, chunk[0..want]) catch break;
+        if (n < 8) break;
+        const usable = n - (n % 8);
+        var i: usize = 0;
+        while (i + 8 <= usable) : (i += 8) {
+            const word = std.mem.readInt(u64, chunk[i..][0..8], .little);
+            if (word < 0x1000 or word % 8 != 0 or inStack(ranges, word)) continue;
+            const edge = edgeAt(memory, task, tasks, stack, word, layout, current, kind) orelse continue;
+            return edge;
+        }
+        if (n < want) break;
+        offset += @as(u64, n);
+    }
+    return null;
+}
+
+/// One edge per blocked task. A mutex match wins over an rwsem match for the same task.
+/// Missing offsets, a missing stack, or a lock whose owner is not a known task produce nothing.
+pub fn walkWaits(memory: anytype, tasks: []const TaskRow, facts: Facts, current: []const u64, out: []WaitEdge) !usize {
+    const stack_off = facts.stack_off orelse return 0;
+    const mutex = lockLayout(facts.mutex_owner, facts.mutex_wait_list, facts.mutex_waiter_list, facts.mutex_waiter_task);
+    const rwsem = lockLayout(facts.rwsem_owner, facts.rwsem_wait_list, facts.rwsem_waiter_list, facts.rwsem_waiter_task);
+    const mutex_ptr = pointerLayout(facts.mutex_owner, facts.mutex_first_waiter, facts.mutex_waiter_task);
+    const rwsem_ptr = pointerLayout(facts.rwsem_owner, facts.rwsem_first_waiter, facts.rwsem_waiter_task);
+    if (mutex == null and rwsem == null and mutex_ptr == null and rwsem_ptr == null) return 0;
+    var ranges: [1024]StackRange = undefined;
+    const range_n = @min(tasks.len, ranges.len);
+    for (tasks[0..range_n], 0..) |task, index| {
+        const base = readU64(memory, task.address + stack_off) catch 0;
+        const end = std.math.add(u64, base, stack_window) catch 0;
+        ranges[index] = .{ .base = if (base == 0 or end == 0) 0 else base, .end = end };
+    }
+    var n: usize = 0;
+    var scanned: usize = 0;
+    for (tasks[0..range_n], 0..) |task, index| {
+        if (n == out.len or scanned == 128) break;
+        const state = task.state orelse continue;
+        if (!isUninterruptible(state)) continue;
+        scanned += 1;
+        const stack = ranges[index];
+        if (stack.base == 0) continue;
+        if (mutex) |layout| if (findWait(memory, task, tasks, ranges[0..range_n], stack, layout, current, .mutex)) |edge| {
+            out[n] = edge;
+            n += 1;
+            continue;
+        };
+        if (mutex_ptr) |layout| {
+            const from_task = if (facts.task_blocked_on) |off| blockedEdge(memory, task, tasks, ranges[0..range_n], stack, off, layout, current) else null;
+            if (from_task orelse findByPointer(memory, task, tasks, ranges[0..range_n], stack, layout, current, .mutex)) |edge| {
+                out[n] = edge;
+                n += 1;
+                continue;
+            }
+        }
+        if (n == out.len) break;
+        if (rwsem) |layout| if (findWait(memory, task, tasks, ranges[0..range_n], stack, layout, current, .rwsem)) |edge| {
+            out[n] = edge;
+            n += 1;
+            continue;
+        };
+        if (rwsem_ptr) |layout| if (findByPointer(memory, task, tasks, ranges[0..range_n], stack, layout, current, .rwsem)) |edge| {
+            out[n] = edge;
+            n += 1;
+        };
+    }
+    return n;
+}
+
+fn commOf(tasks: []const TaskRow, address: u64) []const u8 {
+    for (tasks, 0..) |task, index| if (task.address == address and task.comm_len > 0) return tasks[index].comm[0..tasks[index].comm_len];
+    return "task";
+}
+
+pub fn formatWait(edge: WaitEdge, tasks: []const TaskRow, buf: []u8) []const u8 {
+    const waiter = commOf(tasks, edge.waiter);
+    if (edge.readers) return std.fmt.bufPrint(buf, "{s} waits on rwsem 0x{x} held by readers (readers are not tracked)", .{ waiter, edge.lock }) catch buf[0..0];
+    const owner = commOf(tasks, edge.owner);
+    if (edge.owner_cpu) |cpu| {
+        return std.fmt.bufPrint(buf, "{s} waits on lock 0x{x} owned by {s}, which spins on CPU {d}", .{ waiter, edge.lock, owner, cpu }) catch buf[0..0];
+    }
+    return std.fmt.bufPrint(buf, "{s} waits on lock 0x{x} owned by {s}", .{ waiter, edge.lock, owner }) catch buf[0..0];
 }
 
 /// `thread.sp` points at the inactive frame. The saved return slot's offset
@@ -522,6 +795,83 @@ pub fn textSymbol(section: u32, text_section: u32, text_base: u64, value: u64) ?
     return std.math.add(u64, text_base, value) catch null;
 }
 
+const shf_write: u64 = 1;
+const shf_alloc: u64 = 2;
+const shf_exec: u64 = 4;
+const shf_ro_after: u64 = 0x00200000;
+
+/// True for a section the kernel puts in an init region. `.exit` stays in
+/// the core image when the kernel is built with module unload.
+pub fn moduleInitSection(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, ".init");
+}
+
+pub const AllocSec = struct {
+    init: bool = false,
+    flags: u64,
+    size: u64,
+    alignment: u64,
+};
+
+/// `kind` 0 is text, 1 data, 2 rodata, 3 ro-after-init, 4 init text,
+/// 5 init data, 6 init rodata. 255 means the section is not allocated.
+pub const Place = struct {
+    kind: u8 = 255,
+    offset: u64 = 0,
+};
+
+fn alignUp(value: u64, alignment: u64) u64 {
+    if (alignment <= 1) return value;
+    const mask = alignment - 1;
+    if (alignment & mask != 0) return value;
+    return (value + mask) & ~mask;
+}
+
+const LayoutMask = struct { need: u64, excl: u64, core: u8, init_kind: u8 };
+
+/// Same grouping as the kernel's `layout_sections`: executable, read-only,
+/// ro-after-init, then writable. Offsets accumulate in section order.
+pub fn layoutAlloc(sections: []const AllocSec, out: []Place) void {
+    const masks = [_]LayoutMask{
+        .{ .need = shf_exec | shf_alloc, .excl = 0, .core = 0, .init_kind = 4 },
+        .{ .need = shf_alloc, .excl = shf_write, .core = 2, .init_kind = 6 },
+        .{ .need = shf_ro_after | shf_alloc, .excl = 0, .core = 3, .init_kind = 255 },
+        .{ .need = shf_write | shf_alloc, .excl = 0, .core = 1, .init_kind = 5 },
+    };
+    var cursor = [_]u64{0} ** 7;
+    for (out) |*slot| slot.* = .{};
+    for (masks) |mask| {
+        for (sections, 0..) |sec, index| {
+            if (out[index].kind != 255) continue;
+            if ((sec.flags & mask.need) != mask.need) continue;
+            if ((sec.flags & mask.excl) != 0) continue;
+            const kind: u8 = if (sec.init) mask.init_kind else mask.core;
+            if (kind == 255 or kind >= cursor.len) continue;
+            const aligned = alignUp(cursor[kind], if (sec.alignment == 0) 1 else sec.alignment);
+            out[index] = .{ .kind = kind, .offset = aligned };
+            cursor[kind] = aligned + sec.size;
+        }
+    }
+}
+
+fn memBase(memory: anytype, module_base: u64, facts: Facts, index: u32) u64 {
+    const slot = std.math.add(u64, module_base, facts.mem_off) catch return 0;
+    const at = std.math.add(u64, slot, @as(u64, index) * facts.mem_stride + facts.text_base) catch return 0;
+    return readU64(memory, at) catch 0;
+}
+
+/// At the first instruction the frame pointer still belongs to the caller.
+/// x86's return address is the word at `sp`. arm64's is `ra`.
+pub fn entryFrame(arm: bool, sp: u64, ra: u64, fp: u64, stacked: u64) !Fp {
+    if (arm) {
+        if (ra == 0) return error.KernelFrame;
+        return .{ .ip = ra, .sp = sp, .bp = fp };
+    }
+    if (stacked == 0) return error.KernelFrame;
+    const next = std.math.add(u64, sp, 8) catch return error.KernelFrame;
+    return .{ .ip = stacked, .sp = next, .bp = fp };
+}
+
 pub fn buildIdMatches(image_id: []const u8, memory_id: []const u8) bool {
     return image_id.len > 0 and image_id.len == memory_id.len and std.mem.eql(u8, image_id, memory_id);
 }
@@ -657,6 +1007,150 @@ test "sleeping x86 state, per-cpu slots, shadow cpus and a frame record" {
     try std.testing.expectEqual(@as(?u64, 0x1100), textSymbol(3, 3, 0x1000, 0x100));
     try std.testing.expectEqual(@as(?u64, null), textSymbol(4, 3, 0x1000, 0x100));
     try std.testing.expectEqual(@as(?u64, null), textSymbol(0, 0, 0x1000, 0x100));
+}
+
+test "KGHANG a blocked task names the mutex or rwsem owner and the cpu it spins on" {
+    const a = std.testing.allocator;
+    const mem = try a.alloc(u8, 0xb020);
+    defer a.free(mem);
+    @memset(mem, 0);
+    const facts = Facts{
+        .list_next = 0,
+        .name_off = 0,
+        .name_len = 1,
+        .state_off = 0,
+        .mem_off = 0,
+        .mem_stride = 1,
+        .text_base = 0,
+        .text_size = 1,
+        .pid_off = 0,
+        .comm_off = 0,
+        .comm_len = 1,
+        .tasks_next = 0,
+        .stack_off = 0,
+        .mutex_owner = 0,
+        .mutex_wait_list = 8,
+        .mutex_waiter_list = 0,
+        .mutex_waiter_task = 16,
+        .rwsem_owner = 0,
+        .rwsem_wait_list = 16,
+        .rwsem_waiter_list = 0,
+        .rwsem_waiter_task = 16,
+    };
+    var waiter = TaskRow{ .address = 0x100, .pid = 10, .state = 2 };
+    @memcpy(waiter.comm[0..6], "waiter");
+    waiter.comm_len = 6;
+    var holder = TaskRow{ .address = 0x180, .pid = 11, .state = 0 };
+    @memcpy(holder.comm[0..6], "holder");
+    holder.comm_len = 6;
+    var blocked = TaskRow{ .address = 0x200, .pid = 12, .state = 2 };
+    @memcpy(blocked.comm[0..7], "blocked");
+    blocked.comm_len = 7;
+    var sleeping = TaskRow{ .address = 0x300, .pid = 13, .state = 1 };
+    @memcpy(sleeping.comm[0..5], "sleep");
+    sleeping.comm_len = 5;
+    var idle = TaskRow{ .address = 0x380, .pid = 14, .state = 0x402 };
+    @memcpy(idle.comm[0..4], "idle");
+    idle.comm_len = 4;
+    putU64(mem, 0x100, 0x2000);
+    putU64(mem, 0x180, 0);
+    putU64(mem, 0x200, 0x6000);
+    putU64(mem, 0x2100, 0xa108);
+    putU64(mem, 0x2108, 0xa108);
+    putU64(mem, 0x2110, 0x100);
+    putU64(mem, 0xa100, 0x180);
+    putU64(mem, 0xa108, 0x2100);
+    putU64(mem, 0xa110, 0x2100);
+    putU64(mem, 0x6100, 0xb010);
+    putU64(mem, 0x6108, 0xb010);
+    putU64(mem, 0x6110, 0x200);
+    // A writer-held rwsem: bit 1 (RWSEM_NONSPINNABLE) is masked. Bit 0 would mean readers.
+    putU64(mem, 0xb000, 0x182);
+    putU64(mem, 0xb010, 0x6100);
+    putU64(mem, 0xb018, 0x6100);
+    const tasks = [_]TaskRow{ waiter, holder, blocked, sleeping, idle };
+    const current = [_]u64{ 0, 0, 0, 0x180 };
+    var edges: [8]WaitEdge = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try walkWaits(Flat{ .bytes = mem }, &tasks, Facts{
+        .list_next = 0,
+        .name_off = 0,
+        .name_len = 1,
+        .state_off = 0,
+        .mem_off = 0,
+        .mem_stride = 1,
+        .text_base = 0,
+        .text_size = 1,
+        .pid_off = 0,
+        .comm_off = 0,
+        .comm_len = 1,
+        .tasks_next = 0,
+    }, &current, &edges));
+    const n = try walkWaits(Flat{ .bytes = mem }, &tasks, facts, &current, &edges);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(WaitKind.mutex, edges[0].kind);
+    try std.testing.expectEqual(@as(u64, 0x100), edges[0].waiter);
+    try std.testing.expectEqual(@as(u64, 0xa100), edges[0].lock);
+    try std.testing.expectEqual(@as(u64, 0x180), edges[0].owner);
+    try std.testing.expectEqual(@as(u32, 3), edges[0].owner_cpu.?);
+    try std.testing.expectEqual(WaitKind.rwsem, edges[1].kind);
+    try std.testing.expectEqual(@as(u64, 0xb000), edges[1].lock);
+    try std.testing.expectEqual(@as(u64, 0x180), edges[1].owner);
+    var line: [160]u8 = undefined;
+    try std.testing.expectEqualStrings("waiter waits on lock 0xa100 owned by holder, which spins on CPU 3", formatWait(edges[0], &tasks, &line));
+    try std.testing.expectEqualStrings("blocked waits on lock 0xb000 owned by holder, which spins on CPU 3", formatWait(edges[1], &tasks, &line));
+    var quiet = edges[0];
+    quiet.owner_cpu = null;
+    try std.testing.expectEqualStrings("waiter waits on lock 0xa100 owned by holder", formatWait(quiet, &tasks, &line));
+}
+
+test "KGHANG blocked_on names a mutex that has no embedded wait list" {
+    const a = std.testing.allocator;
+    const mem = try a.alloc(u8, 0x6020);
+    defer a.free(mem);
+    @memset(mem, 0);
+    const facts = Facts{
+        .list_next = 0,
+        .name_off = 0,
+        .name_len = 1,
+        .state_off = 0,
+        .mem_off = 0,
+        .mem_stride = 1,
+        .text_base = 0,
+        .text_size = 1,
+        .pid_off = 0,
+        .comm_off = 0,
+        .comm_len = 1,
+        .tasks_next = 0,
+        .stack_off = 0,
+        .task_blocked_on = 8,
+        .mutex_owner = 0,
+        .mutex_first_waiter = 8,
+        .mutex_waiter_task = 16,
+    };
+    var waiter = TaskRow{ .address = 0x100, .pid = 81, .state = 2 };
+    @memcpy(waiter.comm[0..7], "blocked");
+    waiter.comm_len = 7;
+    var holder = TaskRow{ .address = 0x180, .pid = 82, .state = 0 };
+    @memcpy(holder.comm[0..7], "spinner");
+    holder.comm_len = 7;
+    // Stack window is 16 KiB from 0x1000, so the lock at 0x6000 is outside it.
+    putU64(mem, 0x100, 0x1000);
+    putU64(mem, 0x108, 0x6000);
+    putU64(mem, 0x1110, 0x100);
+    putU64(mem, 0x6000, 0x181);
+    putU64(mem, 0x6008, 0x1100);
+    const tasks = [_]TaskRow{ waiter, holder };
+    const current = [_]u64{ 0, 0x180 };
+    var edges: [4]WaitEdge = undefined;
+    const n = try walkWaits(Flat{ .bytes = mem }, &tasks, facts, &current, &edges);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(WaitKind.mutex, edges[0].kind);
+    try std.testing.expectEqual(@as(u64, 0x100), edges[0].waiter);
+    try std.testing.expectEqual(@as(u64, 0x6000), edges[0].lock);
+    try std.testing.expectEqual(@as(u64, 0x180), edges[0].owner);
+    try std.testing.expectEqual(@as(u32, 1), edges[0].owner_cpu.?);
+    var line: [160]u8 = undefined;
+    try std.testing.expectEqualStrings("blocked waits on lock 0x6000 owned by spinner, which spins on CPU 1", formatWait(edges[0], &tasks, &line));
 }
 
 test "btf struct members become kernel facts and a missing image is refused" {
@@ -857,4 +1351,68 @@ test "btf struct members become kernel facts and a missing image is refused" {
     try std.testing.expectEqual(@as(u32, 8), facts.pt_sp.?);
     try std.testing.expectEqual(@as(u32, 16), facts.pt_size.?);
     try std.testing.expectError(error.BtfMalformed, factsFromBtf(&[_]u8{ 1, 2, 3, 4 }));
+}
+
+test "module layout puts data after the earlier writable sections" {
+    const ax: u64 = shf_exec | shf_alloc;
+    const wa: u64 = shf_write | shf_alloc;
+    const ro: u64 = shf_alloc;
+    const secs = [_]AllocSec{
+        .{ .flags = ro, .size = 0x18, .alignment = 8 },
+        .{ .flags = wa, .size = 0x38, .alignment = 8 },
+        .{ .flags = ax, .size = 0x204, .alignment = 16 },
+        .{ .flags = wa, .size = 0x40, .alignment = 8 },
+        .{ .flags = wa, .size = 0x28, .alignment = 8 },
+        .{ .flags = ro, .size = 0xd8, .alignment = 1 },
+        .{ .init = true, .flags = ax, .size = 0xc3, .alignment = 16 },
+        .{ .flags = ax, .size = 0x49, .alignment = 16 },
+    };
+    var out: [secs.len]Place = undefined;
+    layoutAlloc(&secs, &out);
+    try std.testing.expectEqual(@as(u8, 0), out[2].kind);
+    try std.testing.expectEqual(@as(u64, 0), out[2].offset);
+    try std.testing.expectEqual(@as(u8, 0), out[7].kind);
+    try std.testing.expectEqual(@as(u64, 0x210), out[7].offset);
+    try std.testing.expectEqual(@as(u8, 1), out[4].kind);
+    try std.testing.expectEqual(@as(u64, 0x78), out[4].offset);
+    try std.testing.expectEqual(@as(u8, 4), out[6].kind);
+    try std.testing.expectEqual(@as(u8, 2), out[5].kind);
+    const stacked: u64 = 0xffffffff81000040;
+    const entered = try entryFrame(false, 0xffffffff8100f000, 0, 0xffffffff8100e000, stacked);
+    try std.testing.expectEqual(stacked, entered.ip);
+    try std.testing.expectEqual(@as(u64, 0xffffffff8100f008), entered.sp);
+    const arm = try entryFrame(true, 0xffff80001000, 0xffff80002000, 0xffff80003000, 0);
+    try std.testing.expectEqual(@as(u64, 0xffff80002000), arm.ip);
+    try std.testing.expectEqual(@as(u64, 0xffff80003000), arm.bp);
+}
+
+test "KGHANG a reader-owned rwsem names no owner" {
+    const tasks = [_]TaskRow{.{ .address = 0x1000, .pid = 7, .comm = "writer".* ++ [_]u8{0} ** 10, .comm_len = 6 }};
+    var buf: [128]u8 = undefined;
+    const text = formatWait(.{ .waiter = 0x1000, .lock = 0x5000, .kind = .rwsem, .owner = 0, .readers = true }, &tasks, &buf);
+    try std.testing.expectEqualStrings("writer waits on rwsem 0x5000 held by readers (readers are not tracked)", text);
+}
+
+test "KGHANG a wait list that cycles without its head gives no edge" {
+    var mem = [_]u8{0} ** 0x1000;
+    putU64(&mem, 0x100, 0x200); // the waiter's list node points into a loop
+    putU64(&mem, 0x200, 0x300);
+    putU64(&mem, 0x300, 0x200); // never returns to 0x100
+    const task = TaskRow{ .address = 0x800, .pid = 9 };
+    const ranges = [_]StackRange{.{ .base = 0x200, .end = 0x400 }};
+    const layout = LockLayout{ .owner = 0, .wait_list = 0x10, .waiter_list = 0, .waiter_task = 0x10 };
+    try std.testing.expect(closeWait(Flat{ .bytes = &mem }, task, &.{task}, &ranges, 0x100, layout, &.{}, .mutex) == null);
+}
+
+test "KGHANG a reader-owned rwsem gives a readers edge, not the last reader" {
+    var mem = [_]u8{0} ** 0x1000;
+    putU64(&mem, 0x200, 0x510); // waiter node on the stack -> the lock's wait_list
+    putU64(&mem, 0x510, 0x200); // and back: the list is closed
+    putU64(&mem, 0x500, 0x181); // owner word: last reader 0x180 | RWSEM_READER_OWNED
+    const waiter = TaskRow{ .address = 0x800, .pid = 9 };
+    const reader = TaskRow{ .address = 0x180, .pid = 3 };
+    const ranges = [_]StackRange{.{ .base = 0x200, .end = 0x400 }};
+    const layout = LockLayout{ .owner = 0, .wait_list = 0x10, .waiter_list = 0, .waiter_task = 0x10 };
+    const edge = closeWait(Flat{ .bytes = &mem }, waiter, &.{ waiter, reader }, &ranges, 0x200, layout, &.{}, .rwsem).?;
+    try std.testing.expect(edge.readers and edge.owner == 0 and edge.lock == 0x500);
 }

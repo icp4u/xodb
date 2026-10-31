@@ -162,6 +162,7 @@ test "headless graph observer reads an owned scope without requesting tracing" {
     const c = @import("../c_ui.zig").api;
     // The descriptor collector deliberately excludes its own process. Keep an
     // owned child alive for this scope, and reap it on every exit path.
+    // spawn-allow: test child kept for the owned scope and reaped on every exit
     const pid = c.fork();
     if (pid < 0) return error.FixtureForkFailed;
     if (pid == 0) {

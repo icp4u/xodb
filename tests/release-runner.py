@@ -697,6 +697,17 @@ class RunnerTests(unittest.TestCase):
         self.assertIn('system overview rejects', dict(notes)['system-capture'])
         self.assertIn('opens a packet capture', dict(notes)['private-network-evidence'])
         self.assertIn('core-debugging', [name for name, _ in notes])
+        real_ghidra = next(step for step in gate.plan('host') if step.name == 'ghidra-sidecar-real')
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('GHIDRA_HOME', None)
+            os.environ.pop('XODB_GHIDRA_HOME', None)
+            self.assertEqual(gate.agent_fate(real_ghidra)[0], 'ineligible')
+            with tempfile.TemporaryDirectory() as directory:
+                support = Path(directory) / 'support'
+                support.mkdir()
+                (support / 'analyzeHeadless').touch()
+                os.environ['GHIDRA_HOME'] = directory
+                self.assertEqual(gate.agent_fate(real_ghidra)[0], 'eligible')
         redot_lane, redot_notes = gate.apply_agent_lane(gate.plan('host', redot='fixture-engine'))
         redot_names = [step.name for step in redot_lane]
         redot_why = dict(redot_notes)

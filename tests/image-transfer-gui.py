@@ -28,7 +28,7 @@ subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', '-I', str(w), 'tests/helper
 #include <stdio.h>
 #include <unistd.h>
 int main(void) { char b; puts("ready"); fflush(stdout); return read(0, &b, 1) < 0; }
-asm(".pushsection .debug_xodb_payload,\\"\\",@progbits\\n.skip 16777216\\n.popsection");
+asm(".pushsection .debug_macro,\\"\\",@progbits\\n.skip 16777216\\n.popsection");
 ''')
 fixture = w/'image'
 subprocess.run(['cc', '-g', '-O0', '-Wl,--build-id', str(w/'main.c'), '-o', str(fixture)], check=True, timeout=30)
@@ -49,9 +49,12 @@ try:
     deadline = time.monotonic() + 30
     while True:
         stack = d.tool('get_stack', tid=target.pid)
+        jobs = d.tool('get_debug_metadata')['jobs']
         if not any(f.get('diagnostic') == 'DebugMetadataPending' for f in stack['frames']): break
-        assert time.monotonic() < deadline, stack
-        time.sleep(.005)
+        assert time.monotonic() < deadline, (stack, jobs)
+        # Leave the delayed agent transport a gap in which its background
+        # image worker can own the connection.
+        time.sleep(.5)
     deadline = time.monotonic() + 30
     while True:
         main = d.request('tools/call', {'name': 'find_symbol', 'arguments': {'name': 'main'}})
@@ -59,8 +62,8 @@ try:
         assert main['content'][0]['text'] == 'SymbolDiscoveryPending' and time.monotonic() < deadline, main
         time.sleep(.005)
     def request_image():
-        # Explicit source needs the complete file; the layout-only language
-        # request deliberately no longer transfers this unrelated payload.
+        # Explicit source needs standard DWARF sections; the large synthetic
+        # .debug_macro payload keeps that bounded projection cancellable.
         reply = d.request('tools/call', {'name': 'get_source_location',
                           'arguments': {'address': main['structuredContent']['address']}})
         assert reply.get('isError') and reply['content'][0]['text'] == 'DebugMetadataPending', reply

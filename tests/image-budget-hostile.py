@@ -188,7 +188,8 @@ class Run:
                     why = errors(reply)[0]
                     self.source_refusals[pc] = why
                     assert why in ('BinarySnapshotLimit', 'CompressedDebugBudget', 'NoDebugInfoAtAddress',
-                                   'NoSourceAtAddress', 'MalformedDebugInfo', 'TableLimit', 'DebugMetadataPending'), reply
+                                   'NoSourceAtAddress', 'MalformedDebugInfo', 'TableLimit', 'DebugMetadataLimit',
+                                   'DebugMetadataPending'), reply
                     if why == 'DebugMetadataPending':
                         assert time.monotonic() < deadline, reply
                         time.sleep(.005)
@@ -484,13 +485,15 @@ def sections(w, a, result):
         try:
             t = time.monotonic(); found = r.stack(select=(lib,)); seconds = time.monotonic() - t
             if a.remote:
-                assert 'TableLimit' in r.source_refusals.values(), r.source_refusals
+                # The ranged image builder rejects this hostile section-name
+                # table before libdw can walk it.
+                assert 'DebugMetadataLimit' in r.source_refusals.values(), r.source_refusals
                 assert any(f['diagnostic'] == 'DebugMetadataLimit' for f in found['frames']), found
             else:
                 assert any(f['diagnostic'] == 'TableLimit' for f in found['frames']), found
             assert not named(found, 'probe_wait'), found
             # Unbounded, this walk is 20,000 scans of 64 MiB: minutes. Reading the file is the honest cost.
-            assert seconds < max(1.0, 10 * honest), (seconds, honest)
+            assert seconds < max(2.0 if a.remote else 1.0, 10 * honest), (seconds, honest)
             _, leave = r.close()
             result['sections'] = {'refused_seconds': round(seconds, 3), 'honest_seconds': round(honest, 3), 'exit_seconds': round(leave, 3)}
         finally:

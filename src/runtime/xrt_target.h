@@ -211,6 +211,9 @@ enum xrt_status xrt_target_clear_stop(struct xrt_target *target, int32_t tid, ui
  * reject it, and closing it never signals or waits for a live PID. */
 enum xrt_status xrt_target_core(struct xrt_target *target, int32_t pid,
                                 const struct xrt_thread *threads, size_t count);
+/* Append stopped threads to a core target. The ids are assigned here. */
+enum xrt_status xrt_target_core_extend(struct xrt_target *target, const struct xrt_thread *threads,
+                                       size_t count);
 typedef void (*xrt_new_thread_observer)(void *context, const struct xrt_thread *thread,
                                         bool same_group);
 void xrt_target_observer(struct xrt_target *target, xrt_new_thread_observer observer,

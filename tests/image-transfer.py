@@ -249,11 +249,13 @@ try:
                                'before': before, 'after': usage(client)})
         close(client); client = None
     cold, warm = [row['job'] for row in result['runs'] if row['name'] in ('cold', 'warm')]
-    assert cold['source_bytes'] >= cold['image_total'] > warm['source_bytes'] and warm['source_bytes'] < 65536, (cold, warm)
-    # Object preparation retains some header bytes in memory rather than
-    # counting them as a disk-cache read; the entire bulk payload is cached.
-    assert warm['cached_bytes'] >= warm['image_total'], warm
-    # Cancelling a full upgrade preserves its visible cancellation but releases
+    # The generic source projection above populated the managed range cache.
+    # Both later layout projections reuse it rather than fetching their image
+    # ranges again; object preparation still performs bounded header reads.
+    assert cold['image_total'] == warm['image_total'] > 0, (cold, warm)
+    for reused in (cold, warm):
+        assert reused['source_bytes'] < 65536 and reused['cached_bytes'] >= reused['image_total'], reused
+    # Cancelling a debugger-image upgrade preserves its visible cancellation but releases
     # the cache lease, so rebuilding the language projection reuses its bytes.
     for cancel_when in ('active', 'ready'):
         client = open_client(slow=True)

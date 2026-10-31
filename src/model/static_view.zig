@@ -413,7 +413,9 @@ pub const Capture = struct {
         self.metadata = session.metadata.revision;
         self.refreshed_ns = @import("../target/linux.zig").now();
         const old = self.value;
-        const new_target = replaced or old == null or !std.meta.eql(old.?.request.origin, request.origin);
+        // A source line whose images were still preparing (Pending) has no
+        // target yet: its retry resolves the line again, never address 0.
+        const new_target = replaced or old == null or !std.meta.eql(old.?.request.origin, request.origin) or !self.state.open;
         const new_mode = old == null or old.?.request.mode != request.mode;
         _ = self.arena.reset(.retain_capacity);
         self.value = .{ .request = request };
@@ -614,6 +616,22 @@ pub const Capture = struct {
         }
     }
 };
+
+test "a source line retried after a failed preparation resolves the line again" {
+    var session = Session.init();
+    defer session.deinit();
+    var capture: Capture = .{};
+    defer capture.deinit();
+    const request = Request{ .origin = try Origin.source("/nonexistent/line-retry.c", 3) };
+    capture.refresh(&session, request);
+    const first = capture.value.?.title;
+    try std.testing.expect(!capture.state.open);
+    // As when the line's image was Pending: the timer retries the same request.
+    capture.value.?.status = .pending;
+    capture.refreshed_ns = 0;
+    capture.refresh(&session, request);
+    try std.testing.expectEqualStrings(first, capture.value.?.title);
+}
 
 test "metadata pending refresh ignores an unrelated finished analysis job" {
     var session = Session.init();

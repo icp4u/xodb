@@ -1,6 +1,7 @@
 /* Test-only deterministic early-start race window. No production delay hook.
  * On a private display, the first spawned worker is held at vkCreateInstance
- * until its owner calls pthread_join. pthread_create does not return until
+ * (or vkEnumeratePhysicalDevices with XODB_TEST_EARLY_PHASE=probe) until its
+ * owner calls pthread_join. pthread_create does not return until
  * the worker reached that call (or unexpectedly finished without reaching it).
  * Thus even an immediate argument error must dispose of the in-flight worker.
  * Other threads, including loader/driver threads, are untouched. */
@@ -19,6 +20,7 @@ static pthread_t worker;
 static void *(*entry)(void *);
 static void *argument;
 static _Thread_local int early_worker;
+static _Thread_local unsigned instance_depth;
 
 static int enabled(void) {
     const char *p = getenv("XODB_TEST_PRIVATE_DISPLAY");
@@ -79,17 +81,35 @@ int pthread_join(pthread_t thread, void **result) {
     return status;
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL vkCreateInstance(const VkInstanceCreateInfo *info,
-        const VkAllocationCallbacks *alloc, VkInstance *instance) {
-    PFN_vkCreateInstance real = dlsym(RTLD_NEXT, "vkCreateInstance");
-    if (early_worker) {
+static void barrier(const char *phase) {
+    const char *requested = getenv("XODB_TEST_EARLY_PHASE");
+    if (!requested) requested = "instance";
+    if (early_worker && !strcmp(phase, requested)) {
         pthread_mutex_lock(&lock);
         entered = 1;
         pthread_cond_broadcast(&changed);
         while (!released) pthread_cond_wait(&changed, &lock);
         pthread_mutex_unlock(&lock);
     }
-    return real(info, alloc, instance);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateInstance(const VkInstanceCreateInfo *info,
+        const VkAllocationCallbacks *alloc, VkInstance *instance) {
+    PFN_vkCreateInstance real = dlsym(RTLD_NEXT, "vkCreateInstance");
+    barrier("instance");
+    ++instance_depth;
+    VkResult result = real(info, alloc, instance);
+    --instance_depth;
+    return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL vkEnumeratePhysicalDevices(VkInstance instance,
+        uint32_t *count, VkPhysicalDevice *devices) {
+    PFN_vkEnumeratePhysicalDevices real = dlsym(RTLD_NEXT, "vkEnumeratePhysicalDevices");
+    // A loader/ICD's internal enumeration during instance creation is not
+    // the application's later probe; do not confuse the two checkpoints.
+    if (!instance_depth) barrier("probe");
+    return real(instance, count, devices);
 }
 
 __attribute__((destructor)) static void summary(void) {

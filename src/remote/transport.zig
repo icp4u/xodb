@@ -33,6 +33,7 @@ fn sshSpawn(pid: *i32, raw: ?*anyopaque) callconv(.c) c_int {
     if (macos) return 0;
     const ctx: *SshSpawn = @ptrCast(@alignCast(raw orelse return @intCast(c.EINVAL)));
     var child: c.pid_t = 0;
+    // spawn-allow: create callback of xrt_spawn_owned_helper
     const rc = c.posix_spawnp(&child, "ssh", ctx.actions, null, @ptrCast(ctx.argv), c.environ);
     if (rc != 0) return rc;
     pid.* = @intCast(child);

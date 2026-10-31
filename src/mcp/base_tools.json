@@ -21,7 +21,7 @@
   },
   {
     "name": "list_threads",
-    "description": "List threads and their stable session-local IDs.",
+    "description": "List threads and their stable session-local IDs. In kernel mode each thread is a CPU.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -41,7 +41,7 @@
   },
   {
     "name": "get_registers",
-    "description": "Read target general registers from a stopped thread; values are hexadecimal strings. On LoongArch64, r0 is the kernel restart slot, not architectural zero.",
+    "description": "Read target general registers from a stopped thread; values are hexadecimal strings. On LoongArch64, r0 is the kernel restart slot, not architectural zero. In kernel mode these are the stopped CPU's registers.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -72,7 +72,7 @@
   },
   {
     "name": "read_memory",
-    "description": "Read up to 4096 bytes from the stopped process, returning hex bytes and the actual count.",
+    "description": "Read up to 4096 bytes from the stopped process, returning hex bytes and the actual count. In kernel mode the address is a kernel virtual address.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -214,7 +214,7 @@
   },
   {
     "name": "set_breakpoint",
-    "description": "Set software breakpoints by address, ELF symbol, or source file and line. Returns all probe IDs for a source line. Symbol requests remain pending until resolved, including glibc shared library loads.",
+    "description": "Set software breakpoints by address, ELF symbol, or source file and line. Returns all probe IDs for a source line. Symbol requests remain pending until resolved, including glibc shared library loads. In kernel mode the symbol may be a kernel or module symbol.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -528,12 +528,18 @@
   },
   {
     "name": "find_symbol",
-    "description": "Resolve an ELF symbol to a live runtime address.",
+    "description": "Resolve an ELF symbol to a live runtime address. In kernel mode this includes vmlinux and loaded module text and data. A per-CPU symbol uses cpu when given, otherwise the stopped CPU.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "name": {
           "type": "string"
+        },
+        "cpu": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4095,
+          "description": "Per-CPU slot. Applies only to a per-CPU symbol; omitted uses the stopped CPU."
         },
         "process_id": {
           "type": "integer",
@@ -695,7 +701,7 @@
   },
   {
     "name": "get_stack",
-    "description": "Unwind up to 64 frames using CFI. Each frame carries availability diagnostics. symbol retains the exact linkage name; symbol_display is a compact C++ name when supported (parameter and template-argument types omitted), otherwise the original name.",
+    "description": "Unwind up to 64 frames using CFI. Each frame carries availability diagnostics. symbol retains the exact linkage name; symbol_display is a compact C++ name when supported (parameter and template-argument types omitted), otherwise the original name. In kernel mode the frames come from the kernel unwinder, including loaded modules.",
     "inputSchema": {
       "type": "object",
       "properties": {

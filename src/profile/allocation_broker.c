@@ -82,6 +82,7 @@ static int broker_spawn(int32_t *pid, void *context)
 {
     struct broker_spawn *spawn = context;
     pid_t child = -1;
+    /* spawn-allow: create callback of xrt_spawn_owned_helper */
     int error = posix_spawnp(&child, "sudo", spawn->actions, NULL, spawn->args, environ);
     if (error)
         return error;

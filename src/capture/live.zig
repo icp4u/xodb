@@ -29,6 +29,7 @@ const c = @cImport({
 });
 
 fn forkOwned(pid: *i32, _: ?*anyopaque) callconv(.c) c_int {
+    // spawn-allow: create callback of xrt_spawn_owned_helper
     const child = c.fork();
     if (child < 0) {
         const err = std.c._errno().*;
@@ -472,6 +473,7 @@ fn supervise(argv: anytype, data: [2]c_int, life: [2]c_int) noreturn {
     _ = c.setpgid(0, 0); // own group: no terminal signals; one group to kill
     const supervisor = c.getpid();
     // This tool is the supervisor's child. The debugger's reap does not see it.
+    // spawn-allow: capture tool is the supervisor grandchild, outside the debugger reap
     const tool = c.fork();
     if (tool < 0) c._exit(126);
     if (tool == 0) {

@@ -159,10 +159,18 @@ class Display:
         raise RuntimeError(f"no MCP response to {method}; log tail: {self.tail()}")
 
     def tool(self, name, **arguments):
-        result = self.request("tools/call", {"name": name, "arguments": arguments})
-        if not isinstance(result, dict) or "structuredContent" not in result:
-            raise AssertionError((name, arguments, result))
-        return result["structuredContent"]
+        """The settled reply, as tests/client.py inspect: remote and large
+        images prepare on workers and answer Pending meanwhile. request() is
+        the raw surface for asserting Pending itself."""
+        deadline = time.monotonic() + 30 * load_scale()
+        while True:
+            result = self.request("tools/call", {"name": name, "arguments": arguments})
+            if isinstance(result, dict) and "structuredContent" in result:
+                return result["structuredContent"]
+            preparing = isinstance(result, dict) and result.get("isError") and result["content"][0]["text"] in ("DebugMetadataPending", "SymbolDiscoveryPending")
+            if not preparing or time.monotonic() > deadline:
+                raise AssertionError((name, arguments, result))
+            time.sleep(0.02)
 
     def session(self):
         return self.tool("get_session")

@@ -169,7 +169,8 @@ static void apply_kernel_quirks(struct xrt_gdb *g)
     g->quirks.empty_list_end = true;
     g->quirks.nul_comm = true;
     g->quirks.break_interrupt = true;
-    g->quirks.lazy_inventory = true;
+    /* Not lazy_inventory: a stop on a known thread must still see tasks that
+     * started or exited (a module reload replaces its kthread). Names stay on demand. */
     g->quirks.names_on_demand = true;
     g->quirks.cap_inventory = true;
     g->quirks.detach_after_failure = true;

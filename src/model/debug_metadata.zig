@@ -45,6 +45,8 @@ const Entry = struct {
     verify_generation: u64 = 0,
     verify_pending: bool = false,
     verify_error: ?[]const u8 = null,
+    image_identity: ?runtime.c.struct_xrt_file_identity = null,
+    image_container: bool = false,
     fn deinit(self: *Entry) void {
         if (self.cfi) |*decoder| decoder.deinit();
         c.xmd_destroy(self.job);
@@ -163,6 +165,14 @@ pub const State = struct {
                 ((kind == .image and coverage == .full) or (old.start == region.start and old.end == region.end and old.offset == region.offset)) and
                 old.inode == region.inode and old.device_major == region.device_major and old.device_minor == region.device_minor)
             {
+                // A worker may have been started by a frame while a language
+                // tab polls the same file. Recheck this borrower's narrower
+                // allowance before lending the descriptor; a refusal must not
+                // consume and destroy another caller's ready image.
+                if (kind == .image and !entry.image_container) {
+                    const identity = entry.image_identity orelse return error.BinaryIdentityUnavailable;
+                    try modules.checkImageAllowance(region, @intCast(identity.size), why, modules.sharesRemoteImage(identity, coverage));
+                }
                 entry.touched_query = self.query;
                 return entry;
             }
@@ -213,18 +223,25 @@ pub const State = struct {
         errdefer _ = c.xrt_file_view_close(view);
         const local = c.xrt_file_view_remote(view) == 0;
         const identity = c.xrt_file_view_identity(view).*;
+        var image_container = false;
         if (kind == .image) {
             const image_budget = @import("../binary/snapshot.zig");
             const limit = runtime.c.xrt_target_remote_image_limit(modules.target);
-            if (identity.size <= 0) return error.BinaryIdentityUnavailable;
+            if (identity.size < 4) return error.NotElf;
             const size: u64 = @intCast(identity.size);
+            var magic: [4]u8 = undefined;
+            try runtime.check(@intCast(c.xrt_file_view_read(view, 0, &magic, magic.len)));
+            const elf = std.mem.eql(u8, &magic, "\x7fELF");
+            const container = std.mem.eql(u8, &magic, "PK\x03\x04");
+            image_container = container;
+            if (!elf and !container) return error.NotElf;
+            // Only a complete-file worker feeds the APK/container parser.
+            // Ordinary ELF images use the ranged debugger projection below.
+            if (container and !complete_file) return if (coverage == .sections) error.DebugMetadataContainer else error.NotElf;
             // Container budgets apply to one ELF entry, not to the ZIP. The
             // bounded worker preserves it for the existing entry parser.
-            var magic: [4]u8 = undefined;
-            if (complete_file and size >= magic.len) try runtime.check(@intCast(c.xrt_file_view_read(view, 0, &magic, magic.len)));
-            const container = complete_file and size >= magic.len and std.mem.eql(u8, &magic, "PK\x03\x04");
             const shared = modules.sharesRemoteImage(@bitCast(identity), coverage);
-            if (complete_file and !container) try modules.checkImageAllowance(region, size, why, shared);
+            if (!container) try modules.checkImageAllowance(region, size, why, shared);
             const refused: ?image_budget.Refusal = if (size > limit)
                 .{ .size = size, .limit = limit, .which = .remote, .older_agent = limit < image_budget.remote_image_limit }
             else if (!container and (size > image_budget.per_image_limit or (!shared and size > image_budget.remaining()))) image_budget.refusal(size) else null;
@@ -235,9 +252,12 @@ pub const State = struct {
                 if (complete_file) modules.refusal = reason else modules.refuseImage(region, reason);
                 return error.BinarySnapshotLimit;
             }
-            // Another owner holds this version in full. The synchronous open
-            // answers from those bytes after FILE_OPEN, so no worker copies it.
-            if (complete_file and !container and shared and size <= runtime.c.XRT_REMOTE_SYNC_IMAGE_LIMIT) return error.RemoteImageHeld;
+            // Another owner holds this exact projection. The synchronous open
+            // claims those bytes after FILE_OPEN, so no worker copies it.
+            if (!container and shared and size <= runtime.c.XRT_REMOTE_SYNC_IMAGE_LIMIT) {
+                if (coverage == .sections) return error.RemoteImageSectionsHeld;
+                if (complete_file) return error.RemoteImageHeld;
+            }
         }
         // The worker notices a change only while its view is open. A view
         // reopened over the agent must match the identity stored for this file.
@@ -256,23 +276,29 @@ pub const State = struct {
         else
             c.xmd_start_cfi(view, &job);
         try check(status, null);
-        slot.* = .{ .id = self.next_id, .session_id = self.session_id, .kind = kind, .coverage = coverage, .epoch = self.epoch, .region = region, .path = path, .job = job.?, .touched_query = self.query };
+        slot.* = .{ .id = self.next_id, .session_id = self.session_id, .kind = kind, .coverage = coverage, .epoch = self.epoch, .region = region, .path = path, .job = job.?, .touched_query = self.query, .image_identity = if (kind == .image) @bitCast(identity) else null, .image_container = image_container };
         slot.*.?.region.path = path;
         self.next_id +|= 1;
         self.revision +%= 1;
         return &slot.*.?;
+    }
+    fn fileEntry(self: *State, modules: *Modules, region: Region, why: Modules.Reason) !*Entry {
+        return self.getFor(modules, .image, region, .sections, why) catch |err| {
+            if (err != error.DebugMetadataContainer) return err;
+            return self.getFor(modules, .image, region, .full, why);
+        };
     }
     fn prepareFile(context: *anyopaque, modules: *Modules, region: Region, why: Modules.Reason) !c_int {
         const self: *State = @ptrCast(@alignCast(context));
         if (modules.cachedTypes(region) != null) {
             // A cancelled upgrade stays cancelled until retried; it does not
             // take the language view's projection with it.
-            for (self.entries) |slot| if (slot) |full| {
-                const old = full.region;
-                if (full.retired or full.epoch != self.epoch or full.kind != .image or full.coverage != .full or old.inode != region.inode or
+            for (self.entries) |slot| if (slot) |image| {
+                const old = image.region;
+                if (image.retired or image.epoch != self.epoch or image.kind != .image or image.coverage == .types or old.inode != region.inode or
                     old.device_major != region.device_major or old.device_minor != region.device_minor) continue;
                 var state: c.struct_xmd_snapshot = undefined;
-                c.xmd_poll(full.job, &state);
+                c.xmd_poll(image.job, &state);
                 if (state.state == c.XMD_CANCELLED) return error.DebugMetadataCancelled;
             };
         }
@@ -288,7 +314,7 @@ pub const State = struct {
                 self.revision +%= 1;
             };
         }
-        const entry = self.getFor(modules, .image, region, .full, why) catch |err| switch (err) {
+        const entry = self.fileEntry(modules, region, why) catch |err| switch (err) {
             error.SymbolDiscoveryPending, error.SymbolDiscoveryBudgetExceeded => return error.DebugMetadataPending,
             else => return err,
         };
@@ -303,7 +329,7 @@ pub const State = struct {
         const self: *State = @ptrCast(@alignCast(context));
         for (&self.entries) |*slot| if (slot.*) |*entry| {
             const old = entry.region;
-            if (entry.retired or entry.epoch != self.epoch or entry.kind != .image or entry.coverage != .full or old.inode != region.inode or
+            if (entry.retired or entry.epoch != self.epoch or entry.kind != .image or entry.coverage == .types or old.inode != region.inode or
                 old.device_major != region.device_major or old.device_minor != region.device_minor) continue;
             // The borrower has mapped the sealed descriptor or refused it.
             // Do not retain uncharged backing after the snapshot is released.
@@ -344,14 +370,14 @@ pub const State = struct {
                     // Cancellation is visible before the worker finishes its
                     // last RPC. Rebuild only after it releases the cache lease;
                     // try-join yields Pending, never blocks the owner.
-                    for (self.entries) |slot| if (slot) |full| {
-                        if (!full.retired and full.epoch == self.epoch and full.kind == .image and full.coverage == .full and full.region.inode == region.inode and
-                            full.region.device_major == region.device_major and full.region.device_minor == region.device_minor)
+                    for (self.entries) |slot| if (slot) |image| {
+                        if (!image.retired and image.epoch == self.epoch and image.kind == .image and image.coverage != .types and image.region.inode == region.inode and
+                            image.region.device_major == region.device_major and image.region.device_minor == region.device_minor)
                         {
-                            try check(c.xmd_join(full.job), null);
+                            try check(c.xmd_join(image.job), null);
                             // A ready result can be cancelled before adoption;
                             // validate retires its lease on that path too.
-                            check(c.xmd_validate(full.job), null) catch |cause| {
+                            check(c.xmd_validate(image.job), null) catch |cause| {
                                 if (cause != error.DebugMetadataCancelled) return cause;
                             };
                         }

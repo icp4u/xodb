@@ -352,6 +352,7 @@ test "ordinary-user owned setup leaves descriptor counts unchanged on the observ
     if (fd < 0) return error.TestElfUnavailable;
     defer _ = c.close(fd);
     const offset = try testMarkerOffset(fd);
+    // spawn-allow: test child stopped for the descriptor count and reaped before return
     const child = c.fork();
     if (child < 0) return error.TestForkFailed;
     if (child == 0) {

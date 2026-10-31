@@ -17,6 +17,7 @@ static int ssh_create(int32_t *pid, void *context)
 {
     struct ssh_spawn *spawn = context;
     pid_t child = 0;
+    /* spawn-allow: create callback of xrt_spawn_owned_helper */
     int status = posix_spawnp(&child, "ssh", spawn->actions, spawn->attr, (char *const *)spawn->argv, *_NSGetEnviron());
     if (status)
         return status;

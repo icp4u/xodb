@@ -313,7 +313,8 @@ pub const Target = struct {
         return self.handle.?;
     }
     pub fn arch(self: *const Target) @import("arch.zig").Arch {
-        return if (self.core != null) .x86_64 else @enumFromInt(rt.xrt_target_arch(self.handle).*.machine);
+        if (self.core) |core| return if (core.machine == 183) .aarch64 else .x86_64;
+        return @enumFromInt(rt.xrt_target_arch(self.handle).*.machine);
     }
     pub fn isRemote(self: *const Target) bool {
         return rt.xrt_target_is_remote(self.handle);
@@ -637,12 +638,13 @@ pub const Target = struct {
         return count;
     }
     pub fn writeMemory(self: *Target, address: u64, bytes: []const u8) !void {
+        if (self.core != null) return error.ReadOnlyCore;
         try runtime.check(rt.xrt_target_write(try self.get(), address, bytes.ptr, bytes.len));
     }
     pub fn registers(self: *const Target, tid: i32) !Registers {
         if (self.core) |*core| {
-            if (architecture != .x86_64) return error.UnsupportedCoreArchitecture;
-            return runtime.coreRegisters(&(try core.thread(tid)).regs);
+            const thread = try core.thread(tid);
+            return runtime.coreRegisters(core.machine, thread.regs[0..thread.reg_words]);
         }
         if (self.handle == null) return error.UnknownThread;
         var regs: rt.struct_xrt_registers = undefined;
@@ -657,7 +659,6 @@ pub const Target = struct {
         return null;
     }
     pub fn openCore(self: *Target, path: []const u8) !void {
-        if (architecture != .x86_64) return error.UnsupportedCoreArchitecture;
         if (self.snapshot().pid != 0 or self.core != null or self.snapshot().thread_count != 0) return error.InvalidState;
         var core = try @import("../binary/core.zig").Core.open(std.heap.page_allocator, path);
         errdefer core.deinit();
@@ -666,6 +667,19 @@ pub const Target = struct {
         for (core.threads.items, 0..) |thread, i| threads[i] = std.mem.zeroInit(rt.struct_xrt_thread, .{ .tid = thread.tid, .state = rt.XRT_STOPPED, .signal = thread.signal, .reason = rt.XRT_STOP_SIGNAL });
         try runtime.check(rt.xrt_target_core(try self.get(), core.pid, &threads, core.threads.items.len));
         self.core = core;
+    }
+    /// A core task with no crash-note registers. The file thread is recorded
+    /// first; a failed runtime append removes it, so the two lists stay paired.
+    pub fn addCoreTask(self: *Target, tid: i32) !void {
+        const core = if (self.core) |*found| found else return error.InvalidState;
+        if (tid <= 0) return error.InvalidState;
+        if (self.snapshot().thread_count >= 1024) return error.TooManyThreads;
+        for (self.threadSlice()) |thread| if (thread.tid == tid) return error.InvalidState;
+        const words: u8 = if (core.machine == 183) 34 else 27;
+        try core.threads.append(core.arena.allocator(), .{ .tid = tid, .signal = 0, .reg_words = words });
+        errdefer _ = core.threads.pop();
+        var one = std.mem.zeroInit(rt.struct_xrt_thread, .{ .tid = tid, .state = rt.XRT_STOPPED, .reason = rt.XRT_STOP_SIGNAL });
+        try runtime.check(rt.xrt_target_core_extend(try self.get(), &one, 1));
     }
     pub fn stopInfo(self: *const Target, tid: i32) !StopInfo {
         const index_ = self.index(tid) orelse return error.UnknownThread;
@@ -842,6 +856,7 @@ test "group stop after signal delivery is not a delayed peer interrupt" {
 
 test "attach, inspect every thread, detach and preserve externally owned process" {
     try @import("../test_support.zig").requireLive();
+    // spawn-allow: test child attached and reaped before the test returns
     const pid = c.fork();
     if (pid == 0) {
         _ = c.execl("./zig-out/bin/xodb-fixture", "xodb-fixture", @as(?[*:0]const u8, null));

@@ -704,6 +704,7 @@ static bool pac_suffix_ok(uint64_t insn, uint64_t va)
 }
 static int fork_owned(int32_t *pid, void *context)
 {
+    /* spawn-allow: create callback of xrt_spawn_owned_helper */
     pid_t child = fork();
     (void)context;
     if (child < 0)
@@ -1351,8 +1352,8 @@ enum xrt_status xrt_remote_file(const struct xrt_target *t, const struct xrt_fil
             }
         }
     }
-    /* The retained image is the file. A size-matched sealed descriptor stands
-     * in for it; its bytes are not transferred and are not charged. */
+    /* The retained image projection is the file view. A size-matched sealed
+     * descriptor stands in for it; bytes are not transferred or charged. */
     if (regular && held_image && held_image(&identity)) {
         fd = xrt_host_sealed_file("xodb-target-file");
         if (fd < 0) {

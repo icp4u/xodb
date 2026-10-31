@@ -186,6 +186,48 @@ static int type_section(struct xmd_job *job, uint32_t i) {
         !strcmp(name, "str") || !strcmp(name, "str_offsets") ||
         !strcmp(name, "line_str") || !strcmp(name, "addr") || !strcmp(name, "types");
 }
+/* A generic debugger image needs every mapped byte plus the standard
+ * non-allocated metadata which libdw and the symbol readers can ask for. It
+ * does not need arbitrary linker payloads: those can be very large and are
+ * neither mapped nor part of DWARF (for example a vendor's padding section).
+ * Keep the list explicit so a .debug-looking private blob cannot silently
+ * turn a stopped-frame query back into a whole-file transfer. */
+static int dwarf_section_name(const char *name) {
+    const char *stem;
+    if (!strncmp(name, ".debug_", 7)) stem = name + 7;
+    else if (!strncmp(name, ".zdebug_", 8)) stem = name + 8;
+    else return 0;
+    size_t length = strlen(stem);
+    if (length > 4 && !memcmp(stem + length - 4, ".dwo", 4)) length -= 4;
+    static const char *const known[] = {
+        "abbrev", "addr", "aranges", "cu_index", "frame", "info", "line",
+        "line_str", "loc", "loclists", "macro", "macinfo", "names",
+        "pubnames", "pubtypes", "ranges", "rnglists", "str", "str_offsets",
+        "sup", "tu_index", "types",
+    };
+    for (size_t i = 0; i < sizeof known / sizeof *known; ++i)
+        if (strlen(known[i]) == length && !memcmp(stem, known[i], length)) return 1;
+    return 0;
+}
+static int debugger_section(struct xmd_job *job, uint32_t i) {
+    const struct xbo_section *section = xbo_section(job->object, i);
+    if (!section) return 0;
+    /* SHF_ALLOC, plus the tables/notes on which symbols and build IDs depend.
+     * Relocatable images have no PT_LOAD covering their allocated sections. */
+    if ((section->flags & 2) || type_section(job, i) || section->type == 4 ||
+        section->type == 9 || section->type == 17) return 1;
+    const char *name = xbo_section_name(job->object, i);
+    if (!name) return 0;
+    if (dwarf_section_name(name)) return 1;
+    static const char *const known[] = {
+        ".gdb_index", ".gnu_debugaltlink", ".gnu_debugdata", ".gnu_debuglink",
+        ".stab", ".stabstr", ".ctf", ".BTF", ".BTF.ext",
+        ".orc_unwind", ".orc_unwind_ip",
+    };
+    for (size_t n = 0; n < sizeof known / sizeof *known; ++n)
+        if (!strcmp(name, known[n])) return 1;
+    return 0;
+}
 static enum xbo_status image_start(struct xmd_job *job) {
     uint64_t extent = xbo_identity(job->object)->size;
     if (!extent || extent > XRT_REMOTE_IMAGE_LIMIT) return XBO_LIMIT;
@@ -211,6 +253,7 @@ static enum xbo_status image_start(struct xmd_job *job) {
     for (uint32_t i = 0; status == XBO_OK && i < sections; ++i) {
         const struct xbo_section *section = xbo_section(job->object, i);
         if (job->kind == JOB_TYPES && !type_section(job, i)) continue;
+        if (job->kind == JOB_IMAGE && !debugger_section(job, i)) continue;
         if (section->type != 0 && section->type != 8) /* NULL/NOBITS have no payload. */
             status = image_range(job, section->offset, section->size);
     }

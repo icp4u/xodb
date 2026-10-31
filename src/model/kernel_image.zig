@@ -19,13 +19,19 @@ pub const Orc = struct {
 pub fn copyOrc(a: std.mem.Allocator, image: *const elf.Image, slide: u64) !?Orc {
     const ips_sec = image.sectionByName(".orc_unwind_ip") orelse return null;
     const ent_sec = image.sectionByName(".orc_unwind") orelse return null;
-    // A relocatable object has no load address for this table. Frame pointers cover it.
+    // A relocatable object has no load address for this table. The module
+    // loader applies its relocations separately.
     if ((image.header.type != .executable and image.header.type != .shared) or ips_sec.addr == 0) return null;
+    const width: usize = switch (image.header.machine) {
+        .x86_64 => 6,
+        .loongarch => 8,
+        else => return null,
+    };
     const ip_bytes = image.sectionData(ips_sec) catch return error.KernelOrcMalformed;
     const entries = image.sectionData(ent_sec) catch return error.KernelOrcMalformed;
-    if (ip_bytes.len == 0 or ip_bytes.len % 4 != 0 or entries.len % 6 != 0) return error.KernelOrcMalformed;
+    if (ip_bytes.len == 0 or ip_bytes.len % 4 != 0 or entries.len % width != 0) return error.KernelOrcMalformed;
     const count = ip_bytes.len / 4;
-    if (count != entries.len / 6) return error.KernelOrcMalformed;
+    if (count != entries.len / width) return error.KernelOrcMalformed;
     const ips = try a.alloc(i32, count);
     errdefer a.free(ips);
     for (ips, 0..) |*slot, index| slot.* = std.mem.readInt(i32, ip_bytes[index * 4 ..][0..4], .little);
@@ -152,13 +158,140 @@ pub fn factsFromDwarf(dwarf: *c.Dwarf, work: u64) !aware.Facts {
 }
 
 pub fn factsFromImage(image: *const elf.Image, dwarf: ?*c.Dwarf, work: u64) !aware.Facts {
-    if (dwarf) |handle| {
-        return factsFromDwarf(handle, work) catch |err| switch (err) {
-            error.DwarfTypesUnavailable => factsFromBtf(image),
-            else => err,
-        };
+    var facts = if (dwarf) |handle|
+        factsFromDwarf(handle, work) catch |err| switch (err) {
+            error.DwarfTypesUnavailable => try factsFromBtf(image),
+            else => return err,
+        }
+    else
+        try factsFromBtf(image);
+    fillLocks(&facts, image, dwarf, work);
+    return facts;
+}
+
+fn fillLocks(facts: *aware.Facts, image: *const elf.Image, dwarf: ?*c.Dwarf, work: u64) void {
+    if (dwarf) |handle| _ = fillLocksDwarf(facts, handle, work);
+    if (facts.stack_off != null and facts.mutex_owner != null and facts.rwsem_owner != null) return;
+    const section = image.sectionByName(".BTF") orelse return;
+    const bytes = image.sectionData(section) catch return;
+    fillLocksBtf(facts, bytes);
+}
+
+fn fillLocksDwarf(facts: *aware.Facts, dwarf: *c.Dwarf, work: u64) bool {
+    const names = [_][*:0]const u8{ "task_struct", "mutex", "mutex_waiter", "rw_semaphore", "rwsem_waiter" };
+    const wanted = [_]c.struct_xdt_field{
+        want(0, "stack", c.XDT_POINTER, true),
+        want(0, "blocked_on", c.XDT_POINTER, true),
+        want(1, "owner", c.XDT_ANY, true),
+        want(1, "wait_list", c.XDT_ANY, true),
+        want(1, "first_waiter", c.XDT_POINTER, true),
+        want(2, "list", c.XDT_ANY, true),
+        want(2, "task", c.XDT_POINTER, true),
+        want(3, "owner", c.XDT_ANY, true),
+        want(3, "wait_list", c.XDT_ANY, true),
+        want(3, "first_waiter", c.XDT_POINTER, true),
+        want(4, "list", c.XDT_ANY, true),
+        want(4, "task", c.XDT_POINTER, true),
+    };
+    const schema = c.struct_xdt_schema{
+        .types = @ptrCast(&names),
+        .fields = &wanted,
+        .type_count = names.len,
+        .field_count = wanted.len,
+        .optional_types = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4),
+    };
+    var slots: [wanted.len]c.struct_xdt_slot = undefined;
+    var sizes: [names.len]u32 = undefined;
+    var stats: c.struct_xdt_stats = undefined;
+    if (c.xdt_layout_build(dwarf, &schema, work, &slots, &sizes, &stats)) |_| return false;
+    if (present(slots[0])) |off| facts.stack_off = off;
+    if (present(slots[1])) |off| facts.task_blocked_on = off;
+    if (present(slots[2])) |owner| {
+        if (present(slots[3]) != null and present(slots[5]) != null and present(slots[6]) != null) {
+            facts.mutex_owner = owner;
+            facts.mutex_wait_list = slots[3].offset;
+            facts.mutex_waiter_list = slots[5].offset;
+            facts.mutex_waiter_task = slots[6].offset;
+        }
+        if (present(slots[4]) != null and present(slots[6]) != null) {
+            facts.mutex_owner = owner;
+            facts.mutex_first_waiter = slots[4].offset;
+            facts.mutex_waiter_task = slots[6].offset;
+        }
     }
-    return factsFromBtf(image);
+    if (present(slots[7])) |owner| {
+        if (present(slots[8]) != null and present(slots[10]) != null and present(slots[11]) != null) {
+            facts.rwsem_owner = owner;
+            facts.rwsem_wait_list = slots[8].offset;
+            facts.rwsem_waiter_list = slots[10].offset;
+            facts.rwsem_waiter_task = slots[11].offset;
+        }
+        if (present(slots[9]) != null and present(slots[11]) != null) {
+            facts.rwsem_owner = owner;
+            facts.rwsem_first_waiter = slots[9].offset;
+            facts.rwsem_waiter_task = slots[11].offset;
+        }
+    }
+    return facts.stack_off != null or facts.mutex_owner != null or facts.rwsem_owner != null;
+}
+
+fn fillLocksBtf(facts: *aware.Facts, bytes: []const u8) void {
+    if (facts.stack_off == null) {
+        if (aware.btfMember(bytes, "task_struct", "stack")) |slot| facts.stack_off = slot.offset else |_| {}
+    }
+    if (facts.task_blocked_on == null) {
+        if (aware.btfMember(bytes, "task_struct", "blocked_on")) |slot| facts.task_blocked_on = slot.offset else |_| {}
+    }
+    if (facts.mutex_owner == null) {
+        if (aware.btfMember(bytes, "mutex", "owner")) |owner| {
+            if (aware.btfMember(bytes, "mutex", "wait_list")) |list| {
+                if (aware.btfMember(bytes, "mutex_waiter", "list")) |waiter_list| {
+                    if (aware.btfMember(bytes, "mutex_waiter", "task")) |task| {
+                        facts.mutex_owner = owner.offset;
+                        facts.mutex_wait_list = list.offset;
+                        facts.mutex_waiter_list = waiter_list.offset;
+                        facts.mutex_waiter_task = task.offset;
+                    } else |_| {}
+                } else |_| {}
+            } else |_| {}
+        } else |_| {}
+    }
+    if (facts.mutex_first_waiter == null) {
+        if (aware.btfMember(bytes, "mutex", "owner")) |owner| {
+            if (aware.btfMember(bytes, "mutex", "first_waiter")) |first| {
+                if (aware.btfMember(bytes, "mutex_waiter", "task")) |task| {
+                    facts.mutex_owner = owner.offset;
+                    facts.mutex_first_waiter = first.offset;
+                    facts.mutex_waiter_task = task.offset;
+                } else |_| {}
+            } else |_| {}
+        } else |_| {}
+    }
+    if (facts.rwsem_owner == null) {
+        if (aware.btfMember(bytes, "rw_semaphore", "owner")) |owner| {
+            if (aware.btfMember(bytes, "rw_semaphore", "wait_list")) |list| {
+                if (aware.btfMember(bytes, "rwsem_waiter", "list")) |waiter_list| {
+                    if (aware.btfMember(bytes, "rwsem_waiter", "task")) |task| {
+                        facts.rwsem_owner = owner.offset;
+                        facts.rwsem_wait_list = list.offset;
+                        facts.rwsem_waiter_list = waiter_list.offset;
+                        facts.rwsem_waiter_task = task.offset;
+                    } else |_| {}
+                } else |_| {}
+            } else |_| {}
+        } else |_| {}
+    }
+    if (facts.rwsem_first_waiter == null) {
+        if (aware.btfMember(bytes, "rw_semaphore", "owner")) |owner| {
+            if (aware.btfMember(bytes, "rw_semaphore", "first_waiter")) |first| {
+                if (aware.btfMember(bytes, "rwsem_waiter", "task")) |task| {
+                    facts.rwsem_owner = owner.offset;
+                    facts.rwsem_first_waiter = first.offset;
+                    facts.rwsem_waiter_task = task.offset;
+                } else |_| {}
+            } else |_| {}
+        } else |_| {}
+    }
 }
 
 fn factsFromBtf(image: *const elf.Image) !aware.Facts {

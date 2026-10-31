@@ -67,10 +67,11 @@ enum xrt_status xrt_process_file(int32_t pid, const struct xrt_file_request *, i
  * sealed host copy. */
 enum xrt_status xrt_target_file_resolved(const struct xrt_target *, const struct xrt_file_request *,
         int *, struct xrt_file_identity *, enum xrt_file_source *);
-/* This thread only. While set, a regular file whose whole image is already
- * held skips the body read. The callback returns non-zero only after it has
- * retained that image for the thread. The descriptor is then a sealed file of
- * the opened size and must not be read. NULL keeps the ordinary copy. */
+/* This thread only. While set, a regular file whose prepared image projection
+ * is already held skips the body read. The callback returns non-zero only
+ * after retaining that same-size projection for the thread. The descriptor is
+ * then a sealed file of the opened size and must not be read. NULL keeps the
+ * ordinary copy. */
 void xrt_remote_set_held_image(int (*fn)(const struct xrt_file_identity *));
 enum xrt_status xrt_process_file_resolved(int32_t, const struct xrt_file_request *,
         int *, enum xrt_file_source *);

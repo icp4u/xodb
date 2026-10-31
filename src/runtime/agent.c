@@ -74,6 +74,7 @@ int xrt_spawn_owned_helper(int32_t *pid, int (*create)(int32_t *pid, void *conte
 void xrt_drop_owned_helper(int32_t pid);
 static int fork_owned(int32_t *pid, void *context)
 {
+    /* spawn-allow: create callback of xrt_spawn_owned_helper */
     pid_t child = fork();
     (void)context;
     if (child < 0)

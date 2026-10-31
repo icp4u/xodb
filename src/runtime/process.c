@@ -80,6 +80,7 @@ enum xrt_status xrt_process_launch(const char *const argv[], bool follow, int32_
     int gate[2];
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, gate) < 0)
         return XRT_PIPE_FAILED;
+    /* spawn-allow: debuggee launch is seized and is not an owned helper */
     const pid_t child = fork();
     if (child < 0) {
         close(gate[0]);

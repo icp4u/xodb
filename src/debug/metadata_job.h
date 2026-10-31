@@ -31,9 +31,10 @@ struct xmd_snapshot {
     const char *reason; /* static diagnostic, never borrowed parser storage */
 };
 struct xmd_job;
-/* Remote main-runtime image: merge file-backed ELF section/segment ranges,
- * retain a sealed derived ELF with zero-filled unreferenced gaps, and reuse
- * the bounded managed range cache. Not an exact original-file byte copy.
+/* Remote debugger image: merge load segments with standard DWARF, symbol and
+ * identity section ranges, retain a sealed derived ELF with zero-filled
+ * unreferenced gaps, and reuse the bounded managed range cache. Arbitrary
+ * non-allocated vendor sections are not copied. Not an exact original file.
  * Successful start owns the pinned view; result fd is borrowed until destroy. */
 enum xbo_status xmd_start_image(struct xrt_file_view *, struct xmd_job **);
 /* Types-only derived ELF: missing sections are unadvertised. Never use this

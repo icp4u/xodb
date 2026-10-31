@@ -85,10 +85,12 @@ pub const Module = struct {
     explicit_gdb: bool = false,
     /// vmlinux or a kernel object. User images stay false.
     kernel: bool = false,
-    /// ET_REL object. Only `.text` symbols are placed, at `kernel_text`.
+    /// ET_REL object. Allocated sections are placed from the kernel's layout.
     kernel_reloc: bool = false,
     text_section: u32 = 0,
     kernel_text: u64 = 0,
+    /// Runtime address of each ELF section. Zero means the section is not placed.
+    section_base: []u64 = &.{},
     orc_base: u64 = 0,
     orc_ips: []i32 = &.{},
     orc_entries: []u8 = &.{},
@@ -239,11 +241,15 @@ pub const Modules = struct {
     kernel_facts: ?kernel_aware.Facts = null,
     kernel_pac_mask: ?u64 = null,
     kernel_cpu: ?u32 = null,
+    /// One find_symbol call's per-CPU slot. Null keeps the stopped CPU.
+    lookup_cpu: ?u32 = null,
     kernel_stop_tid: i32 = 0,
     kernel_generation: ?u64 = null,
+    tasks_walked: bool = false,
     percpu_offsets: []u64 = &.{},
     kernel_tasks: []kernel_aware.TaskRow = &.{},
     kernel_current: []u64 = &.{},
+    kernel_waits: []kernel_aware.WaitEdge = &.{},
     kernel_sig: u64 = 0,
     kernel_lists: bool = false,
     kernel_note: [96]u8 = @splat(0),
@@ -371,10 +377,12 @@ pub const Modules = struct {
         if (self.percpu_offsets.len != 0) self.allocator.free(self.percpu_offsets);
         if (self.kernel_tasks.len != 0) self.allocator.free(self.kernel_tasks);
         if (self.kernel_current.len != 0) self.allocator.free(self.kernel_current);
+        if (self.kernel_waits.len != 0) self.allocator.free(self.kernel_waits);
     }
     fn releaseModule(self: *Modules, m: *Module) void {
         if (m.orc_ips.len != 0) self.allocator.free(m.orc_ips);
         if (m.orc_entries.len != 0) self.allocator.free(m.orc_entries);
+        if (m.section_base.len != 0) self.allocator.free(m.section_base);
         if (m.layouts.go_value) |layout| m.debug_allocator.destroy(layout);
         if (m.layouts.go_map) |layout| m.debug_allocator.destroy(layout);
         if (m.debug) |*info| info.deinit();
@@ -387,12 +395,13 @@ pub const Modules = struct {
         self.core_source = core;
         self.immutable = true;
         const name = self.gdb_executable orelse return error.GdbExecutableUnavailable;
-        try self.fromGdbExecutable(name, @intFromEnum(elf.Machine.x86_64), target);
+        try self.fromGdbExecutable(name, core.machine, target);
         self.owner_target = target.handle;
         if (core.vmcore.len != 0) if (kernel_aware.vmcoreInfo(core.vmcore)) |parsed| {
             if (parsed.kernel_pac_mask) |mask| self.kernel_pac_mask = mask;
         } else |_| {};
         self.refreshKernel(target);
+        self.readCoreTasks(target);
     }
     pub fn fromCore(self: *Modules, core: *const @import("../binary/core.zig").Core, executable: ?[]const u8) !void {
         self.core_source = core;
@@ -719,6 +728,11 @@ pub const Modules = struct {
         const generation = target.snapshot().generation;
         if (self.kernel_generation == generation) return;
         self.kernel_generation = generation;
+        self.tasks_walked = false;
+        if (self.kernel_tasks.len != 0) {
+            self.allocator.free(self.kernel_tasks);
+            self.kernel_tasks = &.{};
+        }
         self.noteStoppedCpu();
         if (self.kernel_cpu == null) for (target.threadSlice()) |thread| {
             if (kernel_aware.shadowCpuLocal(thread.tid)) |cpu| {
@@ -737,10 +751,6 @@ pub const Modules = struct {
         self.readPac(vmlinux, reader);
         self.readPercpu(vmlinux, reader);
         self.rememberFork(vmlinux);
-        self.readTasks(vmlinux, reader);
-        if (self.kernel_cpu == null) if (self.taskByTid(self.kernel_stop_tid)) |task| {
-            self.kernel_cpu = task.cpu;
-        };
         self.readObjects(vmlinux, reader);
     }
     fn noteStoppedCpu(self: *Modules) void {
@@ -807,6 +817,87 @@ pub const Modules = struct {
         if (!symbol.hasAddress()) return;
         self.ret_from_fork = module.runtimeAddress(symbol.value) catch null;
     }
+    fn ensureTasks(self: *Modules) void {
+        if (self.tasks_walked) return;
+        const handle = self.owner_target orelse return;
+        if (self.loaded.items.len == 0) return;
+        const vmlinux = self.loaded.items[0];
+        if (!vmlinux.kernel) return;
+        self.tasks_walked = true;
+        const Reader = struct {
+            handle: *rt.struct_xrt_target,
+            pub fn read(reader: @This(), address: u64, dest: []u8) !usize {
+                var count: usize = 0;
+                try runtime_api.check(rt.xrt_target_read(reader.handle, address, dest.ptr, dest.len, &count));
+                return count;
+            }
+        };
+        self.ensureFacts(vmlinux);
+        self.readTasks(vmlinux, Reader{ .handle = handle });
+        if (self.kernel_cpu == null) if (self.taskByTid(self.kernel_stop_tid)) |task| {
+            self.kernel_cpu = task.cpu;
+        };
+    }
+    /// One task walk for a core. The live reader is the wrong path: a core
+    /// read goes through the file, and a second walk would replace this list.
+    fn readCoreTasks(self: *Modules, target: anytype) void {
+        if (self.tasks_walked or self.loaded.items.len == 0) return;
+        const vmlinux = self.loaded.items[0];
+        if (!vmlinux.kernel) return;
+        self.tasks_walked = true;
+        const Reader = struct {
+            target: @TypeOf(target),
+            pub fn read(reader: @This(), address: u64, dest: []u8) !usize {
+                return reader.target.readMemory(address, dest);
+            }
+        };
+        self.ensureFacts(vmlinux);
+        self.readTasks(vmlinux, Reader{ .target = target });
+        self.publishCoreTasks(target);
+    }
+    fn publishCoreTasks(self: *Modules, target: anytype) void {
+        var synthetic: i32 = 0;
+        for (self.kernel_tasks) |*task| {
+            if (self.taskIsCurrent(task.address)) continue;
+            if (target.snapshot().thread_count >= 1024) {
+                self.noteKernel("core task list is capped");
+                return;
+            }
+            const tid = self.coreTaskTid(target, task.pid, &synthetic) orelse continue;
+            task.pub_tid = tid;
+            target.addCoreTask(tid) catch |err| {
+                self.noteKernel(@errorName(err));
+                return;
+            };
+        }
+    }
+    fn taskIsCurrent(self: *const Modules, address: u64) bool {
+        if (address == 0) return false;
+        for (self.kernel_current) |current| if (current == address) return true;
+        // No current_task (arm64): the sole running task on a CPU is that CPU's.
+        if (self.kernel_current.len == 0) for (self.kernel_tasks) |task| if (task.address == address) {
+            const cpu = task.cpu orelse return false;
+            const owner = self.cpuTask(cpu) orelse return false;
+            return owner.address == address;
+        };
+        return false;
+    }
+    fn coreTaskTid(self: *const Modules, target: anytype, pid: i32, synthetic: *i32) ?i32 {
+        if (pid > 0 and !self.tidTaken(target, pid)) return pid;
+        if (synthetic.* > 1024) return null;
+        const id: i32 = 0x61000000 + synthetic.*;
+        synthetic.* += 1;
+        if (self.tidTaken(target, id)) return null;
+        return id;
+    }
+    fn tidTaken(self: *const Modules, target: anytype, tid: i32) bool {
+        _ = self;
+        for (target.threadSlice()) |thread| if (thread.tid == tid) return true;
+        if (target.core) |*core| {
+            for (core.threads.items) |thread| if (thread.tid == tid) return true;
+        }
+        return false;
+    }
     fn readTasks(self: *Modules, module: *Module, memory: anytype) void {
         const facts = self.kernel_facts orelse return;
         const symbol = module.symbols().findSymbol("init_task") orelse return;
@@ -825,15 +916,55 @@ pub const Modules = struct {
         if (n != rows.len) self.allocator.free(rows);
         self.replaceSlice(kernel_aware.TaskRow, &self.kernel_tasks, kept);
         self.readCurrent(module, memory);
+        self.readWaits(memory);
+    }
+    fn readWaits(self: *Modules, memory: anytype) void {
+        const facts = self.kernel_facts orelse return;
+        const rows = self.allocator.alloc(kernel_aware.WaitEdge, 256) catch return;
+        const n = kernel_aware.walkWaits(memory, self.kernel_tasks, facts, self.kernel_current, rows) catch {
+            self.allocator.free(rows);
+            self.replaceSlice(kernel_aware.WaitEdge, &self.kernel_waits, &.{});
+            return;
+        };
+        if (n == 0) {
+            self.allocator.free(rows);
+            self.replaceSlice(kernel_aware.WaitEdge, &self.kernel_waits, &.{});
+            return;
+        }
+        const kept = if (n == rows.len) rows else self.allocator.dupe(kernel_aware.WaitEdge, rows[0..n]) catch {
+            self.allocator.free(rows);
+            self.replaceSlice(kernel_aware.WaitEdge, &self.kernel_waits, &.{});
+            return;
+        };
+        if (n != rows.len) self.allocator.free(rows);
+        self.replaceSlice(kernel_aware.WaitEdge, &self.kernel_waits, kept);
+    }
+    fn appendWaits(self: *const Modules, address: u64, buf: []u8) usize {
+        var used: usize = 0;
+        for (self.kernel_waits) |edge| {
+            if (edge.owner != address and edge.waiter != address) continue;
+            const lead: usize = if (used == 0) 1 else 2;
+            if (used + lead >= buf.len) break;
+            const wrote = kernel_aware.formatWait(edge, self.kernel_tasks, buf[used + lead ..]);
+            if (wrote.len == 0) break;
+            if (lead == 1) buf[used] = ' ' else {
+                buf[used] = ';';
+                buf[used + 1] = ' ';
+            }
+            used += lead + wrote.len;
+        }
+        return used;
     }
     fn readCurrent(self: *Modules, module: *Module, memory: anytype) void {
         const symbol = module.symbols().findSymbol("current_task") orelse return;
+        // Slid like find_symbol: x86-64 per-CPU data is no longer linked at zero here.
+        const value = percpuValue(module, symbol) orelse return;
         const cpus: u32 = if (self.percpu_offsets.len != 0) @intCast(@min(self.percpu_offsets.len, 256)) else 1;
         const slots = self.allocator.alloc(u64, cpus) catch return;
         @memset(slots, 0);
         var cpu: u32 = 0;
         while (cpu < cpus) : (cpu += 1) {
-            const slot = self.percpuRuntime(module, symbol.value, cpu) catch continue;
+            const slot = self.percpuRuntime(module, value, cpu) catch continue;
             slots[cpu] = readWord(memory, slot) catch 0;
         }
         self.replaceSlice(u64, &self.kernel_current, slots);
@@ -946,6 +1077,7 @@ pub const Modules = struct {
         try self.loaded.append(self.allocator, module);
         self.next_id += 1;
         self.snapshot_bytes += mapped.len;
+        self.placeSections(module, row);
     }
     fn findObject(self: *Modules, root: [:0]const u8, file: []const u8) ?[:0]u8 {
         var budget: u32 = 4096;
@@ -970,18 +1102,177 @@ pub const Modules = struct {
         }
         return null;
     }
-    fn taskByTid(self: *const Modules, tid: i32) ?kernel_aware.TaskRow {
-        if (kernel_aware.shadowCpuLocal(tid)) |cpu| {
-            if (cpu < self.kernel_current.len and self.kernel_current[cpu] != 0) {
-                const address = self.kernel_current[cpu];
-                for (self.kernel_tasks) |task| if (task.address == address) return task;
-            }
-            for (self.kernel_tasks) |task| if (task.cpu == cpu) return task;
+    fn placeSections(self: *Modules, module: *Module, row: kernel_aware.ModuleRow) void {
+        const count = module.image.header.section_count;
+        if (count == 0 or count > 1024) return;
+        const bases = self.allocator.alloc(u64, count) catch return;
+        @memset(bases, 0);
+        module.section_base = bases;
+        var indexes: [128]u32 = undefined;
+        var info: [128]kernel_aware.AllocSec = undefined;
+        var n: usize = 0;
+        var index: u32 = 0;
+        while (index < count) : (index += 1) {
+            const sec = module.image.section(index) catch continue;
+            if (sec.flags & 2 == 0) continue;
+            if (n == indexes.len) break;
+            indexes[n] = index;
+            info[n] = .{
+                .init = kernel_aware.moduleInitSection(sec.name),
+                .flags = sec.flags,
+                .size = sec.size,
+                .alignment = sec.alignment,
+            };
+            n += 1;
         }
+        var places: [128]kernel_aware.Place = undefined;
+        kernel_aware.layoutAlloc(info[0..n], places[0..n]);
+        const mem = [_]u64{ row.text, row.data, row.rodata, row.ro_after };
+        for (places[0..n], 0..) |place, slot| {
+            if (place.kind > 3) continue;
+            const base = mem[place.kind];
+            if (base == 0) continue;
+            bases[indexes[slot]] = std.math.add(u64, base, place.offset) catch continue;
+        }
+        self.attachModuleOrc(module);
+    }
+    fn relaTarget(module: *const Module, sym_index: u64, addend: i64) ?u64 {
+        if (sym_index > std.math.maxInt(u32) or addend < 0) return null;
+        const table = (module.image.symbols(.symtab) catch return null) orelse return null;
+        const sym = table.get(@intCast(sym_index)) catch return null;
+        const section = switch (sym.placement) {
+            .section => |index| index,
+            else => return null,
+        };
+        if (section >= module.section_base.len or module.section_base[section] == 0) return null;
+        const extra: u64 = @intCast(addend);
+        const within = std.math.add(u64, sym.value, extra) catch return null;
+        return std.math.add(u64, module.section_base[section], within) catch null;
+    }
+    fn attachModuleOrc(self: *Modules, module: *Module) void {
+        const width: usize = switch (module.image.header.machine) {
+            .x86_64 => 6,
+            .loongarch => 8,
+            else => return,
+        };
+        const ips_sec = module.image.sectionByName(".orc_unwind_ip") orelse return;
+        const ent_sec = module.image.sectionByName(".orc_unwind") orelse return;
+        const rela = module.image.sectionByName(".rela.orc_unwind_ip") orelse return;
+        const ip_bytes = module.image.sectionData(ips_sec) catch return;
+        const entries = module.image.sectionData(ent_sec) catch return;
+        const rels = module.image.sectionData(rela) catch return;
+        if (ip_bytes.len == 0 or ip_bytes.len % 4 != 0 or entries.len % width != 0) return;
+        const count = ip_bytes.len / 4;
+        if (count != entries.len / width or count > 65536 or rels.len % 24 != 0) return;
+        const got = self.allocator.alloc(u64, count) catch return;
+        defer self.allocator.free(got);
+        @memset(got, 0);
+        var cursor: usize = 0;
+        while (cursor + 24 <= rels.len) : (cursor += 24) {
+            const off = std.mem.readInt(u64, rels[cursor..][0..8], .little);
+            const info = std.mem.readInt(u64, rels[cursor + 8 ..][0..8], .little);
+            const addend = std.mem.readInt(i64, rels[cursor + 16 ..][0..8], .little);
+            const typ: u32 = @truncate(info);
+            const sym: u64 = info >> 32;
+            const pc_relative = switch (module.image.header.machine) {
+                .x86_64 => typ == 2 or typ == 4,
+                .loongarch => typ == 0x63,
+                else => false,
+            };
+            if (!pc_relative or off % 4 != 0) continue;
+            const slot = off / 4;
+            if (slot >= count) continue;
+            got[slot] = relaTarget(module, sym, addend) orelse 0;
+        }
+        var keep: usize = 0;
+        for (got) |ip| if (ip != 0) {
+            keep += 1;
+        };
+        if (keep == 0) return;
+        const runtime = self.allocator.alloc(u64, keep) catch return;
+        defer self.allocator.free(runtime);
+        const packed_entries = self.allocator.alloc(u8, keep * width) catch return;
+        var n: usize = 0;
+        for (got, 0..) |ip, slot| {
+            if (ip == 0) continue;
+            runtime[n] = ip;
+            @memcpy(packed_entries[n * width ..][0..width], entries[slot * width ..][0..width]);
+            n += 1;
+        }
+        var index: usize = 1;
+        while (index < n) : (index += 1) {
+            var cursor_i = index;
+            while (cursor_i > 0 and runtime[cursor_i] < runtime[cursor_i - 1]) : (cursor_i -= 1) {
+                std.mem.swap(u64, &runtime[cursor_i], &runtime[cursor_i - 1]);
+                var tmp: [8]u8 = undefined;
+                @memcpy(tmp[0..width], packed_entries[cursor_i * width ..][0..width]);
+                @memcpy(packed_entries[cursor_i * width ..][0..width], packed_entries[(cursor_i - 1) * width ..][0..width]);
+                @memcpy(packed_entries[(cursor_i - 1) * width ..][0..width], tmp[0..width]);
+            }
+        }
+        const ips = self.allocator.alloc(i32, n) catch {
+            self.allocator.free(packed_entries);
+            return;
+        };
+        // Module text on LoongArch sits outside the signed 32-bit window, so
+        // the table is relative to its first address rather than to zero.
+        const base = runtime[0];
+        var used: usize = 0;
+        for (runtime[0..n], 0..) |ip, slot| {
+            const encoded = kernel_orc.encodeIp(base, used, ip) orelse continue;
+            if (used != slot) @memcpy(packed_entries[used * width ..][0..width], packed_entries[slot * width ..][0..width]);
+            ips[used] = encoded;
+            used += 1;
+        }
+        if (used == 0) {
+            self.allocator.free(ips);
+            self.allocator.free(packed_entries);
+            return;
+        }
+        const trimmed_ips = if (used == n) ips else self.allocator.dupe(i32, ips[0..used]) catch {
+            self.allocator.free(ips);
+            self.allocator.free(packed_entries);
+            return;
+        };
+        if (used != n) self.allocator.free(ips);
+        const trimmed_entries = if (used == n) packed_entries else self.allocator.dupe(u8, packed_entries[0 .. used * width]) catch {
+            self.allocator.free(trimmed_ips);
+            self.allocator.free(packed_entries);
+            return;
+        };
+        if (used != n) self.allocator.free(packed_entries);
+        if (module.orc_ips.len != 0) self.allocator.free(module.orc_ips);
+        if (module.orc_entries.len != 0) self.allocator.free(module.orc_entries);
+        module.orc_base = base;
+        module.orc_ips = trimmed_ips;
+        module.orc_entries = trimmed_entries;
+    }
+    fn cpuTask(self: *const Modules, cpu: u32) ?kernel_aware.TaskRow {
+        if (cpu < self.kernel_current.len and self.kernel_current[cpu] != 0) {
+            const address = self.kernel_current[cpu];
+            for (self.kernel_tasks) |task| if (task.address == address) return task;
+        }
+        // Without current_task, only a sole running task on that CPU names it.
+        var found: ?kernel_aware.TaskRow = null;
+        for (self.kernel_tasks) |task| if (task.cpu == cpu and task.state != null and task.state.? == 0) {
+            if (found != null) return null;
+            found = task;
+        };
+        return found;
+    }
+    fn taskByTid(self: *const Modules, tid: i32) ?kernel_aware.TaskRow {
+        if (kernel_aware.shadowCpuLocal(tid)) |cpu| return self.cpuTask(cpu);
+        // A guest dump without VMCOREINFO keeps its note ids, which count CPUs,
+        // not pids: the note's position is its CPU.
+        if (self.core_source) |core| if (!core.kernel) for (core.threads.items, 0..) |thread, index| {
+            if (thread.tid == tid) return self.cpuTask(@intCast(index));
+        };
+        for (self.kernel_tasks) |task| if (task.pub_tid != 0 and task.pub_tid == tid) return task;
         for (self.kernel_tasks) |task| if (task.pid == tid) return task;
         return null;
     }
-    pub fn kernelThreadName(self: *const Modules, tid: i32, buf: *[128]u8) bool {
+    pub fn kernelThreadName(self: *Modules, tid: i32, buf: *[128]u8) bool {
+        self.ensureTasks();
         const task = self.taskByTid(tid) orelse return false;
         const comm = task.comm[0..task.comm_len];
         const head = std.fmt.bufPrint(buf, "{s} pid={d}", .{ comm, task.pid }) catch return false;
@@ -994,6 +1285,7 @@ pub const Modules = struct {
             const more = std.fmt.bufPrint(buf[used..], " cpu={d}", .{cpu}) catch return false;
             used += more.len;
         }
+        if (used + 1 < buf.len) used += self.appendWaits(task.address, buf[used .. buf.len - 1]);
         if (used >= buf.len) return false;
         buf[used] = 0;
         return true;
@@ -1015,15 +1307,15 @@ pub const Modules = struct {
             if (!module.kernel) continue;
             const symbol = module.symbols().findSymbol(name) orelse continue;
             if (module.kernel_reloc) {
-                const section = switch (symbol.placement) {
-                    .section => |index| index,
-                    else => continue,
-                };
-                const address = kernel_aware.textSymbol(section, module.text_section, module.kernel_text, symbol.value) orelse continue;
+                const address = relocAddress(module, symbol) orelse continue;
                 return publishedSymbol(module.image.header.machine, module.id, symbol, address);
             }
             if (percpuValue(module, symbol)) |value| {
-                const cpu = self.kernel_cpu orelse return error.PerCpuNeedsCpu;
+                const cpu = if (self.lookup_cpu) |chosen| chosen else blk: {
+                    if (self.kernel_cpu == null) self.ensureTasks();
+                    break :blk self.kernel_cpu orelse return error.PerCpuNeedsCpu;
+                };
+                if (cpu > 4095) return error.InvalidArguments;
                 const address = try self.percpuRuntime(module, value, cpu);
                 return publishedSymbol(module.image.header.machine, module.id, symbol, address);
             }
@@ -1031,20 +1323,65 @@ pub const Modules = struct {
         }
         return null;
     }
-    fn relocSymbolAt(module: *Module, address: u64) !Symbol {
-        if (address < module.kernel_text) return error.SymbolNotFound;
-        const located = module.symbols().symbolAt(address - module.kernel_text) orelse return error.SymbolNotFound;
-        const section = switch (located.symbol.placement) {
+    fn relocAddress(module: *const Module, symbol: elf.Symbol) ?u64 {
+        const section = switch (symbol.placement) {
             .section => |index| index,
-            else => return error.SymbolNotFound,
+            else => return null,
         };
-        const placed = kernel_aware.textSymbol(section, module.text_section, module.kernel_text, located.symbol.value) orelse return error.SymbolNotFound;
-        var found = publishedSymbol(module.image.header.machine, module.id, located.symbol, placed);
+        if (section < module.section_base.len and module.section_base[section] != 0) {
+            return std.math.add(u64, module.section_base[section], symbol.value) catch null;
+        }
+        return kernel_aware.textSymbol(section, module.text_section, module.kernel_text, symbol.value);
+    }
+    fn relocSymbolAt(module: *Module, address: u64) !Symbol {
+        const table = (module.symbols().symbols(.symtab) catch return error.SymbolNotFound) orelse return error.SymbolNotFound;
+        var sized: ?elf.Symbol = null;
+        var sized_at: u64 = 0;
+        var label: ?elf.Symbol = null;
+        var label_at: u64 = 0;
+        var barrier: ?u64 = null;
+        var index: u32 = 1;
+        while (index < table.count()) : (index += 1) {
+            const sym = table.get(index) catch continue;
+            if (!sym.hasAddress()) continue;
+            const placed_at = relocAddress(module, sym) orelse continue;
+            if (placed_at > address) continue;
+            if (sym.size != 0 and address - placed_at >= sym.size) {
+                if (barrier == null or placed_at > barrier.?) barrier = placed_at;
+                continue;
+            }
+            if (sym.size != 0) {
+                if (sized == null or placed_at > sized_at) {
+                    sized = sym;
+                    sized_at = placed_at;
+                }
+            } else if (label == null or placed_at > label_at) {
+                label = sym;
+                label_at = placed_at;
+            }
+        }
+        const chosen: elf.Symbol = if (sized) |sym| sym else blk: {
+            const sym = label orelse return error.SymbolNotFound;
+            if (address != label_at) {
+                if (barrier) |mark| if (mark >= label_at) return error.SymbolNotFound;
+                const section = switch (sym.placement) {
+                    .section => |sec| sec,
+                    else => return error.SymbolNotFound,
+                };
+                const base = if (section < module.section_base.len) module.section_base[section] else 0;
+                const span = (module.image.section(section) catch return error.SymbolNotFound).size;
+                if (base == 0 or address < base or address - base >= span) return error.SymbolNotFound;
+            }
+            break :blk sym;
+        };
+        const placed = if (sized) |_| sized_at else label_at;
+        var found = publishedSymbol(module.image.header.machine, module.id, chosen, placed);
         found.offset = address - placed;
         return found;
     }
     pub const Recovered = enum { instruction, return_address };
     pub fn recoverKernel(self: *Modules, tid: i32, registers: *loc.RegisterSet, arch_: arch_mod.Arch, memory: anytype) !Recovered {
+        self.ensureTasks();
         const facts = self.kernel_facts orelse return error.KernelTypeInfoUnavailable;
         const task = self.taskByTid(tid) orelse return error.KernelTaskLayoutUnavailable;
         if (arch_ == .x86_64) {
@@ -1078,20 +1415,34 @@ pub const Modules = struct {
         }
         return error.KernelTaskLayoutUnavailable;
     }
-    pub fn kernelUnwind(self: *Modules, arch_: arch_mod.Arch, lookup_pc: u64, registers: loc.RegisterSet, memory: anytype) !@import("../debug/info.zig").Unwind {
+    pub fn kernelUnwind(self: *Modules, arch_: arch_mod.Arch, lookup_pc: u64, registers: loc.RegisterSet, memory: anytype, at_entry: bool) !@import("../debug/info.zig").Unwind {
         const module = self.kernelModuleAt(lookup_pc) orelse return error.UnmappedAddress;
-        if (arch_ == .x86_64 and module.orc_ips.len != 0) {
-            if (kernel_orc.entryAt(module.orc_base, module.orc_ips, module.orc_entries, lookup_pc)) |entry| {
-                if (entry.type != .undefined and entry.type != .end_of_stack) {
+        const width = orcWidth(module);
+        if (width == 6 and arch_ == .x86_64) {
+            if (orcCovering(module, lookup_pc)) |index| {
+                const entry = kernel_orc.decode(module.orc_entries[index * 6 ..][0..6]) orelse return error.KernelFrame;
+                if (entry.type == .undefined or entry.type == .end_of_stack) {
+                    if (module.kernel_reloc) return error.KernelFrame;
+                } else {
                     const next = try kernel_orc.step(entry, orcRegs(arch_, registers), self.kernelPt(), memory);
-                    var caller = registers;
-                    putReg(&caller, arch_.pc(), next.ip);
-                    putReg(&caller, arch_.sp(), next.sp);
-                    putReg(&caller, arch_.ra(), next.ip);
-                    putReg(&caller, frameSlot(arch_), next.bp);
-                    return .{ .cfa = next.sp, .caller = caller, .method = .orc };
+                    return finishUnwind(arch_, registers, next.ip, next.sp, next.bp, next.ip, true);
                 }
-            }
+            } else if (module.kernel_reloc) return error.KernelFrame;
+        } else if (width == 8 and arch_ == .loongarch64) {
+            const index = orcCovering(module, lookup_pc) orelse return error.KernelFrame;
+            const entry = kernel_orc.decodeLoong(module.orc_entries[index * 8 ..][0..8]) orelse return error.KernelFrame;
+            if (entry.type == 0 or entry.type == 1) return error.KernelFrame;
+            var regs = orcRegs(arch_, registers);
+            // csr_era is not a DWARF register, so the PC role is absent here.
+            if (arch_.pc() >= registers.len) regs.ip = lookup_pc;
+            const next = try kernel_orc.stepLoong(entry, regs, memory);
+            // csr_era has no DWARF number, so the caller PC has to occupy the
+            // return-address column. The walk then subtracts one instruction.
+            return finishUnwind(arch_, registers, next.ip, next.sp, next.bp, next.ip, true);
+        }
+        if (arch_ == .loongarch64) return error.KernelFrame;
+        if (at_entry and width == 0) {
+            if (self.entryUnwind(arch_, registers, memory)) |unwound| return unwound else |_| {}
         }
         // An ORC kernel keeps no frame pointer: a module frame there must stop,
         // not follow whatever rbp holds into another stack.
@@ -1101,12 +1452,48 @@ pub const Modules = struct {
         const bp = if (bp_index < registers.len) registers[bp_index] orelse return error.KernelFrame else return error.KernelFrame;
         var frame = try kernel_aware.framePointer(memory, bp);
         if (arch_ == .aarch64) frame.ip = try kernel_aware.stripKernelPac(frame.ip, self.kernel_pac_mask);
+        return finishUnwind(arch_, registers, frame.ip, frame.sp, frame.bp, frame.ip, false);
+    }
+    fn finishUnwind(arch_: arch_mod.Arch, registers: loc.RegisterSet, ip: u64, sp: u64, bp: u64, ra: u64, orc: bool) @import("../debug/info.zig").Unwind {
         var caller = registers;
-        putReg(&caller, arch_.pc(), frame.ip);
-        putReg(&caller, arch_.sp(), frame.sp);
-        putReg(&caller, arch_.ra(), frame.ip);
-        putReg(&caller, bp_index, frame.bp);
-        return .{ .cfa = frame.sp, .caller = caller, .method = .frame_pointer };
+        putReg(&caller, arch_.pc(), ip);
+        putReg(&caller, arch_.sp(), sp);
+        putReg(&caller, arch_.ra(), ra);
+        putReg(&caller, frameSlot(arch_), bp);
+        return .{ .cfa = sp, .caller = caller, .method = if (orc) .orc else .frame_pointer };
+    }
+    fn orcWidth(module: *const Module) usize {
+        if (module.orc_ips.len == 0 or module.orc_entries.len % module.orc_ips.len != 0) return 0;
+        return module.orc_entries.len / module.orc_ips.len;
+    }
+    fn orcSlot(module: *const Module, index: usize) ?u64 {
+        if (index >= module.orc_ips.len) return null;
+        return module.orc_base +% @as(u64, index *% 4) +% @as(u64, @bitCast(@as(i64, module.orc_ips[index])));
+    }
+    fn orcCovering(module: *const Module, ip: u64) ?usize {
+        const index = kernel_orc.find(module.orc_base, module.orc_ips, ip) orelse return null;
+        const covered = orcSlot(module, index) orelse return null;
+        if (covered > ip) return null;
+        return index;
+    }
+    fn entryUnwind(self: *Modules, arch_: arch_mod.Arch, registers: loc.RegisterSet, memory: anytype) !@import("../debug/info.zig").Unwind {
+        const sp_i = arch_.sp();
+        const sp = if (sp_i < registers.len) registers[sp_i] orelse return error.KernelFrame else return error.KernelFrame;
+        const fp_i = frameSlot(arch_);
+        const fp = if (fp_i < registers.len) registers[fp_i] orelse 0 else 0;
+        const ra_i = arch_.ra();
+        const ra = if (ra_i < registers.len) registers[ra_i] orelse 0 else 0;
+        const arm = arch_ == .aarch64;
+        var stacked: u64 = 0;
+        if (!arm) {
+            var buf: [8]u8 = undefined;
+            const n = memory.read(sp, &buf) catch return error.KernelFrame;
+            if (n != 8) return error.KernelFrame;
+            stacked = std.mem.readInt(u64, &buf, .little);
+        }
+        var frame = try kernel_aware.entryFrame(arm, sp, ra, fp, stacked);
+        if (arm) frame.ip = try kernel_aware.stripKernelPac(frame.ip, self.kernel_pac_mask);
+        return finishUnwind(arch_, registers, frame.ip, frame.sp, frame.bp, frame.ip, false);
     }
     fn kernelPt(self: *const Modules) ?kernel_orc.Pt {
         const facts = self.kernel_facts orelse return null;
@@ -1123,6 +1510,7 @@ pub const Modules = struct {
         return switch (arch_) {
             .x86_64 => arch_.registerNumber("rbp") orelse 6,
             .aarch64 => arch_.registerNumber("x29") orelse 29,
+            .loongarch64 => arch_.registerNumber("r22") orelse 22,
             else => arch_.sp(),
         };
     }
@@ -1134,6 +1522,7 @@ pub const Modules = struct {
             .ip = if (ip_i < registers.len) registers[ip_i] orelse 0 else 0,
             .sp = if (sp_i < registers.len) registers[sp_i] orelse 0 else 0,
             .bp = if (bp_i < registers.len) registers[bp_i] orelse 0 else 0,
+            .ra = if (arch_.ra() < registers.len) registers[arch_.ra()] orelse 0 else 0,
         };
     }
     fn coreId(self: *Modules, path: []const u8) ![]const u8 {
@@ -1824,17 +2213,24 @@ pub const Modules = struct {
             self.refusal = snapshot.refusal(size);
             return error.BinarySnapshotLimit;
         };
+        var held_coverage: ?snapshot.Completeness = null;
         const generic: ?c_int = if (prepared == null and !self.immutable and self.core_source == null and rt.xrt_target_is_remote(self.target))
             if (self.image_jobs) |jobs| (jobs.prepare(jobs.context, self, region, why) catch |err| switch (err) {
                 // A held version: the synchronous open below takes the held bytes.
-                error.RemoteImageHeld => null,
+                error.RemoteImageHeld => held: {
+                    held_coverage = .full;
+                    break :held null;
+                },
+                error.RemoteImageSectionsHeld => held: {
+                    held_coverage = .sections;
+                    break :held null;
+                },
                 else => return err,
             }) else null
         else
             null;
         defer if (generic != null) if (self.image_jobs) |jobs| jobs.release(jobs.context, region);
         const ready_fd = if (prepared) |p| p.fd else generic;
-        const coverage: snapshot.Completeness = if (prepared) |p| p.coverage else .full;
         const expected = if (self.core_source != null) try self.coreId(region.path) else null;
         const selected_path = if (self.core_executable) |exe| (if (expected != null and std.mem.eql(u8, expected.?, exe.id)) exe.path else region.path) else region.path;
         const path = try self.allocator.dupeZ(u8, selected_path);
@@ -1846,7 +2242,11 @@ pub const Modules = struct {
             self.remote_boot = snapshot.bootIdTarget(self.target);
             self.remote_boot_checked = true;
         }
-        if (remote_sync) snapshot.beginRemoteHold(self.remote_boot);
+        // A capture only needs the debugger's ELF sections projection. Prefer
+        // an image the live session already holds; a miss still downloads and
+        // records the complete file below.
+        const hold_coverage = held_coverage orelse if (self.immutable) snapshot.Completeness.sections else .full;
+        if (remote_sync) snapshot.beginRemoteHold(self.remote_boot, hold_coverage);
         defer if (remote_sync) snapshot.endRemoteHold();
         var source: mapped_file.Source = if (ready_fd != null) .remote_snapshot else if (self.core_source != null) .core_path else .unopened;
         var opened = std.mem.zeroes(rt.struct_xrt_file_identity);
@@ -1878,6 +2278,10 @@ pub const Modules = struct {
             if (c.pread(fd, &signature, signature.len, 0) != signature.len) return error.NotElf;
             break :blk std.math.cast(usize, stat.st_size) orelse return error.BinarySnapshotLimit;
         };
+        // Generic remote ELF jobs produce a sparse debugger projection. APK
+        // containers still use the complete-file job before selecting an ELF
+        // entry. Explicit callers state their coverage in `prepared`.
+        const coverage: snapshot.Completeness = if (prepared) |p| p.coverage else if (held_image != null) hold_coverage else if (generic != null and std.mem.eql(u8, &signature, "\x7fELF")) .sections else .full;
         const entry: apk.Entry = if (held_image != null) .{ .offset = 0, .size = file_size } else if (std.mem.eql(u8, &signature, "\x7fELF")) .{ .offset = 0, .size = file_size } else try apk.find(self.allocator, fd, file_size, region.offset);
         if (entry.offset % try self.pageSize() != 0) return error.ApkEntryNotPageAligned;
         // Some readers keep fixed bounds whatever the image budgets are.

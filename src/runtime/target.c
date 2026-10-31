@@ -613,6 +613,24 @@ enum xrt_status xrt_target_core(struct xrt_target *t, int32_t pid, const struct 
     return XRT_OK;
 }
 
+enum xrt_status xrt_target_core_extend(struct xrt_target *t, const struct xrt_thread *threads, size_t count)
+{
+    if (!t || !t->core)
+        return XRT_INVALID_STATE;
+    if (!count)
+        return XRT_OK;
+    if (!threads || t->thread_count + count > XRT_MAX_THREADS)
+        return XRT_TOO_MANY_THREADS;
+    for (size_t i = 0; i < count; ++i) {
+        struct xrt_thread *slot = &t->threads[t->thread_count];
+        *slot = threads[i];
+        slot->id = t->next_thread_id++;
+        t->thread_count++;
+    }
+    ++t->generation;
+    return XRT_OK;
+}
+
 enum xrt_status xrt_target_signal_info(const struct xrt_target *t, int32_t tid,
                                        struct xrt_signal_info *out)
 {

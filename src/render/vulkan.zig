@@ -242,16 +242,19 @@ pub const Renderer = struct {
         // The loader has read its variables; a child launched from now on
         // (on any thread) must not inherit them.
         earlyRestore();
+        try checkEarlyAbandon();
         // As in init: when the display's driver gives no instance or no
         // usable device, load every driver in this same attempt.
         if (instance_made) |_| {} else |err| if (filtered) {
             log.debug(.render, "Vulkan early loader filter gave no instance ({s}); loading every driver\n", .{@errorName(err)});
             filtered = false;
             try self.createInstance();
+            try checkEarlyAbandon();
         } else return err;
         phases.begin(.device);
         var found = try self.probe();
         defer found.deinit(std.heap.page_allocator);
+        try checkEarlyAbandon();
         if (filtered) if (for (found.items) |item| {
             if (item.device.usable) break false;
         } else true) {
@@ -261,7 +264,9 @@ pub const Renderer = struct {
             c.vkDestroyInstance(self.instance, null);
             self.instance = null;
             try self.createInstance();
+            try checkEarlyAbandon();
             found = try self.probe();
+            try checkEarlyAbandon();
         };
         const choice = try pick(found.items, display);
         self.physical = found.items[choice.index].physical;
@@ -1447,6 +1452,7 @@ pub const Renderer = struct {
 /// can be asked for on a short private connection before the window exists.
 const Early = struct {
     thread: ?std.Thread = null,
+    abandon: std.atomic.Value(bool) = .init(false),
     renderer: Renderer = .{},
     display: ?select.Node = null,
     filtered: bool = false,
@@ -1487,12 +1493,18 @@ fn earlyRun() void {
         early.failure = err;
     };
 }
+fn checkEarlyAbandon() error{VulkanPreparationAbandoned}!void {
+    if (early.abandon.load(.acquire)) return error.VulkanPreparationAbandoned;
+}
 /// Dispose of an unclaimed early renderer before the process leaves main.
 /// takeEarly clears the thread when ownership transfers, making this a no-op
 /// after normal initialization. prepare already cleans up on failure; deinit
 /// also resets the renderer, so that path is safe to dispose here as well.
 pub fn dropEarly() void {
     const thread = early.thread orelse return;
+    // Do not start another costly preparation phase for a window that will
+    // never exist. An in-flight driver call must still return before we exit.
+    early.abandon.store(true, .release);
     thread.join();
     early.renderer.deinit();
     early = .{};

@@ -155,6 +155,9 @@ pub const Cache = struct {
                         if (row.id != thread.id or row.tid != thread.tid or !row.readable) unchanged = false;
                     }
                 }
+                // With a vmlinux a label carries state, CPU and wait edges, which change
+                // at every stop. Names alone may stay cached.
+                if (session.modules.measure_kernel_slide and self.remote_generation != snap.generation) unchanged = false;
                 if (unchanged) return;
             } else if (self.remote_generation == snap.generation) return;
             const threads = session.target.threadSlice();
@@ -177,6 +180,28 @@ pub const Cache = struct {
             self.revision +%= 1;
             return;
         };
+        if (session.target.core != null and session.modules.measure_kernel_slide) {
+            self.info = .{ .kind = .unavailable };
+            if (snap.state != .stopped) return;
+            const threads = session.target.threadSlice();
+            var unchanged = self.labels.items.len == threads.len;
+            if (unchanged) {
+                for (threads, self.labels.items) |thread, row| {
+                    if (row.id != thread.id or row.tid != thread.tid or !row.readable) unchanged = false;
+                }
+            }
+            if (unchanged) return;
+            self.labels.resize(std.heap.page_allocator, threads.len) catch return;
+            for (threads, self.labels.items) |thread, *row| {
+                row.* = .{ .id = thread.id, .tid = thread.tid, .source = .linux_task_comm };
+                if (session.modules.kernelThreadName(thread.tid, &row.name)) {
+                    row.readable = true;
+                    row.possibly_truncated = false;
+                }
+            }
+            self.revision +%= 1;
+            return;
+        }
         if (session.target.isRemote() or session.target.core != null or session.offline) {
             self.info = .{ .kind = .unavailable };
             self.labels.clearRetainingCapacity();

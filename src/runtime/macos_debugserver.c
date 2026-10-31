@@ -25,6 +25,7 @@ static int debugserver_create(int32_t *out, void *context)
 {
     struct debugserver_spawn *spawn = context;
     pid_t child = 0;
+    /* spawn-allow: create callback of xrt_spawn_owned_helper */
     int status = posix_spawn(&child, spawn->path, spawn->actions, spawn->attr, spawn->argv, environment());
     if (status)
         return status;

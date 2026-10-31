@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Reject a raw spawn in src/ outside the owned-helper implementation.
+
+xrt_spawn_owned_helper is the one place that notes a child before the caller
+continues. src/runtime/owned_helper.c may call the primitives. Every other
+fork, vfork, posix_spawn, posix_spawnp, popen, system, clone, a raw clone or
+fork syscall, std.process.Child, or a std.process spawn/run/exec in src/ needs
+a spawn-allow comment with a reason on the same line or the line above.
+The scan reads source text: a match inside a comment or string also needs a
+reason. Thread spawns and method calls such as graph.clone() are not matched.
+"""
+import os
+import re
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HELPER = "src/runtime/owned_helper.c"
+CALL = re.compile(r"\b(?:fork|vfork|posix_spawn|posix_spawnp)\s*\(")
+CHILD = re.compile(r"\bstd\.process\.(?:Child\b|(?:spawn|run|exec|execv|execve|replace)\w*\s*\()")
+# C: libc process starters called by name, and raw clone/fork syscalls.
+C_ONLY = re.compile(r"(?<![.>\w])(?:popen|system|clone|clone3)\s*\(|\bsyscall\s*\(\s*(?:SYS|__NR)_(?:clone3?|v?fork)\b")
+# Zig: the same libc calls through a C import or std.c, and linux clone/fork.
+ZIG_ONLY = re.compile(r"\b(?:c|std\.c)\.(?:popen|system|clone|clone3)\s*\(|\blinux\.(?:clone2?|clone3)\s*\(|\.syscall\w*\(\s*\.(?:clone3?|v?fork)\b")
+ALLOW = re.compile(r"spawn-allow:\s*(\S.*[A-Za-z].*)\s*$")
+SOURCE = (".c", ".h", ".zig")
+
+
+def allowed(line):
+    match = ALLOW.search(line)
+    return bool(match and match.group(1))
+
+
+def violations(text, path):
+    if path.replace("\\", "/") == HELPER:
+        return []
+    found = []
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        extra = ZIG_ONLY if path.endswith(".zig") else C_ONLY
+        if not CALL.search(line) and not CHILD.search(line) and not extra.search(line):
+            continue
+        previous = lines[index - 1] if index else ""
+        if allowed(line) or allowed(previous):
+            continue
+        found.append((index + 1, line.strip()))
+    return found
+
+
+def scan_tree(root):
+    found = []
+    src = os.path.join(root, "src")
+    for dirpath, dirnames, filenames in os.walk(src):
+        dirnames[:] = [name for name in dirnames if name not in (".git", "zig-out")]
+        for name in sorted(filenames):
+            if not name.endswith(SOURCE):
+                continue
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, root).replace("\\", "/")
+            try:
+                text = open(full, encoding="utf-8", errors="replace").read()
+            except OSError as err:
+                found.append((rel, 0, str(err)))
+                continue
+            for line_no, text_line in violations(text, rel):
+                found.append((rel, line_no, text_line))
+    return found
+
+
+def self_test():
+    raw = "int main(void) { return fork(); }\n"
+    assert violations(raw, "src/demo.c"), "a bare fork must fail"
+    allowed_prev = "/* spawn-allow: fixture child reaped by the test */\nreturn fork();\n"
+    assert not violations(allowed_prev, "src/demo.c"), "a reason on the previous line must pass"
+    same = "posix_spawnp(&pid, path, 0, 0, argv, env); /* spawn-allow: create callback of the owned helper */\n"
+    assert not violations(same, "src/demo.c"), "a reason on the same line must pass"
+    empty = "// spawn-allow:\nfork();\n"
+    assert violations(empty, "src/demo.c"), "an empty reason must fail"
+    actions = "posix_spawn_file_actions_init(&actions);\n"
+    assert not violations(actions, "src/demo.c"), "file-action helpers are not spawns"
+    child = "var child = std.process.Child.init(&argv, allocator);\n"
+    assert violations(child, "src/demo.zig"), "std.process.Child must fail"
+    helper = "int xrt_spawn_owned_helper(void) { return fork(); }\n"
+    assert not violations(helper, HELPER), "the helper implementation may spawn"
+    for text, path in (("FILE *f = popen(cmd, \"r\");\n", "src/demo.c"), ("return system(cmd);\n", "src/demo.c"),
+                       ("long r = syscall(SYS_clone3, &args, sizeof args);\n", "src/demo.c"),
+                       ("_ = c.popen(cmd, \"r\");\n", "src/demo.zig"), ("_ = c.system(cmd);\n", "src/demo.zig"),
+                       ("const r = try std.process.run(.{ .argv = &argv });\n", "src/demo.zig"),
+                       ("_ = std.os.linux.syscall0(.fork);\n", "src/demo.zig")):
+        assert violations(text, path), text
+    for text, path in (("try system(v, ctx, rect, s);\n", "src/demo.zig"), ("fn system(a: A) !V {\n", "src/demo.zig"),
+                       ("self.graph = try view.graph.clone(a);\n", "src/demo.zig"), ("thread = try std.Thread.spawn(.{}, run, .{});\n", "src/demo.zig"),
+                       ("#define X(clone, SYS_clone, 0)\n", "src/demo.h"), ("posix_spawn_file_actions_init(&a);\n", "src/demo.c")):
+        assert not violations(text, path), text
+    missed = violations("vfork();\n", "src/demo.c")
+    assert len(missed) == 1 and missed[0][0] == 1
+
+
+def main():
+    self_test()
+    found = scan_tree(ROOT)
+    for path, line_no, text in found:
+        print(f"{path}:{line_no}: raw spawn needs spawn-allow: {text}")
+    if found:
+        print(f"spawn-lint: {len(found)} raw spawn(s) in src/", file=sys.stderr)
+        return 1
+    print("spawn-lint: ok")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

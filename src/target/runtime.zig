@@ -179,14 +179,20 @@ pub fn dwarfRegisters(regs: Registers) DwarfRegisters {
     return out;
 }
 
-pub fn coreRegisters(words: *const [27]u64) !Registers {
-    var bytes: [27 * 8]u8 = undefined;
+pub fn coreRegisters(machine: u16, words: []const u64) !Registers {
+    const arch_id: u16 = switch (machine) {
+        183 => c.XRT_AARCH64,
+        else => c.XRT_X86_64,
+    };
+    const expect: usize = if (machine == 183) 34 else 27;
+    if (words.len != expect) return error.InvalidCoreRegisters;
+    var bytes: [34 * 8]u8 = undefined;
     for (words, 0..) |word, i| std.mem.writeInt(u64, bytes[i * 8 ..][0..8], word, .little);
-    const arch = c.xrt_arch_get(c.XRT_X86_64) orelse return error.UnsupportedArchitecture;
+    const arch = c.xrt_arch_get(arch_id) orelse return error.UnsupportedArchitecture;
     var abi: c.struct_xrt_abi_id = undefined;
     c.xrt_arch_abi_copy(arch, &abi);
     var regs: c.struct_xrt_registers = undefined;
-    try check(c.xrt_registers_decode(&abi, &bytes, bytes.len, &regs));
+    try check(c.xrt_registers_decode(&abi, &bytes, expect * 8, &regs));
     return .{ .raw = regs };
 }
 
@@ -249,7 +255,7 @@ pub fn isZombie(tid: i32) bool {
 
 test "an unavailable register is not displayed as its snapshot bytes" {
     var words: [27]u64 = @splat(0x1111111111111111);
-    var regs = try coreRegisters(&words);
+    var regs = try coreRegisters(62, &words);
     const rax = regs.descriptions()[3];
     const rip = regs.descriptions()[0];
     try std.testing.expectEqualStrings("rax", std.mem.span(rax.name));
