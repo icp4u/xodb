@@ -9,6 +9,8 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const capstone_link = b.option(enum { vendored }, "capstone", "Native builds use the private Capstone prefix") orelse .vendored;
     _ = capstone_link;
     const capstone = b.option([]const u8, "capstone-prefix", "Private static Capstone prefix") orelse b.graph.environ_map.get("XODB_MAC_CAPSTONE") orelse ".work/capstone";
+    const link_probe = b.option(bool, "link-probe", "Compile an empty Cocoa shim so a fake-prefix link can report unresolved externals") orelse false;
+    const framework_path = b.option([]const u8, "framework-path", "Directory of Cocoa and QuartzCore stubs for a link probe");
     const module = b.createModule(.{ .root_source_file = b.path("src/macos_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const options = b.addOptions();
     options.addOption(bool, "gui", true);
@@ -31,10 +33,17 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include/harfbuzz", .{deps}) });
     module.addObjectFile(.{ .cwd_relative = b.fmt("{s}/lib/libfreetype.a", .{deps}) });
     module.addObjectFile(.{ .cwd_relative = b.fmt("{s}/lib/libharfbuzz.a", .{deps}) });
-    module.addCSourceFile(.{ .file = b.path("src/platform/cocoa_shim.m"), .flags = &.{ "-fobjc-arc", "-Wall", "-Wextra", "-Werror" } });
+    if (link_probe) {
+        const written = b.addWriteFiles();
+        const shim = written.add("cocoa_shim_probe.m",
+            "/* The real shim is omitted. Its calls stay unresolved for the link probe. */\n" ++
+                "void xcocoa_link_probe_anchor(void) {}\n");
+        module.addCSourceFile(.{ .file = shim, .flags = &.{ "-fobjc-arc", "-Wall", "-Wextra", "-Werror" } });
+    } else module.addCSourceFile(.{ .file = b.path("src/platform/cocoa_shim.m"), .flags = &.{ "-fobjc-arc", "-Wall", "-Wextra", "-Werror" } });
     for ([_][]const u8{ "src/platform/macos_process.c", "src/runtime/log.c" }) |source|
         module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
     module.addCSourceFile(.{ .file = b.path("src/memset.c"), .flags = &.{ "-std=c11", "-fno-builtin", "-fno-sanitize=all" } });
+    if (framework_path) |dir| module.addFrameworkPath(.{ .cwd_relative = dir });
     for ([_][]const u8{ "Cocoa", "QuartzCore" }) |framework| module.linkFramework(framework, .{});
     module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/dynamic/dylib/macOS", .{mvk}) });
     module.linkSystemLibrary("MoltenVK", .{ .use_pkg_config = .no });

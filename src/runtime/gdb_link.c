@@ -161,6 +161,10 @@ static enum xrt_status resolve(struct xrt_gdb_link *l, const char *host,
     resolution_release(r);
     return status;
 }
+static bool peer_closed(int err)
+{
+    return err == EPIPE || err == ECONNRESET || err == ENOTCONN || err == ECONNABORTED;
+}
 static enum xrt_status write_bytes(struct xrt_gdb_link *l, const void *data,
                                    size_t size, uint64_t deadline, bool mutation)
 {
@@ -395,6 +399,45 @@ static bool console_packet(const uint8_t *p, size_t n)
               (p[i] >= 'A' && p[i] <= 'F'))) return false;
     return true;
 }
+/* The frame is already decoded. A peer that closed after sending it cannot
+ * take the acknowledgement; the frame still stands and the link stays open
+ * so the caller can report that confirmation. Failing the link here makes a
+ * detach that already reached the stub look unfinished. A timeout while the
+ * peer is alive, or any other write failure, leaves the exchange unconfirmed. */
+static enum xrt_status acknowledge(struct xrt_gdb_link *l, uint64_t deadline)
+{
+    if (l->noack) return XRT_OK;
+    for (;;) {
+        if (xrt_cancel_requested(l->cancel)) {
+            (void)cancelled(l);
+            return XRT_TRANSPORT_FAILED;
+        }
+        if (expired(l)) {
+            (void)operation_timeout(l);
+            return XRT_TRANSPORT_FAILED;
+        }
+        if (l->failed || l->fd < 0) return XRT_TRANSPORT_FAILED;
+        ssize_t n = send(l->fd, "+", 1, MSG_NOSIGNAL);
+        if (n < 0 && errno == ENOTSOCK) n = write(l->fd, "+", 1);
+        if (n == 1) { l->written += 1; return XRT_OK; }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && peer_closed(errno)) return XRT_OK;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            int ready_fd = ready(l, l->fd, POLLOUT, deadline);
+            if (xrt_cancel_requested(l->cancel)) {
+                (void)cancelled(l);
+                return XRT_TRANSPORT_FAILED;
+            }
+            if (expired(l)) {
+                (void)operation_timeout(l);
+                return XRT_TRANSPORT_FAILED;
+            }
+            if (ready_fd > 0) continue;
+        }
+        (void)fail(l, XRT_TRANSPORT_FAILED, "GDB transport write failed or timed out");
+        return XRT_TRANSPORT_FAILED;
+    }
+}
 static enum xrt_status discard(struct xrt_gdb_link *l, void *out, size_t cap, size_t *length,
                                uint64_t deadline)
 {
@@ -443,7 +486,7 @@ static enum xrt_status discard(struct xrt_gdb_link *l, void *out, size_t cap, si
     l->received -= at;
     l->awaiting_ack = false;
     if (*length > body) *length = (size_t)body; /* Never bytes of a following frame. */
-    if (!l->noack && write_bytes(l, "+", 1, deadline, false) != XRT_OK) return XRT_TRANSPORT_FAILED;
+    if (acknowledge(l, deadline) != XRT_OK) return XRT_TRANSPORT_FAILED;
     return xrt_cancel_requested(l->cancel) ? cancelled(l) : XRT_BUFFER_TOO_SMALL;
 }
 static enum xrt_status receive(struct xrt_gdb_link *l, void *out, size_t cap,
@@ -484,7 +527,7 @@ static enum xrt_status receive(struct xrt_gdb_link *l, void *out, size_t cap,
                 if (view.kind != XRT_GDB_PACKET)
                     return fail(l, XRT_PROTOCOL_ERROR, "Unexpected GDB all-stop response");
                 l->awaiting_ack = false;
-                if (!l->noack && write_bytes(l, "+", 1, deadline, false) != XRT_OK) return XRT_TRANSPORT_FAILED;
+                if (acknowledge(l, deadline) != XRT_OK) return XRT_TRANSPORT_FAILED;
                 if (console_packet(out, view.length)) continue;
                 if (xrt_cancel_requested(l->cancel)) return cancelled(l);
                 *length = view.length;

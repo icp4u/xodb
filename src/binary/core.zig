@@ -221,7 +221,9 @@ pub const Core = struct {
             } else if (core and kind == 3) {
                 if (desc.len != 136) return error.InvalidCoreProcessInfo;
                 self.pid = @bitCast(u32le(desc, 24));
-                if (self.pid <= 0) return error.InvalidCoreProcessInfo;
+                // A live kernel image has no process. VMCOREINFO has already set kernel.
+                if (self.pid <= 0 and !self.kernel) return error.InvalidCoreProcessInfo;
+                if (self.pid < 0) self.pid = 0;
                 self.command = std.mem.sliceTo(desc[56..136], 0);
             } else if (core and kind == 0x53494749) {
                 if (desc.len != 128) return error.InvalidCoreSignal;
@@ -1100,4 +1102,26 @@ test "KGHANG a kernel-half core is a kernel image and a low mapping still reject
     try std.testing.expectEqual(@as(u8, 0x3c), byte[0]);
     try std.testing.expectError(error.InvalidCoreRegisters, openNote.open(a, tmp.dir, "user-zero", &.{0x400000}));
     try std.testing.expectError(error.InvalidCoreRegisters, openNote.open(a, tmp.dir, "mixed-zero", &.{ 0x400000, 0xffff888000001000 }));
+}
+
+test "KGHANG a kernel image note may name no process" {
+    const a = std.testing.allocator;
+    var note: std.ArrayList(u8) = .empty;
+    defer note.deinit(a);
+    try pushNote(&note, a, "VMCOREINFO", 0, "OSRELEASE=0\n");
+    var desc: [136]u8 = @splat(0);
+    try pushNote(&note, a, "CORE", 3, &desc);
+    var core = Core{ .arena = std.heap.ArenaAllocator.init(a) };
+    defer core.deinit();
+    core.machine = 62;
+    try core.notes(note.items);
+    try std.testing.expect(core.kernel);
+    try std.testing.expectEqual(@as(i32, 0), core.pid);
+    var user = Core{ .arena = std.heap.ArenaAllocator.init(a) };
+    defer user.deinit();
+    user.machine = 62;
+    var only: std.ArrayList(u8) = .empty;
+    defer only.deinit(a);
+    try pushNote(&only, a, "CORE", 3, &desc);
+    try std.testing.expectError(error.InvalidCoreProcessInfo, user.notes(only.items));
 }

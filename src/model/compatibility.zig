@@ -2,6 +2,7 @@
 const std = @import("std");
 const linux = @import("../target/linux.zig");
 const identity = @import("process_identity.zig");
+const kernel_aware = @import("kernel_aware.zig");
 const c = @cImport({
     @cUndef("_FORTIFY_SOURCE");
     @cDefine("_GNU_SOURCE", "1");
@@ -35,12 +36,17 @@ pub const Label = struct {
     readable: bool = false,
     internal_name: bool = false,
     possibly_truncated: bool = false,
+    /// Outgoing wait hops. Empty when this thread is not waiting. The name stays within 128 bytes.
+    wait_chain: [4]kernel_aware.WaitHop = .{ .{}, .{}, .{}, .{} },
+    wait_chain_len: u8 = 0,
+    wait_chain_end: kernel_aware.ChainEnd = .complete,
     pub fn text(self: *const Label) []const u8 {
         return std.mem.sliceTo(&self.name, 0);
     }
     pub fn jsonStringify(self: Label, writer: *std.json.Stringify) !void {
         var queue: [18]u8 = undefined;
-        try writer.write(.{ .id = self.id, .tid = self.tid, .name = if (self.readable) self.text() else null, .source = self.source, .dispatch_queue = if (self.dispatch_queue) |address| std.fmt.bufPrint(&queue, "0x{x}", .{address}) catch unreachable else null, .possibly_truncated = self.possibly_truncated, .wine_internal_name = self.internal_name });
+        const chain: ?[]const kernel_aware.WaitHop = if (self.wait_chain_len == 0) null else self.wait_chain[0..self.wait_chain_len];
+        try writer.write(.{ .id = self.id, .tid = self.tid, .name = if (self.readable) self.text() else null, .source = self.source, .dispatch_queue = if (self.dispatch_queue) |address| std.fmt.bufPrint(&queue, "0x{x}", .{address}) catch unreachable else null, .possibly_truncated = self.possibly_truncated, .wine_internal_name = self.internal_name, .wait_chain = chain, .wait_chain_truncated = if (chain == null) null else @as(?bool, self.wait_chain_end == .truncated), .wait_chain_cycle = if (chain == null) null else @as(?bool, self.wait_chain_end == .cycle) });
     }
 };
 
@@ -173,6 +179,7 @@ pub const Cache = struct {
                 if (session.modules.measure_kernel_slide and session.modules.kernelThreadName(thread.tid, &row.name)) {
                     row.readable = true;
                     row.possibly_truncated = false;
+                    row.wait_chain_len = @intCast(session.modules.kernelWaitChain(thread.tid, &row.wait_chain, &row.wait_chain_end));
                 }
                 if (detail.has_dispatch_queue) row.dispatch_queue = detail.dispatch_queue;
             }
@@ -197,6 +204,7 @@ pub const Cache = struct {
                 if (session.modules.kernelThreadName(thread.tid, &row.name)) {
                     row.readable = true;
                     row.possibly_truncated = false;
+                    row.wait_chain_len = @intCast(session.modules.kernelWaitChain(thread.tid, &row.wait_chain, &row.wait_chain_end));
                 }
             }
             self.revision +%= 1;
@@ -288,4 +296,25 @@ test "Wine names are bounded hints and ordinary application names remain visible
     try std.testing.expectEqualStrings("/tools/Proton X", protonRoot("/tools/Proton X/files/lib/wine/ntdll.so").?);
     try std.testing.expect(protonRoot("/usr/lib/wine/ntdll.so") == null);
     try std.testing.expect(protonRoot("/tools/not-wine/files/lib/wine/ntdll.so") == null);
+}
+
+test "a thread label publishes the full wait chain beside its 128-byte name" {
+    var label = Label{};
+    var first = kernel_aware.WaitHop{ .lock = 0xffffffffc00fb068, .kind = .mutex, .owner_len = 11, .owner_cpu = 3 };
+    @memcpy(first.owner[0..11], "kg0-spinner");
+    var second = kernel_aware.WaitHop{ .lock = 0xffffffffc00fb0a0, .kind = .mutex, .owner_len = 10 };
+    @memcpy(second.owner[0..10], "kg0-holder");
+    label.wait_chain[0] = first;
+    label.wait_chain[1] = second;
+    label.wait_chain_len = 2;
+    const text = try std.json.Stringify.valueAlloc(std.testing.allocator, label, .{});
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"wait_chain\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "0xffffffffc00fb068") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "0xffffffffc00fb0a0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "kg0-holder") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"owner_cpu\":3") != null);
+    const quiet = try std.json.Stringify.valueAlloc(std.testing.allocator, Label{}, .{});
+    defer std.testing.allocator.free(quiet);
+    try std.testing.expect(std.mem.indexOf(u8, quiet, "\"wait_chain\":null") != null);
 }

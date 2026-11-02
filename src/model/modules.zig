@@ -476,9 +476,10 @@ pub const Modules = struct {
     }
     /// Slide such that `linux_banner` in target memory matches the image.
     /// Zero is the link address. Any other slide is a multiple of `step` that
-    /// puts one stopped program counter inside the image. Two different slides
-    /// that both match are refused.
-    pub fn kernelSlide(link_lo: u64, span: u64, banner_link: u64, banner: []const u8, pcs: []const u64, step: u64, memory: anytype) !u64 {
+    /// puts one stopped program counter inside the image, or the VMCOREINFO
+    /// offset when that value is a multiple of `step` and the banner matches.
+    /// Two different slides that both match are refused.
+    pub fn kernelSlide(link_lo: u64, span: u64, banner_link: u64, banner: []const u8, pcs: []const u64, step: u64, memory: anytype, note_offset: ?u64) !u64 {
         if (banner.len < 24 or span == 0 or step == 0 or link_lo > banner_link or banner_link - link_lo >= span) return error.KernelBannerMissing;
         // A kernel that relocates by copying (LoongArch) leaves its loaded image,
         // banner included, at the link address. A slid match is the live copy.
@@ -515,6 +516,17 @@ pub const Modules = struct {
                 offset += step;
             }
         }
+        // A crash note names its slide. The number counts only when the banner
+        // matches, so a stale or zero offset cannot hide a program-counter match.
+        if (note_offset) |offset| if (offset != 0 and offset % step == 0) {
+            if (std.math.add(u64, banner_link, offset)) |runtime| {
+                if (bannerAt(memory, runtime, banner)) {
+                    if (found) |old| {
+                        if (old != offset) return error.KernelSlideAmbiguous;
+                    } else found = offset;
+                }
+            } else |_| {}
+        };
         if (found == null and at_link) found = 0;
         return found orelse error.KernelSlideNotFound;
     }
@@ -538,17 +550,23 @@ pub const Modules = struct {
         const banner_link: u64 = link_lo + 0x1000;
         const pcs = [_]u64{link_lo + 0x100 + step};
         const slid = Mem{ .slots = .{ .{ .at = banner_link + step, .bytes = banner }, .{} } };
-        try std.testing.expectEqual(step, try kernelSlide(link_lo, span, banner_link, banner, &pcs, step, slid));
+        try std.testing.expectEqual(step, try kernelSlide(link_lo, span, banner_link, banner, &pcs, step, slid, null));
         const zero = Mem{ .slots = .{ .{ .at = banner_link, .bytes = banner }, .{} } };
-        try std.testing.expectEqual(@as(u64, 0), try kernelSlide(link_lo, span, banner_link, banner, &.{}, step, zero));
+        try std.testing.expectEqual(@as(u64, 0), try kernelSlide(link_lo, span, banner_link, banner, &.{}, step, zero, null));
         const neither = Mem{ .slots = .{ .{}, .{} } };
-        try std.testing.expectError(error.KernelSlideNotFound, kernelSlide(link_lo, span, banner_link, banner, &pcs, step, neither));
+        try std.testing.expectError(error.KernelSlideNotFound, kernelSlide(link_lo, span, banner_link, banner, &pcs, step, neither, null));
         const both = Mem{ .slots = .{ .{ .at = banner_link, .bytes = banner }, .{ .at = banner_link + step, .bytes = banner } } };
-        try std.testing.expectEqual(step, try kernelSlide(link_lo, span, banner_link, banner, &pcs, step, both));
+        try std.testing.expectEqual(step, try kernelSlide(link_lo, span, banner_link, banner, &pcs, step, both, null));
         const pcs2 = [_]u64{ link_lo + 0x100 + step, link_lo + 0x100 + 2 * step };
         const two = Mem{ .slots = .{ .{ .at = banner_link + step, .bytes = banner }, .{ .at = banner_link + 2 * step, .bytes = banner } } };
-        try std.testing.expectError(error.KernelSlideAmbiguous, kernelSlide(link_lo, span, banner_link, banner, &pcs2, step, two));
-        try std.testing.expectError(error.KernelBannerMissing, kernelSlide(link_lo, span, banner_link, "short", &pcs, step, slid));
+        try std.testing.expectError(error.KernelSlideAmbiguous, kernelSlide(link_lo, span, banner_link, banner, &pcs2, step, two, null));
+        try std.testing.expectError(error.KernelBannerMissing, kernelSlide(link_lo, span, banner_link, "short", &pcs, step, slid, null));
+        const quiet = [_]u64{0};
+        try std.testing.expectEqual(step, try kernelSlide(link_lo, span, banner_link, banner, &quiet, step, slid, step));
+        try std.testing.expectError(error.KernelSlideNotFound, kernelSlide(link_lo, span, banner_link, banner, &quiet, step, neither, step));
+        try std.testing.expectError(error.KernelSlideNotFound, kernelSlide(link_lo, span, banner_link, banner, &quiet, step, slid, 0x1000));
+        try std.testing.expectError(error.KernelSlideAmbiguous, kernelSlide(link_lo, span, banner_link, banner, &pcs, step, two, 2 * step));
+        try std.testing.expectEqual(step, try kernelSlide(link_lo, span, banner_link, banner, &pcs, step, both, step));
         try std.testing.expectEqual(@as(u64, 0x200000), kernelSlideStep(.aarch64));
         try std.testing.expectEqual(@as(u64, 0x10000), kernelSlideStep(.loongarch));
     }
@@ -609,7 +627,11 @@ pub const Modules = struct {
                     return reader.target.readMemory(address, dest);
                 }
             };
-            slide = try kernelSlide(link_lo, link_hi - link_lo, banner_sym.value, banner, pcs[0..npc], kernelSlideStep(image.header.machine), Reader{ .target = target });
+            var note_offset: ?u64 = null;
+            if (target.core) |*core| if (core.vmcore.len != 0) {
+                if (kernel_aware.vmcoreInfo(core.vmcore)) |parsed| note_offset = parsed.kernel_offset else |_| {}
+            };
+            slide = try kernelSlide(link_lo, link_hi - link_lo, banner_sym.value, banner, pcs[0..npc], kernelSlideStep(image.header.machine), Reader{ .target = target }, note_offset);
         }
         // The stub cannot name its image. A rebuild can keep every code byte
         // and still change its DWARF, so the loaded GNU build ID must match.
@@ -858,7 +880,10 @@ pub const Modules = struct {
     fn publishCoreTasks(self: *Modules, target: anytype) void {
         var synthetic: i32 = 0;
         for (self.kernel_tasks) |*task| {
-            if (self.taskIsCurrent(task.address)) continue;
+            // A CPU's current task is that CPU's note thread. A kcore has a note
+            // only for the reading CPU, so another CPU's current task is still
+            // listed; its stack is refused (recoverKernel), not unwound from stale state.
+            if (self.taskIsCurrent(task.address)) if (self.currentCpu(task.*)) |cpu| if (self.cpuHasNote(cpu)) continue;
             if (target.snapshot().thread_count >= 1024) {
                 self.noteKernel("core task list is capped");
                 return;
@@ -870,6 +895,19 @@ pub const Modules = struct {
                 return;
             };
         }
+    }
+    fn currentCpu(self: *const Modules, task: kernel_aware.TaskRow) ?u32 {
+        for (self.kernel_current, 0..) |current, cpu| if (current == task.address) return @intCast(cpu);
+        return task.cpu;
+    }
+    fn cpuHasNote(self: *const Modules, cpu: u32) bool {
+        const core = self.core_source orelse return true;
+        for (core.threads.items, 0..) |thread, index| {
+            if (kernel_aware.shadowCpuLocal(thread.tid)) |noted| {
+                if (noted == cpu) return true;
+            } else if (!core.kernel and index == cpu) return true;
+        }
+        return false;
     }
     fn taskIsCurrent(self: *const Modules, address: u64) bool {
         if (address == 0) return false;
@@ -941,18 +979,40 @@ pub const Modules = struct {
     }
     fn appendWaits(self: *const Modules, address: u64, buf: []u8) usize {
         var used: usize = 0;
-        for (self.kernel_waits) |edge| {
-            if (edge.owner != address and edge.waiter != address) continue;
+        var held: [8]u64 = undefined;
+        var held_n: usize = 0;
+        // The thread's own wait comes first; what it holds follows if there is room.
+        // Edge order follows the task walk and must not decide which part survives.
+        var pass: u2 = 0;
+        while (pass < 2) : (pass += 1) for (self.kernel_waits, 0..) |edge, index| {
+            const outgoing = edge.waiter == address;
+            if (!outgoing and edge.owner != address) continue;
+            if (outgoing != (pass == 0)) continue;
+            if (!outgoing) {
+                var seen = false;
+                for (held[0..held_n]) |lock| if (lock == edge.lock) {
+                    seen = true;
+                    break;
+                };
+                if (seen) continue;
+                if (held_n < held.len) {
+                    held[held_n] = edge.lock;
+                    held_n += 1;
+                }
+            }
             const lead: usize = if (used == 0) 1 else 2;
             if (used + lead >= buf.len) break;
-            const wrote = kernel_aware.formatWait(edge, self.kernel_tasks, buf[used + lead ..]);
+            const wrote = if (outgoing)
+                kernel_aware.formatChain(self.kernel_waits, index, self.kernel_tasks, buf[used + lead ..])
+            else
+                kernel_aware.formatHold(edge, buf[used + lead ..]);
             if (wrote.len == 0) break;
             if (lead == 1) buf[used] = ' ' else {
                 buf[used] = ';';
                 buf[used + 1] = ' ';
             }
             used += lead + wrote.len;
-        }
+        };
         return used;
     }
     fn readCurrent(self: *Modules, module: *Module, memory: anytype) void {
@@ -993,12 +1053,46 @@ pub const Modules = struct {
         self.dropRelocated();
         for (rows[0..n]) |row| {
             if (row.state != 0 or row.text == 0 or row.text_size == 0) continue;
-            self.loadObject(module, row) catch |err| self.noteKernel(@errorName(err));
+            self.loadObject(module, row, memory) catch |err| self.noteKernel(@errorName(err));
         }
         self.kernel_sig = sig;
         self.kernel_lists = true;
     }
+    /// A refused kernel module object is a load failure that list_modules shows.
+    fn noteModuleFailure(self: *Modules, row: kernel_aware.ModuleRow, name: []const u8, err: anyerror) void {
+        if (self.load_failures.items.len >= 64) return;
+        const path = std.fmt.allocPrint(self.allocator, "kernel/{s}.ko", .{name}) catch return;
+        const end = std.math.add(u64, row.text, row.text_size) catch row.text;
+        self.load_failures.append(self.allocator, .{ .start = row.text, .end = end, .path = path, .diagnostic = @errorName(err) }) catch self.allocator.free(path);
+    }
+    fn noteModuleUnverified(self: *Modules, row: kernel_aware.ModuleRow, name: []const u8) void {
+        if (self.load_failures.items.len >= 64) return;
+        const path = std.fmt.allocPrint(self.allocator, "kernel/{s}.ko", .{name}) catch return;
+        const detail = self.allocator.dupe(u8, "loaded without verification: the kernel publishes no module symbol table to compare") catch {
+            self.allocator.free(path);
+            return;
+        };
+        const end = std.math.add(u64, row.text, row.text_size) catch row.text;
+        self.load_failures.append(self.allocator, .{ .start = row.text, .end = end, .path = path, .diagnostic = "KernelModuleUnverified", .detail = detail }) catch {
+            self.allocator.free(path);
+            self.allocator.free(detail);
+        };
+    }
+    fn dropKernelFailures(self: *Modules) void {
+        var index: usize = 0;
+        while (index < self.load_failures.items.len) {
+            const failure = self.load_failures.items[index];
+            if (!std.mem.startsWith(u8, failure.path, "kernel/")) {
+                index += 1;
+                continue;
+            }
+            self.allocator.free(failure.path);
+            if (failure.detail) |detail| self.allocator.free(detail);
+            _ = self.load_failures.orderedRemove(index);
+        }
+    }
     fn dropRelocated(self: *Modules) void {
+        self.dropKernelFailures();
         var index: usize = 0;
         while (index < self.loaded.items.len) {
             const module = self.loaded.items[index];
@@ -1011,7 +1105,7 @@ pub const Modules = struct {
             _ = self.loaded.orderedRemove(index);
         }
     }
-    fn loadObject(self: *Modules, vmlinux: *Module, row: kernel_aware.ModuleRow) !void {
+    fn loadObject(self: *Modules, vmlinux: *Module, row: kernel_aware.ModuleRow, memory: anytype) !void {
         const root = self.modules_dir orelse return;
         const name = row.name[0..row.name_len];
         if (name.len == 0 or name.len > 48 or std.mem.indexOfScalar(u8, name, '/') != null) return;
@@ -1074,10 +1168,61 @@ pub const Modules = struct {
             .kernel_text = row.text,
             .file_source = .host_path,
         };
+        self.placeSections(module, row);
+        if (!row.ksym_present) {
+            // No module symbol table in this kernel (or no type info for it): load, but say so.
+            self.noteModuleUnverified(row, name);
+        } else {
+            const agree = self.moduleSymbolsAgree(module, row, memory) catch {
+                self.releaseModule(module);
+                var note: [96]u8 = undefined;
+                self.noteKernel(std.fmt.bufPrint(&note, "module {s} symbol table unreadable", .{name}) catch "module symbol table unreadable");
+                self.noteModuleFailure(row, name, error.KernelModuleSymbolTableUnreadable);
+                return;
+            };
+            if (!agree) {
+                self.releaseModule(module);
+                var note: [96]u8 = undefined;
+                self.noteKernel(std.fmt.bufPrint(&note, "module {s} symbols differ", .{name}) catch "module symbols differ");
+                self.noteModuleFailure(row, name, error.KernelModuleSymbolsDiffer);
+                return;
+            }
+        }
         try self.loaded.append(self.allocator, module);
         self.next_id += 1;
         self.snapshot_bytes += mapped.len;
-        self.placeSections(module, row);
+    }
+    fn moduleSymbolsAgree(self: *Modules, module: *const Module, row: kernel_aware.ModuleRow, memory: anytype) !bool {
+        _ = self;
+        if (row.ksym_failed) return error.KernelSymbolTable;
+        if (row.ksym_count == 0) return true;
+        var placed: [512]kernel_aware.SectionSym = undefined;
+        const n = placedModuleSymbols(module, &placed);
+        return kernel_aware.kallsymsSectionsAgree(memory, row.ksym_symtab, row.ksym_count, row.ksym_strtab, module.image.format.is64, placed[0..n]);
+    }
+    fn placedModuleSymbols(module: *const Module, out: []kernel_aware.SectionSym) usize {
+        const table = (module.image.symbols(.symtab) catch return 0) orelse return 0;
+        var n: usize = 0;
+        var pass: u2 = 0;
+        while (pass < 2) : (pass += 1) {
+            var index: u32 = 1;
+            while (index < table.count() and n < out.len) : (index += 1) {
+                const sym = table.get(index) catch continue;
+                const global = sym.bind == .global or sym.bind == .weak or sym.bind == .gnu_unique;
+                if (pass == 0 and !global) continue;
+                if (pass == 1 and global) continue;
+                if (sym.name.len == 0 or sym.name.len > 128 or !sym.hasAddress()) continue;
+                // AArch64 mapping symbols ($x, $d, ...) mark code/data runs in many sections; they name nothing.
+                if (sym.name[0] == '$') continue;
+                const section = switch (sym.placement) {
+                    .section => |index_sec| index_sec,
+                    else => continue,
+                };
+                out[n] = .{ .name = sym.name, .section = section, .offset = sym.value };
+                n += 1;
+            }
+        }
+        return n;
     }
     fn findObject(self: *Modules, root: [:0]const u8, file: []const u8) ?[:0]u8 {
         var budget: u32 = 4096;
@@ -1290,6 +1435,13 @@ pub const Modules = struct {
         buf[used] = 0;
         return true;
     }
+    /// Hops of this task's wait, at most four. The 128-byte label keeps the first.
+    pub fn kernelWaitChain(self: *Modules, tid: i32, out: []kernel_aware.WaitHop, end: *kernel_aware.ChainEnd) usize {
+        self.ensureTasks();
+        end.* = .complete;
+        const task = self.taskByTid(tid) orelse return 0;
+        return kernel_aware.chainHopsEnd(self.kernel_waits, self.kernel_tasks, task.address, out, end);
+    }
     fn percpuValue(module: *const Module, symbol: elf.Symbol) ?u64 {
         if (!module.kernel or module.kernel_reloc) return null;
         const section = switch (symbol.placement) {
@@ -1384,6 +1536,8 @@ pub const Modules = struct {
         self.ensureTasks();
         const facts = self.kernel_facts orelse return error.KernelTypeInfoUnavailable;
         const task = self.taskByTid(tid) orelse return error.KernelTaskLayoutUnavailable;
+        // Running on a CPU with no register note: its saved state is stale.
+        if (self.core_source != null and self.taskIsCurrent(task.address)) return error.KernelTaskRunning;
         if (arch_ == .x86_64) {
             const sp_off = facts.thread_sp orelse return error.KernelTaskLayoutUnavailable;
             const ret_off = facts.saved_ret orelse return error.KernelTaskLayoutUnavailable;
@@ -4171,4 +4325,38 @@ test "budget stderr admits one notice per interval across stops and owners" {
     // Burst, silence, then one notice; no backlog is printed.
     try std.testing.expect(throttle.allow(2 * std.time.ns_per_s));
     try std.testing.expect(!throttle.allow(2 * std.time.ns_per_s));
+}
+
+test "kernel thread labels describe their own thread on a two-hop chain" {
+    var mods = Modules.init(std.testing.allocator);
+    defer {
+        mods.kernel_tasks = &.{};
+        mods.kernel_waits = &.{};
+        mods.deinit();
+    }
+    var tasks = [_]kernel_aware.TaskRow{
+        .{ .address = 0x1000, .pid = 10, .comm_len = 11 },
+        .{ .address = 0x2000, .pid = 11, .comm_len = 10 },
+        .{ .address = 0x3000, .pid = 12, .comm_len = 11 },
+    };
+    @memcpy(tasks[0].comm[0..11], "kg0-blocked");
+    @memcpy(tasks[1].comm[0..10], "kg0-holder");
+    @memcpy(tasks[2].comm[0..11], "kg0-spinner");
+    var waits = [_]kernel_aware.WaitEdge{
+        .{ .waiter = 0x1000, .lock = 0xffffffffc0155088, .kind = .mutex, .owner = 0x2000 },
+        .{ .waiter = 0x2000, .lock = 0xffffffffc0155070, .kind = .mutex, .owner = 0x3000, .owner_cpu = 3 },
+    };
+    mods.kernel_tasks = &tasks;
+    mods.kernel_waits = &waits;
+    var buf: [96]u8 = undefined;
+    const spin = buf[0..mods.appendWaits(0x3000, &buf)];
+    try std.testing.expect(std.mem.indexOf(u8, spin, "spins on CPU 3 holding") != null);
+    try std.testing.expect(std.mem.indexOf(u8, spin, "waits") == null);
+    var hbuf: [96]u8 = undefined;
+    const hold = hbuf[0..mods.appendWaits(0x2000, &hbuf)];
+    try std.testing.expect(std.mem.startsWith(u8, hold, " kg0-holder waits on lock 0xffffffffc0155070 owned by kg0-spinner"));
+    try std.testing.expect(std.mem.indexOf(u8, hold, "kg0-blocked") == null);
+    var bbuf: [96]u8 = undefined;
+    const blocked = bbuf[0..mods.appendWaits(0x1000, &bbuf)];
+    try std.testing.expect(std.mem.startsWith(u8, blocked, " kg0-blocked waits on lock 0xffffffffc0155088 owned by kg0-holder"));
 }

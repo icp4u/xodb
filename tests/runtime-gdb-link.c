@@ -179,10 +179,46 @@ static void oversized_cancelled(void)
     int result; assert(waitpid(child, &result, 0) == child && WIFEXITED(result) && !WEXITSTATUS(result));
     close(sent[0]); xrt_cancel_release(cancel); free(out); free(link);
 }
+/* A checksummed frame followed by a closed peer still stands. A close with
+ * no frame remains a transport failure, and that assertion is unchanged. */
+static void ack_after_close(void)
+{
+    int pair[2];
+    assert(!socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair));
+    uint8_t wire[64];
+    size_t size = 0;
+    assert(xrt_gdb_encode((const uint8_t *)"OK", 2, wire, sizeof wire, &size) == XRT_GDB_OK);
+    write_all(pair[1], wire, size);
+    assert(!close(pair[1]));
+    struct xrt_gdb_link *link = calloc(1, sizeof(*link));
+    assert(link);
+    link->fd = pair[0];
+    link->packet_size = 1024;
+    uint8_t out[16];
+    assert(xrt_gdb_receive(link, out, sizeof out, &size, true) == XRT_OK);
+    assert(size == 2 && !memcmp(out, "OK", 2));
+    assert(!link->failed && link->fd >= 0);
+    size = 7;
+    assert(xrt_gdb_receive(link, out, sizeof out, &size, true) == XRT_TRANSPORT_FAILED);
+    assert(link->failed && link->fd == -1 && strstr(link->reason, "peer closed"));
+    free(link);
+
+    assert(!socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair));
+    assert(!close(pair[1]));
+    link = calloc(1, sizeof(*link));
+    assert(link);
+    link->fd = pair[0];
+    link->packet_size = 1024;
+    size = 7;
+    assert(xrt_gdb_receive(link, out, sizeof out, &size, true) == XRT_TRANSPORT_FAILED);
+    assert(link->failed && link->fd == -1 && strstr(link->reason, "peer closed"));
+    free(link);
+}
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
     expired_budget();
+    ack_after_close();
     for (int kind = 0; kind < BIG_CASES; ++kind) oversized(kind);
     oversized_cancelled();
     int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0); assert(listener >= 0);
@@ -218,5 +254,5 @@ int main(void)
     for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i)
         assert(xrt_gdb_connect(link, invalid[i], NULL) == XRT_INVALID_ARGUMENT);
     free(link);
-    puts("GDB link: TCP, NAK retransmit, checksum retry, no-ack, console, interrupt, EOF, oversized and cancelled oversized replies pass");
+    puts("GDB link: TCP, NAK retransmit, checksum retry, no-ack, console, interrupt, EOF, closed-peer acknowledgement, oversized and cancelled oversized replies pass");
 }

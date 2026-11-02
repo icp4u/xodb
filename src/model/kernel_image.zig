@@ -45,7 +45,7 @@ fn want(owner: u8, name: [*:0]const u8, kind: c_uint, optional: bool) c.struct_x
     return .{ .owner = owner, .name = name, .kind = @intCast(kind), .width = 0, .optional = @intFromBool(optional) };
 }
 
-const type_names = [_][*:0]const u8{ "module", "module_memory", "task_struct", "inactive_task_frame", "pt_regs" };
+const type_names = [_][*:0]const u8{ "module", "module_memory", "task_struct", "inactive_task_frame", "pt_regs", "mod_kallsyms" };
 const fields = [_]c.struct_xdt_field{
     want(0, "list.next", c.XDT_POINTER, false),
     want(0, "name", c.XDT_ANY, false),
@@ -68,6 +68,11 @@ const fields = [_]c.struct_xdt_field{
     want(3, "ret_addr", c.XDT_ANY, false),
     want(4, "ip", c.XDT_ANY, false),
     want(4, "sp", c.XDT_ANY, false),
+    want(0, "kallsyms", c.XDT_POINTER, true),
+    want(0, "core_kallsyms", c.XDT_ANY, true),
+    want(5, "symtab", c.XDT_POINTER, true),
+    want(5, "num_symtab", c.XDT_ANY, true),
+    want(5, "strtab", c.XDT_POINTER, true),
 };
 
 fn layoutName(text: []const u8) anyerror {
@@ -109,7 +114,7 @@ pub fn factsFromDwarf(dwarf: *c.Dwarf, work: u64) !aware.Facts {
         .fields = &fields,
         .type_count = type_names.len,
         .field_count = fields.len,
-        .optional_types = (1 << 3) | (1 << 4),
+        .optional_types = (1 << 3) | (1 << 4) | (1 << 5),
     };
     var slots: [fields.len]c.struct_xdt_slot = undefined;
     var sizes: [type_names.len]u32 = undefined;
@@ -153,6 +158,13 @@ pub fn factsFromDwarf(dwarf: *c.Dwarf, work: u64) !aware.Facts {
         facts.pt_size = sizes[4];
         facts.pt_ip = slots[19].offset;
         facts.pt_sp = slots[20].offset;
+    }
+    if (present(slots[21])) |off| facts.kallsyms_off = off;
+    if (present(slots[22])) |off| facts.core_kallsyms_off = off;
+    if (present(slots[23]) != null and present(slots[24]) != null and present(slots[25]) != null) {
+        facts.ksym_symtab = slots[23].offset;
+        facts.ksym_count = slots[24].offset;
+        facts.ksym_strtab = slots[25].offset;
     }
     return facts;
 }

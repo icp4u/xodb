@@ -514,6 +514,19 @@ static void kgdb_put(char *bank, unsigned offset, uint64_t value)
 }
 enum { KGDB_LIVE = 0, KGDB_SHORT = 1, KGDB_BADHEX = 2, KGDB_SERIAL = 3, KGDB_RUNNING = 4,
        KGDB_MANY = 5, KGDB_BADSTOP = 6 };
+/* The reply is in the socket. Wait for the client's acknowledgement before
+ * exiting so that frame is still readable when this process closes. */
+static void kgdb_detach(int fd)
+{
+    unsigned char b;
+    kgdb_reply(fd, "OK");
+    for (;;) {
+        ssize_t n = read(fd, &b, 1);
+        if (n < 0 && errno == EINTR) continue;
+        break;
+    }
+    _exit(0);
+}
 /* Mirrors Linux kgdb on the wire: ids without leading zero bytes, an empty
  * reply ending the thread list, NUL-padded comm names, no reply to 0x03 while
  * running, and on x86 the address after int3 as the stopped pc. */
@@ -595,10 +608,7 @@ static void kgdb_serve(int fd, int mode)
             if (mode == KGDB_BADSTOP) {
                 kgdb_reply(fd, "T");
                 got = kgdb_command(&io, request, sizeof request);
-                if (got > 0 && !strcmp(request, "D")) {
-                    kgdb_reply(fd, "OK");
-                    _exit(0);
-                }
+                if (got > 0 && !strcmp(request, "D")) kgdb_detach(fd);
                 _exit(9);
             }
             if (breakpoint) {
@@ -611,10 +621,7 @@ static void kgdb_serve(int fd, int mode)
             if (breakpoint) _exit(8); /* Stepping onto its own int3. */
             kgdb_put(stopped_task ? task_bank : shadow_bank, 128, stopped_task ? 0x402004 : 0x401004);
             strcpy(response, stopped_task ? "T05thread:1;" : "T05thread:fffffffe;");
-        } else if (!strcmp(request, "D")) {
-            kgdb_reply(fd, "OK");
-            _exit(0);
-        }
+        } else if (!strcmp(request, "D")) kgdb_detach(fd);
         kgdb_reply(fd, response);
     }
 }

@@ -47,6 +47,14 @@ pub const Facts = struct {
     rwsem_first_waiter: ?u32 = null,
     /// `task_struct.blocked_on`, a mutex pointer set while `mutex_lock` sleeps.
     task_blocked_on: ?u32 = null,
+    /// `module.kallsyms`, a pointer. Null when the image has no such field.
+    kallsyms_off: ?u32 = null,
+    /// `module.core_kallsyms`, the embedded table.
+    core_kallsyms_off: ?u32 = null,
+    /// Offsets of `symtab`, `num_symtab`, and `strtab` within `mod_kallsyms`.
+    ksym_symtab: ?u32 = null,
+    ksym_count: ?u32 = null,
+    ksym_strtab: ?u32 = null,
 };
 
 pub const Vmcore = struct {
@@ -139,7 +147,17 @@ pub const ModuleRow = struct {
     ro_after: u64 = 0,
     build_id: [64]u8 = @splat(0),
     build_id_len: u8 = 0,
+    /// The image published kallsyms fields. `ksym_failed` means the header
+    /// could not be read, so the object must not be placed from the file.
+    ksym_present: bool = false,
+    ksym_failed: bool = false,
+    ksym_symtab: u64 = 0,
+    ksym_count: u32 = 0,
+    ksym_strtab: u64 = 0,
 };
+
+/// A module symbol table larger than this is not checked in full.
+pub const kallsyms_symbol_cap: u32 = 65536;
 
 fn readAt(memory: anytype, address: u64, dest: []u8) !void {
     const n = memory.read(address, dest) catch return error.KernelMemory;
@@ -194,6 +212,7 @@ pub fn walkModules(memory: anytype, head: u64, facts: Facts, out: []ModuleRow) !
             try readAt(memory, base + off, row.build_id[0..id_n]);
             row.build_id_len = @intCast(id_n);
         };
+        readModuleKallsyms(memory, base, facts, &row);
         out[n] = row;
         n += 1;
         const next = try readU64(memory, link);
@@ -201,6 +220,47 @@ pub fn walkModules(memory: anytype, head: u64, facts: Facts, out: []ModuleRow) !
         link = next;
     }
     return n;
+}
+
+fn readModuleKallsyms(memory: anytype, base: u64, facts: Facts, row: *ModuleRow) void {
+    const inner = facts.ksym_symtab != null and facts.ksym_count != null and facts.ksym_strtab != null;
+    const have_ptr = facts.kallsyms_off != null and inner;
+    const have_core = facts.core_kallsyms_off != null and inner;
+    if (!have_ptr and !have_core) return;
+    row.ksym_present = true;
+    if (have_ptr) {
+        const ptr = readU64(memory, base + facts.kallsyms_off.?) catch {
+            row.ksym_failed = true;
+            return;
+        };
+        if (ptr != 0) {
+            fillKallsyms(memory, ptr, facts, row);
+            return;
+        }
+    }
+    if (have_core) fillKallsyms(memory, base + facts.core_kallsyms_off.?, facts, row);
+}
+
+fn fillKallsyms(memory: anytype, table: u64, facts: Facts, row: *ModuleRow) void {
+    const symtab = readU64(memory, table + facts.ksym_symtab.?) catch {
+        row.ksym_failed = true;
+        return;
+    };
+    const count = readU32(memory, table + facts.ksym_count.?) catch {
+        row.ksym_failed = true;
+        return;
+    };
+    const strtab = readU64(memory, table + facts.ksym_strtab.?) catch {
+        row.ksym_failed = true;
+        return;
+    };
+    if (count > kallsyms_symbol_cap or (count > 0 and (symtab == 0 or strtab == 0))) {
+        row.ksym_failed = true;
+        return;
+    }
+    row.ksym_symtab = symtab;
+    row.ksym_count = count;
+    row.ksym_strtab = strtab;
 }
 
 pub const TaskRow = struct {
@@ -243,7 +303,7 @@ pub fn walkTasks(memory: anytype, init_task: u64, facts: Facts, out: []TaskRow) 
     return n;
 }
 
-pub const WaitKind = enum { mutex, rwsem };
+pub const WaitKind = enum { mutex, rwsem, unknown };
 
 pub const WaitEdge = struct {
     waiter: u64,
@@ -253,7 +313,12 @@ pub const WaitEdge = struct {
     owner_cpu: ?u32 = null,
     /// An rwsem held for read: the readers are not tracked, so no owner is named.
     readers: bool = false,
+    /// The lock address is known, but the owner word is empty or not a walked task.
+    unknown_owner: bool = false,
 };
+
+/// Outbound wait sentences follow at most this many edges, including the first.
+pub const chain_bound = 4;
 
 const LockLayout = struct {
     owner: u32,
@@ -311,7 +376,7 @@ const stack_window: u64 = 16 * 1024;
 
 /// `list_head.next` is the first field. The lock's wait list is the one node
 /// that is not inside a task stack. Owner flags occupy the low three bits.
-fn findWait(memory: anytype, task: TaskRow, tasks: []const TaskRow, ranges: []const StackRange, stack: StackRange, layout: LockLayout, current: []const u64, kind: WaitKind) ?WaitEdge {
+fn findWait(memory: anytype, task: TaskRow, tasks: []const TaskRow, ranges: []const StackRange, stack: StackRange, layout: LockLayout, current: []const u64, kind: WaitKind, allow_unknown: bool) ?WaitEdge {
     var chunk: [512]u8 = undefined;
     var offset: u64 = 0;
     while (offset + 8 <= stack_window) {
@@ -329,7 +394,7 @@ fn findWait(memory: anytype, task: TaskRow, tasks: []const TaskRow, ranges: []co
             if (base < stack.base) continue;
             const list_at = base + layout.waiter_list;
             if (list_at < stack.base or list_at + 8 > stack.end) continue;
-            const edge = closeWait(memory, task, tasks, ranges, list_at, layout, current, kind) orelse continue;
+            const edge = closeWait(memory, task, tasks, ranges, list_at, layout, current, kind, allow_unknown) orelse continue;
             return edge;
         }
         if (n < want) break;
@@ -338,7 +403,7 @@ fn findWait(memory: anytype, task: TaskRow, tasks: []const TaskRow, ranges: []co
     return null;
 }
 
-fn closeWait(memory: anytype, task: TaskRow, tasks: []const TaskRow, ranges: []const StackRange, list_at: u64, layout: LockLayout, current: []const u64, kind: WaitKind) ?WaitEdge {
+fn closeWait(memory: anytype, task: TaskRow, tasks: []const TaskRow, ranges: []const StackRange, list_at: u64, layout: LockLayout, current: []const u64, kind: WaitKind, allow_unknown: bool) ?WaitEdge {
     var node = readU64(memory, list_at) catch return null;
     var outside: ?u64 = null;
     var closed = false;
@@ -362,8 +427,21 @@ fn closeWait(memory: anytype, task: TaskRow, tasks: []const TaskRow, ranges: []c
     const raw = readU64(memory, lock + layout.owner) catch return null;
     // RWSEM_READER_OWNED: the owner word is only the last reader, not a holder.
     if (kind == .rwsem and raw & 1 != 0) return .{ .waiter = task.address, .lock = lock, .kind = kind, .owner = 0, .readers = true };
+    return namedOwner(task, tasks, lock, raw, current, kind, allow_unknown);
+}
+
+fn namedOwner(task: TaskRow, tasks: []const TaskRow, lock: u64, raw: u64, current: []const u64, kind: WaitKind, allow_unknown: bool) ?WaitEdge {
     const owner = raw & ~@as(u64, 7);
-    if (owner == 0 or owner == task.address or !knownTask(tasks, owner)) return null;
+    if (owner == 0 or owner == task.address or !knownTask(tasks, owner)) {
+        if (!allow_unknown) return null;
+        return .{
+            .waiter = task.address,
+            .lock = lock,
+            .kind = kind,
+            .owner = 0,
+            .unknown_owner = true,
+        };
+    }
     return .{
         .waiter = task.address,
         .lock = lock,
@@ -375,7 +453,7 @@ fn closeWait(memory: anytype, task: TaskRow, tasks: []const TaskRow, ranges: []c
 
 /// The lock's `first_waiter` points at a waiter on this task's stack, and that
 /// waiter's task field is this task. Owner flags occupy the low three bits.
-fn edgeAt(memory: anytype, task: TaskRow, tasks: []const TaskRow, stack: StackRange, lock: u64, layout: PointerLayout, current: []const u64, kind: WaitKind) ?WaitEdge {
+fn edgeAt(memory: anytype, task: TaskRow, tasks: []const TaskRow, stack: StackRange, lock: u64, layout: PointerLayout, current: []const u64, kind: WaitKind, allow_unknown: bool) ?WaitEdge {
     const first = readU64(memory, lock + layout.first_waiter) catch return null;
     if (first == 0 or first % 8 != 0 or first < stack.base or first >= stack.end) return null;
     const pointed_at = first + layout.waiter_task;
@@ -385,26 +463,18 @@ fn edgeAt(memory: anytype, task: TaskRow, tasks: []const TaskRow, stack: StackRa
     const raw = readU64(memory, lock + layout.owner) catch return null;
     // RWSEM_READER_OWNED: the owner word is only the last reader, not a holder.
     if (kind == .rwsem and raw & 1 != 0) return .{ .waiter = task.address, .lock = lock, .kind = kind, .owner = 0, .readers = true };
-    const owner = raw & ~@as(u64, 7);
-    if (owner == 0 or owner == task.address or !knownTask(tasks, owner)) return null;
-    return .{
-        .waiter = task.address,
-        .lock = lock,
-        .kind = kind,
-        .owner = owner,
-        .owner_cpu = ownerCpu(current, owner),
-    };
+    return namedOwner(task, tasks, lock, raw, current, kind, allow_unknown);
 }
 
-fn blockedEdge(memory: anytype, task: TaskRow, tasks: []const TaskRow, ranges: []const StackRange, stack: StackRange, blocked_off: u32, layout: PointerLayout, current: []const u64) ?WaitEdge {
+fn blockedEdge(memory: anytype, task: TaskRow, tasks: []const TaskRow, ranges: []const StackRange, stack: StackRange, blocked_off: u32, layout: PointerLayout, current: []const u64, allow_unknown: bool) ?WaitEdge {
     const lock = readU64(memory, task.address + blocked_off) catch return null;
     if (lock == 0 or lock % 8 != 0 or inStack(ranges, lock)) return null;
-    return edgeAt(memory, task, tasks, stack, lock, layout, current, .mutex);
+    return edgeAt(memory, task, tasks, stack, lock, layout, current, .mutex, allow_unknown);
 }
 
 /// A kernel pointer on the waiter stack whose `first_waiter` names that waiter.
 /// Used when the lock has no embedded wait list to walk back to.
-fn findByPointer(memory: anytype, task: TaskRow, tasks: []const TaskRow, ranges: []const StackRange, stack: StackRange, layout: PointerLayout, current: []const u64, kind: WaitKind) ?WaitEdge {
+fn findByPointer(memory: anytype, task: TaskRow, tasks: []const TaskRow, ranges: []const StackRange, stack: StackRange, layout: PointerLayout, current: []const u64, kind: WaitKind, allow_unknown: bool) ?WaitEdge {
     var chunk: [512]u8 = undefined;
     var offset: u64 = 0;
     while (offset + 8 <= stack_window) {
@@ -416,7 +486,7 @@ fn findByPointer(memory: anytype, task: TaskRow, tasks: []const TaskRow, ranges:
         while (i + 8 <= usable) : (i += 8) {
             const word = std.mem.readInt(u64, chunk[i..][0..8], .little);
             if (word < 0x1000 or word % 8 != 0 or inStack(ranges, word)) continue;
-            const edge = edgeAt(memory, task, tasks, stack, word, layout, current, kind) orelse continue;
+            const edge = edgeAt(memory, task, tasks, stack, word, layout, current, kind, allow_unknown) orelse continue;
             return edge;
         }
         if (n < want) break;
@@ -426,14 +496,16 @@ fn findByPointer(memory: anytype, task: TaskRow, tasks: []const TaskRow, ranges:
 }
 
 /// One edge per blocked task. A mutex match wins over an rwsem match for the same task.
-/// Missing offsets, a missing stack, or a lock whose owner is not a known task produce nothing.
+/// A known lock whose owner is not a walked task is an unknown-owner edge.
+/// A `blocked_on` address that matches neither type is an unknown-lock edge.
+/// Missing offsets or a missing stack produce nothing.
 pub fn walkWaits(memory: anytype, tasks: []const TaskRow, facts: Facts, current: []const u64, out: []WaitEdge) !usize {
     const stack_off = facts.stack_off orelse return 0;
     const mutex = lockLayout(facts.mutex_owner, facts.mutex_wait_list, facts.mutex_waiter_list, facts.mutex_waiter_task);
     const rwsem = lockLayout(facts.rwsem_owner, facts.rwsem_wait_list, facts.rwsem_waiter_list, facts.rwsem_waiter_task);
     const mutex_ptr = pointerLayout(facts.mutex_owner, facts.mutex_first_waiter, facts.mutex_waiter_task);
     const rwsem_ptr = pointerLayout(facts.rwsem_owner, facts.rwsem_first_waiter, facts.rwsem_waiter_task);
-    if (mutex == null and rwsem == null and mutex_ptr == null and rwsem_ptr == null) return 0;
+    if (mutex == null and rwsem == null and mutex_ptr == null and rwsem_ptr == null and facts.task_blocked_on == null) return 0;
     var ranges: [1024]StackRange = undefined;
     const range_n = @min(tasks.len, ranges.len);
     for (tasks[0..range_n], 0..) |task, index| {
@@ -450,31 +522,54 @@ pub fn walkWaits(memory: anytype, tasks: []const TaskRow, facts: Facts, current:
         scanned += 1;
         const stack = ranges[index];
         if (stack.base == 0) continue;
-        if (mutex) |layout| if (findWait(memory, task, tasks, ranges[0..range_n], stack, layout, current, .mutex)) |edge| {
-            out[n] = edge;
-            n += 1;
-            continue;
-        };
-        if (mutex_ptr) |layout| {
-            const from_task = if (facts.task_blocked_on) |off| blockedEdge(memory, task, tasks, ranges[0..range_n], stack, off, layout, current) else null;
-            if (from_task orelse findByPointer(memory, task, tasks, ranges[0..range_n], stack, layout, current, .mutex)) |edge| {
+        // A known owner wins over an unknown one, so a false structural match with an empty owner word cannot hide a real rwsem.
+        var pass: u2 = 0;
+        while (pass < 2) : (pass += 1) {
+            const allow_unknown = pass == 1;
+            if (mutex) |layout| if (findWait(memory, task, tasks, ranges[0..range_n], stack, layout, current, .mutex, allow_unknown)) |edge| {
                 out[n] = edge;
                 n += 1;
-                continue;
+                break;
+            };
+            if (mutex_ptr) |layout| {
+                const from_task = if (facts.task_blocked_on) |off| blockedEdge(memory, task, tasks, ranges[0..range_n], stack, off, layout, current, allow_unknown) else null;
+                if (from_task orelse findByPointer(memory, task, tasks, ranges[0..range_n], stack, layout, current, .mutex, allow_unknown)) |edge| {
+                    out[n] = edge;
+                    n += 1;
+                    break;
+                }
             }
+            if (n == out.len) break;
+            if (rwsem) |layout| if (findWait(memory, task, tasks, ranges[0..range_n], stack, layout, current, .rwsem, allow_unknown)) |edge| {
+                out[n] = edge;
+                n += 1;
+                break;
+            };
+            if (rwsem_ptr) |layout| if (findByPointer(memory, task, tasks, ranges[0..range_n], stack, layout, current, .rwsem, allow_unknown)) |edge| {
+                out[n] = edge;
+                n += 1;
+                break;
+            };
+        } else if (unknownLock(memory, task, ranges[0..range_n], facts.task_blocked_on)) |edge| {
+            if (n == out.len) break;
+            out[n] = edge;
+            n += 1;
         }
-        if (n == out.len) break;
-        if (rwsem) |layout| if (findWait(memory, task, tasks, ranges[0..range_n], stack, layout, current, .rwsem)) |edge| {
-            out[n] = edge;
-            n += 1;
-            continue;
-        };
-        if (rwsem_ptr) |layout| if (findByPointer(memory, task, tasks, ranges[0..range_n], stack, layout, current, .rwsem)) |edge| {
-            out[n] = edge;
-            n += 1;
-        };
     }
     return n;
+}
+
+fn unknownLock(memory: anytype, task: TaskRow, ranges: []const StackRange, blocked_off: ?u32) ?WaitEdge {
+    const off = blocked_off orelse return null;
+    const lock = readU64(memory, task.address + off) catch return null;
+    if (lock == 0 or lock % 8 != 0 or inStack(ranges, lock)) return null;
+    return .{
+        .waiter = task.address,
+        .lock = lock,
+        .kind = .unknown,
+        .owner = 0,
+        .unknown_owner = true,
+    };
 }
 
 fn commOf(tasks: []const TaskRow, address: u64) []const u8 {
@@ -484,12 +579,78 @@ fn commOf(tasks: []const TaskRow, address: u64) []const u8 {
 
 pub fn formatWait(edge: WaitEdge, tasks: []const TaskRow, buf: []u8) []const u8 {
     const waiter = commOf(tasks, edge.waiter);
+    if (edge.kind == .unknown) return std.fmt.bufPrint(buf, "{s} waits on an unknown lock at 0x{x}", .{ waiter, edge.lock }) catch buf[0..0];
     if (edge.readers) return std.fmt.bufPrint(buf, "{s} waits on rwsem 0x{x} held by readers (readers are not tracked)", .{ waiter, edge.lock }) catch buf[0..0];
+    if (edge.unknown_owner) return std.fmt.bufPrint(buf, "{s} waits on lock 0x{x} owned by an unknown task", .{ waiter, edge.lock }) catch buf[0..0];
     const owner = commOf(tasks, edge.owner);
     if (edge.owner_cpu) |cpu| {
         return std.fmt.bufPrint(buf, "{s} waits on lock 0x{x} owned by {s}, which spins on CPU {d}", .{ waiter, edge.lock, owner, cpu }) catch buf[0..0];
     }
     return std.fmt.bufPrint(buf, "{s} waits on lock 0x{x} owned by {s}", .{ waiter, edge.lock, owner }) catch buf[0..0];
+}
+
+/// The owner's own label. It names the lock this task holds, not the waiter.
+pub fn formatHold(edge: WaitEdge, buf: []u8) []const u8 {
+    const what: []const u8 = if (edge.kind == .rwsem) "rwsem" else "lock";
+    if (edge.owner_cpu) |cpu| {
+        return std.fmt.bufPrint(buf, "spins on CPU {d} holding {s} 0x{x}", .{ cpu, what, edge.lock }) catch buf[0..0];
+    }
+    return std.fmt.bufPrint(buf, "holds {s} 0x{x}", .{ what, edge.lock }) catch buf[0..0];
+}
+
+fn findWaiter(edges: []const WaitEdge, waiter: u64) ?usize {
+    for (edges, 0..) |edge, index| if (edge.waiter == waiter) return index;
+    return null;
+}
+
+fn formatHop(edge: WaitEdge, tasks: []const TaskRow, buf: []u8) []const u8 {
+    if (edge.kind == .unknown) return std.fmt.bufPrint(buf, ", which waits on an unknown lock at 0x{x}", .{edge.lock}) catch buf[0..0];
+    if (edge.readers) return std.fmt.bufPrint(buf, ", which waits on rwsem 0x{x} held by readers", .{edge.lock}) catch buf[0..0];
+    if (edge.unknown_owner) return std.fmt.bufPrint(buf, ", which waits on lock 0x{x} owned by an unknown task", .{edge.lock}) catch buf[0..0];
+    const owner = commOf(tasks, edge.owner);
+    if (edge.owner_cpu) |cpu| {
+        return std.fmt.bufPrint(buf, ", which waits on lock 0x{x} owned by {s}, which spins on CPU {d}", .{ edge.lock, owner, cpu }) catch buf[0..0];
+    }
+    return std.fmt.bufPrint(buf, ", which waits on lock 0x{x} owned by {s}", .{ edge.lock, owner }) catch buf[0..0];
+}
+
+/// One sentence for a chain of waits. The walk stops at `chain_bound` edges, at an unknown owner, or when an owner repeats.
+pub fn formatChain(edges: []const WaitEdge, index: usize, tasks: []const TaskRow, buf: []u8) []const u8 {
+    if (index >= edges.len) return buf[0..0];
+    var used = formatWait(edges[index], tasks, buf).len;
+    if (used == 0 or edges[index].unknown_owner or edges[index].kind == .unknown or edges[index].readers) return buf[0..used];
+    var seen: [chain_bound]u64 = undefined;
+    seen[0] = edges[index].waiter;
+    var seen_n: usize = 1;
+    var owner = edges[index].owner;
+    var hops: usize = 1;
+    while (hops < chain_bound) : (hops += 1) {
+        if (owner == 0) break;
+        var repeated = false;
+        for (seen[0..seen_n]) |addr| if (addr == owner) {
+            repeated = true;
+            break;
+        };
+        if (repeated) break;
+        const next = findWaiter(edges, owner) orelse break;
+        if (seen_n < seen.len) {
+            seen[seen_n] = owner;
+            seen_n += 1;
+        }
+        const piece = formatHop(edges[next], tasks, buf[used..]);
+        if (piece.len == 0) {
+            // A label has 128 bytes. Say the chain goes on rather than end it silently.
+            if (buf.len - used >= 4) {
+                @memcpy(buf[used..][0..4], ", ..");
+                used += 4;
+            }
+            break;
+        }
+        used += piece.len;
+        if (edges[next].unknown_owner or edges[next].kind == .unknown or edges[next].readers or edges[next].owner == 0) break;
+        owner = edges[next].owner;
+    }
+    return buf[0..used];
 }
 
 /// `thread.sp` points at the inactive frame. The saved return slot's offset
@@ -499,6 +660,141 @@ pub fn sleepingX86(thread_sp: u64, saved_ret: u32, bp: u64, ret: u64) !struct { 
     if (ret == 0) return error.KernelTaskLayoutUnavailable;
     const sp = std.math.add(u64, thread_sp, @as(u64, saved_ret) + 8) catch return error.KernelTaskLayoutUnavailable;
     return .{ .ip = ret, .sp = sp, .bp = bp };
+}
+
+/// One hop of a wait chain. The thread label is 128 bytes and keeps a single hop.
+pub const WaitHop = struct {
+    lock: u64 = 0,
+    kind: WaitKind = .mutex,
+    owner: [16]u8 = @splat(0),
+    owner_len: u8 = 0,
+    owner_cpu: ?u32 = null,
+    readers: bool = false,
+    /// The owner word did not name a task. A reader-held lock is separate.
+    unknown_owner: bool = false,
+    pub fn jsonStringify(self: WaitHop, writer: *std.json.Stringify) !void {
+        var lock_hex: [18]u8 = undefined;
+        const lock = std.fmt.bufPrint(&lock_hex, "0x{x}", .{self.lock}) catch unreachable;
+        const owner: ?[]const u8 = if (self.readers or self.unknown_owner or self.owner_len == 0) null else self.owner[0..self.owner_len];
+        try writer.write(.{ .lock = lock, .kind = self.kind, .owner = owner, .owner_cpu = self.owner_cpu, .readers = self.readers, .unknown_owner = self.unknown_owner });
+    }
+};
+
+fn findWaiterEdge(edges: []const WaitEdge, waiter: u64) ?usize {
+    for (edges, 0..) |edge, index| if (edge.waiter == waiter) return index;
+    return null;
+}
+
+fn fillHop(edge: WaitEdge, tasks: []const TaskRow) WaitHop {
+    var hop = WaitHop{
+        .lock = edge.lock,
+        .kind = edge.kind,
+        .owner_cpu = edge.owner_cpu,
+        .readers = edge.readers,
+    };
+    if (edge.readers or edge.owner == 0) {
+        hop.unknown_owner = edge.owner == 0 and !edge.readers;
+        return hop;
+    }
+    const name = commOf(tasks, edge.owner);
+    const n = @min(name.len, hop.owner.len);
+    @memcpy(hop.owner[0..n], name[0..n]);
+    hop.owner_len = @intCast(n);
+    return hop;
+}
+
+/// Follow `waiter`'s owner for at most four hops. Stops on a repeated owner,
+/// a reader-held lock, an owner that is not waiting, or an owner of zero.
+/// How a published chain ended: at its last hop, at a repeated owner, or at the hop bound with more beyond.
+pub const ChainEnd = enum { complete, cycle, truncated };
+
+pub fn chainHops(edges: []const WaitEdge, tasks: []const TaskRow, waiter: u64, out: []WaitHop) usize {
+    var end: ChainEnd = .complete;
+    return chainHopsEnd(edges, tasks, waiter, out, &end);
+}
+
+pub fn chainHopsEnd(edges: []const WaitEdge, tasks: []const TaskRow, waiter: u64, out: []WaitHop, end: *ChainEnd) usize {
+    end.* = .complete;
+    if (out.len == 0 or waiter == 0) return 0;
+    const first = findWaiterEdge(edges, waiter) orelse return 0;
+    const limit = @min(out.len, 4);
+    var seen: [4]u64 = undefined;
+    var seen_n: usize = 0;
+    var index: usize = first;
+    var n: usize = 0;
+    while (n < limit) {
+        const edge = edges[index];
+        if (seen_n < seen.len) {
+            seen[seen_n] = edge.waiter;
+            seen_n += 1;
+        }
+        out[n] = fillHop(edge, tasks);
+        n += 1;
+        if (edge.readers or edge.owner == 0) break;
+        var repeated = false;
+        for (seen[0..seen_n]) |addr| if (addr == edge.owner) {
+            repeated = true;
+            break;
+        };
+        if (repeated) {
+            end.* = .cycle;
+            break;
+        }
+        index = findWaiterEdge(edges, edge.owner) orelse break;
+        if (n == limit) end.* = .truncated;
+    }
+    return n;
+}
+
+fn taskNamed(address: u64, pid: i32, comm: []const u8) TaskRow {
+    var row = TaskRow{ .address = address, .pid = pid, .comm_len = @intCast(comm.len) };
+    @memcpy(row.comm[0..comm.len], comm);
+    return row;
+}
+
+test "a wait chain keeps every hop the 128-byte label cannot" {
+    const tasks = [_]TaskRow{
+        taskNamed(0xffff961301001000, 80, "kg0-blocked"),
+        taskNamed(0xffff961301002000, 81, "kg0-spinner"),
+        taskNamed(0xffff961301003000, 82, "kg0-holder"),
+    };
+    const two = [_]WaitEdge{
+        .{ .waiter = 0xffff961301001000, .lock = 0xffffffffc00fb068, .kind = .mutex, .owner = 0xffff961301002000 },
+        .{ .waiter = 0xffff961301002000, .lock = 0xffffffffc00fb0a0, .kind = .mutex, .owner = 0xffff961301003000, .owner_cpu = 1 },
+    };
+    var narrow: [128]u8 = undefined;
+    const first = formatWait(two[0], &tasks, &narrow);
+    var second_buf: [128]u8 = undefined;
+    const second = formatWait(two[1], &tasks, &second_buf);
+    try std.testing.expect(first.len + 2 + second.len > narrow.len);
+    var hops: [4]WaitHop = undefined;
+    try std.testing.expectEqual(@as(usize, 2), chainHops(&two, &tasks, tasks[0].address, &hops));
+    try std.testing.expectEqual(@as(u64, 0xffffffffc00fb0a0), hops[1].lock);
+    try std.testing.expectEqualStrings("kg0-holder", hops[1].owner[0..hops[1].owner_len]);
+    try std.testing.expectEqual(@as(?u32, 1), hops[1].owner_cpu);
+    try std.testing.expectEqual(@as(usize, 0), chainHops(&two, &tasks, tasks[2].address, &hops));
+
+    const cycle = [_]WaitEdge{
+        .{ .waiter = 0x1000, .lock = 0x11, .kind = .mutex, .owner = 0x2000 },
+        .{ .waiter = 0x2000, .lock = 0x22, .kind = .mutex, .owner = 0x1000 },
+    };
+    const names = [_]TaskRow{ taskNamed(0x1000, 1, "A"), taskNamed(0x2000, 2, "B") };
+    try std.testing.expectEqual(@as(usize, 2), chainHops(&cycle, &names, 0x1000, &hops));
+    try std.testing.expectEqualStrings("A", hops[1].owner[0..hops[1].owner_len]);
+
+    var chain_tasks: [6]TaskRow = undefined;
+    var chain_edges: [5]WaitEdge = undefined;
+    for (0..6) |i| chain_tasks[i] = taskNamed(0x1000 + @as(u64, i), @intCast(i + 1), &[_]u8{'A' + @as(u8, @intCast(i))});
+    for (0..5) |i| chain_edges[i] = .{ .waiter = chain_tasks[i].address, .lock = 0x10 + @as(u64, i), .kind = .mutex, .owner = chain_tasks[i + 1].address };
+    try std.testing.expectEqual(@as(usize, 4), chainHops(&chain_edges, &chain_tasks, chain_tasks[0].address, &hops));
+    try std.testing.expectEqualStrings("E", hops[3].owner[0..hops[3].owner_len]);
+
+    const readers = [_]WaitEdge{.{ .waiter = 0x1000, .lock = 0x50, .kind = .rwsem, .owner = 0, .readers = true }};
+    try std.testing.expectEqual(@as(usize, 1), chainHops(&readers, &names, 0x1000, &hops));
+    try std.testing.expect(hops[0].readers and !hops[0].unknown_owner and hops[0].owner_len == 0);
+    const unknown = [_]WaitEdge{.{ .waiter = 0x1000, .lock = 0x60, .kind = .mutex, .owner = 0 }};
+    try std.testing.expectEqual(@as(usize, 1), chainHops(&unknown, &names, 0x1000, &hops));
+    try std.testing.expect(hops[0].unknown_owner and hops[0].owner_len == 0);
 }
 
 pub fn perCpuAddress(offsets: []const u64, cpu: u32, symbol: u64) !u64 {
@@ -614,26 +910,34 @@ const BtfView = struct {
         return rest[0..end];
     }
 
+    const Step = struct { info: BtfType, pos: u32, next: u32 };
+
+    fn step(self: BtfView, pos: u32) !Step {
+        if (pos + 12 > self.types_end) return error.BtfMalformed;
+        const info_bits = std.mem.readInt(u32, self.bytes[pos + 4 ..][0..4], .little);
+        const kind_raw: u8 = @intCast((info_bits >> 24) & 0x7f);
+        const kind = std.enums.fromInt(BtfKind, kind_raw) orelse return error.BtfUnsupported;
+        const vlen = info_bits & 0xffffff;
+        const info = BtfType{
+            .kind = kind,
+            .vlen = vlen,
+            .kflag = info_bits >> 31 != 0,
+            .size_or_type = std.mem.readInt(u32, self.bytes[pos + 8 ..][0..4], .little),
+            .extra = try btfExtra(kind, vlen),
+        };
+        const next = std.math.add(u32, pos + 12, info.extra) catch return error.BtfMalformed;
+        if (next > self.types_end) return error.BtfMalformed;
+        return .{ .info = info, .pos = pos, .next = next };
+    }
+
     fn at(self: BtfView, id: u32) !struct { info: BtfType, pos: u32 } {
         if (id == 0) return error.BtfMalformed;
         var pos = self.types;
         var cur: u32 = 1;
         while (pos + 12 <= self.types_end) {
-            const info_bits = std.mem.readInt(u32, self.bytes[pos + 4 ..][0..4], .little);
-            const kind_raw: u8 = @intCast((info_bits >> 24) & 0x7f);
-            const kind = std.enums.fromInt(BtfKind, kind_raw) orelse return error.BtfUnsupported;
-            const vlen = info_bits & 0xffffff;
-            const info = BtfType{
-                .kind = kind,
-                .vlen = vlen,
-                .kflag = info_bits >> 31 != 0,
-                .size_or_type = std.mem.readInt(u32, self.bytes[pos + 8 ..][0..4], .little),
-                .extra = try btfExtra(kind, vlen),
-            };
-            const next = std.math.add(u32, pos + 12, info.extra) catch return error.BtfMalformed;
-            if (next > self.types_end) return error.BtfMalformed;
-            if (cur == id) return .{ .info = info, .pos = pos };
-            pos = next;
+            const item = try self.step(pos);
+            if (cur == id) return .{ .info = item.info, .pos = item.pos };
+            pos = item.next;
             cur += 1;
         }
         return error.BtfMalformed;
@@ -658,12 +962,15 @@ fn byteOffset(raw: u32, kflag: bool) !u32 {
 
 pub fn btfMember(bytes: []const u8, type_name: []const u8, member_name: []const u8) !Member {
     const view = try BtfView.parse(bytes);
-    var id: u32 = 1;
-    while (true) : (id += 1) {
-        const found = view.at(id) catch |err| switch (err) {
+    // Ids are dense from 1. One forward pass stays linear. Looking each id up
+    // from the first type does not finish on a kernel-sized BTF section.
+    var scan = view.types;
+    while (scan + 12 <= view.types_end) {
+        const found = view.step(scan) catch |err| switch (err) {
             error.BtfMalformed => break,
             else => return err,
         };
+        scan = found.next;
         const type_off = std.mem.readInt(u32, view.bytes[found.pos..][0..4], .little);
         if (!std.mem.eql(u8, try view.name(type_off), type_name)) continue;
         var info = found.info;
@@ -772,9 +1079,10 @@ pub fn factsFromBtf(bytes: []const u8) !Facts {
             const pt = try view.at((try requireMember(bytes, "pt_regs", "ip")).type_id);
             _ = pt;
             // Size lives on the struct, not on the member. Find the struct by walking.
-            var id: u32 = 1;
-            while (true) : (id += 1) {
-                const item = view.at(id) catch break;
+            var pos: u32 = view.types;
+            while (pos + 12 <= view.types_end) {
+                const item = view.step(pos) catch break;
+                pos = item.next;
                 const item_name = view.name(std.mem.readInt(u32, view.bytes[item.pos..][0..4], .little)) catch break;
                 if (item.info.kind == .@"struct" and std.mem.eql(u8, item_name, "pt_regs")) {
                     facts.pt_size = item.info.size_or_type;
@@ -785,6 +1093,17 @@ pub fn factsFromBtf(bytes: []const u8) !Facts {
             }
         }
     } else |_| {}
+    if (btfMember(bytes, "mod_kallsyms", "symtab")) |symtab| {
+        if (btfMember(bytes, "mod_kallsyms", "num_symtab")) |count| {
+            if (btfMember(bytes, "mod_kallsyms", "strtab")) |strtab| {
+                facts.ksym_symtab = symtab.offset;
+                facts.ksym_count = count.offset;
+                facts.ksym_strtab = strtab.offset;
+            } else |_| {}
+        } else |_| {}
+    } else |_| {}
+    if (btfMember(bytes, "module", "kallsyms")) |slot| facts.kallsyms_off = slot.offset else |_| {}
+    if (btfMember(bytes, "module", "core_kallsyms")) |slot| facts.core_kallsyms_off = slot.offset else |_| {}
     return facts;
 }
 
@@ -874,6 +1193,153 @@ pub fn entryFrame(arm: bool, sp: u64, ra: u64, fp: u64, stacked: u64) !Fp {
 
 pub fn buildIdMatches(image_id: []const u8, memory_id: []const u8) bool {
     return image_id.len > 0 and image_id.len == memory_id.len and std.mem.eql(u8, image_id, memory_id);
+}
+
+pub const NamedAddr = struct {
+    name: []const u8,
+    address: u64,
+};
+
+/// True when every name that appears in both tables has the same address.
+/// A name may occur more than once; any equal address accepts it. Two
+/// non-empty tables that share no name do not agree. An empty table cannot
+/// be checked and agrees. `wide` selects the 24-byte or 16-byte symbol record.
+pub fn kallsymsAgree(memory: anytype, symtab: u64, count: u32, strtab: u64, wide: bool, placed: []const NamedAddr) !bool {
+    if (count == 0 or placed.len == 0) return true;
+    if (symtab == 0 or strtab == 0 or count > kallsyms_symbol_cap or placed.len > 512) return error.KernelSymbolTable;
+    const width: u64 = if (wide) 24 else 16;
+    const shndx_off: usize = if (wide) 6 else 14;
+    var seen: [512]bool = @splat(false);
+    var hit: [512]bool = @splat(false);
+    var named_count: u32 = 0;
+    var index: u32 = 0;
+    while (index < count) : (index += 1) {
+        var rec: [24]u8 = undefined;
+        const rec_len: usize = if (wide) 24 else 16;
+        try readAt(memory, symtab + @as(u64, index) * width, rec[0..rec_len]);
+        const shndx = std.mem.readInt(u16, rec[shndx_off..][0..2], .little);
+        if (shndx == 0 or shndx >= 0xff00) continue;
+        const name_off = std.mem.readInt(u32, rec[0..4], .little);
+        const value: u64 = if (wide)
+            std.mem.readInt(u64, rec[8..16], .little)
+        else
+            std.mem.readInt(u32, rec[4..8], .little);
+        var name_buf: [192]u8 = undefined;
+        const name = readSymbolName(memory, strtab + name_off, &name_buf) orelse continue;
+        if (name.len == 0) continue;
+        named_count += 1;
+        for (placed, 0..) |item, slot| {
+            if (!std.mem.eql(u8, item.name, name)) continue;
+            seen[slot] = true;
+            if (item.address == value) hit[slot] = true;
+        }
+    }
+    if (named_count == 0) return error.KernelSymbolTable;
+    var shared = false;
+    for (placed, 0..) |_, slot| {
+        if (!seen[slot]) continue;
+        shared = true;
+        if (!hit[slot]) return false;
+    }
+    return shared;
+}
+
+pub const SectionSym = struct {
+    name: []const u8,
+    section: u32,
+    /// File offset within `section`. The kernel's address is this plus the
+    /// base it chose for the section.
+    offset: u64,
+};
+
+/// True when every section that appears in both tables has one base.
+/// The base is a kernel address minus the file offset. Sections may sit at
+/// different addresses than a file layout predicts. A symbol that moved
+/// inside its section disagrees. A name may occur more than once; any
+/// pairing that yields one base accepts it. An empty table cannot be
+/// checked and agrees. Two non-empty tables that share no name do not.
+pub fn kallsymsSectionsAgree(memory: anytype, symtab: u64, count: u32, strtab: u64, wide: bool, placed: []const SectionSym) !bool {
+    if (count == 0 or placed.len == 0) return true;
+    if (symtab == 0 or strtab == 0 or count > kallsyms_symbol_cap or placed.len > 512) return error.KernelSymbolTable;
+    const width: u64 = if (wide) 24 else 16;
+    const shndx_off: usize = if (wide) 6 else 14;
+    const hit_cap = 8;
+    var hits: [512][hit_cap]u64 = undefined;
+    var n_hit: [512]u8 = @splat(0);
+    var seen: [512]bool = @splat(false);
+    var named_count: u32 = 0;
+    var index: u32 = 0;
+    while (index < count) : (index += 1) {
+        var rec: [24]u8 = undefined;
+        const rec_len: usize = if (wide) 24 else 16;
+        try readAt(memory, symtab + @as(u64, index) * width, rec[0..rec_len]);
+        const shndx = std.mem.readInt(u16, rec[shndx_off..][0..2], .little);
+        if (shndx == 0 or shndx >= 0xff00) continue;
+        const name_off = std.mem.readInt(u32, rec[0..4], .little);
+        const value: u64 = if (wide)
+            std.mem.readInt(u64, rec[8..16], .little)
+        else
+            std.mem.readInt(u32, rec[4..8], .little);
+        var name_buf: [192]u8 = undefined;
+        const name = readSymbolName(memory, strtab + name_off, &name_buf) orelse continue;
+        if (name.len == 0) continue;
+        named_count += 1;
+        for (placed, 0..) |item, slot| {
+            if (!std.mem.eql(u8, item.name, name)) continue;
+            seen[slot] = true;
+            if (n_hit[slot] == hit_cap) continue;
+            hits[slot][n_hit[slot]] = value;
+            n_hit[slot] += 1;
+        }
+    }
+    if (named_count == 0) return error.KernelSymbolTable;
+    var shared = false;
+    var checked: [512]bool = @splat(false);
+    for (placed, 0..) |item, slot| {
+        if (!seen[slot] or checked[slot]) continue;
+        if (!sectionBaseAgrees(placed, &seen, &hits, &n_hit, item.section)) return false;
+        shared = true;
+        for (placed, 0..) |other, other_slot| if (other.section == item.section) {
+            checked[other_slot] = true;
+        };
+    }
+    return shared;
+}
+
+fn sectionBaseAgrees(placed: []const SectionSym, seen: *const [512]bool, hits: *const [512][8]u64, n_hit: *const [512]u8, section: u32) bool {
+    var anchor: ?usize = null;
+    for (placed, 0..) |item, slot| {
+        if (!seen[slot] or item.section != section) continue;
+        if (anchor == null) anchor = slot;
+    }
+    const first = anchor orelse return true;
+    var cand: u8 = 0;
+    while (cand < n_hit[first]) : (cand += 1) {
+        const base = hits[first][cand] -% placed[first].offset;
+        var ok = true;
+        for (placed, 0..) |item, slot| {
+            if (!seen[slot] or item.section != section) continue;
+            const want = base +% item.offset;
+            var found = false;
+            var hit: u8 = 0;
+            while (hit < n_hit[slot]) : (hit += 1) {
+                if (hits[slot][hit] == want) found = true;
+            }
+            if (!found) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) return true;
+    }
+    return false;
+}
+
+fn readSymbolName(memory: anytype, address: u64, buf: []u8) ?[]const u8 {
+    const n = memory.read(address, buf) catch return null;
+    if (n == 0) return null;
+    const end = std.mem.indexOfScalar(u8, buf[0..n], 0) orelse return null;
+    return buf[0..end];
 }
 
 const Flat = struct {
@@ -981,6 +1447,109 @@ test "module and task lists follow the image's field offsets" {
     try std.testing.expectEqual(@as(i32, 42), tasks[1].pid);
     try std.testing.expectEqual(@as(u32, 1), tasks[1].cpu.?);
     try std.testing.expectEqualStrings("kworker", tasks[1].comm[0..tasks[1].comm_len]);
+}
+
+test "kallsyms disagreement refuses a shifted symbol and keeps a match" {
+    var mem: [0x280]u8 = @splat(0);
+    const facts = Facts{
+        .list_next = 0x10,
+        .name_off = 0x20,
+        .name_len = 2,
+        .state_off = 0x28,
+        .mem_off = 0x30,
+        .mem_stride = 16,
+        .text_base = 0,
+        .text_size = 8,
+        .pid_off = 0,
+        .comm_off = 8,
+        .comm_len = 4,
+        .tasks_next = 0x18,
+        .kallsyms_off = 0x40,
+        .core_kallsyms_off = 0x48,
+        .ksym_symtab = 0,
+        .ksym_count = 8,
+        .ksym_strtab = 16,
+    };
+    putU64(&mem, 0x200, 0x10);
+    putU64(&mem, 0x10, 0x200);
+    @memcpy(mem[0x20..][0..2], "ko");
+    putU64(&mem, 0x30, 0x1000);
+    putU32(&mem, 0x38, 0x100);
+    putU64(&mem, 0x40, 0x80);
+    putU64(&mem, 0x80, 0x100);
+    putU32(&mem, 0x88, 3);
+    putU64(&mem, 0x90, 0x180);
+    // Record 0 is the null symbol. The next two share a name at two addresses.
+    std.mem.writeInt(u16, mem[0x118 + 6 ..][0..2], 1, .little);
+    putU64(&mem, 0x118 + 8, 0x1000);
+    std.mem.writeInt(u16, mem[0x130 + 6 ..][0..2], 1, .little);
+    putU64(&mem, 0x130 + 8, 0x2000);
+    @memcpy(mem[0x180..][0..5], "lock\x00");
+    var rows: [2]ModuleRow = undefined;
+    const flat = Flat{ .bytes = &mem };
+    try std.testing.expectEqual(@as(usize, 1), try walkModules(flat, 0x200, facts, &rows));
+    try std.testing.expect(rows[0].ksym_present);
+    try std.testing.expect(!rows[0].ksym_failed);
+    try std.testing.expectEqual(@as(u64, 0x100), rows[0].ksym_symtab);
+    try std.testing.expectEqual(@as(u32, 3), rows[0].ksym_count);
+    try std.testing.expectEqual(@as(u64, 0x180), rows[0].ksym_strtab);
+    const match = [_]NamedAddr{.{ .name = "lock", .address = 0x1000 }};
+    const shifted = [_]NamedAddr{.{ .name = "lock", .address = 0x1090 }};
+    const other = [_]NamedAddr{.{ .name = "other", .address = 0x1000 }};
+    const either = [_]NamedAddr{.{ .name = "lock", .address = 0x2000 }};
+    try std.testing.expect(try kallsymsAgree(flat, rows[0].ksym_symtab, rows[0].ksym_count, rows[0].ksym_strtab, true, &match));
+    try std.testing.expect(!try kallsymsAgree(flat, rows[0].ksym_symtab, rows[0].ksym_count, rows[0].ksym_strtab, true, &shifted));
+    try std.testing.expect(!try kallsymsAgree(flat, rows[0].ksym_symtab, rows[0].ksym_count, rows[0].ksym_strtab, true, &other));
+    try std.testing.expect(try kallsymsAgree(flat, rows[0].ksym_symtab, rows[0].ksym_count, rows[0].ksym_strtab, true, &either));
+    try std.testing.expect(try kallsymsAgree(flat, rows[0].ksym_symtab, 0, rows[0].ksym_strtab, true, &match));
+    // A null pointer uses the embedded table.
+    putU64(&mem, 0x40, 0);
+    putU64(&mem, 0x48, 0x100);
+    putU32(&mem, 0x50, 3);
+    putU64(&mem, 0x58, 0x180);
+    try std.testing.expectEqual(@as(usize, 1), try walkModules(flat, 0x200, facts, &rows));
+    try std.testing.expectEqual(@as(u64, 0x100), rows[0].ksym_symtab);
+    try std.testing.expect(!rows[0].ksym_failed);
+    // A header that cannot be read is a failed row, not a failed walk.
+    putU64(&mem, 0x40, 0x400);
+    try std.testing.expectEqual(@as(usize, 1), try walkModules(flat, 0x200, facts, &rows));
+    try std.testing.expect(rows[0].ksym_present);
+    try std.testing.expect(rows[0].ksym_failed);
+}
+
+test "kallsyms section bases agree across a load bias and refuse a moved symbol" {
+    var mem: [0x280]u8 = @splat(0);
+    // Five records: a null symbol, two in one section, two in another.
+    const names = "keep\x00lock\x00str\x00str2\x00";
+    @memcpy(mem[0x180..][0..names.len], names);
+    putSym(&mem, 0x118, 0, 1, 0x8000);
+    putSym(&mem, 0x130, 5, 1, 0x8028);
+    putSym(&mem, 0x148, 10, 2, 0x5000);
+    putSym(&mem, 0x160, 14, 2, 0x5001);
+    const flat = Flat{ .bytes = &mem };
+    const match = [_]SectionSym{
+        .{ .name = "keep", .section = 1, .offset = 0 },
+        .{ .name = "lock", .section = 1, .offset = 0x28 },
+        .{ .name = "str", .section = 2, .offset = 0 },
+        .{ .name = "str2", .section = 2, .offset = 1 },
+    };
+    const moved = [_]SectionSym{
+        .{ .name = "keep", .section = 1, .offset = 0 },
+        .{ .name = "lock", .section = 1, .offset = 0x48 },
+        .{ .name = "str", .section = 2, .offset = 0 },
+        .{ .name = "str2", .section = 2, .offset = 1 },
+    };
+    const other = [_]SectionSym{.{ .name = "other", .section = 1, .offset = 0 }};
+    try std.testing.expect(try kallsymsSectionsAgree(flat, 0x100, 5, 0x180, true, &match));
+    try std.testing.expect(!try kallsymsSectionsAgree(flat, 0x100, 5, 0x180, true, &moved));
+    try std.testing.expect(!try kallsymsSectionsAgree(flat, 0x100, 5, 0x180, true, &other));
+    try std.testing.expect(try kallsymsSectionsAgree(flat, 0x100, 0, 0x180, true, &match));
+}
+
+fn putSym(mem: []u8, at: u64, name_off: u32, shndx: u16, value: u64) void {
+    putU32(mem, at, name_off);
+    std.mem.writeInt(u16, mem[@intCast(at + 6)..][0..2], shndx, .little);
+    putU64(mem, at + 8, value);
 }
 
 test "sleeping x86 state, per-cpu slots, shadow cpus and a frame record" {
@@ -1101,6 +1670,10 @@ test "KGHANG a blocked task names the mutex or rwsem owner and the cpu it spins 
     var quiet = edges[0];
     quiet.owner_cpu = null;
     try std.testing.expectEqualStrings("waiter waits on lock 0xa100 owned by holder", formatWait(quiet, &tasks, &line));
+    try std.testing.expectEqualStrings("spins on CPU 3 holding lock 0xa100", formatHold(edges[0], &line));
+    try std.testing.expectEqualStrings("spins on CPU 3 holding rwsem 0xb000", formatHold(edges[1], &line));
+    try std.testing.expectEqualStrings("holds lock 0xa100", formatHold(quiet, &line));
+    try std.testing.expect(std.mem.indexOf(u8, formatHold(edges[0], &line), "waiter") == null);
 }
 
 test "KGHANG blocked_on names a mutex that has no embedded wait list" {
@@ -1401,7 +1974,7 @@ test "KGHANG a wait list that cycles without its head gives no edge" {
     const task = TaskRow{ .address = 0x800, .pid = 9 };
     const ranges = [_]StackRange{.{ .base = 0x200, .end = 0x400 }};
     const layout = LockLayout{ .owner = 0, .wait_list = 0x10, .waiter_list = 0, .waiter_task = 0x10 };
-    try std.testing.expect(closeWait(Flat{ .bytes = &mem }, task, &.{task}, &ranges, 0x100, layout, &.{}, .mutex) == null);
+    try std.testing.expect(closeWait(Flat{ .bytes = &mem }, task, &.{task}, &ranges, 0x100, layout, &.{}, .mutex, true) == null);
 }
 
 test "KGHANG a reader-owned rwsem gives a readers edge, not the last reader" {
@@ -1413,6 +1986,141 @@ test "KGHANG a reader-owned rwsem gives a readers edge, not the last reader" {
     const reader = TaskRow{ .address = 0x180, .pid = 3 };
     const ranges = [_]StackRange{.{ .base = 0x200, .end = 0x400 }};
     const layout = LockLayout{ .owner = 0, .wait_list = 0x10, .waiter_list = 0, .waiter_task = 0x10 };
-    const edge = closeWait(Flat{ .bytes = &mem }, waiter, &.{ waiter, reader }, &ranges, 0x200, layout, &.{}, .rwsem).?;
+    const edge = closeWait(Flat{ .bytes = &mem }, waiter, &.{ waiter, reader }, &ranges, 0x200, layout, &.{}, .rwsem, false).?;
     try std.testing.expect(edge.readers and edge.owner == 0 and edge.lock == 0x500);
+}
+
+fn named(address: u64, pid: i32, name: []const u8) TaskRow {
+    var task = TaskRow{ .address = address, .pid = pid };
+    @memcpy(task.comm[0..name.len], name);
+    task.comm_len = @intCast(name.len);
+    return task;
+}
+
+test "KGHANG an owner that is not a walked task is named unknown" {
+    var mem = [_]u8{0} ** 0x1000;
+    putU64(&mem, 0x200, 0x510);
+    putU64(&mem, 0x510, 0x200);
+    putU64(&mem, 0x500, 0);
+    const waiter = named(0x800, 9, "waiter");
+    const ranges = [_]StackRange{.{ .base = 0x200, .end = 0x400 }};
+    const layout = LockLayout{ .owner = 0, .wait_list = 0x10, .waiter_list = 0, .waiter_task = 0x10 };
+    try std.testing.expect(closeWait(Flat{ .bytes = &mem }, waiter, &.{waiter}, &ranges, 0x200, layout, &.{}, .mutex, false) == null);
+    const empty = closeWait(Flat{ .bytes = &mem }, waiter, &.{waiter}, &ranges, 0x200, layout, &.{}, .mutex, true).?;
+    try std.testing.expect(empty.unknown_owner and empty.owner == 0 and empty.lock == 0x500 and !empty.readers);
+    var line: [160]u8 = undefined;
+    const tasks = [_]TaskRow{waiter};
+    try std.testing.expectEqualStrings("waiter waits on lock 0x500 owned by an unknown task", formatWait(empty, &tasks, &line));
+    putU64(&mem, 0x500, 0x999);
+    const stray = closeWait(Flat{ .bytes = &mem }, waiter, &.{waiter}, &ranges, 0x200, layout, &.{}, .mutex, true).?;
+    try std.testing.expect(stray.unknown_owner and stray.owner == 0);
+    putU64(&mem, 0x500, 0x800);
+    const self_owned = closeWait(Flat{ .bytes = &mem }, waiter, &.{waiter}, &ranges, 0x200, layout, &.{}, .mutex, true).?;
+    try std.testing.expect(self_owned.unknown_owner and self_owned.owner == 0);
+}
+
+test "KGHANG blocked_on that matches no lock type is an unknown lock" {
+    var mem = [_]u8{0} ** 0x6020;
+    const facts = Facts{
+        .list_next = 0,
+        .name_off = 0,
+        .name_len = 1,
+        .state_off = 0,
+        .mem_off = 0,
+        .mem_stride = 1,
+        .text_base = 0,
+        .text_size = 1,
+        .pid_off = 0,
+        .comm_off = 0,
+        .comm_len = 1,
+        .tasks_next = 0,
+        .stack_off = 0,
+        .task_blocked_on = 8,
+    };
+    const waiter = named(0x100, 4, "blocked");
+    var row = waiter;
+    row.state = 2;
+    putU64(&mem, 0x100, 0x1000);
+    putU64(&mem, 0x108, 0x6000);
+    const tasks = [_]TaskRow{row};
+    var edges: [4]WaitEdge = undefined;
+    const n = try walkWaits(Flat{ .bytes = &mem }, &tasks, facts, &.{}, &edges);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(WaitKind.unknown, edges[0].kind);
+    try std.testing.expectEqual(@as(u64, 0x6000), edges[0].lock);
+    try std.testing.expect(edges[0].unknown_owner);
+    var line: [160]u8 = undefined;
+    try std.testing.expectEqualStrings("blocked waits on an unknown lock at 0x6000", formatWait(edges[0], &tasks, &line));
+    putU64(&mem, 0x108, 0);
+    try std.testing.expectEqual(@as(usize, 0), try walkWaits(Flat{ .bytes = &mem }, &tasks, facts, &.{}, &edges));
+}
+
+test "KGHANG a wait chain names each hop and stops at the bound" {
+    const tasks = [_]TaskRow{
+        named(0x1000, 1, "A"),
+        named(0x2000, 2, "B"),
+        named(0x3000, 3, "C"),
+        named(0x4000, 4, "D"),
+        named(0x5000, 5, "E"),
+        named(0x6000, 6, "F"),
+    };
+    const two = [_]WaitEdge{
+        .{ .waiter = 0x1000, .lock = 0x11, .kind = .mutex, .owner = 0x2000 },
+        .{ .waiter = 0x2000, .lock = 0x22, .kind = .mutex, .owner = 0x3000 },
+    };
+    var buf: [500]u8 = undefined;
+    try std.testing.expectEqualStrings("A waits on lock 0x11 owned by B, which waits on lock 0x22 owned by C", formatChain(&two, 0, &tasks, &buf));
+    const edges = [_]WaitEdge{
+        .{ .waiter = 0x1000, .lock = 0x11, .kind = .mutex, .owner = 0x2000 },
+        .{ .waiter = 0x2000, .lock = 0x22, .kind = .mutex, .owner = 0x3000 },
+        .{ .waiter = 0x3000, .lock = 0x33, .kind = .mutex, .owner = 0x4000 },
+        .{ .waiter = 0x4000, .lock = 0x44, .kind = .mutex, .owner = 0x5000 },
+        .{ .waiter = 0x5000, .lock = 0x55, .kind = .mutex, .owner = 0x6000 },
+    };
+    const bounded = formatChain(&edges, 0, &tasks, &buf);
+    try std.testing.expectEqualStrings("A waits on lock 0x11 owned by B, which waits on lock 0x22 owned by C, which waits on lock 0x33 owned by D, which waits on lock 0x44 owned by E", bounded);
+    try std.testing.expect(std.mem.indexOf(u8, bounded, "F") == null);
+    const cycle = [_]WaitEdge{
+        .{ .waiter = 0x1000, .lock = 0x11, .kind = .mutex, .owner = 0x2000 },
+        .{ .waiter = 0x2000, .lock = 0x22, .kind = .mutex, .owner = 0x1000 },
+    };
+    const closed = formatChain(&cycle, 0, &tasks, &buf);
+    try std.testing.expectEqualStrings("A waits on lock 0x11 owned by B, which waits on lock 0x22 owned by A", closed);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, closed, "0x11"));
+}
+
+test "KGHANG a chain cut by a short label buffer says so" {
+    const tasks = [_]TaskRow{ named(0xffff961301001000, 80, "kg0-blocked"), named(0xffff961301002000, 81, "kg0-spinner"), named(0xffff961301003000, 82, "kg0-holder") };
+    const two = [_]WaitEdge{
+        .{ .waiter = 0xffff961301001000, .lock = 0xffffffffc00fb068, .kind = .mutex, .owner = 0xffff961301002000 },
+        .{ .waiter = 0xffff961301002000, .lock = 0xffffffffc00fb0a0, .kind = .mutex, .owner = 0xffff961301003000, .owner_cpu = 1 },
+    };
+    var buf: [92]u8 = undefined; // a label tail after "comm pid= state= cpu="
+    try std.testing.expectEqualStrings("kg0-blocked waits on lock 0xffffffffc00fb068 owned by kg0-spinner, ..", formatChain(&two, 0, &tasks, &buf));
+    var wide: [400]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, formatChain(&two, 0, &tasks, &wide), "owned by kg0-holder, which spins on CPU 1") != null);
+}
+
+test "KGHANG a published chain says whether it was cut or closed a cycle" {
+    var names = [_]TaskRow{ .{ .address = 0x1000, .pid = 1 }, .{ .address = 0x2000, .pid = 2 }, .{ .address = 0x3000, .pid = 3 }, .{ .address = 0x4000, .pid = 4 }, .{ .address = 0x5000, .pid = 5 }, .{ .address = 0x6000, .pid = 6 } };
+    _ = &names;
+    var hops: [4]WaitHop = undefined;
+    var end: ChainEnd = .complete;
+    const five = [_]WaitEdge{
+        .{ .waiter = 0x1000, .lock = 0x11, .kind = .mutex, .owner = 0x2000 },
+        .{ .waiter = 0x2000, .lock = 0x22, .kind = .mutex, .owner = 0x3000 },
+        .{ .waiter = 0x3000, .lock = 0x33, .kind = .mutex, .owner = 0x4000 },
+        .{ .waiter = 0x4000, .lock = 0x44, .kind = .mutex, .owner = 0x5000 },
+        .{ .waiter = 0x5000, .lock = 0x55, .kind = .mutex, .owner = 0x6000 },
+    };
+    try std.testing.expectEqual(@as(usize, 4), chainHopsEnd(&five, &names, 0x1000, &hops, &end));
+    try std.testing.expectEqual(ChainEnd.truncated, end);
+    try std.testing.expectEqual(@as(usize, 4), chainHopsEnd(five[0..4], &names, 0x1000, &hops, &end));
+    try std.testing.expectEqual(ChainEnd.complete, end);
+    const cycle = [_]WaitEdge{
+        .{ .waiter = 0x1000, .lock = 0x11, .kind = .mutex, .owner = 0x2000 },
+        .{ .waiter = 0x2000, .lock = 0x22, .kind = .mutex, .owner = 0x1000 },
+    };
+    try std.testing.expectEqual(@as(usize, 2), chainHopsEnd(&cycle, &names, 0x1000, &hops, &end));
+    try std.testing.expectEqual(ChainEnd.cycle, end);
 }

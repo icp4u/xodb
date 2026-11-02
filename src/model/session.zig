@@ -2388,7 +2388,11 @@ pub const Session = struct {
                         return reader.session.target.readMemory(address, dest);
                     }
                 };
-                const kind = self.modules.recoverKernel(tid, &registers, arch_, StopReader{ .session = self }) catch break;
+                const kind = self.modules.recoverKernel(tid, &registers, arch_, StopReader{ .session = self }) catch |err| {
+                    // A task running on a CPU without a register note has no stack to show.
+                    if (err == error.KernelTaskRunning) return err;
+                    break;
+                };
                 kernel_return = kind == .return_address;
                 pc = if (slot < registers.len) registers[slot] orelse break else break;
             }

@@ -65,7 +65,8 @@ is local to that process workspace and is not written back.
 MCP `get_session` includes advisory `compatibility` and `thread_labels` fields.
 `list_threads` also returns the labels alongside its unchanged full inventory.
 Each label binds the debugger thread ID and Linux TID and reports its source,
-readability, possible truncation and internal-name hint.
+readability, possible truncation and internal-name hint. `wait_chain` is null
+except on a kernel thread that is waiting on a lock.
 
 Implementation references: Wine's [thread naming](https://github.com/wine-mirror/wine/blob/master/dlls/ntdll/unix/thread.c)
 and Proton's [installation version file](https://github.com/ValveSoftware/Proton/blob/proton_11.0/proton).

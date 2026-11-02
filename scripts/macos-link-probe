@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Link the macOS client against empty libraries and stub frameworks.
+
+Headers come from the host. Libraries are empty. Cocoa, QuartzCore and
+MoltenVK are text stubs. The Cocoa shim is compiled empty, so its calls stay
+unresolved. Capstone, FreeType, HarfBuzz, Vulkan and those shim calls may be
+unresolved. Any other unresolved symbol fails the probe. That is the check
+that a macOS link still defines this tree's own functions.
+"""
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ALLOWED = ("_cs_", "_FT_", "_hb_", "_vk", "_xcocoa_")
+SYMBOL = re.compile(r"undefined symbol:\s+(\S+)")
+QUOTED = re.compile(r'"(_[^"]+)"')
+
+
+def allowed(symbol):
+    return symbol.startswith(ALLOWED)
+
+
+def unexpected(symbols):
+    return sorted(symbol for symbol in symbols if not allowed(symbol))
+
+
+def self_test():
+    assert not allowed("_xrt_note_owned_helper")
+    assert not allowed("_ptrace")
+    assert allowed("_cs_open")
+    assert allowed("_FT_Init_FreeType")
+    assert allowed("_hb_shape")
+    assert allowed("_vkCreateInstance")
+    assert allowed("_xcocoa_open")
+    assert unexpected(["_vkCreateInstance", "_xrt_note_owned_helper", "_cs_open"]) == ["_xrt_note_owned_helper"]
+    assert unexpected(["_xcocoa_open"]) == []
+
+
+def write_tbd(path, install_name):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "w", encoding="utf-8").write(
+        "--- !tapi-tbd\n"
+        "tbd-version: 4\n"
+        "targets: [ arm64-macos ]\n"
+        f"install-name: '{install_name}'\n"
+        "current-version: 1\n"
+        "compatibility-version: 1\n"
+        "exports:\n"
+        "  - targets: [ arm64-macos ]\n"
+        "    symbols: [ ]\n"
+        "...\n"
+    )
+
+
+def empty_archive(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        os.remove(path)
+    subprocess.run(["ar", "rc", path], check=True)
+
+
+def link_dir(path, target):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.lexists(path):
+        return
+    os.symlink(target, path)
+
+
+def prepare(work):
+    deps = os.path.join(work, "deps")
+    capstone = os.path.join(work, "capstone")
+    mvk = os.path.join(work, "mvk")
+    shaders = os.path.join(work, "shaders")
+    sdk = os.path.join(work, "sdk")
+    link_dir(os.path.join(deps, "include", "freetype2"), "/usr/include/freetype2")
+    link_dir(os.path.join(deps, "include", "harfbuzz"), "/usr/include/harfbuzz")
+    link_dir(os.path.join(capstone, "include", "capstone"), "/usr/include/capstone")
+    link_dir(os.path.join(mvk, "include", "vulkan"), "/usr/include/vulkan")
+    link_dir(os.path.join(mvk, "include", "vk_video"), "/usr/include/vk_video")
+    empty_archive(os.path.join(deps, "lib", "libfreetype.a"))
+    empty_archive(os.path.join(deps, "lib", "libharfbuzz.a"))
+    empty_archive(os.path.join(capstone, "lib", "libcapstone.a"))
+    names = (
+        "ui.vert", "ui.frag", "cell.vert", "cell.frag", "box.vert", "point.vert",
+        "line.vert", "glyph.vert", "scene.frag", "post.vert", "blur.frag", "composite.frag",
+    )
+    os.makedirs(shaders, exist_ok=True)
+    magic = bytes((0x03, 0x02, 0x23, 0x07))
+    for name in names:
+        open(os.path.join(shaders, name + ".spv"), "wb").write(magic)
+    write_tbd(
+        os.path.join(sdk, "System", "Library", "Frameworks", "Cocoa.framework", "Cocoa.tbd"),
+        "/System/Library/Frameworks/Cocoa.framework/Versions/A/Cocoa",
+    )
+    write_tbd(
+        os.path.join(sdk, "System", "Library", "Frameworks", "QuartzCore.framework", "QuartzCore.tbd"),
+        "/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore",
+    )
+    dylib = os.path.join(mvk, "dynamic", "dylib", "macOS")
+    write_tbd(os.path.join(dylib, "libMoltenVK.tbd"), "@rpath/libMoltenVK.dylib")
+    frameworks = os.path.join(sdk, "System", "Library", "Frameworks")
+    return deps, capstone, mvk, shaders, frameworks
+
+
+def collect(text):
+    found = set(SYMBOL.findall(text))
+    if not found:
+        for line in text.splitlines():
+            if "undefined symbol" not in line.lower() and "Undefined symbols" not in line:
+                continue
+            found.update(QUOTED.findall(line))
+    return found
+
+
+def main():
+    self_test()
+    work = os.path.join(ROOT, ".work", "macos-link-probe")
+    if os.path.isdir(work):
+        shutil.rmtree(work)
+    os.makedirs(work)
+    deps, capstone, mvk, shaders, frameworks = prepare(work)
+    log_path = os.path.join(work, "link.log")
+    cmd = [
+        os.path.join(ROOT, "scripts", "build"),
+        "-Dtarget=aarch64-macos",
+        "-Doptimize=ReleaseSafe",
+        "-Dlink-probe=true",
+        "-Ddeps=" + deps,
+        "-Dcapstone-prefix=" + capstone,
+        "-Dmoltenvk=" + mvk,
+        "-Dshader-dir=" + shaders,
+        "-Dframework-path=" + frameworks,
+        "-p", os.path.join(work, "prefix"),
+    ]
+    # scripts/build keeps a caller's shared ZIG_GLOBAL_CACHE_DIR and otherwise
+    # uses the tree's own .cache/zig-global.
+    proc = subprocess.run(cmd, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    open(log_path, "w", encoding="utf-8", errors="replace").write(proc.stdout)
+    symbols = collect(proc.stdout)
+    bad = unexpected(symbols)
+    if bad:
+        print(f"macos-link-probe: {len(bad)} unexpected undefined symbol(s)", file=sys.stderr)
+        for symbol in bad:
+            print(symbol)
+        return 1
+    if proc.returncode != 0 and not symbols:
+        tail = "\n".join(proc.stdout.splitlines()[-40:])
+        print(tail, file=sys.stderr)
+        print("macos-link-probe: link did not report undefined symbols", file=sys.stderr)
+        return 1
+    print(f"macos-link-probe: ok ({len(symbols)} allowed unresolved)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

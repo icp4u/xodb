@@ -1,7 +1,7 @@
 [
   {
     "name": "get_session",
-    "description": "Inspect the shared session and its generation.",
+    "description": "Inspect the shared session and its generation. In kernel mode a thread label may carry wait_chain: up to 4 hops, each with lock, kind (mutex, rwsem or unknown), owner (null when held by readers or unknown), owner_cpu (when the owner is running), readers and unknown_owner; wait_chain_truncated marks more hops beyond the fourth, wait_chain_cycle an owner that repeats. Non-waiting threads have wait_chain null.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -21,7 +21,7 @@
   },
   {
     "name": "list_threads",
-    "description": "List threads and their stable session-local IDs. In kernel mode each thread is a CPU.",
+    "description": "List threads and their stable session-local IDs. In kernel mode the threads are the CPUs and the tasks; thread labels carry wait_chain as described for get_session.",
     "inputSchema": {
       "type": "object",
       "properties": {

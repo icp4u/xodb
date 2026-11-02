@@ -182,6 +182,9 @@ COVERS = (
     (('scripts/spawn-lint', 'src/*.zig', 'src/*/*.zig', 'src/*/*/*.zig', 'src/*/*/*/*.zig',
       'src/*.c', 'src/*/*.c', 'src/*/*/*.c', 'src/*/*/*/*.c', 'src/*.h', 'src/*/*.h', 'src/*/*/*.h', 'src/*/*/*/*.h'),
      ('spawn-lint',)),
+    (('scripts/macos-link-probe', 'build_macos.zig', 'src/*.zig', 'src/*/*.zig', 'src/*/*/*.zig', 'src/*/*/*/*.zig',
+      'src/*.c', 'src/*/*.c', 'src/*/*/*.c', 'src/*/*/*/*.c', 'src/*.m', 'src/*/*.m'),
+     ('macos-link-probe',)),
     (('scripts/abi-lint', 'tests/fixtures/abi-lint/*', 'build.zig', 'src/*.zig', 'src/*/*.zig', 'src/*/*/*.zig', 'src/*/*/*/*.zig'), ('abi-lint',)),
     (('docs/*', '*.md', 'packaging/*', 'scripts/package-source'), ('package-source',)),
 )
@@ -208,7 +211,7 @@ NO_RETRY = {'scene3d-faults', 'vulkan-faults', 'vulkan-enumeration', 'vulkan-dev
 
 # Same class of cheap check as the tuple above. Kept out of that tuple's
 # neighborhood so the registration stays local to this step.
-ALWAYS = ALWAYS + ('spawn-lint',)
+ALWAYS = ALWAYS + ('spawn-lint', 'macos-link-probe')
 
 # Host and gui steps (name globs) that run in `periodic` (live) or
 # `periodic-gui` (gui) instead, with the same commands: soaks, stress and
@@ -633,6 +636,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                   dict(kind='build', needs=() if headless else ('headless-app',))))
     if live:
         steps.append(('abi-lint', [sys.executable, '-B', 'scripts/abi-lint'], 600, dict(kind='build')))
+        steps.append(('macos-link-probe', [sys.executable, '-B', 'scripts/macos-link-probe'], 1800, dict(kind='build')))
     if macos and not headless and tier in ('gui', 'all', 'periodic'):
         steps.append(('macos-native', [sys.executable, '-B', 'tests/macos-native.py', '--ssh', macos], 420))
         steps.append(('macos-bootstrap', [sys.executable, '-B', 'tests/macos-native.py', '--ssh', macos, '--bootstrap'], 420))
