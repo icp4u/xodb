@@ -1,5 +1,21 @@
 [
   {
+    "name": "get_kernel_target",
+    "description": "Read a bounded page of kernel-target inventory (--vmlinux with KGDB, vmcore or kcore): tasks with raw Linux state and CPU, CPUs supported by task assignments or matched current tasks, loaded modules and load_failures including KernelModuleUnverified, or four-hop wait chains. Shares the optional F7 GUI model. Does not attach, resume, or inspect host procfs. generation can reject a different stop; live kcore and metadata growth are not atomic snapshots. Uninitialized possible-CPU slots are omitted; current_task may be null and online state is unknown.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "section": {"type": "string", "enum": ["tasks", "cpus", "modules", "waits"]},
+        "start": {"type": "integer", "minimum": 0},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 128},
+        "generation": {"type": "integer", "minimum": 0},
+        "process_id": {"type": "integer", "minimum": 1, "maximum": 1024}
+      },
+      "additionalProperties": false
+    },
+    "annotations": {"readOnlyHint": true, "xodbSessionAccess": "observer"}
+  },
+  {
     "name": "get_session",
     "description": "Inspect the shared session and its generation. In kernel mode a thread label may carry wait_chain: up to 4 hops, each with lock, kind (mutex, rwsem or unknown), owner (null when held by readers or unknown), owner_cpu (when the owner is running), readers and unknown_owner; wait_chain_truncated marks more hops beyond the fourth, wait_chain_cycle an owner that repeats. Non-waiting threads have wait_chain null.",
     "inputSchema": {
@@ -524,6 +540,141 @@
     "annotations": {
       "readOnlyHint": false,
       "xodbSessionAccess": "mutator"
+    }
+  },
+  {
+    "name": "execute_call",
+    "description": "Run a C/C++ function in the target (x86-64 SysV Linux, local or through the runtime agent). This executes target code: it may change memory, take locks, deadlock or never return. Requires execute scope (shared sessions: the controller lease under an execute ceiling) and allow_execution=true. Only the selected thread runs, on a checked range of its own stack below the red zone; a return trap at the entry point ends the call. Saved registers, vector state and borrowed stack bytes are restored and compared byte for byte; callee side effects are not rolled back. A timeout, signal, breakpoint, escaping C++ exception or other stop leaves the thread stopped inside the call with call_frame_active=true until resolve_execution restores or abandons it. Arguments are read-only expressions in the given frame; string and array literals are refused (ScratchUnavailable). Variadic callees and callees without DWARF need an explicit prototype; C++ member functions need an explicit this.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "tid": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "frame": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 63,
+          "description": "Frame used to look up argument names; the call always runs on the thread's current stack."
+        },
+        "callee": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "A function symbol (C name, mangled name, or demangled C++ name optionally with a parameter list or template arguments), a PLT/IFUNC import followed through its bound GOT slot, or a function-pointer expression."
+        },
+        "arguments": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          }
+        },
+        "prototype": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 1024,
+          "description": "Explicit C prototype with scalar and pointer types, e.g. \"size_t(const char *)\" or \"int(const char *, ...)\"."
+        },
+        "this": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "description": "Expression for the object pointer of a C++ member call. A virtual method dispatches through this object's vtable."
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 30000,
+          "description": "Wall-clock limit, default 5000."
+        },
+        "allow_execution": {
+          "type": "boolean",
+          "description": "Must be true: consent to run target code."
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "process_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024,
+          "description": "Stable debugger process ID; omitted means original process 1, independent of GUI selection."
+        }
+      },
+      "required": [
+        "tid",
+        "callee",
+        "allow_execution",
+        "generation"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "xodbSessionAccess": "executor"
+    }
+  },
+  {
+    "name": "resolve_execution",
+    "description": "Resolve an active call frame left by execute_call. action=restore writes xodb's saved registers, vector state and borrowed stack bytes back and verifies them (callee side effects stay); action=abandon keeps the thread where it stopped inside the callee and turns the return trap into a visible breakpoint so continue works again. Requires execute scope.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "restore",
+            "abandon"
+          ]
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "process_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024,
+          "description": "Stable debugger process ID; omitted means original process 1, independent of GUI selection."
+        }
+      },
+      "required": [
+        "action",
+        "generation"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "xodbSessionAccess": "executor"
+    }
+  },
+  {
+    "name": "get_execution_state",
+    "description": "Whether a call frame is active, and the execution journal: actor, scope, thread, callee, duration and outcome of each debugger-started call. Argument texts and results are not journaled. Never runs target code.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "process_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024,
+          "description": "Stable debugger process ID; omitted means original process 1, independent of GUI selection."
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "observer"
     }
   },
   {

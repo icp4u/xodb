@@ -190,7 +190,7 @@ fn fillLocks(facts: *aware.Facts, image: *const elf.Image, dwarf: ?*c.Dwarf, wor
 }
 
 fn fillLocksDwarf(facts: *aware.Facts, dwarf: *c.Dwarf, work: u64) bool {
-    const names = [_][*:0]const u8{ "task_struct", "mutex", "mutex_waiter", "rw_semaphore", "rwsem_waiter" };
+    const names = [_][*:0]const u8{ "task_struct", "mutex", "mutex_waiter", "rw_semaphore", "rwsem_waiter", "rq" };
     const wanted = [_]c.struct_xdt_field{
         want(0, "stack", c.XDT_POINTER, true),
         want(0, "blocked_on", c.XDT_POINTER, true),
@@ -204,19 +204,21 @@ fn fillLocksDwarf(facts: *aware.Facts, dwarf: *c.Dwarf, work: u64) bool {
         want(3, "first_waiter", c.XDT_POINTER, true),
         want(4, "list", c.XDT_ANY, true),
         want(4, "task", c.XDT_POINTER, true),
+        want(5, "curr", c.XDT_POINTER, true),
     };
     const schema = c.struct_xdt_schema{
         .types = @ptrCast(&names),
         .fields = &wanted,
         .type_count = names.len,
         .field_count = wanted.len,
-        .optional_types = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4),
+        .optional_types = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5),
     };
     var slots: [wanted.len]c.struct_xdt_slot = undefined;
     var sizes: [names.len]u32 = undefined;
     var stats: c.struct_xdt_stats = undefined;
     if (c.xdt_layout_build(dwarf, &schema, work, &slots, &sizes, &stats)) |_| return false;
     if (present(slots[0])) |off| facts.stack_off = off;
+    if (present(slots[12])) |off| facts.rq_curr = off;
     if (present(slots[1])) |off| facts.task_blocked_on = off;
     if (present(slots[2])) |owner| {
         if (present(slots[3]) != null and present(slots[5]) != null and present(slots[6]) != null) {

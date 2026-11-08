@@ -178,8 +178,12 @@ pub const Server = struct {
             try shared_context.check(shared_context.c.xsvc_authorize(peer.service, peer.client_id, shared_context.c.XSVC_OBSERVE, @import("../target/linux.zig").now()));
             if (!shared_context.handles(name)) {
                 const access_ = (try self.toolPolicy(if (self.overview_only) overview.definitions else if (root.imported != null) @import("imported.zig").definitions else tool_definitions, name)).required;
-                if (access_ == .controller or access_ == .mutator) {
-                    try peer.authorize(access_ == .mutator);
+                if (access_ == .controller or access_ == .mutator or access_ == .executor) {
+                    try peer.authorize(switch (access_) {
+                        .mutator => .mutate,
+                        .executor => .execute,
+                        else => .control,
+                    });
                     const lease = @import("../service/lease.zig").Lease.capture(peer.service, peer.client_id) orelse return error.ControlLeaseRequired;
                     if (agent.lease != lease.id) return error.ControlLeaseRequired;
                 }
@@ -281,8 +285,9 @@ pub const Server = struct {
             switch (policy.required) {
                 .observer => {},
                 .requester => try shared_context.check(shared_context.c.xsvc_authorize(peer.service, peer.client_id, shared_context.c.XSVC_OBSERVE, @import("../target/linux.zig").now())),
-                .controller => try peer.authorize(false),
-                .mutator => try peer.authorize(true),
+                .controller => try peer.authorize(.control),
+                .mutator => try peer.authorize(.mutate),
+                .executor => try peer.authorize(.execute),
                 .lease => return error.InvalidToolSessionAccess,
             }
         } else if (!policy.localAllowed(root.agent_scope, root.shared_jobs)) return error.AgentScopeDenied;
@@ -472,6 +477,8 @@ pub const Server = struct {
         if (profiles.handles(name)) return profiles.call(a, session, name, args);
         const static_analysis = @import("static_analysis.zig");
         if (static_analysis.handles(name)) return static_analysis.call(a, session, name, args);
+        const executions = @import("execution.zig");
+        if (executions.handles(name)) return executions.call(a, session, name, args, &self.error_detail);
         if (session.offline) {
             const reads = [_][]const u8{ "get_session", "get_audit", "query_events", "list_threads", "get_breakpoints" };
             for (reads) |read| {
@@ -480,6 +487,7 @@ pub const Server = struct {
         }
         if (std.mem.eql(u8, name, "list_locals")) return @import("locals_list.zig").call(a, session, args, &self.error_detail);
         if (std.mem.eql(u8, name, "list_modules")) return @import("module_list.zig").call(a, session, args);
+        if (std.mem.eql(u8, name, "get_kernel_target")) return @import("kernel_target.zig").call(a, session, args);
         if (args != .object) return error.InvalidArguments;
         var fields = args.object.iterator();
         while (fields.next()) |field| {

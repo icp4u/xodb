@@ -108,7 +108,8 @@ for mode,limit in [('wait',16384),('sustained',65536),('burst',256),('exit',1638
         assert abi_text in cap['syscalls']['number_abi'],cap['syscalls']
         assert ('x86-64 threads' if expected_arch=='x86_64' else 'native 64-bit threads') in cap['syscalls']['scope'],cap['syscalls']
         assert not cap['syscalls']['invalid'],cap
-        assert cap['status'] in ('manual','syscall_limit','target_ended','image_changed','mappings_changed'),cap
+        assert cap['status'] in ('manual','partial','syscall_limit','target_ended','image_changed','mappings_changed'),cap
+        assert (cap['status']=='partial')==(cap['syscalls']['lost']>0) and (cap['status']!='partial' or cap['diagnostic']),cap
         if mode=='wait':
             reads=[r for r in detail if r['name']=='read' and r['result']==-9]
             sleeps=[r for r in detail if r['name']=='clock_nanosleep' and r['elapsed_ns'] is not None]
@@ -116,15 +117,22 @@ for mode,limit in [('wait',16384),('sustained',65536),('burst',256),('exit',1638
             assert len(sleeps)==3 and all(r['elapsed_ns']>=45000000 for r in sleeps),sleeps
             assert any(r['scheduling_overlap']['off_cpu_ns']>40000000 for r in sleeps),sleeps
         if mode=='sustained':
-            assert cap['status']=='manual',cap
+            assert cap['status']==('partial' if cap['syscalls']['lost'] else 'manual'),cap
             calls=[r for r in detail if r['name']=='getpid' and r['reason']=='complete']
-            assert len(calls)==19200,(len(calls),cap)
+            expected_calls=300*64
+            missing_calls=expected_calls-len(calls)
+            assert not cap['syscalls']['discarded'] and not cap['syscalls']['unread_possible'],cap
+            assert 0<=missing_calls<=cap['syscalls']['lost'],(len(calls),cap)
         if mode=='burst':
-            assert cap['status']=='syscall_limit' and len(detail)==limit,cap
+            assert cap['status']==('partial' if cap['syscalls']['lost'] else 'syscall_limit') and len(detail)==limit,cap
             assert cap['syscalls']['unread_possible'],cap
-        if mode=='loss': assert cap['syscalls']['lost']>0,cap
+        if mode=='loss':
+            assert cap['syscalls']['lost']>0 and cap['status']=='partial',cap
+            assert 'syscall_limit' in cap['stop_reasons'],cap
         if mode=='exec':
-            assert cap['status'] in ('image_changed','mappings_changed'),cap
+            if cap['syscalls']['lost']:
+                assert cap['status']=='partial' and any(r in cap['stop_reasons'] for r in ('image_changed','mappings_changed')),cap
+            else: assert cap['status'] in ('image_changed','mappings_changed'),cap
             assert any(r['name']=='execve' and r['elapsed_ns'] is None for r in detail),detail
         if mode=='exit': assert any(r['name']=='exit_group' and r['elapsed_ns'] is None for r in detail),detail
         for r in detail:
@@ -132,7 +140,7 @@ for mode,limit in [('wait',16384),('sustained',65536),('burst',256),('exit',1638
                 assert r['elapsed_ns']==sum(r['scheduling_overlap'].values()),r
                 assert r['reason']=='complete'
             else: assert r['scheduling_overlap'] is None,r
-        if mode in ('wait','sustained','burst') and expected_arch=='x86_64':
+        if mode in ('wait','sustained','burst','loss') and expected_arch=='x86_64':
             archive=work/(mode+'.xcap')
             c.action('save_capture_archive',capture_id=cap['id'],revision=cap['revision'],path=str(archive))
             archive_ready(c)
@@ -140,10 +148,10 @@ for mode,limit in [('wait',16384),('sustained',65536),('burst',256),('exit',1638
             try:
                 archive_ready(offline)
                 saved=offline.inspect('get_profile')['capture']
-                assert saved['syscalls']==cap['syscalls'],(saved['syscalls'],cap['syscalls'])
+                assert saved['status']==cap['status'] and saved['syscalls']==cap['syscalls'],(saved,cap)
                 assert rows(offline,saved)==detail
             finally:offline.close()
-        elif mode in ('wait','sustained','burst'):
+        elif mode in ('wait','sustained','burst','loss'):
             archive=work/(mode+'.xcap')
             c.action('save_capture_archive',capture_id=cap['id'],revision=cap['revision'],path=str(archive))
             archive_failed(c,'ArchiveUnsupportedArchitecture')

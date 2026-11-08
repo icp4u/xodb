@@ -154,6 +154,8 @@ pub const Session = struct {
     runtime_types: @import("runtime_types.zig").Cache = .{},
     runtime_instances: @import("runtime_instances.zig").State = .{},
     runtime_writes: @import("runtime_writes.zig").State = .{},
+    /// Inferior calls: journal, the active call frame and GUI consent.
+    execution: @import("execution_state.zig").State = .{},
     inspections: @import("../observe/context.zig").Manager = .{},
     persistent: @import("persistent.zig").Manager = .{},
     launch_argv: []const [:0]const u8 = &.{},
@@ -961,6 +963,7 @@ pub const Session = struct {
                 .watchpoint_hit => .watchpoint_hit,
                 .exit => .exit,
                 .detach => .detach,
+                .execution => .execution,
                 else => continue,
             };
             if (kind != .continued and kind != .detach and !capture.includesThread(event.tid)) continue;
@@ -993,6 +996,8 @@ pub const Session = struct {
         if (!self.target.snapshot().owned or self.launch_argv.len == 0) return error.RestartRequiresOwnedLaunch;
         if (self.target.snapshot().state != .stopped and self.target.snapshot().state != .exited and self.target.snapshot().state != .idle) return error.PauseBeforeRestart;
         if (self.archiveBusy()) return error.ArchiveBusy;
+        // Relaunching kills the process; its call frame ends with it.
+        self.execution.active = null;
         self.allocations.stop(.target_ended);
         if (self.profile) |capture| if (capture.collector != null) capture.stop(.target_ended, linux.now());
         if (self.target.snapshot().state == .stopped) try self.persistent.remember(self);
@@ -1041,22 +1046,28 @@ pub const Session = struct {
     }
     pub fn refreshMaps(self: *Session) !void {
         defer self.metadata.bind(self);
-        if (self.target.gdbRemoteInfo()) |gdb| if (gdb.libraries == .unsupported) {
-            const executable = self.modules.gdb_executable orelse return error.GdbLibrariesUnavailable;
-            if (self.target.snapshot().state == .stopped) {
-                self.modules.target = self.target.handle;
-                self.modules.owner_target = self.target.handle;
-                if (self.modules.loaded.items.len == 0) {
-                    self.modules.debug_files = self.symbolFiles();
-                    self.modules.beginStop(self.target.snapshot().generation);
-                    try self.modules.fromGdbExecutable(executable, self.target.arch().descriptor().machine, &self.target);
+        if (self.target.gdbRemoteInfo()) |gdb| {
+            const kernel_file = self.modules.measure_kernel_slide and self.modules.gdb_executable != null;
+            if (gdb.libraries == .unsupported or kernel_file) {
+                const executable = self.modules.gdb_executable orelse return error.GdbLibrariesUnavailable;
+                if (self.target.snapshot().state == .stopped) {
+                    self.modules.target = self.target.handle;
+                    self.modules.owner_target = self.target.handle;
+                    if (self.modules.loaded.items.len == 0) {
+                        self.modules.debug_files = self.symbolFiles();
+                        self.modules.beginStop(self.target.snapshot().generation);
+                        try self.modules.fromGdbExecutable(executable, self.target.arch().descriptor().machine, &self.target);
+                    }
+                    if (self.modules.measure_kernel_slide) {
+                        self.modules.refreshKernel(&self.target);
+                        self.modules.publishStubTasks(&self.target);
+                    }
                 }
-                if (self.modules.measure_kernel_slide) self.modules.refreshKernel(&self.target);
+                self.maps_epoch = self.target.snapshot().image_epoch;
+                self.maps_generation = self.target.snapshot().generation;
+                return;
             }
-            self.maps_epoch = self.target.snapshot().image_epoch;
-            self.maps_generation = self.target.snapshot().generation;
-            return;
-        };
+        }
         if (self.target.core != null) return;
         if (self.target.snapshot().state == .stopped and self.maps_generation != self.target.snapshot().generation) {
             if (self.maps_epoch != self.target.snapshot().image_epoch) {
@@ -2805,7 +2816,7 @@ pub const Session = struct {
     pub fn authorize(self: *Session, actor: Actor, effect: Effect, generation: ?u64) !void {
         if (self.target.core != null) return error.ReadOnlyCore;
         if (actor == .agent) {
-            if (self.agent_scope == .observe or (effect == .mutation and self.agent_scope != .mutate)) return error.AgentScopeDenied;
+            if (self.agent_scope == .observe or (effect == .mutation and self.agent_scope != .mutate) or (effect == .inferior_call and self.agent_scope != .execute)) return error.AgentScopeDenied;
             if (generation == null) return error.GenerationRequired;
         }
         if (generation) |g| try self.target.expectGeneration(g);
@@ -2889,7 +2900,7 @@ pub const Session = struct {
         return null;
     }
     pub fn snapshot(self: *const Session) Snapshot {
-        return .{ .compatibility = self.compatibility.info, .thread_labels = self.compatibility.labels.items, .gdb_remote = self.target.gdbRemoteInfo(), .mode = if (self.imported != null) .imported else if (self.offline) .archive else if (self.target.core != null) .core else .live, .process_id = self.process_id, .session_id = self.id, .generation = self.target.snapshot().generation, .image_epoch = self.target.snapshot().image_epoch, .pid = self.target.snapshot().pid, .architecture = if (self.imported) |state| (if (state.profile) |data| data.wire.architecture else "pending") else @tagName(self.target.arch()), .state = self.target.snapshot().state, .threads = self.target.threadSlice(), .last_event_sequence = self.target.snapshot().sequence, .agent_scope = self.agent_scope, .source_stepping = self.source_step != null, .symbol_discovery_pending = self.persistent.resolving, .pe_metadata_pending = self.modules.peDiscoveryPending(), .pe_metadata = self.modules.pe_images.snapshot(), .debug_metadata = self.metadata.snapshot(), .continue_pending = self.pending_continue != null, .source_step_resumes = self.source_step_resumes, .source_step_planned_instructions = self.source_step_batched, .running_to = if (self.run_to) |run| run.address else null, .step_diagnostic = self.step_diagnostic, .last_action = if (self.audit_count > 0) self.audit[self.audit_count - 1] else null, .exit = self.exitSummary(), .resume_warning = self.target.resumeWarning(), .image_notice = self.imageNotice() };
+        return .{ .call_frame_active = self.execution.active, .executions = self.execution.sequence, .compatibility = self.compatibility.info, .thread_labels = self.compatibility.labels.items, .gdb_remote = self.target.gdbRemoteInfo(), .mode = if (self.imported != null) .imported else if (self.offline) .archive else if (self.target.core != null) .core else .live, .process_id = self.process_id, .session_id = self.id, .generation = self.target.snapshot().generation, .image_epoch = self.target.snapshot().image_epoch, .pid = self.target.snapshot().pid, .architecture = if (self.imported) |state| (if (state.profile) |data| data.wire.architecture else "pending") else @tagName(self.target.arch()), .state = self.target.snapshot().state, .threads = self.target.threadSlice(), .last_event_sequence = self.target.snapshot().sequence, .agent_scope = self.agent_scope, .source_stepping = self.source_step != null, .symbol_discovery_pending = self.persistent.resolving, .pe_metadata_pending = self.modules.peDiscoveryPending(), .pe_metadata = self.modules.pe_images.snapshot(), .debug_metadata = self.metadata.snapshot(), .continue_pending = self.pending_continue != null, .source_step_resumes = self.source_step_resumes, .source_step_planned_instructions = self.source_step_batched, .running_to = if (self.run_to) |run| run.address else null, .step_diagnostic = self.step_diagnostic, .last_action = if (self.audit_count > 0) self.audit[self.audit_count - 1] else null, .exit = self.exitSummary(), .resume_warning = self.target.resumeWarning(), .image_notice = self.imageNotice() };
     }
     pub fn deinit(self: *Session) void {
         self.compatibility.deinit();
@@ -2921,6 +2932,7 @@ pub const Session = struct {
         self.inspections.deinit();
         self.runtime_types.deinit();
         self.runtime_writes.deinit();
+        self.execution.deinit();
         self.memory.deinit();
         self.persistent.deinit();
         for (self.launch_argv) |arg| std.heap.page_allocator.free(arg);
@@ -2939,7 +2951,7 @@ pub const Session = struct {
     }
 };
 pub const ExitSummary = struct { kind: enum { status, signal }, status: ?i32 = null, signal: ?i32 = null, signal_name: ?[]const u8 = null };
-pub const Snapshot = struct { compatibility: @import("compatibility.zig").Info = .{}, thread_labels: []const @import("compatibility.zig").Label = &.{}, gdb_remote: ?linux.GdbRemoteInfo = null, process_id: u64 = 1, mode: enum { live, core, archive, imported } = .live, session_id: u64, generation: u64, image_epoch: u64 = 0, pid: i32, architecture: []const u8, state: linux.State, threads: []const linux.Thread, last_event_sequence: u64, agent_scope: AgentScope, source_stepping: bool, symbol_discovery_pending: bool = false, pe_metadata_pending: bool = false, pe_metadata: @import("pe_images.zig").State.Snapshot = .{}, debug_metadata: @import("debug_metadata.zig").Snapshot = .{}, continue_pending: bool = false, source_step_resumes: usize = 0, source_step_planned_instructions: usize = 0, running_to: ?u64, step_diagnostic: ?[]const u8, last_action: ?Audit, exit: ?ExitSummary = null, resume_warning: ?[]const u8 = null, image_notice: ?[]const u8 = null };
+pub const Snapshot = struct { call_frame_active: ?@import("execution_state.zig").Active = null, executions: u64 = 0, compatibility: @import("compatibility.zig").Info = .{}, thread_labels: []const @import("compatibility.zig").Label = &.{}, gdb_remote: ?linux.GdbRemoteInfo = null, process_id: u64 = 1, mode: enum { live, core, archive, imported } = .live, session_id: u64, generation: u64, image_epoch: u64 = 0, pid: i32, architecture: []const u8, state: linux.State, threads: []const linux.Thread, last_event_sequence: u64, agent_scope: AgentScope, source_stepping: bool, symbol_discovery_pending: bool = false, pe_metadata_pending: bool = false, pe_metadata: @import("pe_images.zig").State.Snapshot = .{}, debug_metadata: @import("debug_metadata.zig").Snapshot = .{}, continue_pending: bool = false, source_step_resumes: usize = 0, source_step_planned_instructions: usize = 0, running_to: ?u64, step_diagnostic: ?[]const u8, last_action: ?Audit, exit: ?ExitSummary = null, resume_warning: ?[]const u8 = null, image_notice: ?[]const u8 = null };
 test {
     std.testing.refAllDecls(linux);
     std.testing.refAllDecls(cfg);

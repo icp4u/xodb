@@ -1,5 +1,74 @@
 # Short demo walkthroughs
 
+## Calling a function in the target
+
+x86-64 Linux with gdb and a C++ compiler. From the xodb source directory, with
+a built `zig-out/bin/xodb`:
+
+```sh
+python3 tests/execute-call.py --work "$(mktemp -d)"
+python3 tests/execute-call.py --work "$(mktemp -d)" --agent zig-out/bin/xodb-agent
+```
+
+Each `PASS oracle …` line is one `execute_call` next to gdb's `print` of the
+same call on the same fixture stop (ints, narrow ints, floats, aggregates in
+registers and in memory, stack arguments, varargs, `strlen`/`memcpy` through
+their GOT slots, a function pointer, C++ members and a virtual call). After
+each one the registers, x87/SSE/AVX state and the borrowed stack range match
+the pre-call dump byte for byte. Then a 300 ms timeout in an infinite loop, a
+SIGSEGV, a call blocked on a mutex another stopped thread holds (`futex`), a
+breakpoint inside the callee and an escaping exception each leave an active
+call frame that refuses `continue` until `resolve_execution` restores it.
+The run ends with `0 failure(s)`. See [EXECUTION.md](EXECUTION.md).
+
+## Kernel target and two-hop waits
+
+Requires the built kernel-lab kit (x86_64 ORC image and initramfs), QEMU, and an
+absolute path to the xodb executable. This uses an owned guest, not the host's
+kernel. Set `LAB` to the kit's parent and `XODB` to the executable. Run from the
+xodb source directory. Each `kl-run` prints its own `KL_RUN_DIR`, `KL_KGDB`,
+`KL_VMLINUX` and `KL_MODULES`; use those exact values below, never another run's.
+
+```sh
+"$LAB/kit/kl-run" x86_64 --cpus 4 --memory 1024 --run-id owned-view
+# Wait for KG0_INIT_READY in this run's console log.
+"$LAB/kit/kl-console" "$KL_RUN_DIR" send hang
+# Wait for KG0_HANG_CHAIN_READY hops=2.
+"$LAB/kit/kl-console" "$KL_RUN_DIR" nmi-kgdb
+"$XODB" --gdb-remote "$KL_KGDB" --vmlinux "$KL_VMLINUX" --modules "$KL_MODULES"
+```
+
+Press **F7**, then **1–4** or **Tab** for Tasks, CPUs, Modules and Waits.
+`kg0-blocked` waits for `kg0-holder`, which waits for `kg0-spinner` on CPU 3.
+Each hop has its own row; arrow keys or the wheel scroll. Modules lists
+`kg0_test.ko` and any verification notes. **Esc** restores the original panes.
+Close xodb (KGDB detaches and resumes the guest), then stop only this run with
+`"$LAB/kit/kl-stop" "$KL_RUN_DIR"`. For automated GUI tests, use a private
+headless compositor.
+
+For live `/proc/kcore`, make a separate guest. The kit stages the executable,
+matching kernel and module, then runs the reader as root **inside that guest**:
+
+```sh
+"$LAB/kit/kl-run" x86_64 --kcore --cpus 4 --memory 1024 --xodb "$XODB" --run-id owned-kcore-view
+# Use this run's KL_RUN_DIR; wait for KG0_KCORE_READY in its console log.
+"$LAB/kit/kl-kcore" "$KL_RUN_DIR" examples/kernel-target.jsonl --timeout 180 > replies.jsonl
+"$LAB/kit/kl-stop" "$KL_RUN_DIR"
+```
+
+The request file initializes MCP and asks for all four inventories plus the
+session. The kit creates the same two-hop hang and verifies the reply stream.
+Reply id 5 contains `rows` with the two owners; id 4 contains loaded modules
+and separate load-failure/verification rows. The lab fits in these 128-row
+pages; elsewhere follow `next` with `start` and `generation`. Live kcore is
+not an atomic snapshot. Its running CPU tasks may refuse stack unwinding with
+`KernelTaskRunning`; they still appear in the inventory.
+
+The x86_64 lab recipe is exercised by `tests/kernel-target-lab.py`, including
+KGDB, a QEMU ELF guest dump, live kcore and a private GUI. Run it with
+`XODB_KERNEL_LAB="$LAB"`; add `--core`, `--kcore`, or `--gui` for those variants.
+It starts and stops its own guest and keeps evidence in an owned `.work` folder.
+
 ## Pseudo-C beside a live stop
 
 ```sh

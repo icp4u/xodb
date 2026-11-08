@@ -412,8 +412,13 @@ static enum xrt_status invoke(const struct xrt_target *target, const struct xrt_
         return mutation && written ? XRT_REMOTE_OUTCOME_UNKNOWN : status;
     }
     struct xrt_wire_frame reply;
+    /* An inferior call holds the reply for up to its own bounded timeout,
+     * plus the agent's interrupt grace. */
+    const int reply_ms = call->op == XRT_RPC_INFCALL && call->args[0] <= XRT_INFCALL_TIMEOUT_MAX_MS
+                             ? 10000 + (int)call->args[0]
+                             : 10000;
     enum xrt_wire_result received =
-        xrt_wire_read_cancel(c->fd, &reply, c->reply, XRT_WIRE_MAX_BODY, 10000, c->cancel);
+        xrt_wire_read_cancel(c->fd, &reply, c->reply, XRT_WIRE_MAX_BODY, reply_ms, c->cancel);
     if (received != XRT_WIRE_OK) {
         enum xrt_status status = received == XRT_WIRE_CANCELLED ? XRT_REMOTE_CANCELLED :
             received == XRT_WIRE_INVALID ? XRT_PROTOCOL_ERROR : XRT_TRANSPORT_FAILED;
@@ -428,7 +433,8 @@ static enum xrt_status invoke(const struct xrt_target *target, const struct xrt_
     if (reply.flags != 1 || reply.request != frame.request || reply.op != frame.op ||
         reply.target != frame.target)
         return invalid_reply(c, mutation);
-    if (reply.status > XRT_AMBIGUOUS_MATCH && reply.status != XRT_FILE_SLOT_LIMIT)
+    if (reply.status > XRT_AMBIGUOUS_MATCH && reply.status != XRT_FILE_SLOT_LIMIT &&
+        reply.status != XRT_CALL_FRAME_ACTIVE)
         return mutation ? XRT_REMOTE_OUTCOME_UNKNOWN : XRT_UNSUPPORTED_MODE;
     struct xrt_codec in = xrt_codec(c->reply, reply.size, true);
     uint64_t value = 0;
@@ -658,6 +664,14 @@ enum xrt_status xrt_remote_health(const struct xrt_target *t)
     if (status == XRT_OK && t->connection->gdb) status = xrt_gdb_health(t->connection->gdb);
     pthread_mutex_unlock(&t->connection->mutex);
     return status;
+}
+bool xrt_remote_supports(const struct xrt_target *t, uint64_t capability)
+{
+    if (!t || !t->connection) return false;
+    pthread_mutex_lock(&t->connection->mutex);
+    const bool supported = !t->connection->gdb && (t->connection->capabilities & capability) == capability;
+    pthread_mutex_unlock(&t->connection->mutex);
+    return supported;
 }
 enum xrt_status xrt_remote_fail(const struct xrt_target *t, enum xrt_status status)
 {
@@ -1493,6 +1507,15 @@ enum xrt_status xrt_target_gdb_info(const struct xrt_target *t, struct xrt_gdb_i
     xrt_gdb_info(t->connection->gdb, out);
     pthread_mutex_unlock(&t->connection->mutex);
     return XRT_OK;
+}
+enum xrt_status xrt_target_add_memory_thread(struct xrt_target *t, int32_t tid)
+{
+    if (!t || !t->connection || !t->connection->gdb) return XRT_INVALID_STATE;
+    pthread_mutex_lock(&t->connection->mutex);
+    enum xrt_status status = t->connection->failed ? t->connection->failed :
+        xrt_gdb_add_memory_thread(t->connection->gdb, t, tid);
+    pthread_mutex_unlock(&t->connection->mutex);
+    return status;
 }
 enum xrt_status xrt_target_gdb_thread_info(const struct xrt_target *t, int32_t tid,
                                           struct xrt_gdb_thread_info *out)

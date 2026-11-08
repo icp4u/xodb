@@ -149,6 +149,33 @@ static void test_open_failure_cleanup(void)
     gone();
     ++groups;
 }
+/* EXECUTE is parallel to MUTATE, not above it: an execute ceiling grants
+ * control and execute but not mutate, and a mutate ceiling grants no execute. */
+static void test_execute_scope(void)
+{
+    struct xsvc *s = xsvc_open(path);
+    CHECK(s);
+    struct xsvc_peer a, b;
+    int a_fd = add(s, 1, &a), b_fd = add(s, 2, &b);
+    OK(xsvc_tick(s, 2, XSVC_EXECUTE));
+    OK(xsvc_claim(s, a.id, 100, 3));
+    OK(xsvc_check(s, a.id, 4));
+    OK(xsvc_authorize(s, a.id, XSVC_EXECUTE, 4));
+    CHECK(xsvc_authorize(s, a.id, XSVC_MUTATE, 4) == XSVC_SCOPE_DENIED);
+    CHECK(xsvc_authorize(s, b.id, XSVC_EXECUTE, 4) == XSVC_CONTROL_REQUIRED);
+    OK(xsvc_authorize(s, b.id, XSVC_OBSERVE, 4));
+    OK(xsvc_tick(s, 5, XSVC_MUTATE));
+    CHECK(state(s).controller == 0);
+    OK(xsvc_claim(s, a.id, 100, 6));
+    CHECK(xsvc_authorize(s, a.id, XSVC_EXECUTE, 7) == XSVC_SCOPE_DENIED);
+    OK(xsvc_authorize(s, a.id, XSVC_MUTATE, 7));
+    CHECK(xsvc_scope_grants(XSVC_EXECUTE, XSVC_CONTROL) && !xsvc_scope_grants(XSVC_EXECUTE, XSVC_MUTATE));
+    CHECK(!xsvc_scope_grants(XSVC_MUTATE, XSVC_EXECUTE) && !xsvc_scope_grants(XSVC_CONTROL, XSVC_EXECUTE));
+    CHECK(!xsvc_scope_grants(XSVC_EXECUTE + 1, XSVC_OBSERVE) && !xsvc_scope_grants(XSVC_EXECUTE, XSVC_EXECUTE + 1));
+    CHECK(close(a_fd) == 0 && close(b_fd) == 0);
+    xsvc_close(s);
+    ++groups;
+}
 static void test_policy(void)
 {
     struct xsvc *s = xsvc_open(path);
@@ -239,8 +266,8 @@ static void test_invalid(void)
     CHECK(xsvc_release(s, 999, later) == XSVC_NO_CLIENT);
     CHECK(xsvc_drop(s, 999, later) == XSVC_NO_CLIENT);
     CHECK(xsvc_check(s, 999, later) == XSVC_NO_CLIENT);
-    CHECK(xsvc_authorize(s, peer.id, 3, later) == XSVC_BAD_REQUEST);
-    CHECK(xsvc_tick(s, later, 3) == XSVC_BAD_REQUEST);
+    CHECK(xsvc_authorize(s, peer.id, XSVC_EXECUTE + 1, later) == XSVC_BAD_REQUEST);
+    CHECK(xsvc_tick(s, later, XSVC_EXECUTE + 1) == XSVC_BAD_REQUEST);
     CHECK(xsvc_tick(s, 9, XSVC_OBSERVE) == XSVC_BAD_REQUEST);
     struct xsvc_peer untouched = {123, 456};
     CHECK(xsvc_accept(s, 9, &untouched) == -1 && errno == EINVAL);
@@ -574,6 +601,7 @@ int main(void)
     test_open_failure_cleanup();
     test_accept_pressure();
     test_policy();
+    test_execute_scope();
     test_invalid();
     test_owner_revoke();
     test_capacity();

@@ -16,7 +16,10 @@
  * Call tick with monotonic nanoseconds before reporting state. Backward time,
  * invalid arguments and unknown IDs never modify outputs or service state. */
 struct xsvc;
-enum xsvc_scope { XSVC_OBSERVE = 0, XSVC_CONTROL = 1, XSVC_MUTATE = 2 };
+/* Not an ordering: EXECUTE grants control and inferior calls, not direct
+ * mutation, and MUTATE does not grant EXECUTE. Use xsvc_scope_grants. */
+enum xsvc_scope { XSVC_OBSERVE = 0, XSVC_CONTROL = 1, XSVC_MUTATE = 2, XSVC_EXECUTE = 3 };
+bool xsvc_scope_grants(unsigned scope, unsigned required);
 enum xsvc_result {
     XSVC_OK = 0,
     XSVC_BAD_REQUEST,
@@ -80,7 +83,8 @@ enum xsvc_result xsvc_release(struct xsvc *service, uint64_t id, uint64_t now_ns
  * no-op. Useful when several human scope toggles restore the original ceiling. */
 enum xsvc_result xsvc_revoke(struct xsvc *service, uint64_t now_ns);
 /* check is authorize(required_scope=CONTROL). Observe reads need no lease;
- * control/mutate require both the global scope ceiling and this peer's lease. */
+ * control/mutate/execute require both a granting scope ceiling and this
+ * peer's lease. */
 enum xsvc_result xsvc_check(struct xsvc *service, uint64_t id, uint64_t now_ns);
 enum xsvc_result xsvc_authorize(struct xsvc *service, uint64_t id,
                                  unsigned required_scope, uint64_t now_ns);

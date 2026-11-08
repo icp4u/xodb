@@ -48,7 +48,9 @@ enum xrt_event_kind {
     XRT_EVENT_IMAGE_REPLACED,
     XRT_EVENT_PROCESS_BIRTH,
     XRT_EVENT_PROCESS_SEPARATED,
-    XRT_EVENT_PROCESS_RELEASED
+    XRT_EVENT_PROCESS_RELEASED,
+    /* Debugger-started execution of target code; detail is the outcome. */
+    XRT_EVENT_EXECUTION
 };
 enum xrt_watch_kind { XRT_WATCH_WRITE, XRT_WATCH_READ_WRITE, XRT_WATCH_EXECUTE };
 enum xrt_birth_kind { XRT_BIRTH_FORK, XRT_BIRTH_VFORK, XRT_BIRTH_CLONE_UNKNOWN };
@@ -214,6 +216,9 @@ enum xrt_status xrt_target_core(struct xrt_target *target, int32_t pid,
 /* Append stopped threads to a core target. The ids are assigned here. */
 enum xrt_status xrt_target_core_extend(struct xrt_target *target, const struct xrt_thread *threads,
                                        size_t count);
+/* A stopped task read from kernel memory. It is not a stub thread: continue
+ * and step refuse it, and a register read is an empty bank for the walker. */
+enum xrt_status xrt_target_add_memory_thread(struct xrt_target *target, int32_t tid);
 typedef void (*xrt_new_thread_observer)(void *context, const struct xrt_thread *thread,
                                         bool same_group);
 void xrt_target_observer(struct xrt_target *target, xrt_new_thread_observer observer,

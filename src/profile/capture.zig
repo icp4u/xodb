@@ -117,6 +117,30 @@ pub const Filter = timeline.Filter;
 pub const annotations = @import("annotations.zig");
 pub const CacheKey = annotations.Key;
 pub const Stop = enum { collecting, manual, duration, capacity, mapping_limit, mappings_changed, metadata_lost, thread_scope_changed, decode_error, target_ended, image_changed, drain_limit, collector_error, scheduling_limit, scheduling_error, syscall_limit, syscall_error };
+pub const SummaryStatus = enum { collecting, manual, duration, capacity, mapping_limit, mappings_changed, metadata_lost, thread_scope_changed, decode_error, target_ended, image_changed, drain_limit, collector_error, scheduling_limit, scheduling_error, syscall_limit, syscall_error, partial };
+fn summaryStatus(status: Stop, syscall_lost: u64) SummaryStatus {
+    if (status != .collecting and syscall_lost > 0) return .partial;
+    return @enumFromInt(@intFromEnum(status));
+}
+/// A partial summary keeps why it is partial and how collection ended. An
+/// existing diagnostic already explains the stop and is kept unchanged.
+fn summaryDiagnostic(status: Stop, syscall_lost: u64, diagnostic: []const u8) []const u8 {
+    if (summaryStatus(status, syscall_lost) != .partial or diagnostic.len > 0) return diagnostic;
+    return switch (status) {
+        inline else => |tag| "partial: the kernel perf ring lost syscall records (see syscalls.lost); collection ended: " ++ @tagName(tag),
+    };
+}
+test "capture summary reports terminal syscall loss as partial" {
+    inline for (std.meta.tags(Stop)) |status| try std.testing.expectEqualStrings(@tagName(status), @tagName(summaryStatus(status, 0)));
+    try std.testing.expectEqual(SummaryStatus.collecting, summaryStatus(.collecting, 1));
+    try std.testing.expectEqual(SummaryStatus.partial, summaryStatus(.manual, 1));
+    try std.testing.expectEqual(SummaryStatus.partial, summaryStatus(.duration, 1));
+    try std.testing.expectEqual(SummaryStatus.partial, summaryStatus(.target_ended, 1));
+    try std.testing.expectEqual(SummaryStatus.partial, summaryStatus(.syscall_limit, 1));
+    try std.testing.expectEqualStrings("", summaryDiagnostic(.manual, 0, ""));
+    try std.testing.expectEqualStrings("kept", summaryDiagnostic(.syscall_limit, 3, "kept"));
+    try std.testing.expectEqualStrings("partial: the kernel perf ring lost syscall records (see syscalls.lost); collection ended: manual", summaryDiagnostic(.manual, 3, ""));
+}
 pub const Opened = union(enum) { capture: *Capture, failed: perf.Failure };
 const kallsyms_cache_slots = 4;
 /// Boot id plus a hash of the loaded modules. Reloading a driver module in
@@ -474,7 +498,7 @@ pub const Capture = struct {
         return null;
     }
     pub fn summary(self: *const Capture) Summary {
-        return .{ .producer = self.producer, .follow_threads = self.config.follow_threads, .ring_budget_bytes = if (self.config.ring_budget_bytes == 0) null else self.config.ring_budget_bytes, .ring_allocated_bytes = (if (self.collector) |collector| collector.allocatedRingBytes() else 0) + (if (self.syscall_collector != null) syscall_perf.ringBytes(self.thread_count) else 0) + (if (self.offcpu_collector != null) offcpu_live.ringBytes(self.thread_count) else 0), .opening_threads = self.openingThreads(), .scope = if (self.config.follow_threads and self.kernel_stacks_granted) "all threads in this process, including held newborns; user and kernel CPU; child processes remain outside scope" else if (self.config.follow_threads) "all threads in this process, including held newborns; user CPU only; child processes remain outside scope" else if (self.kernel_stacks_granted) "fixed selected threads, user and kernel CPU; new tasks stop collection; a subset leaves mappings unverified" else "fixed selected threads, user CPU only; new tasks stop collection; a subset leaves mappings unverified", .id = self.id, .session_id = self.session_id, .opening_generation = self.generation, .image_epoch = self.image_epoch, .pid = self.pid, .revision = self.revision, .status = self.status, .stop_reasons = self.stop_reasons[0..self.stop_reason_count], .started_ns = self.started_ns, .collection_enabled_ns = self.collection_enabled_ns, .ended_ns = self.ended_ns, .duration_ms = self.config.duration_ms, .accepted = self.accepted, .threads = self.threads[0..self.thread_count], .sampled_state = .{ .requested_bytes = self.config.user_stack_bytes, .budget_bytes = self.config.user_stack_budget_bytes, .retained_bytes = self.user_state.used, .records = self.user_state.count, .skipped_stacks = self.user_state.skipped, .first_skipped_sample = self.firstSkippedSample(), .allocated_bytes = self.user_state.allocationBytes() }, .stored_samples = self.samples.len(), .sample_limit = self.config.sample_limit, .discarded_samples = self.discarded_samples, .lost_records = self.lost_records, .lost_samples = self.lost_samples, .throttles = self.throttles, .unthrottles = self.unthrottles, .mapping_events = self.mapping_events, .exec_events = self.exec_events, .exit_events = self.exit_events, .fork_events = self.fork_events, .scope_change = self.scope_change, .unknown_records = self.unknown_records, .unselected_threads = self.unselected_threads, .missing_images = self.missing_images, .trusted_before_ns = if (self.trusted_before_ns == std.math.maxInt(u64)) null else self.trusted_before_ns, .failure = self.failure, .diagnostic = self.diagnostic, .kernel_stacks_requested = self.kernel_stacks_requested, .kernel_stacks_granted = self.kernel_stacks_granted, .kernel_symbolizable = self.kernel_symbolizable, .kernel_symbol_reason = self.kernel_symbol_reason, .off_cpu = self.offCpuSummary(), .cpu_activity = self.cpu_activity, .scheduling = self.schedulingSummary(), .syscalls = self.syscallSummary(), .application_intervals = self.application_intervals.items.items.len, .mapping_revision = self.mapping_revision, .mapping_history = .{ .per_image_bytes_limit = @import("../binary/snapshot.zig").per_image_limit, .total_image_bytes_limit = @import("../binary/snapshot.zig").total_limit, .opening_regions = self.history.opening_count, .recorded_changes = self.history.changes.items.len, .unresolved_executable_mappings = self.unresolvedMappings(), .opened_images = self.images.loaded.items.len + self.pe_assets.entries.items.len, .pe_images = self.pe_assets.entries.items.len, .pe_metadata_bytes = self.pe_assets.metadata_bytes, .pe_failed = self.pe_assets_failed, .pe_pending = self.pe_assets_pending, .snapshot_bytes = self.images.snapshot_bytes, .images_not_searched = self.images.skipped().count, .image_budget = self.images.skipped().first } };
+        return .{ .producer = self.producer, .follow_threads = self.config.follow_threads, .ring_budget_bytes = if (self.config.ring_budget_bytes == 0) null else self.config.ring_budget_bytes, .ring_allocated_bytes = (if (self.collector) |collector| collector.allocatedRingBytes() else 0) + (if (self.syscall_collector != null) syscall_perf.ringBytes(self.thread_count) else 0) + (if (self.offcpu_collector != null) offcpu_live.ringBytes(self.thread_count) else 0), .opening_threads = self.openingThreads(), .scope = if (self.config.follow_threads and self.kernel_stacks_granted) "all threads in this process, including held newborns; user and kernel CPU; child processes remain outside scope" else if (self.config.follow_threads) "all threads in this process, including held newborns; user CPU only; child processes remain outside scope" else if (self.kernel_stacks_granted) "fixed selected threads, user and kernel CPU; new tasks stop collection; a subset leaves mappings unverified" else "fixed selected threads, user CPU only; new tasks stop collection; a subset leaves mappings unverified", .id = self.id, .session_id = self.session_id, .opening_generation = self.generation, .image_epoch = self.image_epoch, .pid = self.pid, .revision = self.revision, .status = summaryStatus(self.status, self.syscalls.lost), .stop_reasons = self.stop_reasons[0..self.stop_reason_count], .started_ns = self.started_ns, .collection_enabled_ns = self.collection_enabled_ns, .ended_ns = self.ended_ns, .duration_ms = self.config.duration_ms, .accepted = self.accepted, .threads = self.threads[0..self.thread_count], .sampled_state = .{ .requested_bytes = self.config.user_stack_bytes, .budget_bytes = self.config.user_stack_budget_bytes, .retained_bytes = self.user_state.used, .records = self.user_state.count, .skipped_stacks = self.user_state.skipped, .first_skipped_sample = self.firstSkippedSample(), .allocated_bytes = self.user_state.allocationBytes() }, .stored_samples = self.samples.len(), .sample_limit = self.config.sample_limit, .discarded_samples = self.discarded_samples, .lost_records = self.lost_records, .lost_samples = self.lost_samples, .throttles = self.throttles, .unthrottles = self.unthrottles, .mapping_events = self.mapping_events, .exec_events = self.exec_events, .exit_events = self.exit_events, .fork_events = self.fork_events, .scope_change = self.scope_change, .unknown_records = self.unknown_records, .unselected_threads = self.unselected_threads, .missing_images = self.missing_images, .trusted_before_ns = if (self.trusted_before_ns == std.math.maxInt(u64)) null else self.trusted_before_ns, .failure = self.failure, .diagnostic = summaryDiagnostic(self.status, self.syscalls.lost, self.diagnostic), .kernel_stacks_requested = self.kernel_stacks_requested, .kernel_stacks_granted = self.kernel_stacks_granted, .kernel_symbolizable = self.kernel_symbolizable, .kernel_symbol_reason = self.kernel_symbol_reason, .off_cpu = self.offCpuSummary(), .cpu_activity = self.cpu_activity, .scheduling = self.schedulingSummary(), .syscalls = self.syscallSummary(), .application_intervals = self.application_intervals.items.items.len, .mapping_revision = self.mapping_revision, .mapping_history = .{ .per_image_bytes_limit = @import("../binary/snapshot.zig").per_image_limit, .total_image_bytes_limit = @import("../binary/snapshot.zig").total_limit, .opening_regions = self.history.opening_count, .recorded_changes = self.history.changes.items.len, .unresolved_executable_mappings = self.unresolvedMappings(), .opened_images = self.images.loaded.items.len + self.pe_assets.entries.items.len, .pe_images = self.pe_assets.entries.items.len, .pe_metadata_bytes = self.pe_assets.metadata_bytes, .pe_failed = self.pe_assets_failed, .pe_pending = self.pe_assets_pending, .snapshot_bytes = self.images.snapshot_bytes, .images_not_searched = self.images.skipped().count, .image_budget = self.images.skipped().first } };
     }
     pub fn poll(self: *Capture, now: u64) void {
         if (self.collector == null) return;
@@ -988,10 +1012,11 @@ pub const Capture = struct {
         const link = try image.linkAddress(frame_.address);
         const offset = image.image.fileOffset(link) orelse return error.ProfileFrameUnavailable;
         if (frame_.lookup_address < frame_.address or frame_.lookup_address - frame_.address > 65536) return error.ProfileAssemblyLimit;
-        const bytes = @min(image.mapping.len - offset, frame_.lookup_address - frame_.address + 128);
+        const mapping = image.debuggerImage().projectedBytes();
+        const bytes = @min(mapping.len - offset, frame_.lookup_address - frame_.address + 128);
         const disasm = @import("../model/disassembly.zig");
         const decoded = try a.alloc(disasm.Instruction, 4096);
-        const count = try disasm.decodeFor(@enumFromInt(@intFromEnum(image.image.header.machine)), image.mapping[offset..][0..bytes], frame_.address, decoded);
+        const count = try disasm.decodeFor(@enumFromInt(@intFromEnum(image.image.header.machine)), mapping[offset..][0..bytes], frame_.address, decoded);
         var first: usize = 0;
         for (decoded[0..count], 0..) |instruction, i| {
             if (instruction.address <= frame_.lookup_address) first = i;
@@ -1453,7 +1478,7 @@ pub const Summary = struct {
     image_epoch: u64,
     pid: i32,
     revision: u64,
-    status: Stop,
+    status: SummaryStatus,
     stop_reasons: []const Stop,
     started_ns: u64,
     collection_enabled_ns: ?u64,

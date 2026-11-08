@@ -21,6 +21,7 @@ if not ghidra or not (Path(ghidra) / "support/analyzeHeadless").exists():
 
 ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0)  # PR_SET_CHILD_SUBREAPER
 work = Path(tempfile.mkdtemp(prefix="xodb-ghl-", dir=os.environ.get("XODB_TEST_TMPDIR")))
+os.environ["XDG_STATE_HOME"] = str(work / "state-home")
 atexit.register(shutil.rmtree, work, True)
 endpoint = work / "private/socket/.xodb.ghidra.s"
 os.environ.update(

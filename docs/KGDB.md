@@ -1,5 +1,41 @@
 # KGDB remote
 
+## Kernel target panel and MCP
+
+With `--vmlinux` and a KGDB, vmcore or live kcore target, **F7** opens a read-only
+overlay. It is closed by default and leaves the existing layout unchanged.
+**1–4** or **Tab** selects Tasks, CPUs, Modules or Waits; arrows, Page Up/Down
+and the wheel scroll. **Esc** or **F7** closes it. The frame thread renders a
+copied owner publication; it never walks target memory. Closing the panel stops
+requesting inventory rows. F8's existing emergency agent-scope control remains
+available; other debugger hotkeys do not leak through the open overlay.
+
+MCP `get_kernel_target` reads the same model, with `section`, `start`, `limit`
+(1–128, default 32), optional stopped `generation`, and `process_id`.
+The result has `rows`, `total`, `next`, `generation`, `reason`, `truncated` and
+`limits`. Carry the generation and next index when paging; `StaleSnapshot`
+means start again. Ordinary targets refuse `KernelTargetRequired`. Running
+kernels return empty rows with `TargetRunning`. No new attach, control or host
+procfs access is implied. `get_kernel_stacks` is the separate host census. A task row's `tid` is the debugger thread for that task: a core's published thread, or on a live stub the thread whose id is the pid; it is null when the debugger has no thread for the task (for example an idle swapper). In the `--connect` remote GUI, F7 remains Instruction step; this overlay uses F7 only in the main workspace.
+
+| Section | Rows |
+| --- | --- |
+| `tasks` | Kernel PID, debugger TID (zero if not mapped), name, raw state bits or null, CPU or null, task address as hex |
+| `cpus` | CPU indices supported by a task's CPU assignment or a matched current task; current address (null if unavailable), resolved PID/name where known. Uninitialized possible-CPU slots are omitted. Online/offline state is not established. |
+| `modules` | Loaded kernel images and separate `load_failure` entries with reason/detail, including `KernelModuleUnverified`; an unverified loaded object appears in both |
+| `waits` | Waiting PID/name, up to four `hops`, and `end` (`complete`, `truncated` or `cycle`); each hop preserves lock address/kind, owner, CPU, reader and unknown-owner flags |
+
+The bounded view retains at most 4096 tasks, 4096 CPU slots, 576 module rows and
+256 waiting tasks. The underlying task/module reader can report its own limit
+or missing-layout reason. Null state/CPU and unknown owners remain unknown.
+Names and module paths obey `--redact`. `atomic_snapshot: false` is conservative
+for every target: live `/proc/kcore` is changing memory, not a coherent stop;
+even a paused kernel's view is a bounded inventory rather than a completeness
+claim. The x86_64 [lab demo](DEMOS.md#kernel-target-and-two-hop-waits) covers
+KGDB, ELF guest dumps and live kcore without accessing the host kernel.
+
+## Target transport and kernel awareness
+
 `--gdb-remote` accepts three endpoint forms.
 
 - `tcp:HOST:PORT` and the older `HOST:PORT` form. Brackets still mark an IPv6 host.
@@ -31,7 +67,7 @@ Real kgdb differs from gdbserver. The client keeps those differences in one quir
 
 The session snapshot's `gdb_remote` object has `kernel` set for this stub.
 
-`--core FILE` with `--vmlinux FILE` opens a kdump vmcore, or an ELF guest dump whose load segments already name guest virtual addresses, through this same kernel view. Each kdump crash note becomes one CPU thread, using the same local per-CPU id as a live stub, because idle notes repeat pid 0. A guest dump that has no VMCOREINFO note keeps the note pids. VMCOREINFO supplies the page-table root and whether the guest is using five-level paging. A virtual address that misses every load segment is translated with that page table, including large pages, and read from the segment that owns the physical page. A kdump file's load segments cover kernel text and the direct map, so module memory and vmalloc stacks take the walk. A guest dump that already includes those ranges reads them from the load segments. The slide is still measured from `linux_banner`. There is no output-size limit and no stub. QEMU's paged `dump-guest-memory` writes 8 in `e_ehsize`; that field is ignored, as readelf and GDB do. Only x86-64 cores open: an arm64 vmcore is refused with `UnsupportedCoreArchitecture`. Only the CPUs named by crash notes are threads, so a sleeping task's stack (for example a mutex waiter) is not yet shown. On an ORC kernel a module frame stops with `KernelModuleOrcUnavailable` rather than following a stale frame pointer.
+`--core FILE` with `--vmlinux FILE` opens a kdump vmcore, or an ELF guest dump whose load segments already name guest virtual addresses, through this same kernel view. Each kdump crash note becomes one CPU thread, using the same local per-CPU id as a live stub, because idle notes repeat pid 0. A guest dump that has no VMCOREINFO note keeps the note pids. VMCOREINFO supplies the page-table root and whether the guest is using five-level paging. A virtual address that misses every load segment is translated with that page table, including large pages, and read from the segment that owns the physical page. A kdump file's load segments cover kernel text and the direct map, so module memory and vmalloc stacks take the walk. A guest dump that already includes those ranges reads them from the load segments. The slide is still measured from `linux_banner`. There is no output-size limit and no stub. QEMU's paged `dump-guest-memory` writes 8 in `e_ehsize`; that field is ignored, as readelf and GDB do. x86-64 and arm64 cores open; the task walk adds sleeping tasks beyond the crash-note CPUs. ORC module frames use the module's table, and report `KernelModuleOrcUnavailable` when it is unavailable rather than following a stale frame pointer.
 
 Launch, attach, restart, follow, process files, and libraries are refused. Software breakpoints use `Z0`. Write and access hardware watches use `Z2` and `Z4`. An empty reply from the stub is a refusal. Execute watches are refused by this client.
 
@@ -39,7 +75,15 @@ Launch, attach, restart, follow, process files, and libraries are refused. Softw
 
 `--modules DIR` names a directory of kernel objects. The client walks the kernel module list and loads each live object's text when the file name and, when the kernel publishes one, the build id match. A missing object, a differing build id, or symbols that disagree with the kernel's own table is a note, and that object is not loaded. A refused object is listed by `list_modules` under `load_failures` as `kernel/NAME.ko` with `KernelModuleSymbolsDiffer` or `KernelModuleSymbolTableUnreadable`. A kernel that publishes no module symbol table loads the object as `KernelModuleUnverified`, with that detail, rather than refusing it or passing it silently. AArch64 mapping symbols (`$x`, `$d`) are not compared. DWARF supplies struct offsets. BTF is used only when DWARF is absent. A sleeping x86 task whose program counter is zero is unwound from its saved thread state. An arm64 kernel return is stripped with the PAC mask published by the image. A kernel-looking pointer without that mask stops the walk. The arm64 and loongarch64 images are ET_DYN at a fixed kernel address and are accepted. A kernel that relocates by copying (LoongArch) leaves its loaded image at the link address; a slid banner match wins over it. Per-CPU symbols use the stopped task's CPU, or a supplied cpu when the symbol is per-CPU. Task labels show `pid`, `state` and `cpu` (from `thread_info.cpu`). The module list is read once per stop. Task names are read when a label or a stack asks for them.
 
-A loaded module's allocatable sections are placed the way the kernel lays them out, so a module data symbol has a runtime address. Module code on an ORC kernel, including LoongArch, unwinds from the module's ORC table; a missing or terminal entry stops the walk. On a frame-pointer kernel the walk uses the frame pointer, and a stop at the first instruction of a function keeps the caller. Task names are read when a label or a stack asks for them. Hardware watches are accepted by x86 kgdb in the KVM lab but did not fire, for stock GDB either. In a core, a CPU thread is named after that CPU's current task: `current_task` where the kernel has it, otherwise the only running task on that CPU; a guest dump without VMCOREINFO names its notes by position. A CPU's current task is not published a second time as a sleeping task.
+A loaded module's allocatable sections are placed the way the kernel lays them out, so a module data symbol has a runtime address. Module code on an ORC kernel, including LoongArch, unwinds from the module's ORC table; a missing or terminal entry stops the walk. On a frame-pointer kernel the walk uses the frame pointer, and a stop at the first instruction of a function keeps the caller. Task names are read when a label or a stack asks for them. Hardware watches are accepted by x86 kgdb in the KVM lab but did not fire, for stock GDB either. In a core, a CPU thread is named after that CPU's current task: `current_task` where the kernel has it, otherwise the only running task on that CPU; a guest dump without VMCOREINFO names its notes by position. A CPU's current task is not published a second time as a sleeping task. A stub that offers a target description still uses this kernel view when `--vmlinux` is set. Its own threads stay the CPU threads: each is named for the CPU whose per-CPU base matches `gs_base`, or whose kernel stack contains that thread's stack pointer. A task that is not current on one of those CPUs is shown beside them and unwound from saved thread state. Continue and step still address the stub's own threads. An idle task that is absent from the task list is read from the per-CPU current pointer and names that CPU's thread. An image with no per-CPU current_task symbol uses the runqueue's current task pointer instead.
+
+QEMU's own gdbstub (`qemu-system-* -gdb unix:PATH,server=on,wait=off`, or `-s`) is such a stub. It stops every vCPU, including one spinning with interrupts off, so a hang needs no NMI or KGDB entry:
+
+```sh
+xodb --gdb-remote unix:PATH --vmlinux vmlinux --modules DIR
+```
+
+The vCPU threads carry the task labels and wait chains; the KASLR slide is measured from the target. In `get_kernel_target`, a task's `tid` is its debugger thread: the CPU thread for a CPU's current task, the published thread for a sleeping task, or null. Continue and step on a task thread are refused with `UnknownThread` ("kernel task is not a CPU thread"). Task threads are rebuilt at each stop; leaving a stop drops them without thread-exit events. Without `--vmlinux` the stub shows only its vCPU threads, as before. `tests/kernel-target-lab.py --gdbstub` (and `--gdbstub --gui`) checks this against the lab.
 
 An aarch64 vmcore opens through the same view, with 34 general registers from its crash note. The page walk follows the note's address size, including a 52-bit kernel whose top index is four bits. The PAC mask from the note is applied to arm64 return addresses. A core walks the task list once. Each task that is not current on a crash-note CPU becomes a labelled thread, and a zero program counter is unwound from saved thread state, so a mutex waiter shows mutex_lock. A per-CPU symbol takes an optional cpu; without it the stopped CPU is used. The panicking CPU's frame in `__crash_kexec` or `crash_kexec` continues with the image's DWARF call frame when the kernel unwind stops. Page-table reads use an index of load segments ordered by physical address.
 

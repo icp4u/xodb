@@ -281,7 +281,7 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
                 \\  semq, overview, redot, profile. XODB_LOG takes the same value; the option wins.
                 \\--log-file FILE appends these lines to FILE (created 0600) and leaves stderr quiet; XODB_LOG_FILE=FILE
                 \\  does the same, and is how the processes xodb starts are given the file.
-                \\--vmlinux FILE loads that kernel image for a KGDB target and measures the KASLR slide.
+                \\--vmlinux FILE loads that kernel image for a gdb remote target and measures the KASLR slide.
                 \\--modules DIR is a directory of kernel objects named beside that image.
                 \\
             , .{});
@@ -1581,6 +1581,8 @@ test {
     std.testing.refAllDecls(@import("debug/location.zig"));
     std.testing.refAllDecls(@import("debug/macho_unwind.zig"));
     std.testing.refAllDecls(@import("model/image_label.zig"));
+    std.testing.refAllDecls(@import("model/execution.zig"));
+    std.testing.refAllDecls(@import("mcp/execution.zig"));
 }
 
 test {

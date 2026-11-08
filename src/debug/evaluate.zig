@@ -170,13 +170,21 @@ const Parser = struct {
             return integer(value);
         }
         const name = try self.identifier();
+        // A call runs target code. This evaluator never executes; the
+        // explicit execute_call path does, with its own scope and consent.
+        if (self.peek('(')) return error.ExecutionRequired;
         if (std.mem.eql(u8, name, "true")) return .{ .type = &bool_type, .bits = 1 };
         if (std.mem.eql(u8, name, "false")) return .{ .type = &bool_type, .bits = 0 };
         return self.ctx.lookup(self.ctx.user, name);
     }
+    fn peek(self: *Parser, char: u8) bool {
+        self.space();
+        return self.pos < self.source.len and self.source[self.pos] == char;
+    }
     fn postfix(self: *Parser, value: Value, depth: u32) anyerror!Value {
         var v = value;
         while (true) {
+            if (self.peek('(')) return error.ExecutionRequired;
             if (self.take("[")) {
                 const subscript = try materialize(self.ctx, try self.expression(0, depth + 1));
                 const index = try scalar(subscript);
@@ -327,6 +335,11 @@ test "expression precedence, dereference, pointer arithmetic and explicit failur
     try std.testing.expectError(error.ValueUnavailable, evaluate(ctx, "missing + 1"));
     try std.testing.expectError(error.InvalidExpression, evaluate(ctx, "x = 3"));
     try std.testing.expectError(error.ShortCircuitNotSupported, evaluate(ctx, "0 && *(&x + 100)"));
+    // Calls never evaluate, before any lookup or read.
+    try std.testing.expectError(error.ExecutionRequired, evaluate(ctx, "strlen(x)"));
+    try std.testing.expectError(error.ExecutionRequired, evaluate(ctx, "x + f ()"));
+    try std.testing.expectError(error.ExecutionRequired, evaluate(ctx, "(x)(1)"));
+    try std.testing.expectError(error.ExecutionRequired, evaluate(ctx, "unknown_function(1)"));
 }
 
 test "enum names preserve signed narrow bits and unsigned 64-bit constants" {

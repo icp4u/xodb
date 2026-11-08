@@ -82,6 +82,7 @@ pub const ViewSelection = struct {
     browse_address: ?u64 = null,
     browse_assembly: ?u64 = null,
     show_flow: bool = false,
+    show_kernel: bool = false,
     show_stop: bool = false,
     show_processes: bool = false,
     show_probes: bool = false,
@@ -102,9 +103,15 @@ pub const ViewSelection = struct {
     text: [128]u8 = @splat(0),
     text_len: usize = 0,
     fn inspection(self: *const ViewSelection) boundary.Inspection {
-        return .{ .selection = self.selection, .request_id = self.request_id, .kind = self.kind, .browse_address = self.browse_address, .browse_assembly = self.browse_assembly, .show_flow = self.show_flow, .show_stop = self.show_stop, .show_processes = self.show_processes, .show_probes = self.show_probes, .show_setup = self.show_setup, .logical_frames = self.logical_frames, .static_analysis = self.static_analysis, .runtime_types = self.runtime_types, .invocations = self.invocations, .allocations = self.allocations, .profile = self.profile, .timeline = self.timeline, .sample = self.sample, .syscalls = self.syscalls, .memory = self.memory, .inline_scope = self.inline_scope, .binding_start = self.binding_start, .language_selection = self.language_selection, .text = self.text[0..self.text_len] };
+        return .{ .selection = self.selection, .request_id = self.request_id, .kind = self.kind, .browse_address = self.browse_address, .browse_assembly = self.browse_assembly, .show_flow = self.show_flow, .show_kernel = self.show_kernel, .show_stop = self.show_stop, .show_processes = self.show_processes, .show_probes = self.show_probes, .show_setup = self.show_setup, .logical_frames = self.logical_frames, .static_analysis = self.static_analysis, .runtime_types = self.runtime_types, .invocations = self.invocations, .allocations = self.allocations, .profile = self.profile, .timeline = self.timeline, .sample = self.sample, .syscalls = self.syscalls, .memory = self.memory, .inline_scope = self.inline_scope, .binding_start = self.binding_start, .language_selection = self.language_selection, .text = self.text[0..self.text_len] };
     }
 };
+test "owner recapture keeps the requested kernel inventory visibility" {
+    var selection: ViewSelection = .{ .process = 1, .selection = .{ .tid = 0 }, .request_id = 1, .show_kernel = true };
+    try std.testing.expect(selection.inspection().show_kernel);
+    selection.show_kernel = false;
+    try std.testing.expect(!selection.inspection().show_kernel);
+}
 pub const Worker = struct {
     commands: boundary.Queue = .{},
     publications: boundary.Publications,
@@ -342,7 +349,7 @@ pub const Worker = struct {
                 if (result) |value| {
                     if (command.request.action == .inspect and (value == .view or value == .debugger or value == .language)) {
                         const inspection = command.request.action.inspect;
-                        self.selection = .{ .process = command.request.stamp.process, .selection = inspection.selection, .request_id = inspection.request_id, .kind = inspection.kind, .browse_address = inspection.browse_address, .browse_assembly = inspection.browse_assembly, .show_flow = inspection.show_flow, .show_stop = inspection.show_stop, .show_processes = inspection.show_processes, .show_probes = inspection.show_probes, .show_setup = inspection.show_setup, .logical_frames = inspection.logical_frames, .static_analysis = inspection.static_analysis, .runtime_types = inspection.runtime_types, .invocations = inspection.invocations, .allocations = inspection.allocations, .profile = inspection.profile, .timeline = inspection.timeline, .sample = inspection.sample, .syscalls = inspection.syscalls, .memory = inspection.memory, .inline_scope = inspection.inline_scope };
+                        self.selection = .{ .process = command.request.stamp.process, .selection = inspection.selection, .request_id = inspection.request_id, .kind = inspection.kind, .browse_address = inspection.browse_address, .browse_assembly = inspection.browse_assembly, .show_flow = inspection.show_flow, .show_kernel = inspection.show_kernel, .show_stop = inspection.show_stop, .show_processes = inspection.show_processes, .show_probes = inspection.show_probes, .show_setup = inspection.show_setup, .logical_frames = inspection.logical_frames, .static_analysis = inspection.static_analysis, .runtime_types = inspection.runtime_types, .invocations = inspection.invocations, .allocations = inspection.allocations, .profile = inspection.profile, .timeline = inspection.timeline, .sample = inspection.sample, .syscalls = inspection.syscalls, .memory = inspection.memory, .inline_scope = inspection.inline_scope };
                         self.selection.?.binding_start = inspection.binding_start;
                         self.selection.?.language_selection = inspection.language_selection;
                         self.selection.?.text_len = inspection.text.len;
@@ -933,13 +940,7 @@ test "live remote owner publishes while frontend transport guard is armed" {
     // This is a bounded functional wait, not a latency requirement. From this
     // point until join the frontend reads only message state, never Session.
     const deadline = linux.now() + 60 * std.time.ns_per_s;
-    while (current == null) {
-        current = worker.publications.take(null) catch null;
-        if (current != null) break;
-        if (worker.done.load(.acquire)) return worker.failure orelse error.OwnerStopped;
-        if (linux.now() >= deadline) return error.PublicationTimeout;
-        _ = c.usleep(1000);
-    }
+    try testWaitInspection(worker, &current, 1, deadline);
     try std.testing.expect(current.?.value.matchesInspection(current.?.value.stamp, 1));
     try std.testing.expect(current.?.value.view.?.threads.len > 0);
     try std.testing.expect(current.?.value.view.?.registers.len > 0);
@@ -1186,6 +1187,18 @@ test "live remote owner publishes while frontend transport guard is armed" {
     try std.testing.expect(current.?.value.sample == null and current.?.value.syscalls == null);
 }
 
+fn testWaitInspection(worker: *Worker, current: *?*const boundary.Publication, request_id: u64, deadline: u64) !void {
+    while (true) {
+        if (worker.publications.take(current.*) catch null) |next| current.* = next;
+        // Metadata discovery can publish pending before the owner recaptures
+        // a ready view. Arrival alone is not the requested inspection state.
+        if (current.*) |value| if (value.value.matchesInspection(value.value.stamp, request_id)) return;
+        if (worker.done.load(.acquire)) return worker.failure orelse error.OwnerStopped;
+        if (linux.now() >= deadline) return error.PublicationTimeout;
+        _ = c.usleep(1000);
+    }
+}
+
 fn testSubmit(worker: *Worker, current: *?*const boundary.Publication, action: boundary.Action, deadline: u64) !Completion {
     var sequence: ?u64 = null;
     while (true) {
@@ -1240,8 +1253,12 @@ test "metadata discovered during preparation stays pending until recaptured" {
     try std.testing.expectEqual(@FieldType(boundary.Presentation, "status").pending, pending.value.status);
     try std.testing.expect(!pending.value.matchesInspection(pending.value.stamp, 1));
     try std.testing.expect(worker.last_metadata != session.metadata.revision);
+    // A pending publication must not satisfy the live test's readiness wait,
+    // and a stalled owner must still hit its ceiling without losing the view.
+    try std.testing.expectError(error.PublicationTimeout, testWaitInspection(worker, &current, 1, linux.now()));
+    try std.testing.expect(current == pending);
     const after = prepared.header(session);
     try worker.publish(null, null, .{ .header = after, .key = after.key(0, 0) }, null);
-    current = (try worker.publications.take(pending)).?;
+    try testWaitInspection(worker, &current, 1, linux.now() + std.time.ns_per_s);
     try std.testing.expect(current.?.value.matchesInspection(current.?.value.stamp, 1));
 }

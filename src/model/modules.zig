@@ -60,6 +60,34 @@ test "region image kind distinguishes a host file, the vdso, and other paths" {
     try std.testing.expectEqual(ImageKind.none, sample.region("[vvar]", 0).imageKind());
     try std.testing.expectEqual(ImageKind.none, sample.region("", 0).imageKind());
 }
+pub const ImageMapping = union(snapshot.Completeness) {
+    full: []align(std.heap.page_size_min) u8,
+    sections: []align(std.heap.page_size_min) u8,
+    types: []align(std.heap.page_size_min) u8,
+
+    pub fn init(bytes: []align(std.heap.page_size_min) u8, kind: snapshot.Completeness) ImageMapping {
+        return switch (kind) {
+            .full => .{ .full = bytes },
+            .sections => .{ .sections = bytes },
+            .types => .{ .types = bytes },
+        };
+    }
+    pub fn coverage(self: ImageMapping) snapshot.Completeness {
+        return std.meta.activeTag(self);
+    }
+    fn storage(self: ImageMapping) []align(std.heap.page_size_min) u8 {
+        return switch (self) {
+            inline else => |bytes| bytes,
+        };
+    }
+};
+pub const DebuggerView = struct {
+    projection: []align(std.heap.page_size_min) u8,
+
+    pub fn projectedBytes(self: DebuggerView) []align(std.heap.page_size_min) u8 {
+        return self.projection;
+    }
+};
 pub const Module = struct {
     id: u64,
     inode: u64,
@@ -78,7 +106,7 @@ pub const Module = struct {
     debug_file: ?*const @import("../binary/debug_files.zig").File = null,
     debug_allocator: std.mem.Allocator = std.heap.page_allocator,
     file_offset: u64 = 0, // ELF entry offset in the backing file; zero for standalone ELF.
-    mapping: []align(std.heap.page_size_min) u8,
+    mapping: ImageMapping,
     owns_mapping: bool = true,
     preparing_full: bool = false,
     immutable: bool = false,
@@ -95,10 +123,31 @@ pub const Module = struct {
     orc_ips: []i32 = &.{},
     orc_entries: []u8 = &.{},
     file_source: mapped_file.Source = .unopened,
+    pub const ProjectionUse = enum { archive_identity, static_analysis, unwind_fingerprint };
+    /// Whole-file consumers use `completeImage` unless they deliberately
+    /// accept a sparse debugger-section projection and name that use here.
+    pub fn completeImage(self: *const Module) ![]const u8 {
+        return switch (self.mapping) {
+            .full => |bytes| bytes,
+            .sections, .types => error.DebuggerImageProjection,
+        };
+    }
+    pub fn imageAllowingProjection(self: *const Module, comptime use: ProjectionUse) []const u8 {
+        _ = use;
+        return self.mapping.storage();
+    }
+    /// Debuggers consume exactly the retained view. A remote view can be a
+    /// section or type projection; whole-file consumers use the methods above.
+    pub fn debuggerImage(self: *const Module) DebuggerView {
+        return .{ .projection = self.mapping.storage() };
+    }
+    pub fn imageCoverage(self: *const Module) snapshot.Completeness {
+        return self.mapping.coverage();
+    }
     pub fn debugInfo(self: *Module) !*DebugInfo {
         if (self.debug == null) {
             self.debug_refusal = null;
-            self.debug = DebugInfo.initWithBudget(self.image, self.mapping, self.debug_file, self.debug_allocator, self.debug_sweep, &self.debug_refusal) catch |err| {
+            self.debug = DebugInfo.initWithBudget(self.image, self.debuggerImage().projectedBytes(), self.debug_file, self.debug_allocator, self.debug_sweep, &self.debug_refusal) catch |err| {
                 self.debug_refusal_pending = self.debug_refusal != null;
                 return err;
             };
@@ -117,10 +166,38 @@ pub const Module = struct {
         return std.math.add(u64, link, self.bias) catch error.InvalidAddress;
     }
 };
-pub const Symbol = struct { module_id: u64, name: []const u8, address: u64, size: u64, offset: u64 = 0, entry: u64 = 0 };
+test "whole-image consumers must opt into debugger projections" {
+    var bytes: [4]u8 align(std.heap.page_size_min) = "ELF!".*;
+    var module = Module{
+        .id = 1,
+        .inode = 2,
+        .device_major = 3,
+        .device_minor = 4,
+        .path = "/fixture",
+        .image = undefined,
+        .bias = 0,
+        .start = 0,
+        .end = bytes.len,
+        .mapping = .{ .sections = &bytes },
+        .owns_mapping = false,
+    };
+    try std.testing.expectEqual(snapshot.Completeness.sections, module.imageCoverage());
+    try std.testing.expectEqualSlices(u8, &bytes, module.debuggerImage().projectedBytes());
+    try std.testing.expectError(error.DebuggerImageProjection, module.completeImage());
+    try std.testing.expectEqualSlices(u8, &bytes, module.imageAllowingProjection(.archive_identity));
+    module.mapping = .{ .types = &bytes };
+    try std.testing.expectEqual(snapshot.Completeness.types, module.imageCoverage());
+    try std.testing.expectError(error.DebuggerImageProjection, module.completeImage());
+    module.mapping = .{ .full = &bytes };
+    try std.testing.expectEqual(snapshot.Completeness.full, module.imageCoverage());
+    try std.testing.expectEqualSlices(u8, &bytes, try module.completeImage());
+}
+/// `ifunc`: the address is a GNU indirect-function resolver, not the
+/// implementation a call would reach.
+pub const Symbol = struct { module_id: u64, name: []const u8, address: u64, size: u64, offset: u64 = 0, entry: u64 = 0, ifunc: bool = false };
 fn publishedSymbol(machine: elf.Machine, module_id: u64, symbol: elf.Symbol, address: u64) Symbol {
     const entry: u64 = if (machine == .ppc64 and symbol.type == .func) elf.ppc64LocalEntry(symbol.other) else 0;
-    return .{ .module_id = module_id, .name = symbol.name, .address = address, .size = symbol.size, .entry = entry };
+    return .{ .module_id = module_id, .name = symbol.name, .address = address, .size = symbol.size, .entry = entry, .ifunc = symbol.type == .gnu_ifunc };
 }
 pub const Modules = struct {
     // These sealed sparse views contain symbols and placement metadata only.
@@ -128,7 +205,7 @@ pub const Modules = struct {
     pub const FileKind = enum { elf, pe, macho, other };
     const FileKey = pe.FileKey;
     const max_file_kinds = 16384;
-    const FileClassification = struct { kind: FileKind, identity: ?rt.struct_xrt_file_identity, checked_revision: u64, failure: ?anyerror = null, pe_headers_valid: ?bool = null };
+    const FileClassification = struct { kind: FileKind, identity: ?rt.struct_xrt_file_identity, checked_revision: u64, failure: ?anyerror = null, pe_headers_valid: ?bool = null, metadata_not_elf: bool = false };
     const FileIdentity = struct {
         region: Region,
         identity: ?rt.struct_xrt_file_identity = null,
@@ -244,6 +321,12 @@ pub const Modules = struct {
     /// One find_symbol call's per-CPU slot. Null keeps the stopped CPU.
     lookup_cpu: ?u32 = null,
     kernel_stop_tid: i32 = 0,
+    /// Described-stub CPU threads, local tid to CPU. Not a shadow id.
+    stub_tid: [64]i32 = @splat(0),
+    stub_cpu: [64]u32 = @splat(0),
+    stub_n: u8 = 0,
+    /// Thread ids from a described stub are not kernel pids.
+    live_stub_tasks: bool = false,
     kernel_generation: ?u64 = null,
     tasks_walked: bool = false,
     percpu_offsets: []u64 = &.{},
@@ -386,7 +469,7 @@ pub const Modules = struct {
         if (m.layouts.go_value) |layout| m.debug_allocator.destroy(layout);
         if (m.layouts.go_map) |layout| m.debug_allocator.destroy(layout);
         if (m.debug) |*info| info.deinit();
-        if (m.owns_mapping) snapshot.free(m.mapping);
+        if (m.owns_mapping) snapshot.free(m.mapping.storage());
         self.allocator.free(m.path);
         self.allocator.destroy(m);
     }
@@ -698,7 +781,7 @@ pub const Modules = struct {
             .bias = slide,
             .start = start,
             .end = end,
-            .mapping = mapped,
+            .mapping = .{ .full = mapped },
             .immutable = true,
             .explicit_gdb = true,
             .kernel = self.measure_kernel_slide,
@@ -750,6 +833,7 @@ pub const Modules = struct {
         const generation = target.snapshot().generation;
         if (self.kernel_generation == generation) return;
         self.kernel_generation = generation;
+        self.stub_n = 0;
         self.tasks_walked = false;
         if (self.kernel_tasks.len != 0) {
             self.allocator.free(self.kernel_tasks);
@@ -839,6 +923,11 @@ pub const Modules = struct {
         if (!symbol.hasAddress()) return;
         self.ret_from_fork = module.runtimeAddress(symbol.value) catch null;
     }
+    /// Owner-only bounded stop inventory; reuses the walk made for thread names.
+    pub fn kernelTaskRows(self: *Modules) []const kernel_aware.TaskRow {
+        self.ensureTasks();
+        return self.kernel_tasks;
+    }
     fn ensureTasks(self: *Modules) void {
         if (self.tasks_walked) return;
         const handle = self.owner_target orelse return;
@@ -895,6 +984,126 @@ pub const Modules = struct {
                 return;
             };
         }
+    }
+    /// CPU threads of a described stub stay as they are. Sleeping tasks, and a
+    /// current task with no paired CPU thread, are stopped threads beside them.
+    pub fn publishStubTasks(self: *Modules, target: anytype) void {
+        const info = target.gdbRemoteInfo() orelse return;
+        if (info.kernel or target.core != null) return;
+        if (!self.measure_kernel_slide or self.loaded.items.len == 0) return;
+        if (target.snapshot().state != .stopped) return;
+        const vmlinux = self.loaded.items[0];
+        if (!vmlinux.kernel) return;
+        self.live_stub_tasks = true;
+        self.ensureTasks();
+        self.assignStubCpus(target);
+        if (self.stubCpuOf(self.kernel_stop_tid)) |cpu| self.kernel_cpu = cpu;
+        var synthetic: i32 = 0;
+        for (self.kernel_tasks) |*task| {
+            if (self.taskIsCurrent(task.address)) if (self.currentCpu(task.*)) |cpu| if (self.cpuHasStub(cpu)) continue;
+            if (task.pub_tid != 0 and self.tidTaken(target, task.pub_tid)) continue;
+            if (target.snapshot().thread_count >= 1024) {
+                self.noteKernel("task list is capped");
+                return;
+            }
+            const tid = self.coreTaskTid(target, task.pid, &synthetic) orelse continue;
+            task.pub_tid = tid;
+            target.addMemoryTask(tid) catch |err| {
+                self.noteKernel(@errorName(err));
+                return;
+            };
+        }
+    }
+    fn stubCpuOf(self: *const Modules, tid: i32) ?u32 {
+        var index: usize = 0;
+        while (index < self.stub_n) : (index += 1) if (self.stub_tid[index] == tid) return self.stub_cpu[index];
+        return null;
+    }
+    fn cpuHasStub(self: *const Modules, cpu: u32) bool {
+        var index: usize = 0;
+        while (index < self.stub_n) : (index += 1) if (self.stub_cpu[index] == cpu) return true;
+        return false;
+    }
+    fn publishedTid(self: *const Modules, tid: i32) bool {
+        for (self.kernel_tasks) |task| if (task.pub_tid != 0 and task.pub_tid == tid) return true;
+        return false;
+    }
+    fn assignStubCpus(self: *Modules, target: anytype) void {
+        self.stub_n = 0;
+        var stacks: [256]u64 = @splat(0);
+        self.currentStacks(target, &stacks);
+        const x86 = target.arch() == .x86_64;
+        for (target.threadSlice()) |thread| {
+            if (self.stub_n == self.stub_tid.len) break;
+            if (self.publishedTid(thread.tid)) continue;
+            const regs = target.registers(thread.tid) catch continue;
+            const sp = registerSp(regs.raw) orelse 0;
+            const gs: ?u64 = if (x86) registerName(regs.raw, "gs_base") else null;
+            const cpu = kernel_aware.cpuForStop(sp, gs, self.percpu_offsets, stacks[0..@min(stacks.len, @max(self.kernel_current.len, 1))]) orelse continue;
+            self.stub_tid[self.stub_n] = thread.tid;
+            self.stub_cpu[self.stub_n] = cpu;
+            self.stub_n += 1;
+        }
+        var drop: [64]bool = @splat(false);
+        var index: usize = 0;
+        while (index < self.stub_n) : (index += 1) {
+            var other: usize = 0;
+            while (other < index) : (other += 1) if (self.stub_cpu[other] == self.stub_cpu[index]) {
+                drop[other] = true;
+                drop[index] = true;
+            };
+        }
+        var kept: u8 = 0;
+        index = 0;
+        while (index < self.stub_n) : (index += 1) {
+            if (drop[index]) continue;
+            self.stub_tid[kept] = self.stub_tid[index];
+            self.stub_cpu[kept] = self.stub_cpu[index];
+            kept += 1;
+        }
+        self.stub_n = kept;
+    }
+    fn currentStacks(self: *Modules, target: anytype, out: []u64) void {
+        @memset(out, 0);
+        const facts = self.kernel_facts orelse return;
+        const off = facts.stack_off orelse return;
+        const Reader = struct {
+            target: @TypeOf(target),
+            pub fn read(reader: @This(), address: u64, dest: []u8) !usize {
+                return reader.target.readMemory(address, dest);
+            }
+        };
+        const reader = Reader{ .target = target };
+        const n = @min(out.len, self.kernel_current.len);
+        var cpu: usize = 0;
+        while (cpu < n) : (cpu += 1) {
+            const address = self.kernel_current[cpu];
+            if (address == 0) continue;
+            out[cpu] = readWord(reader, address + off) catch 0;
+        }
+    }
+    fn registerSp(regs: rt.struct_xrt_registers) ?u64 {
+        var out: u64 = 0;
+        runtime_api.check(rt.xrt_registers_role(&regs, rt.XRT_ROLE_SP, &out)) catch return null;
+        return out;
+    }
+    fn registerName(regs: rt.struct_xrt_registers, name: []const u8) ?u64 {
+        var out: u64 = 0;
+        runtime_api.check(rt.xrt_registers_value(&regs, name.ptr, name.len, &out)) catch return null;
+        return out;
+    }
+    /// The debugger thread that shows a task: its published id, a described
+    /// stub's CPU thread for that CPU's current task, or on KGDB the thread named
+    /// by its pid. A described stub's thread ids are not pids. Null when none.
+    pub fn taskTid(self: *const Modules, task: kernel_aware.TaskRow, threads: anytype) ?i32 {
+        if (task.pub_tid != 0) return task.pub_tid;
+        if (self.taskIsCurrent(task.address)) if (self.currentCpu(task)) |cpu| {
+            var index: usize = 0;
+            while (index < self.stub_n) : (index += 1) if (self.stub_cpu[index] == cpu) return self.stub_tid[index];
+        };
+        if (self.live_stub_tasks or task.pid <= 0) return null;
+        for (threads) |thread| if (thread.tid == task.pid) return task.pid;
+        return null;
     }
     fn currentCpu(self: *const Modules, task: kernel_aware.TaskRow) ?u32 {
         for (self.kernel_current, 0..) |current, cpu| if (current == task.address) return @intCast(cpu);
@@ -954,7 +1163,38 @@ pub const Modules = struct {
         if (n != rows.len) self.allocator.free(rows);
         self.replaceSlice(kernel_aware.TaskRow, &self.kernel_tasks, kept);
         self.readCurrent(module, memory);
+        self.adoptCurrentTasks(memory);
         self.readWaits(memory);
+    }
+    /// Idle tasks other than the list head are not linked. Name them from
+    /// the per-CPU current pointer so a CPU thread can still find its task.
+    fn adoptCurrentTasks(self: *Modules, memory: anytype) void {
+        const facts = self.kernel_facts orelse return;
+        var extra: [256]kernel_aware.TaskRow = undefined;
+        var extra_n: usize = 0;
+        for (self.kernel_current) |address| {
+            if (address == 0 or extra_n == extra.len) continue;
+            var seen = false;
+            for (self.kernel_tasks) |task| if (task.address == address) {
+                seen = true;
+                break;
+            };
+            if (seen) continue;
+            for (extra[0..extra_n]) |task| if (task.address == address) {
+                seen = true;
+                break;
+            };
+            if (seen) continue;
+            const row = kernel_aware.readTask(memory, address, facts) catch continue;
+            if (row.comm_len == 0) continue;
+            extra[extra_n] = row;
+            extra_n += 1;
+        }
+        if (extra_n == 0) return;
+        const grown = self.allocator.alloc(kernel_aware.TaskRow, self.kernel_tasks.len + extra_n) catch return;
+        @memcpy(grown[0..self.kernel_tasks.len], self.kernel_tasks);
+        @memcpy(grown[self.kernel_tasks.len..], extra[0..extra_n]);
+        self.replaceSlice(kernel_aware.TaskRow, &self.kernel_tasks, grown);
     }
     fn readWaits(self: *Modules, memory: anytype) void {
         const facts = self.kernel_facts orelse return;
@@ -1016,7 +1256,17 @@ pub const Modules = struct {
         return used;
     }
     fn readCurrent(self: *Modules, module: *Module, memory: anytype) void {
-        const symbol = module.symbols().findSymbol("current_task") orelse return;
+        // x86 publishes current_task. arm64 keeps the pointer in sp_el0 and
+        // mirrors it as the runqueue's current task.
+        if (module.symbols().findSymbol("current_task")) |symbol| {
+            self.readCurrentSlots(module, memory, symbol, 0);
+            return;
+        }
+        const add = (self.kernel_facts orelse return).rq_curr orelse return;
+        const symbol = module.symbols().findSymbol("runqueues") orelse return;
+        self.readCurrentSlots(module, memory, symbol, add);
+    }
+    fn readCurrentSlots(self: *Modules, module: *Module, memory: anytype, symbol: elf.Symbol, add: u64) void {
         // Slid like find_symbol: x86-64 per-CPU data is no longer linked at zero here.
         const value = percpuValue(module, symbol) orelse return;
         const cpus: u32 = if (self.percpu_offsets.len != 0) @intCast(@min(self.percpu_offsets.len, 256)) else 1;
@@ -1025,7 +1275,7 @@ pub const Modules = struct {
         var cpu: u32 = 0;
         while (cpu < cpus) : (cpu += 1) {
             const slot = self.percpuRuntime(module, value, cpu) catch continue;
-            slots[cpu] = readWord(memory, slot) catch 0;
+            slots[cpu] = readWord(memory, slot +% add) catch 0;
         }
         self.replaceSlice(u64, &self.kernel_current, slots);
     }
@@ -1100,7 +1350,7 @@ pub const Modules = struct {
                 index += 1;
                 continue;
             }
-            if (module.owns_mapping) self.snapshot_bytes -|= module.mapping.len;
+            if (module.owns_mapping) self.snapshot_bytes -|= module.mapping.storage().len;
             self.releaseModule(module);
             _ = self.loaded.orderedRemove(index);
         }
@@ -1159,7 +1409,7 @@ pub const Modules = struct {
             .bias = 0,
             .start = row.text,
             .end = end,
-            .mapping = mapped,
+            .mapping = .{ .full = mapped },
             .immutable = true,
             .explicit_gdb = true,
             .kernel = true,
@@ -1407,14 +1657,45 @@ pub const Modules = struct {
     }
     fn taskByTid(self: *const Modules, tid: i32) ?kernel_aware.TaskRow {
         if (kernel_aware.shadowCpuLocal(tid)) |cpu| return self.cpuTask(cpu);
+        if (self.stubCpuOf(tid)) |cpu| return self.cpuTask(cpu);
         // A guest dump without VMCOREINFO keeps its note ids, which count CPUs,
         // not pids: the note's position is its CPU.
         if (self.core_source) |core| if (!core.kernel) for (core.threads.items, 0..) |thread, index| {
             if (thread.tid == tid) return self.cpuTask(@intCast(index));
         };
         for (self.kernel_tasks) |task| if (task.pub_tid != 0 and task.pub_tid == tid) return task;
+        // A described stub numbers CPU threads from 1. That id is not a pid.
+        if (self.live_stub_tasks) return null;
         for (self.kernel_tasks) |task| if (task.pid == tid) return task;
         return null;
+    }
+    test "described stub thread names its CPU rather than a task pid" {
+        const a = std.testing.allocator;
+        var modules = Modules.init(a);
+        defer modules.deinit();
+        modules.live_stub_tasks = true;
+        const tasks = try a.alloc(kernel_aware.TaskRow, 2);
+        tasks[0] = .{ .address = 0x1000, .pid = 1 };
+        tasks[1] = .{ .address = 0x2000, .pid = 7, .pub_tid = 0x61000000 };
+        modules.kernel_tasks = tasks;
+        const current = try a.alloc(u64, 1);
+        current[0] = 0x1000;
+        modules.kernel_current = current;
+        modules.stub_n = 1;
+        modules.stub_tid[0] = 1;
+        modules.stub_cpu[0] = 0;
+        try std.testing.expectEqual(@as(u64, 0x1000), (modules.taskByTid(1) orelse return error.KernelTaskLayoutUnavailable).address);
+        try std.testing.expectEqual(@as(i32, 7), (modules.taskByTid(0x61000000) orelse return error.KernelTaskLayoutUnavailable).pid);
+        try std.testing.expect(modules.taskByTid(7) == null);
+        // The kernel-target view names the same threads: a current task is its
+        // CPU's thread, and a stub thread id is never read as a pid.
+        const Thread = struct { tid: i32 };
+        const threads = [_]Thread{ .{ .tid = 1 }, .{ .tid = 7 } };
+        try std.testing.expectEqual(@as(?i32, 1), modules.taskTid(tasks[0], &threads));
+        try std.testing.expectEqual(@as(?i32, 0x61000000), modules.taskTid(tasks[1], &threads));
+        try std.testing.expectEqual(@as(?i32, null), modules.taskTid(.{ .address = 0x3000, .pid = 7 }, &threads));
+        modules.live_stub_tasks = false;
+        try std.testing.expectEqual(@as(?i32, 7), modules.taskTid(.{ .address = 0x3000, .pid = 7 }, &threads));
     }
     pub fn kernelThreadName(self: *Modules, tid: i32, buf: *[128]u8) bool {
         self.ensureTasks();
@@ -1536,8 +1817,9 @@ pub const Modules = struct {
         self.ensureTasks();
         const facts = self.kernel_facts orelse return error.KernelTypeInfoUnavailable;
         const task = self.taskByTid(tid) orelse return error.KernelTaskLayoutUnavailable;
-        // Running on a CPU with no register note: its saved state is stale.
-        if (self.core_source != null and self.taskIsCurrent(task.address)) return error.KernelTaskRunning;
+        // Running on a CPU: saved state is stale. A described stub's CPU thread
+        // holds the live registers, the same as a crash note.
+        if (self.taskIsCurrent(task.address) and (self.core_source != null or self.live_stub_tasks)) return error.KernelTaskRunning;
         if (arch_ == .x86_64) {
             const sp_off = facts.thread_sp orelse return error.KernelTaskLayoutUnavailable;
             const ret_off = facts.saved_ret orelse return error.KernelTaskLayoutUnavailable;
@@ -1836,9 +2118,9 @@ pub const Modules = struct {
         if (module.preparing_full) return;
         if (module.debug) |*debug| debug.deinit();
         module.debug = null;
-        self.snapshot_bytes -= module.mapping.len;
-        snapshot.free(module.mapping);
-        module.mapping = &.{};
+        self.snapshot_bytes -= module.mapping.storage().len;
+        snapshot.free(module.mapping.storage());
+        module.mapping = .{ .full = &.{} };
         module.owns_mapping = false;
         module.preparing_full = true;
         self.budget_dirty = true;
@@ -2340,7 +2622,7 @@ pub const Modules = struct {
         errdefer self.allocator.free(path);
         const module = try self.allocator.create(Module);
         errdefer self.allocator.destroy(module);
-        module.* = .{ .id = try self.moduleId(region, p.bias, 0), .inode = region.inode, .device_major = region.device_major, .device_minor = region.device_minor, .path = path, .image = image, .bias = p.bias, .start = p.first.start, .end = p.end, .mapping = mapped, .file_offset = 0, .immutable = self.immutable, .debug_sweep = why == .sweep, .file_source = .target_memory };
+        module.* = .{ .id = try self.moduleId(region, p.bias, 0), .inode = region.inode, .device_major = region.device_major, .device_minor = region.device_minor, .path = path, .image = image, .bias = p.bias, .start = p.first.start, .end = p.end, .mapping = .{ .full = mapped }, .file_offset = 0, .immutable = self.immutable, .debug_sweep = why == .sweep, .file_source = .target_memory };
         try self.loaded.ensureUnusedCapacity(self.allocator, 1);
         self.loaded.appendAssumeCapacity(module);
         self.snapshot_bytes += mapped.len;
@@ -2510,7 +2792,7 @@ pub const Modules = struct {
         const p = try self.placement(&image, entry.offset, region, observed);
         var module = try self.allocator.create(Module);
         errdefer self.allocator.destroy(module);
-        module.* = .{ .id = try self.moduleId(region, p.bias, entry.offset), .inode = region.inode, .device_major = region.device_major, .device_minor = region.device_minor, .path = path, .image = image, .bias = p.bias, .start = p.first.start, .end = p.end, .mapping = mapped, .file_offset = entry.offset, .immutable = self.immutable, .debug_sweep = why == .sweep };
+        module.* = .{ .id = try self.moduleId(region, p.bias, entry.offset), .inode = region.inode, .device_major = region.device_major, .device_minor = region.device_minor, .path = path, .image = image, .bias = p.bias, .start = p.first.start, .end = p.end, .mapping = ImageMapping.init(mapped, coverage), .file_offset = entry.offset, .immutable = self.immutable, .debug_sweep = why == .sweep };
         module.file_source = source;
         if (self.debug_files) |files| {
             module.debug_file = (if (entry.offset == 0) self.companionFor(region, &image, path) else files.matching(&image)) catch |err| blk: {
@@ -3481,6 +3763,29 @@ pub const Modules = struct {
     fn fileKey(region: Region) FileKey {
         return .{ .inode = region.inode, .device_major = region.device_major, .device_minor = region.device_minor };
     }
+    /// The asynchronous metadata probe is reached through every VMA alias in
+    /// a source sweep. Remember its definite negative once for this maps
+    /// revision; a later revision must prove the file again.
+    pub fn metadataNotElf(self: *const Modules, region: Region) bool {
+        const cached = self.file_kinds.get(fileKey(region)) orelse return false;
+        return cached.checked_revision == self.maps_revision and cached.metadata_not_elf;
+    }
+    pub fn rememberMetadataNotElf(self: *Modules, region: Region, identity: rt.struct_xrt_file_identity) void {
+        const key = fileKey(region);
+        if (self.file_kinds.getPtr(key)) |cached| {
+            if (cached.identity == null or !std.meta.eql(cached.identity.?, identity)) {
+                cached.kind = .other;
+                cached.identity = identity;
+                cached.failure = null;
+                cached.pe_headers_valid = null;
+            }
+            cached.checked_revision = self.maps_revision;
+            cached.metadata_not_elf = true;
+            return;
+        }
+        if (self.file_kinds.count() >= max_file_kinds) self.file_kinds.clearRetainingCapacity();
+        self.file_kinds.put(self.allocator, key, .{ .kind = .other, .identity = identity, .checked_revision = self.maps_revision, .metadata_not_elf = true }) catch {};
+    }
     pub fn openFileView(self: *Modules, request: *const rt.struct_xrt_file_request, view: *?*rt.struct_xrt_file_view) !void {
         try runtime_api.check(if (self.owner_target) |target|
             rt.xrt_target_file_view_open_owner(target, request, view)
@@ -3948,7 +4253,7 @@ test "module relabel preserves exact provenance at process-scale mapping counts"
         const r = modules.regions.items[i];
         if (i < 100) {
             const module = try a.create(Module);
-            module.* = .{ .id = i + 1, .inode = r.inode, .device_major = r.device_major, .device_minor = r.device_minor, .path = try a.dupeZ(u8, r.path), .image = fixture_image, .mapping = &.{}, .owns_mapping = false, .bias = 0, .start = r.start, .end = r.end, .file_source = .target_root };
+            module.* = .{ .id = i + 1, .inode = r.inode, .device_major = r.device_major, .device_minor = r.device_minor, .path = try a.dupeZ(u8, r.path), .image = fixture_image, .mapping = .{ .full = &.{} }, .owns_mapping = false, .bias = 0, .start = r.start, .end = r.end, .file_source = .target_root };
             try modules.loaded.append(a, module);
         } else {
             const ptr = c.mmap(null, 4096, c.PROT_READ | c.PROT_WRITE, c.MAP_PRIVATE | c.MAP_ANONYMOUS, -1, 0);
@@ -4151,6 +4456,26 @@ test "the main executable is identified by device as well as inode and path" {
         try std.testing.expect(!Modules.isExecutable(pid, r));
         break;
     };
+}
+
+test "metadata NotElf memo covers aliases for one maps revision" {
+    var modules = Modules.init(std.testing.allocator);
+    defer modules.deinit();
+    modules.maps_revision = 9;
+    const first = Region{ .start = 0x1000, .end = 0x2000, .offset = 0, .inode = 7, .device_major = 1, .device_minor = 2, .permissions = "r--p".*, .path = "/first" };
+    var alias = first;
+    alias.start = 0x5000;
+    alias.end = 0x6000;
+    alias.offset = 0x4000;
+    alias.path = "/alias";
+    const identity = std.mem.zeroes(rt.struct_xrt_file_identity);
+    try std.testing.expect(!modules.metadataNotElf(first));
+    modules.rememberMetadataNotElf(first, identity);
+    try std.testing.expect(modules.metadataNotElf(first));
+    try std.testing.expect(modules.metadataNotElf(alias));
+    modules.maps_revision += 1;
+    try std.testing.expect(!modules.metadataNotElf(first));
+    try std.testing.expect(!modules.metadataNotElf(alias));
 }
 
 test "cached file kinds revalidate PE and other answers once per map revision" {

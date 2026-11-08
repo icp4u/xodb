@@ -65,6 +65,8 @@ enum xrt_status xrt_memory_mutation_allowed(const struct xrt_target *t)
 }
 enum xrt_status xrt_execution_allowed(const struct xrt_target *t)
 {
+    if (xrt_target_infcall_active(t))
+        return XRT_CALL_FRAME_ACTIVE;
     if (t->detach_pending)
         return XRT_DETACH_INCOMPLETE;
     if (t->birth_count)
@@ -493,6 +495,10 @@ enum xrt_status xrt_target_detach(struct xrt_target *t)
         return XRT_READ_ONLY_CORE;
     if (!t->pid || t->state == XRT_IDLE)
         return XRT_INVALID_STATE;
+    /* Releasing a thread inside a debugger-started call would let it run on
+     * with the borrowed context. Restore or abandon first. */
+    if (xrt_target_infcall_active(t))
+        return XRT_CALL_FRAME_ACTIVE;
     xrt_reap_detached(t);
     if (t->reap_count + t->thread_count + 1 > 2048)
         return XRT_TOO_MANY_PENDING_CHILDREN;
@@ -633,6 +639,7 @@ enum xrt_status xrt_target_close(struct xrt_target *t)
         return XRT_OK;
     xodb_maps_free(&t->maps);
     t->maps_valid = false;
+    xrt_infcall_release(t);
     if (t->core) {
         t->core = false;
         t->pid = 0;

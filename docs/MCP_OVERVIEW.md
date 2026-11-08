@@ -47,11 +47,11 @@ The client launches xodb and keeps its stdin/stdout connected, for example:
 ./zig-out/bin/xodb --headless --mcp --agent-scope observe --attach PID
 ```
 
-Omit `--headless` to include the GUI. Today this gives one client connection to
-one xodb session. Connecting additional agents to an already-running GUI needs
-further transport/session work. A one-client TCP listener and an SSH/TCP GUI
-client now exist; see [remote debugging](REMOTE_DEBUGGING.md). HTTP, Unix sockets,
-MCP resources and prompt catalogs are not implemented. Diagnostic and target
+Omit `--headless` to include the GUI. Additional local agents can connect through
+`--session-socket PATH` and `xodb --session-connect PATH`; observer clients share
+the owner's stopped state, and control requires its lease. An SSH/TCP GUI client
+also exists; see [remote debugging](REMOTE_DEBUGGING.md). HTTP, MCP resources
+and prompt catalogs are not implemented. Diagnostic and target
 output goes to stderr; stdout carries
 MCP messages. Disconnecting stdio ends xodb; launched targets are cleaned up and
 attached targets are detached.
@@ -128,6 +128,32 @@ Unrecognised, malformed or oversized names retain their original display.
 Parsing has fixed input, output, recursion and work limits and does not call an
 allocating full demangler. Microsoft C++ and Rust encodings are not decoded by
 this display path. Inline frames and other symbol-producing tools are unchanged.
+
+## Kernel target inventory
+
+For a kernel target opened with `--vmlinux`, `get_kernel_target` is an
+observer-only inventory shared with the optional F7 panel. Choose `section`:
+`tasks`, `cpus`, `modules`, or `waits`. It is not `get_kernel_stacks`, which
+samples host procfs and is also available in overview mode. The kernel-target
+tool is debugger-only and never attaches to a host process.
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_kernel_target","arguments":{"section":"waits","limit":32}}}
+```
+
+Use the returned `next` integer as `start`, carrying `generation` and any
+`process_id` to subsequent pages. `limit` defaults to 32, maximum 128;
+`StaleSnapshot` means restart pagination at the new stop. `rows`, `total`,
+`reason`, `truncated`, and `limits` describe the bounded cache, not an exhaustive
+or atomic live-memory snapshot. Modules include separate `load_failure` rows,
+including `KernelModuleUnverified` alongside an unverified loaded object.
+Wait rows retain four hops and their termination reason; unknown owners,
+reader-held locks and unresolved CPU current tasks are not guessed. CPU rows
+require task CPU evidence or a matched current task, not just a nonzero word
+in possible-CPU storage; online/offline state is not established.
+Addresses are hex strings. Ordinary targets refuse `KernelTargetRequired`;
+a running kernel returns no rows and `reason: "TargetRunning"`. See
+[kernel targets](KGDB.md#kernel-target-panel-and-mcp) for fields and limits.
 
 ## Paging module maps
 

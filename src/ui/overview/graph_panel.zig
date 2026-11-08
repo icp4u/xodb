@@ -129,19 +129,44 @@ fn pulse(v: *const vw.View, metric: c.struct_xrt_fdflow_metric, now: u64) f32 {
     return 1.0 - @as(f32, @floatFromInt(@min(700_000_000, now -| metric.last_ns))) / 700_000_000.0;
 }
 
-/// The galaxy: the picture fills the pane and the text sits on it.
-fn renderGalaxy(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
+fn galaxyHeader(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     var buffer: [512]u8 = undefined;
     var failure_buffer: [320]u8 = undefined;
     const lk = galaxy.look(ctx.p);
     const demo = v.graph.demo != 0;
-    if (!lk.plain) try ctx.r.shape(rect, lk.field, .{ .radii = @splat(6) });
     const navigation = &@import("galaxy_descriptors.zig").navigation().motion.navigation;
     try ctx.textFit(rect.x + 8, rect.y + 4, rect.w - 16, if (@import("galaxy_descriptors.zig").navigation().table.open) "Descriptor graph / TABLE" else if (navigation.tour) "Descriptor galaxy / TOUR" else "Descriptor galaxy", lk.text);
     try ctx.r.shape(.{ .x = rect.x + 8, .y = rect.y + 32, .w = rect.w - 16, .h = 30 }, draw.fade(lk.warn, 0.12), .{ .radii = @splat(5) });
     const banner = v.recordedTraceBanner(&buffer) orelse if (demo) "DEMO · synthetic processes · nothing is read or traced" else bannerText(v, &buffer, &failure_buffer);
     try ctx.statusLine(rect.x + 16, rect.y + 38, rect.w - 32, banner, lk.warn);
     v.hover(.{ .x = rect.x + 8, .y = rect.y + 32, .w = rect.w - 16, .h = 30 }, "{s}", .{banner});
+    if (demo) return;
+    const g = v.graph.graph orelse {
+        try ctx.textFit(rect.x + 12, rect.y + 84, rect.w - 24, v.graph.failure() orelse "Waiting for descriptor snapshot", lk.dim);
+        return;
+    };
+    if (v.graph.projection == null) return;
+    const stats = std.fmt.bufPrint(&buffer, "{d} processes · {d} fds · {d} denied · {d} stale · {d} unknown · CPUs {d}/{d} · lost {d}", .{ g.processes, g.member_count, g.denied_processes, g.stale_descriptors, g.unknown_descriptors, if (v.graph.flow_running) v.graph.flow_active_cpus else 0, v.graph.flow_online_cpus, v.graph.flow_lost }) catch "";
+    try ctx.statusLine(rect.x + 8, rect.y + 72, rect.w - 16, stats, lk.dim);
+    const omissions = std.fmt.bufPrint(&buffer, "{d} unscanned · {d} gone · capped: {d} processes / {d} fds · {d} unmatched peers", .{ g.unscanned_processes, g.gone_processes, g.dropped_processes, g.dropped_descriptors, g.unmatched_peers }) catch "";
+    try ctx.statusLine(rect.x + 8, rect.y + 94, rect.w - 16, omissions, lk.dim);
+    if (v.graph.failure()) |reason| {
+        const failure = std.fmt.bufPrint(&buffer, "{s} · showing previous snapshot ({d:.1}s old)", .{ reason, @as(f64, @floatFromInt(now -| g.taken_ns)) / 1_000_000_000.0 }) catch reason;
+        try ctx.statusLine(rect.x + 8, rect.y + 116, rect.w - 16, failure, lk.warn);
+    }
+}
+
+/// The galaxy fills the pane; its status text has a quiet foreground strip.
+fn renderGalaxy(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
+    var buffer: [512]u8 = undefined;
+    const lk = galaxy.look(ctx.p);
+    const demo = v.graph.demo != 0;
+    if (!lk.plain) try ctx.r.shape(rect, lk.field, .{ .radii = @splat(6) });
+    const navigation = &@import("galaxy_descriptors.zig").navigation().motion.navigation;
+    if (!demo and (v.graph.graph == null or v.graph.projection == null)) {
+        try galaxyHeader(v, ctx, rect, now);
+        return;
+    }
     var rows: [8]draw.Rect = undefined;
     var row_count: usize = 0;
     for ([_]f32{ 4, 38, 72, 94 }) |y| {
@@ -153,36 +178,27 @@ fn renderGalaxy(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
         row_count += 1;
     }
     var top: f32 = 124;
-    if (!demo) {
-        const g = v.graph.graph orelse {
-            try ctx.textFit(rect.x + 12, rect.y + 84, rect.w - 24, v.graph.failure() orelse "Waiting for descriptor snapshot", lk.dim);
-            return;
-        };
-        if (v.graph.projection == null) return;
-        const stats = std.fmt.bufPrint(&buffer, "{d} processes · {d} fds · {d} denied · {d} stale · {d} unknown · CPUs {d}/{d} · lost {d}", .{ g.processes, g.member_count, g.denied_processes, g.stale_descriptors, g.unknown_descriptors, if (v.graph.flow_running) v.graph.flow_active_cpus else 0, v.graph.flow_online_cpus, v.graph.flow_lost }) catch "";
-        try ctx.statusLine(rect.x + 8, rect.y + 72, rect.w - 16, stats, lk.dim);
-        const omissions = std.fmt.bufPrint(&buffer, "{d} unscanned · {d} gone · capped: {d} processes / {d} fds · {d} unmatched peers", .{ g.unscanned_processes, g.gone_processes, g.dropped_processes, g.dropped_descriptors, g.unmatched_peers }) catch "";
-        try ctx.statusLine(rect.x + 8, rect.y + 94, rect.w - 16, omissions, lk.dim);
-        if (v.graph.failure()) |reason| {
-            const failure = std.fmt.bufPrint(&buffer, "{s} · showing previous snapshot ({d:.1}s old)", .{ reason, @as(f64, @floatFromInt(now -| g.taken_ns)) / 1_000_000_000.0 }) catch reason;
-            try ctx.statusLine(rect.x + 8, rect.y + 116, rect.w - 16, failure, lk.warn);
-            rows[row_count] = .{ .x = rect.x, .y = rect.y + 116, .w = rect.w, .h = 22 };
-            row_count += 1;
-            top = 146;
-        }
+    if (!demo and v.graph.failure() != null) {
+        rows[row_count] = .{ .x = rect.x, .y = rect.y + 116, .w = rect.w, .h = 22 };
+        row_count += 1;
+        top = 146;
     }
     // Win95 keeps its framed plot; elsewhere stars may use the whole field between the text rows.
     const body = if (lk.plain) draw.Rect{ .x = rect.x + 24, .y = rect.y + 150, .w = @max(1, rect.w - 48), .h = @max(1, rect.h - 234) } else draw.Rect{ .x = rect.x + 64, .y = rect.y + top + 22, .w = @max(1, rect.w - 128), .h = @max(1, rect.h - top - 22 - 104) };
     const field = draw.Rect{ .x = rect.x, .y = rect.y + top - 4, .w = rect.w, .h = @max(1, rect.h - top - 72) };
     const clip = ctx.r.clip;
-    // Clouds may drift under the text rows; labels may not (see `rows`).
+    // Keep the scene geometry; the header is painted above decorative clouds.
     ctx.r.clip = draw.intersect(clip, rect);
     const counts = @import("galaxy_descriptors.zig").render(v, ctx, field, body, rows[0..row_count], now) catch |err| {
         ctx.r.clip = clip;
         return err;
     };
     ctx.r.clip = clip;
+    if (!lk.plain) try ctx.r.shape(.{ .x = rect.x, .y = rect.y, .w = rect.w, .h = @min(rect.h, top - 4) }, lk.field, .{ .radii = .{ 6, 6, 0, 0 } });
+    try galaxyHeader(v, ctx, rect, now);
     if (@import("galaxy_descriptors.zig").navigation().table.open) return;
+    // The footer rows sit below the scene field; clouds may cross them too.
+    if (!lk.plain) try ctx.r.shape(.{ .x = rect.x, .y = field.y + field.h, .w = rect.w, .h = @max(0, rect.y + rect.h - field.y - field.h) }, lk.field, .{ .radii = .{ 0, 0, 6, 6 } });
     if (c.getenv("XODB_OVERVIEW_AUDIT") != null)
         log.info(.overview, "xodb: galaxy-frame stars={d} clusters={d} strands={d} drawn={d} impulses={d} cloud={d} mesh={d} labels={d} moving={d} demo={d} buffer={d:.2} clock={d}\n", .{ counts.stars, counts.clusters, counts.strands, counts.strands_drawn, counts.impulses, counts.cloud, counts.mesh, counts.labels, @intFromBool(counts.moving), v.graph.demo, counts.used, v.graph.clock });
     if (demo) {

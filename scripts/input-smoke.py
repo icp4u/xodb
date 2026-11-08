@@ -15,6 +15,7 @@ import subprocess
 import sys
 
 root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(root / 'tests'))
 spec = importlib.util.spec_from_file_location('t07', root/'tests/helpers/input.py')
 suite = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(suite)

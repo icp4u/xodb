@@ -17,7 +17,11 @@ pub fn execute(a: A, session: anytype, connection: u64, service: ?*authority.c.s
             const root = if (session.process_tree) |tree| tree.root() else session;
             try authority.check(authority.c.xsvc_tick(shared, now, @intFromEnum(root.agent_scope)));
             try authority.check(authority.c.xsvc_authorize(shared, agent.client, authority.c.XSVC_OBSERVE, now));
-            try authority.authorize(shared, agent.client, request.operation.effect() == .mutation, now);
+            try authority.authorize(shared, agent.client, switch (request.operation.effect()) {
+                .mutation => .mutate,
+                .inferior_call => .execute,
+                .execution => .control,
+            }, now);
             const lease = leases.Lease.capture(shared, agent.client) orelse return error.ControlLeaseRequired;
             if (agent.lease != lease.id) return error.ControlLeaseRequired;
             caller.client = agent.client;

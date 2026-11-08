@@ -218,6 +218,23 @@ static enum xrt_status remember_thread(struct xrt_gdb *g, struct xrt_target *t,
     if (!t->pid) t->pid = g->process && g->process <= INT_MAX ? (int32_t)g->process : id;
     return XRT_OK;
 }
+/* A sleeping kernel task is not a CPU the stub can resume. It stays out of
+ * g->threads, so continue and step never name it in a packet. */
+enum xrt_status xrt_gdb_add_memory_thread(struct xrt_gdb *g, struct xrt_target *t, int32_t tid)
+{
+    if (!g || !t || tid <= 0) return XRT_INVALID_ARGUMENT;
+    if (g->kernel || t->core || t->state != XRT_STOPPED) return XRT_INVALID_STATE;
+    if (thread_index(g, tid) >= 0) return XRT_INVALID_STATE;
+    if (t->thread_count == XRT_MAX_THREADS && xrt_thread_index(t, tid) < 0)
+        return XRT_TOO_MANY_THREADS;
+    enum xrt_status status = xrt_add_thread(t, tid, false);
+    if (status != XRT_OK) return status;
+    int index = xrt_thread_index(t, tid);
+    t->threads[index].state = XRT_STOPPED;
+    t->threads[index].reason = XRT_STOP_NONE;
+    t->threads[index].signal = 0;
+    return XRT_OK;
+}
 static void format_thread(const struct xrt_gdb *g, const struct remote_thread *thread,
                            char *out, size_t size)
 {
@@ -276,6 +293,23 @@ static enum xrt_status threads(struct xrt_gdb *g, struct xrt_target *t)
     /* kgdb ends the list with an empty reply rather than "l". */
     if (!(g->length == 1 && g->reply[0] == 'l') && !(g->quirks.empty_list_end && !g->length))
         return XRT_PROTOCOL_ERROR;
+    /* Before the stub list shrinks: a thread it never listed is a kernel task
+     * read from memory. It leaves with the stop that published it, not as an
+     * exiting thread. */
+    for (size_t i = t->thread_count; i > 0; --i) {
+        size_t at = i - 1;
+        int old = thread_index(g, t->threads[at].tid);
+        bool found = false;
+        if (old >= 0)
+            for (size_t j = 0; j < count; ++j)
+                if (g->threads[old].pid == present[j].pid && g->threads[old].tid == present[j].tid) {
+                    found = true; break;
+                }
+        if (found) continue;
+        if (old >= 0) event(t, XRT_EVENT_THREAD_EXITING, t->threads[at].tid, 0);
+        memmove(t->threads + at, t->threads + at + 1, (t->thread_count - at - 1) * sizeof(t->threads[0]));
+        --t->thread_count;
+    }
     size_t kept = 0;
     for (size_t i = 0; i < g->thread_count; ++i) {
         bool found = false;
@@ -287,14 +321,6 @@ static enum xrt_status threads(struct xrt_gdb *g, struct xrt_target *t)
         else if (g->selected == g->threads[i].local) g->selected = 0;
     }
     g->thread_count = kept;
-    for (size_t i = t->thread_count; i > 0; --i) {
-        size_t at = i - 1;
-        if (thread_index(g, t->threads[at].tid) < 0) {
-            event(t, XRT_EVENT_THREAD_EXITING, t->threads[at].tid, 0);
-            memmove(t->threads + at, t->threads + at + 1, (t->thread_count - at - 1) * sizeof(t->threads[0]));
-            --t->thread_count;
-        }
-    }
     for (size_t i = 0; i < count; ++i) {
         int32_t local;
         status = remember_thread(g, t, present[i].pid, present[i].tid, &local);
@@ -443,6 +469,13 @@ static enum xrt_status registers(struct xrt_gdb *g, struct xrt_target *t,
                                   int32_t tid, struct xrt_registers *out)
 {
     if (t->state != XRT_STOPPED) return XRT_NOT_STOPPED;
+    /* Not a stub thread. A zero PC lets the kernel walker supply the frame. */
+    if (thread_index(g, tid) < 0 && xrt_thread_index(t, tid) >= 0) {
+        if (!t->arch) return XRT_UNSUPPORTED_ARCHITECTURE;
+        memset(out, 0, sizeof(*out));
+        out->abi = xrt_arch_abi(t->arch);
+        return XRT_OK;
+    }
     enum xrt_status status = select_thread(g, tid);
     if (status != XRT_OK) return status;
     if (!g->single_registers) {
@@ -801,6 +834,8 @@ static enum xrt_status resume(struct xrt_gdb *g, struct xrt_target *t, int32_t t
     enum xrt_status status;
     int i = xrt_thread_index(t, tid);
     if (i < 0) return XRT_UNKNOWN_THREAD;
+    if (thread_index(g, tid) < 0)
+        return problem(g, XRT_UNKNOWN_THREAD, "kernel task is not a CPU thread");
     if (step && g->kernel && tid != g->info.stop_tid)
         return problem(g, XRT_UNSUPPORTED_CONTROL, "KGDB steps only the CPU that entered the debugger");
     struct xrt_registers regs; uint64_t pc;

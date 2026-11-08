@@ -761,7 +761,6 @@ pub fn mayCancel(owner: Owner, requester: Requester) bool {
 const Hashed = struct { module_id: u64, ptr: usize, len: usize, sha: [64]u8 };
 const max_warm_images = 8;
 const max_warm_functions = 16;
-const warm_stop_delay_ms = 150;
 const sidecar_hold_retry_delay_ms = 2000;
 /// Ghidra cannot resume a cancelled import. Avoid immediately paying the same
 /// startup cost again after every foreground request.
@@ -1010,8 +1009,7 @@ pub const State = struct {
     warm_seen: [64]u64 = @splat(0),
     warm_seen_count: usize = 0,
     warm_generation: ?u64 = null,
-    warm_stopped_generation: ?u64 = null,
-    warm_stopped_since_ms: u64 = 0,
+    warm_stop: @import("warm_stop.zig").Stop = .{},
     /// The first image ever queued: the main executable. Never given up.
     warm_main: ?u64 = null,
     warm_main_path: ?[]u8 = null,
@@ -1128,7 +1126,7 @@ pub const State = struct {
 
     fn overEagerBound(self: *State, session: *Session, address: u64) bool {
         const module = session.modules.at(address) catch return false;
-        if (module.mapping.len <= self.eager_library_bytes) return false;
+        if (module.imageAllowingProjection(.static_analysis).len <= self.eager_library_bytes) return false;
         const main = self.warm_main_path orelse return false;
         return !std.mem.eql(u8, main, module.path);
     }
@@ -1145,7 +1143,7 @@ pub const State = struct {
         candidates[count.*] = .{
             .sha256 = function.key.image_sha256,
             .path = function.module_path,
-            .mapping = if (local_path) null else module.mapping,
+            .mapping = if (local_path) null else module.imageAllowingProjection(.static_analysis),
             .entry = function.key.entry,
             .build_id = function.build_id,
             .seed_callees = seed_callees,
@@ -1183,19 +1181,10 @@ pub const State = struct {
         // the worker after it has cancelled its queued Ghidra job.
         if (self.warmup) |warm| if (snapshot.state != .stopped) {
             warm.cancel.store(true, .release);
-            self.warm_stopped_generation = null;
+            _ = self.warm_stop.ready(null, nowMs());
             return;
         };
-        if (snapshot.state != .stopped) {
-            self.warm_stopped_generation = null;
-            return;
-        }
-        if (self.warm_stopped_generation == null or self.warm_stopped_generation.? != snapshot.generation) {
-            self.warm_stopped_generation = snapshot.generation;
-            self.warm_stopped_since_ms = nowMs();
-            return;
-        }
-        if (nowMs() - self.warm_stopped_since_ms < warm_stop_delay_ms) return;
+        if (!self.warm_stop.ready(if (snapshot.state == .stopped) snapshot.generation else null, nowMs())) return;
         if (!self.warmup_enabled or self.warmup != null) return;
         if (snapshot.pid == 0) return;
         var select_arena = std.heap.ArenaAllocator.init(page);
@@ -1222,7 +1211,8 @@ pub const State = struct {
                 self.warm_main = main.id;
             }
             if (!self.sawWarmImage(main.id) and !self.warmBackedOff(main.path)) {
-                selected_images[0] = .{ .id = main.id, .path = main.path, .mapping = main.mapping, .size = main.mapping.len, .file_offset = main.file_offset };
+                const bytes = main.imageAllowingProjection(.static_analysis);
+                selected_images[0] = .{ .id = main.id, .path = main.path, .mapping = bytes, .size = bytes.len, .file_offset = main.file_offset };
                 count = 1;
             }
         }
@@ -1271,11 +1261,12 @@ pub const State = struct {
             };
             if (duplicate) continue;
             const main = self.warm_main == null and count == 0 or self.warm_main == module.id;
-            if (!main and module.mapping.len > self.eager_library_bytes) {
+            const bytes = module.imageAllowingProjection(.static_analysis);
+            if (!main and bytes.len > self.eager_library_bytes) {
                 self.markWarmSeen(module.id);
                 continue;
             }
-            selected_images[count] = .{ .id = module.id, .path = module.path, .mapping = module.mapping, .size = module.mapping.len, .file_offset = module.file_offset };
+            selected_images[count] = .{ .id = module.id, .path = module.path, .mapping = bytes, .size = bytes.len, .file_offset = module.file_offset };
             count += 1;
         }
         var selected_functions: [max_warm_functions]WarmFunctionCandidate = undefined;
@@ -1436,12 +1427,13 @@ pub const State = struct {
     }
 
     fn identity(self: *State, module: anytype) [64]u8 {
-        const ptr = @intFromPtr(module.mapping.ptr);
-        for (self.hashed) |entry| if (entry) |h| if (h.module_id == module.id and h.ptr == ptr and h.len == module.mapping.len) return h.sha;
+        const bytes = module.imageAllowingProjection(.static_analysis);
+        const ptr = @intFromPtr(bytes.ptr);
+        for (self.hashed) |entry| if (entry) |h| if (h.module_id == module.id and h.ptr == ptr and h.len == bytes.len) return h.sha;
         var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(module.mapping, &digest, .{});
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
         const sha = std.fmt.bytesToHex(digest, .lower);
-        self.hashed[self.hash_next] = .{ .module_id = module.id, .ptr = ptr, .len = module.mapping.len, .sha = sha };
+        self.hashed[self.hash_next] = .{ .module_id = module.id, .ptr = ptr, .len = bytes.len, .sha = sha };
         self.hash_next = (self.hash_next + 1) % self.hashed.len;
         return sha;
     }
@@ -1472,12 +1464,13 @@ pub const State = struct {
         if (size == 0) return error.FunctionBoundsUnavailable;
         if (size > max_function_bytes) return error.FunctionTooLarge;
         if (module.explicit_gdb) {
+            const bytes = module.debuggerImage().projectedBytes();
             const count: usize = @intCast(@min(size, 64));
             const offset = module.image.fileOffset(entry) orelse return error.GdbExecutableMismatch;
-            if (offset > module.mapping.len or count > module.mapping.len - @as(usize, @intCast(offset))) return error.GdbExecutableMismatch;
+            if (offset > bytes.len or count > bytes.len - @as(usize, @intCast(offset))) return error.GdbExecutableMismatch;
             var memory: [64]u8 = undefined;
             if (try session.target.readMemory(try module.runtimeAddress(entry), memory[0..count]) != count or
-                !std.mem.eql(u8, memory[0..count], module.mapping[@intCast(offset)..][0..count])) return error.GdbExecutableMismatch;
+                !std.mem.eql(u8, memory[0..count], bytes[@intCast(offset)..][0..count])) return error.GdbExecutableMismatch;
         }
         const build_id = if (module.image.buildId()) |id| try hexAlloc(a, id) else null;
         return .{ .key = .{ .image_sha256 = self.identity(module), .entry = entry, .size = size }, .name = name, .module_id = module.id, .module_path = module.path, .bias = module.bias, .bounds_source = source, .build_id = build_id };
@@ -1537,7 +1530,7 @@ pub const State = struct {
             const temporary = try std.fmt.allocPrintSentinel(page, "{s}/.image-{s}.tmp", .{ dir, &function.key.image_sha256 }, 0);
             defer page.free(temporary);
             _ = libc.unlink(temporary.ptr);
-            try writeFile(temporary, module.mapping);
+            try writeFile(temporary, module.imageAllowingProjection(.static_analysis));
             if (libc.rename(temporary.ptr, image_path.ptr) != 0) return error.ImageSnapshotWriteFailed;
         }
         if (self.job) |old| {

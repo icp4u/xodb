@@ -41,7 +41,7 @@ pub fn addElf(capture: *Capture, path: []const u8, start: u64, end: u64) !*modul
     errdefer @import("../binary/snapshot.zig").free(mapped);
     const module = try a.create(modules.Module);
     errdefer a.destroy(module);
-    module.* = .{ .id = capture.images.next_id, .inode = @intCast(stat.st_ino), .device_major = c.major(stat.st_dev), .device_minor = c.minor(stat.st_dev), .path = name, .image = try elf.Image.parse(mapped), .bias = elf_bias, .start = start, .end = end, .mapping = mapped, .immutable = true };
+    module.* = .{ .id = capture.images.next_id, .inode = @intCast(stat.st_ino), .device_major = c.major(stat.st_dev), .device_minor = c.minor(stat.st_dev), .path = name, .image = try elf.Image.parse(mapped), .bias = elf_bias, .start = start, .end = end, .mapping = .{ .full = mapped }, .immutable = true };
     capture.images.next_id += 1;
     try capture.images.loaded.append(a, module);
     return module;

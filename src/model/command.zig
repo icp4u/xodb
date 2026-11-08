@@ -1,7 +1,12 @@
 //! Transport-independent command values. No live handle or frontend type.
-pub const AgentScope = enum { observe, control, mutate };
+/// `execute` sits above control, parallel to mutate: it may control and run
+/// target code (inferior calls) but not write memory/registers directly.
+/// Never compare scopes by ordinal.
+pub const AgentScope = enum { observe, control, mutate, execute };
 pub const Actor = enum { human, agent };
-pub const Effect = enum { execution, mutation };
+/// `execution` resumes or controls the target; `inferior_call` runs target
+/// code on the debugger's behalf.
+pub const Effect = enum { execution, mutation, inferior_call };
 pub const Caller = union(enum) {
     human,
     agent: struct { client: u64, lease: ?u64 },

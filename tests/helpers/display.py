@@ -9,6 +9,9 @@ import select
 import subprocess
 import time
 from datetime import datetime
+from helpers.environment import ensure as ensure_test_environment
+ensure_test_environment()
+from pathlib import Path
 # Tests never adopt or start the user's Ghidra sidecar; the sidecar tests set their own.
 os.environ.setdefault('XODB_GHIDRA_SIDECAR', 'off')
 
@@ -17,10 +20,22 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 WORK = os.path.join(ROOT, ".work", "timeline-"+datetime.now().strftime("%Y%m%dT%H%M%S%f"))
 VPTR_XML = "/usr/share/wlr-protocols/unstable/wlr-virtual-pointer-unstable-v1.xml"
 
+def nvidia_render_node(sysfs="/sys/class/drm", dri="/dev/dri"):
+    """An available NVIDIA render node, or None to keep automatic selection."""
+    for entry in sorted(Path(sysfs).glob("renderD*")):
+        try:
+            vendor = (entry / "device/vendor").read_text().strip().lower()
+        except OSError:
+            continue
+        node = Path(dri) / entry.name
+        if vendor == "0x10de" and node.exists():
+            return str(node)
+    return None
+
 class Display:
     """A private headless Sway with its own runtime directory and caches."""
 
-    def __init__(self, name, width=1280, height=800):
+    def __init__(self, name, width=1280, height=800, *, render_node=None):
         self.dir = os.path.join(WORK, name)
         self.runtime = os.path.join(self.dir, "runtime")
         os.makedirs(self.runtime, mode=0o700)
@@ -34,6 +49,8 @@ class Display:
         with open(config, "w") as f:
             f.write(f"xwayland disable\noutput HEADLESS-1 mode {width}x{height}\noutput * bg #0b0f16 solid_color\ndefault_border none\nfocus_follows_mouse no\nseat seat0 hide_cursor 100\n")
         env = dict(os.environ)
+        if render_node is not None:
+            env["WLR_RENDER_DRM_DEVICE"] = render_node
         for key in ("DISPLAY", "WAYLAND_DISPLAY", "SWAYSOCK", "DBUS_SESSION_BUS_ADDRESS"):
             env.pop(key, None)
         env.update(TMPDIR=os.path.join(self.dir, "tmp"), XDG_CACHE_HOME=os.path.join(self.dir, "cache"), MESA_SHADER_CACHE_DIR=os.path.join(self.dir, "cache/mesa"), __GL_SHADER_DISK_CACHE_PATH=os.path.join(self.dir, "cache/nvidia"), XDG_RUNTIME_DIR=self.runtime, WLR_BACKENDS="headless", WLR_HEADLESS_OUTPUTS="1", WLR_LIBINPUT_NO_DEVICES="1")

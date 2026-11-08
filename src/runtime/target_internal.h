@@ -5,6 +5,7 @@
 #include "mapped_file.h"
 #include "xrt_files.h"
 #include "xrt_memory.h"
+#include "xrt_infcall.h"
 #include <assert.h>
 #include <errno.h>
 #include <signal.h>
@@ -125,6 +126,8 @@ struct xrt_target {
     bool watchpoints_dirty, watch_cancelled;
     xrt_new_thread_observer observer;
     void *observer_context;
+    /* Saved context of an inferior call; NULL until the first call. */
+    struct xrt_infcall *infcall;
 };
 
 enum xrt_status xrt_trace(unsigned request, int32_t tid, uintptr_t address, uintptr_t data);

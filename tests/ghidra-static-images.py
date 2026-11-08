@@ -18,6 +18,7 @@ if not ghidra or not (Path(ghidra) / "support/analyzeHeadless").exists():
 
 ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0)
 work = Path(tempfile.mkdtemp(prefix="xodb-ghs-", dir=os.environ.get("XODB_TEST_TMPDIR")))
+os.environ["XDG_STATE_HOME"] = str(work / "state-home")
 atexit.register(shutil.rmtree, work, True)
 source = ROOT / "tests/fixtures/semq/static-image.c"
 pe_object, pe, macho = work / "static.obj", work / "static.exe", work / "static-arm64"

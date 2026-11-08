@@ -20,6 +20,8 @@ import threading
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'tests'))
+from helpers.environment import isolated as isolated_test_environment
 
 # Coarse map from sources to the steps that cover them: (source globs, step
 # name globs). `release-check affected` runs the steps of every row that a
@@ -113,6 +115,8 @@ COVERS = (
     (('tests/runtime-sysstat.c',), ('sysstat-*', 'build-tests')),
     (('src/model/kernel_census.zig', 'src/mcp/kernel_census.zig', 'src/ui/overview/kernel_census.zig',
       'tests/kernel-census*'), ('kernel-census*', 'gui-kernel-census')),
+    (('src/model/kernel_view.zig', 'src/mcp/kernel_target.zig', 'src/ui/kernel_target.zig',
+      'tests/kernel-target*', 'examples/kernel-target.jsonl'), ('kernel-target*', 'gui-kernel-target-lab*')),
     (('src/mcp/shared*', 'src/mcp/session_tools.json', 'src/mcp/processes.zig', 'src/service/*'),
      ('shared-*', 'gui-shared-*', 'controller-scope-*', 'client-control', '*-shared-*', 'jai-*-1', 'elisp-bindings-*-1')),
     (('src/mcp/inspection.zig', 'src/ui/inspection.zig'), ('inspections*', 'inspection-lifecycle*', 'gui-inspection')),
@@ -151,6 +155,9 @@ COVERS = (
     (('src/binary/snapshot.zig', 'src/model/modules.zig', 'src/runtime/remote.c', 'src/runtime/xrt_files.h',
       'tests/image-budget-held.py', 'tests/fixtures/file-read-count.py'),
      ('image-budget-held',)),
+    (('src/model/execution.zig', 'src/mcp/execution.zig', 'src/runtime/infcall.c', 'src/runtime/xrt_infcall.h',
+      'src/debug/evaluate.zig', 'src/debug/info.zig', 'tests/execute-call*'),
+     ('execute-call*',)),
     (('src/model/modules.zig', 'src/binary/snapshot.zig', 'src/binary/mapped_file.zig', 'src/binary/core.zig',
       'src/profile/capture.zig', 'src/profile/archive.zig', 'tests/vdso-module.py'),
      ('vdso-module*',)),
@@ -220,6 +227,7 @@ ALWAYS = ALWAYS + ('spawn-lint', 'macos-link-probe')
 # of the rest. host/gui/all keep a quicker check of each area. `affected`
 # still selects one of these when a test script it runs changes.
 PERIODIC = (
+    'kernel-target-lab*', 'gui-kernel-target-lab*',
     'vulkan-exit-soak',
     'kernel-census-lab',
     'gdscript-stack-file-slots-*',
@@ -313,6 +321,11 @@ class Steps(list):
 AGENT_BIN = './zig-out/bin/xodb-agent'
 AGENT_LANE_SUFFIX = '-agent-lane'
 AGENT_INELIGIBLE = {
+    'kernel-target-lab': 'owned KGDB peer, not the C agent',
+    'kernel-target-lab-core': 'owned ELF kernel core, not the C agent',
+    'kernel-target-lab-kcore': 'live kcore inside an owned guest, not the C agent',
+    'gui-kernel-target-lab': 'owned KGDB peer, not the C agent',
+    'gui-kernel-target-lab-core': 'owned ELF kernel core, not the C agent',
     'core-debugging': 'reads an ELF core in-process; the C agent is not a core reader',
     'python-core': 'reads an ELF core in-process; the C agent is not a core reader',
     'runtime-cores': 'reads ELF cores in-process; the C agent is not a core reader',
@@ -325,6 +338,7 @@ AGENT_INELIGIBLE = {
     'macos-local': 'macOS debugserver over ssh, not the Linux C agent',
     'macos-native-stress': 'macOS debugserver over ssh, not the Linux C agent',
     'system-capture': 'system overview rejects --runtime-agent; it has no target transport',
+    'kernel-census': 'system overview rejects --runtime-agent; the census reads host procfs, not a target transport',
     'private-network-evidence': 'opens a packet capture or a mitmproxy flow; those modes reject --runtime-agent',
     'usb-evidence': 'opens a packet capture; that mode rejects --runtime-agent',
     'dbus-evidence': 'opens a packet capture; that mode rejects --runtime-agent',
@@ -395,7 +409,6 @@ AGENT_DIRECT = {
     'tests/remote-queued-drop.py': 'an existing agent twin runs this command',
     'tests/remote-stops.py': 'an existing agent twin runs this command',
     'tests/overview-headless.py': 'this step has no target for the C agent',
-    'tests/kernel-census.py': 'this step has no target for the C agent',
     'tests/system-capture-flow.py': 'this step has no target for the C agent',
     'tests/ghidra-static-images.py': 'this step has no target for the C agent',
     'tests/apk/check.py': 'this step has no target for the C agent',
@@ -500,7 +513,8 @@ def _normalized_argv(argv):
     return tuple(out)
 
 
-# tests/release-runner.py quotes the gate flag --headless. It does not start xodb.
+# release-runner quotes gate flags and checks a targetless MCP session's HOME;
+# it does not exercise a target transport or need an agent-lane variant.
 PLAIN_LAUNCH_FLAG_EXEMPT = 'tests/release-runner.py'
 
 
@@ -534,7 +548,7 @@ def agent_fate(step):
     if step.name in AGENT_INELIGIBLE:
         return 'ineligible', AGENT_INELIGIBLE[step.name]
     script = _test_script(step)
-    if script is None or step.kind == 'build':
+    if script is None or step.kind == 'build' or script == PLAIN_LAUNCH_FLAG_EXEMPT:
         return 'plain', ''
     users, direct = _client_and_direct()
     if script in users:
@@ -543,7 +557,7 @@ def agent_fate(step):
         if script in AGENT_ROUTABLE:
             return 'eligible', ''
         return 'ineligible', AGENT_DIRECT.get(script, 'starts xodb without tests/client.py, so the lane switch cannot reach it')
-    if script != PLAIN_LAUNCH_FLAG_EXEMPT and _script_names_launch_flag(script):
+    if _script_names_launch_flag(script):
         return 'invalid', 'a plain step whose script contains --headless or --listen'
     return 'plain', ''
 
@@ -886,6 +900,11 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             label = 'vdso-module' + ('-agent' if remote else '')
             steps.append((label, [sys.executable, '-B', 'tests/vdso-module.py', '--work', '.work/' + label,
                           *(['--agent', 'zig-out/bin/xodb-agent'] if remote else [])], 120))
+        # Inferior calls: gdb oracle, bit-exact restore, recovery and refusals.
+        for remote in (False, True):
+            label = 'execute-call' + ('-agent' if remote else '')
+            steps.append((label, [sys.executable, '-B', 'tests/execute-call.py', '--work', '.work/' + label,
+                          *(['--agent', 'zig-out/bin/xodb-agent'] if remote else [])], 120))
         for variant in ('chain', 'debug-frame', 'companions', 'mixed'):
             label = 'module-unwind-' + variant
             steps.append((label, [sys.executable, '-B', 'tests/module-unwind.py', *([] if variant == 'chain' else ['--'+variant]), '--work', '.work/'+label], 60))
@@ -923,6 +942,9 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('kernel-census-component', ['zig', 'test', 'src/model/kernel_census.zig', '-lc', '-OReleaseSafe'], 60))
         steps.append(('kernel-census', [sys.executable, '-B', 'tests/kernel-census.py'], 30))
         steps.append(('kernel-census-native', [sys.executable, '-B', 'tests/kernel-census-native.py'], 30))
+        steps.append(('kernel-target', [sys.executable, '-B', 'tests/kernel-target.py'], 30))
+        for suffix, options in (('', []), ('-core', ['--core']), ('-kcore', ['--kcore'])):
+            steps.append(('kernel-target-lab' + suffix, [sys.executable, '-B', 'tests/kernel-target-lab.py', *options], 360))
         steps.append(('kernel-census-lab', [sys.executable, '-B', 'tests/kernel-census-lab.py'], 180))
         steps.append(('system-capture', [sys.executable, '-B', 'tests/system-capture.py'], 60))
         steps.append(('system-capture-flow', [sys.executable, '-B', 'tests/system-capture-flow.py'], 60))
@@ -1213,6 +1235,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('gui-overview-small-matrix-tracing-failure', [sys.executable, '-B', 'tests/overview-small-gui.py', '--matrix', '--tracing-failure'], 600))
         steps.append(('gui-overview-live', [sys.executable, '-B', 'tests/overview-live.py'], 180))
         steps.append(('gui-kernel-census', [sys.executable, '-B', 'tests/kernel-census-gui.py'], 30))
+        steps.append(('gui-kernel-target-lab', [sys.executable, '-B', 'tests/kernel-target-lab.py', '--gui'], 360))
+        steps.append(('gui-kernel-target-lab-core', [sys.executable, '-B', 'tests/kernel-target-lab.py', '--gui', '--core'], 360))
         steps.append(('gui-system-capture', [sys.executable, '-B', 'tests/system-capture-gui.py'], 60))
         steps.append(('gui-fetch', [sys.executable, '-B', 'tests/fetch-gui.py'], 120))
         steps.append(('gui-radio', [sys.executable, '-B', 'tests/radio-gui.py'], 180))
@@ -1438,18 +1462,36 @@ def child_environment(inherited):
     return env
 
 
+def step_skip_reason(argv, env):
+    # Explicit optional fixtures, not a guess based on a child's output. A
+    # configured but broken lab must execute and fail normally.
+    for script in ('tests/kernel-target-lab.py', 'tests/kernel-census-lab.py'):
+        if script in argv and not env.get('XODB_KERNEL_LAB'):
+            return 'XODB_KERNEL_LAB is not configured'
+    return None
+
+
 def run_step(name, argv, timeout, cwd, env, logs, halt=None):
     # halt is set for a step that runs beside others: an Event that interrupts it.
     log = logs / (name + '.log')
     started = time.monotonic()
     outcome = dict(name=name, argv=list(argv), timeout_seconds=timeout, log=str(log), status='failed')
+    reason = step_skip_reason(argv, env)
+    if reason:
+        with log.open('x') as stream:
+            stream.write(f'SKIP {name}: {reason}\n')
+        outcome.update(status='skipped', reason=reason, seconds=round(time.monotonic() - started, 3))
+        print(f"{'skipped':16} {name} ({reason})", flush=True)
+        return outcome
     child = None
     marker = None
     baseline = children()
     with log.open('x') as stream:
         try:
             argv, marker = arm_agent_start_check(name, argv, cwd, logs)
-            child = subprocess.Popen(argv, cwd=cwd, env=child_environment(env), stdout=stream,
+            step_env = child_environment(env)
+            step_env['XODB_TEST_LOG_DIR'] = str((logs / (name + '.artifacts')).resolve())
+            child = subprocess.Popen(argv, cwd=cwd, env=step_env, stdout=stream,
                                      stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
             try:
                 while True:
@@ -1497,6 +1539,16 @@ def run_step(name, argv, timeout, cwd, env, logs, halt=None):
         outcome['agent_started'] = started_agent
         if not started_agent and outcome['status'] == 'passed':
             outcome['status'] = 'agent_not_started'
+    # A direct Python assertion may bypass the helper's explicit failure path.
+    # Freeze its last completed OCR pair before run_steps starts any retry.
+    artifacts = logs / (name + '.artifacts')
+    if (artifacts / 'ocr-latest').is_dir():
+        outcome['gui_evidence'] = str(artifacts.resolve())
+        if outcome['status'] != 'passed' and not (artifacts / 'ocr-first-failure').exists():
+            try:
+                shutil.copytree(artifacts / 'ocr-latest', artifacts / 'ocr-first-failure')
+            except OSError as exc:
+                outcome['gui_evidence_error'] = str(exc)
     outcome['seconds'] = round(time.monotonic() - started, 3)
     print(f"{outcome['status']:16} {name} ({outcome['seconds']:.1f}s)", flush=True)
     return outcome
@@ -1597,7 +1649,11 @@ def run_steps(steps, tree, env, logs, report, keep_going=False, retries=0, jobs=
             if result['name'] == 'capabilities' and result.get('exit_code') == 2 and not result.get('leftover_pids'):
                 blocked = True
                 break
-            if result['status'] in ('passed', 'flaky'):
+            if result['status'] == 'skipped':
+                # Not a failure, but it cannot satisfy a prerequisite that
+                # promises this step passed. Unrelated optional work continues.
+                bad.add(result['name'])
+            elif result['status'] in ('passed', 'flaky'):
                 good.add(result['name'])
             else:
                 bad.add(result['name'])
@@ -1641,6 +1697,7 @@ def run_steps(steps, tree, env, logs, report, keep_going=False, retries=0, jobs=
     report['flaky'] = flaky
     report['failures'] = [dict(name=step['name'], status=step['status'], log=step['log']) for step in failures]
     report['summary'] = dict(planned=len(steps), passed=sum(step['status'] == 'passed' for step in done),
+                             skipped=sum(step['status'] == 'skipped' for step in done),
                              flaky=len(flaky), failed=len(failures), not_run=len(report['not_run']))
     if failures:
         report.update(status='failed', reason=', '.join(step['name'] + ': ' + step['status'] for step in failures))
@@ -2025,6 +2082,8 @@ def main(argv=None):
     # cache and state directories.
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1', XODB_TEST_NO_LIVE='0' if live else '1',
                XODB_GHIDRA_SIDECAR='off')
+    env = isolated_test_environment(env, run / '.work/xdg')
+    report['xdg_root'] = env['XODB_TEST_XDG_ROOT']
     # C live tests use presence of this opt-out, while Zig tests inspect its
     # value. Remove it completely so host/all really exercise both runtimes.
     if live:
@@ -2150,7 +2209,7 @@ def main(argv=None):
         for step in report.get('skipped', []):
             print(f"{'not run':16} {step['name']} (needs {', '.join(step['needs'])})", flush=True)
         if summary:
-            print(f"Summary: {summary['passed']} passed, {summary['flaky']} flaky, {summary['failed']} failed, {summary['not_run']} not run"
+            print(f"Summary: {summary['passed']} passed, {summary['skipped']} skipped, {summary['flaky']} flaky, {summary['failed']} failed, {summary['not_run']} not run"
                   + (': flaky ' + ', '.join(report['flaky']) if report['flaky'] else ''), flush=True)
         if args.slowest:
             print(f"Slowest: " + ', '.join(f"{step['name']} {step['seconds']:.1f}s" for step in timed[:args.slowest])

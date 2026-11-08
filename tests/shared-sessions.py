@@ -19,6 +19,8 @@ import sys
 import tempfile
 import time
 from helpers.exact import assert_reply_exact
+from helpers.environment import ensure as ensure_test_environment
+ensure_test_environment()
 
 
 TIMEOUT = 5

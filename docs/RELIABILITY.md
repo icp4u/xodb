@@ -52,7 +52,12 @@ below when those capabilities are intentionally unavailable.
 GUI steps that fail are retried once by default in `gui`, `all` and
 `periodic-gui` (`--retry-flaky N`; `0` turns it off). A step that passes only on
 retry is recorded as `flaky` in the summary line and `results.json`, never as
-passed. `scripts/build` uses an existing `ZIG_GLOBAL_CACHE_DIR`, so gate
+passed. The optional kernel-lab steps (`kernel-target-lab*`,
+`gui-kernel-target-lab*`, `kernel-census-lab`) are recorded as `skipped`, with
+a reason, when `XODB_KERNEL_LAB` is unset: counted apart from passed, never a
+failure on their own, but a step that needs one is not run and fails the run.
+Set the variable to run them for real. Other tests that print SKIP and exit 0
+still count as passed. `scripts/build` uses an existing `ZIG_GLOBAL_CACHE_DIR`, so gate
 snapshots can share one warm cache; `packaging/build` always uses the in-tree
 cache.
 

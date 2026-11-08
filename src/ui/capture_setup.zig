@@ -303,6 +303,8 @@ pub const Facts = struct {
     discarded_samples: u64,
     lost_samples: u64,
     lost_records: u64,
+    /// Syscall records the kernel ring dropped; nonzero makes the capture partial.
+    syscall_lost: u64 = 0,
     follow_threads: bool = false,
     selected_threads: usize,
     unselected_threads: usize,
@@ -356,7 +358,7 @@ pub fn stackLine(buffer: []u8, facts: Facts) []const u8 {
     return std.fmt.bufPrint(buffer, "Stacks {s}/{s}: {d}/{d} kept, {d} over budget{s}, {d} no stack, {d} no regs", .{ sizeText(&a, facts.stack_bytes), sizeText(&b, facts.stack_budget), s.retained, s.samples, s.budget_gaps, first, s.kernel_absent, (s.samples - s.registers) }) catch "";
 }
 pub fn factsFrom(capture: *const profile.Capture) Facts {
-    return .{ .follow_threads = capture.config.follow_threads, .stack_bytes = capture.config.user_stack_bytes, .stack_budget = capture.config.user_stack_budget_bytes, .stacks = stackCounts(capture), .id = capture.id, .offline = capture.offline, .collecting = capture.collector != null, .status = capture.status, .stop_reasons = capture.stop_reasons[0..capture.stop_reason_count], .started_ns = capture.started_ns, .collection_enabled_ns = capture.collection_enabled_ns, .ended_ns = capture.ended_ns, .duration_ms = capture.config.duration_ms, .frequency_hz = capture.config.frequency_hz, .context_switch = capture.config.context_switch, .samples = capture.samples.len(), .sample_limit = capture.config.sample_limit, .discarded_samples = capture.discarded_samples, .lost_samples = capture.lost_samples, .lost_records = capture.lost_records, .selected_threads = capture.thread_count, .unselected_threads = capture.unselected_threads, .scope_change = capture.scope_change, .failure = capture.failure, .pid = capture.pid };
+    return .{ .follow_threads = capture.config.follow_threads, .stack_bytes = capture.config.user_stack_bytes, .stack_budget = capture.config.user_stack_budget_bytes, .stacks = stackCounts(capture), .id = capture.id, .offline = capture.offline, .collecting = capture.collector != null, .status = capture.status, .stop_reasons = capture.stop_reasons[0..capture.stop_reason_count], .started_ns = capture.started_ns, .collection_enabled_ns = capture.collection_enabled_ns, .ended_ns = capture.ended_ns, .duration_ms = capture.config.duration_ms, .frequency_hz = capture.config.frequency_hz, .context_switch = capture.config.context_switch, .samples = capture.samples.len(), .sample_limit = capture.config.sample_limit, .discarded_samples = capture.discarded_samples, .lost_samples = capture.lost_samples, .lost_records = capture.lost_records, .syscall_lost = capture.syscalls.lost, .selected_threads = capture.thread_count, .unselected_threads = capture.unselected_threads, .scope_change = capture.scope_change, .failure = capture.failure, .pid = capture.pid };
 }
 pub const Severity = enum { normal, warning, failure };
 /// A readable stop reason: what happened, and a next step today's behavior supports.
@@ -415,6 +417,10 @@ pub fn lossLine(buffer: []u8, facts: Facts) []const u8 {
     }
     if (facts.discarded_samples > 0) {
         const piece = std.fmt.bufPrint(buffer[n..], "{s}{d} sample{s} not kept after storage filled", .{ if (n == 0) "Lost: " else "; ", facts.discarded_samples, if (facts.discarded_samples == 1) "" else "s" }) catch return buffer[0..n];
+        n += piece.len;
+    }
+    if (facts.syscall_lost > 0 and !facts.collecting) {
+        const piece = std.fmt.bufPrint(buffer[n..], "{s}partial: the kernel dropped {d} syscall record{s}; syscall timing is incomplete", .{ if (n == 0) "Lost: " else "; ", facts.syscall_lost, if (facts.syscall_lost == 1) "" else "s" }) catch return buffer[0..n];
         n += piece.len;
     }
     return buffer[0..n];
@@ -627,6 +633,14 @@ test "outcomes use recorded evidence and keep the primary reason" {
     try testing.expectEqualStrings("A new thread or process appeared", reason(facts.status).title);
     try testing.expectEqualStrings("New thread: PID 1000 / TID 1077, created by TID 1001. Task outside capture scope", detailLine(&buffer, facts, .{}));
     try testing.expect(lossLine(&buffer, facts).len > 0);
+    facts.lost_samples = 0;
+    facts.lost_records = 0;
+    try testing.expectEqualStrings("", lossLine(&buffer, facts));
+    facts.syscall_lost = 263;
+    try testing.expectEqualStrings("Lost: partial: the kernel dropped 263 syscall records; syscall timing is incomplete", lossLine(&buffer, facts));
+    facts.syscall_lost = 0;
+    facts.lost_samples = 3;
+    facts.lost_records = 1;
     facts.collecting = true;
     facts.ended_ns = null;
     try testing.expectEqual(@as(?u64, 57_500_000_000), remainingNs(facts, .{ .now_ns = 3_500_000_000 }));

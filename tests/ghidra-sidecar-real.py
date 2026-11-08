@@ -23,11 +23,13 @@ if not ghidra or not (Path(ghidra) / "support/analyzeHeadless").exists():
 
 sys.path.insert(0, str(ROOT / "tests"))
 from client import Client
+from helpers.input import load_scale
 # The sidecar detaches from its starter. As a child subreaper this test stays
 # its parent and reaps it after the stop, so the release runner adopts nothing.
 import ctypes
 ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0)  # PR_SET_CHILD_SUBREAPER
 work = Path(tempfile.mkdtemp(prefix="xodb-ghr-", dir=os.environ.get("XODB_TEST_TMPDIR")))
+os.environ["XDG_STATE_HOME"] = str(work / "state-home")
 atexit.register(shutil.rmtree, work, True)
 fixture_dir = work / "qx"
 subprocess.run(["sh", "tests/fixtures/semq/build_fixtures.sh", str(fixture_dir)], check=True, timeout=60)
@@ -245,8 +247,16 @@ try:
         current = status()
         if current["documents_cached"] > baseline_documents and current["queue"] == 0: break
         time.sleep(.02)
+    first_d_budget_ms = 100 * load_scale()
     before = time.monotonic(); first_d = poll(client, "qx_branch_s"); first_d_ms = (time.monotonic() - before) * 1000
-    assert first_d.get("status") == "completed" and first_d_ms < 100, (first_d_ms, first_d)
+    # The warm property is the sidecar's own time for this request. The MCP
+    # poll around it also pays client and scheduler latency, which bursts on a
+    # shared host (237 ms end to end with worker_ms 2.4 at load scale ~1), so
+    # the outer bound adds a fixed 400 ms of slack: a stalled xodb path of
+    # a second still fails at any load scale below 6.
+    first_d_worker_ms = (first_d.get("producer") or {}).get("worker_ms")
+    assert (first_d.get("status") == "completed" and first_d_worker_ms is not None and
+            first_d_worker_ms < first_d_budget_ms and first_d_ms < first_d_budget_ms + 400), (first_d_ms, first_d_worker_ms, first_d_budget_ms, first_d)
 
     # A low-priority request from another client cannot hold a foreground D
     # behind it. qx_branch_u has not been warmed or requested yet.
@@ -583,7 +593,7 @@ while time.monotonic() < deadline:
         if os.waitpid(-1, os.WNOHANG)[0] == 0: time.sleep(.02)
     except ChildProcessError: break
 else: raise AssertionError("the stopped sidecar left a process behind")
-print(f"pass: real Ghidra sidecar ELF fixed, PIE, CET and shared library; first warmed d {first_d_ms:.1f} ms; "
+print(f"pass: real Ghidra sidecar ELF fixed, PIE, CET and shared library; first warmed d {first_d_ms:.1f} ms, worker {first_d_worker_ms:.1f} ms (budget {first_d_budget_ms:.1f} ms); "
       f"warm cache {warm_ms:.1f} ms; pooled uncached median {sorted(pooled_ms)[len(pooled_ms)//2]:.1f} ms, "
       f"cross-client foreground {priority_ms:.1f} ms; RSS demo {demo_rss_kib / 1024:.1f} MiB" +
       (f", after {idle_seconds:.0f}s idle {idle_rss_kib / 1024:.1f} MiB" if idle_rss_kib is not None else "") +

@@ -19,6 +19,7 @@ loongarch_step.c
 riscv_step.c
 watchpoints.c
 events.c
+infcall.c
 family.c
 owned_helper.c
 xstate.c

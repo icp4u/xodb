@@ -51,6 +51,329 @@ def lane(tier, *args, **flags):
 
 
 class RunnerTests(unittest.TestCase):
+    def assertOnlyToolCaches(self, home):
+        allowed = tuple(Path(name) for name in (
+            '.cache/zig', '.cache/go-build', 'go/pkg/mod',
+            '.cache/mesa_shader_cache', '.cache/mesa_shader_cache_db',
+            '.cache/mesa_shader_cache_sf', '.cache/radv_builtin_shaders'))
+        unexpected = []
+        for path in home.rglob('*'):
+            relative = path.relative_to(home)
+            if any(relative == cache or cache in relative.parents for cache in allowed):
+                continue
+            if path.is_dir() and any(relative in cache.parents for cache in allowed):
+                continue
+            unexpected.append(str(relative))
+        self.assertEqual(sorted(unexpected), [], 'unexpected writes under fake HOME')
+
+    def test_fake_home_allowlist_rejects_application_paths(self):
+        with tempfile.TemporaryDirectory(dir=root / '.work', prefix='home-allowlist-') as name:
+            directory = Path(name)
+            directory.chmod(0o755)
+            home = directory / 'home'
+            for cache in ('.cache/zig', '.cache/go-build', 'go/pkg/mod',
+                          '.cache/mesa_shader_cache', '.cache/mesa_shader_cache_db',
+                          '.cache/mesa_shader_cache_sf', '.cache/radv_builtin_shaders'):
+                path = home / cache / 'owned'
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('tool cache')
+            self.assertOnlyToolCaches(home)
+            for bad in ('.cache/xodb-debug-v2/0.names', '.cache/xodb/ghidra-sidecar/image',
+                        '.local/state/xodb/sidecar.log', '.config/xodb/settings',
+                        '.cache/zig-unrelated/owned', 'go/pkg/unrelated/owned'):
+                with self.subTest(path=bad), tempfile.TemporaryDirectory(dir=directory) as other:
+                    fake = Path(other)
+                    fake.chmod(0o755)
+                    planted = fake / bad
+                    planted.parent.mkdir(parents=True)
+                    planted.write_text('not a tool cache')
+                    with self.assertRaisesRegex(AssertionError, 'unexpected writes under fake HOME'):
+                        self.assertOnlyToolCaches(fake)
+
+    def test_real_xodb_session_keeps_fake_home_clean(self):
+        with tempfile.TemporaryDirectory(dir=root / '.work', prefix='home-session-') as name:
+            directory = Path(name)
+            directory.chmod(0o755)
+            home = directory / 'home'
+            home.mkdir()
+            inherited = dict(os.environ, HOME=str(home))
+            for key in ('XDG_CACHE_HOME', 'XDG_STATE_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME',
+                        'XODB_TEST_XDG_ROOT', 'ZIG_GLOBAL_CACHE_DIR', 'GOCACHE', 'GOMODCACHE',
+                        'GOPATH', 'MESA_SHADER_CACHE_DIR', 'XODB_RUNTIME_AGENT', 'XODB_TEST_RUNTIME_AGENT'):
+                inherited.pop(key, None)
+            inherited.update(XODB_BIN=str(root / 'zig-out/bin/xodb'), XODB_GHIDRA_SIDECAR='off')
+            env = gate.isolated_test_environment(inherited, directory / 'private')
+            source = '''import os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from client import Client
+private, home = Path(sys.argv[2]), Path(sys.argv[3])
+# No target: the portable tier needs neither ptrace/perf nor a display.
+client = Client('observe', None)
+try:
+    session = client.session()
+    assert session['pid'] == 0 and not session['threads'], session
+    actual = dict(entry.split('=', 1) for entry in Path(f'/proc/{client.p.pid}/environ').read_text().split('\\0') if '=' in entry)
+    assert actual['HOME'] == str(home)
+    for kind in ('CACHE', 'STATE', 'CONFIG'):
+        assert Path(actual['XDG_' + kind + '_HOME']) == private / kind.lower()
+finally:
+    client.close()
+print('PASS real targetless MCP session and private XDG inheritance')
+'''
+            result = gate.run_step('fake-home-xodb', [sys.executable, '-c', source, str(root / 'tests'),
+                                   str(directory / 'private'), str(home)], 15, root, env, directory)
+            output = Path(result['log']).read_text()
+            self.assertEqual(result['status'], 'passed', output)
+            self.assertIn('PASS real targetless MCP session', output)
+            self.assertOnlyToolCaches(home)
+
+    def test_xdg_runs_are_private_and_tool_caches_stay_shared(self):
+        with tempfile.TemporaryDirectory(dir=root / '.work', prefix='xdg-runs-') as name:
+            directory = Path(name)
+            directory.chmod(0o755)
+            inherited = {'HOME': str(directory / 'caller'), 'XDG_CACHE_HOME': str(directory / 'shared'),
+                         'XDG_STATE_HOME': str(directory / 'caller-state'), 'XDG_CONFIG_HOME': str(directory / 'caller-config'),
+                         'GOPATH': str(directory / 'go') + os.pathsep + str(directory / 'second-go')}
+            original = dict(inherited)
+            first = gate.isolated_test_environment(inherited, directory / 'first')
+            second = gate.isolated_test_environment(inherited, directory / 'second')
+            self.assertEqual(inherited, original)
+            for kind in ('CACHE', 'STATE', 'CONFIG'):
+                key = f'XDG_{kind}_HOME'
+                self.assertEqual(Path(first[key]), directory / 'first' / kind.lower())
+                self.assertTrue(Path(first[key]).is_dir())
+                self.assertNotEqual(first[key], second[key])
+            self.assertEqual(first['ZIG_GLOBAL_CACHE_DIR'], str(directory / 'shared/zig'))
+            self.assertEqual(first['GOCACHE'], str(directory / 'shared/go-build'))
+            self.assertEqual(first['GOMODCACHE'], str(directory / 'go/pkg/mod'))
+            self.assertEqual(first['MESA_SHADER_CACHE_DIR'], str(directory / 'shared'))
+            for key in ('ZIG_GLOBAL_CACHE_DIR', 'GOCACHE', 'GOMODCACHE', 'MESA_SHADER_CACHE_DIR'):
+                self.assertEqual(first[key], second[key])
+            explicit = dict(inherited, **{key: str(directory / key) for key in (
+                'ZIG_GLOBAL_CACHE_DIR', 'GOCACHE', 'GOMODCACHE', 'MESA_SHADER_CACHE_DIR')})
+            kept = gate.isolated_test_environment(explicit, directory / 'explicit')
+            for key in ('ZIG_GLOBAL_CACHE_DIR', 'GOCACHE', 'GOMODCACHE', 'MESA_SHADER_CACHE_DIR'):
+                self.assertEqual(kept[key], explicit[key])
+
+    def test_xdg_missing_home_does_not_find_the_real_home(self):
+        with tempfile.TemporaryDirectory(dir=root / '.work', prefix='xdg-no-home-') as name:
+            directory = Path(name)
+            directory.chmod(0o755)
+            for inherited in ({}, {'XDG_CACHE_HOME': 'relative-cache'}):
+                env = gate.isolated_test_environment(inherited, directory)
+                self.assertNotIn('HOME', env)
+                for key in ('XDG_CACHE_HOME', 'XDG_STATE_HOME', 'XDG_CONFIG_HOME',
+                            'ZIG_GLOBAL_CACHE_DIR', 'GOCACHE', 'GOMODCACHE', 'MESA_SHADER_CACHE_DIR'):
+                    self.assertTrue(Path(env[key]).is_relative_to(directory), (key, env[key]))
+
+    def test_xdg_applies_to_plain_gate_children(self):
+        with tempfile.TemporaryDirectory(dir=root / '.work', prefix='xdg-child-') as name:
+            directory = Path(name)
+            directory.chmod(0o755)
+            caller = directory / 'caller'
+            caller.mkdir()
+            inherited = dict(os.environ, XDG_CACHE_HOME=str(caller), XDG_STATE_HOME=str(caller), XDG_CONFIG_HOME=str(caller))
+            env = gate.isolated_test_environment(inherited, directory / 'run')
+            source = '''import os
+from pathlib import Path
+for kind in ('CACHE', 'STATE', 'CONFIG'):
+    path = Path(os.environ[f'XDG_{kind}_HOME'])
+    assert path.is_relative_to(Path(os.environ['XODB_TEST_XDG_ROOT']))
+    (path / 'owned-marker').write_text(kind)
+'''
+            result = gate.run_step('xdg-owned', [sys.executable, '-c', source], 5, directory, env, directory)
+            self.assertEqual(result['status'], 'passed')
+            self.assertEqual(list(caller.iterdir()), [])
+            for kind in ('cache', 'state', 'config'):
+                self.assertTrue((directory / 'run' / kind / 'owned-marker').is_file())
+
+    def test_main_installs_xdg_before_running_any_step(self):
+        with tempfile.TemporaryDirectory(dir=root / '.work', prefix='xdg-main-') as name:
+            directory = Path(name)
+            directory.chmod(0o755)
+            caller = directory / 'caller'
+            caller.mkdir()
+            observed = []
+            def run(steps, tree, env, logs, report, *args):
+                del steps, args
+                observed.append(env)
+                for kind in ('CACHE', 'STATE', 'CONFIG'):
+                    self.assertTrue(Path(env[f'XDG_{kind}_HOME']).is_relative_to(tree))
+                result = gate.run_step('xdg-main-child', [sys.executable, '-c',
+                    "import os; from pathlib import Path; "
+                    "[(Path(os.environ['XDG_'+kind+'_HOME'])/'marker').write_text(kind) "
+                    "for kind in ('CACHE','STATE','CONFIG')]"], 5, tree, env, logs)
+                report['steps'].append(result)
+                return 0 if result['status'] == 'passed' else 1
+            with mock.patch.object(gate, 'ROOT', directory), \
+                 mock.patch.object(gate, 'plan', return_value=gate.Steps()), \
+                 mock.patch.object(gate, 'snapshot', return_value={}), \
+                 mock.patch.object(gate, 'run_steps', run), \
+                 mock.patch.object(gate.subprocess, 'check_output', return_value='fixture\n'), \
+                 mock.patch.object(gate.subprocess, 'run', return_value=mock.Mock(returncode=0, stdout='', stderr='')), \
+                 mock.patch.object(gate.shutil, 'which', return_value='/fixture/tool'), \
+                 mock.patch.dict(os.environ, XDG_CACHE_HOME=str(caller), XDG_STATE_HOME=str(caller), XDG_CONFIG_HOME=str(caller)):
+                self.assertEqual(gate.main(['portable', '--headless']), 0)
+                self.assertEqual(os.environ['XDG_CACHE_HOME'], str(caller))
+            self.assertEqual(len(observed), 1)
+            self.assertEqual(list(caller.iterdir()), [])
+            for kind in ('CACHE', 'STATE', 'CONFIG'):
+                self.assertEqual((Path(observed[0][f'XDG_{kind}_HOME']) / 'marker').read_text(), kind)
+
+    def test_standalone_client_isolates_once_and_keeps_explicit_cases(self):
+        with tempfile.TemporaryDirectory(dir=root / '.work', prefix='xdg-client-') as name:
+            directory = Path(name)
+            directory.chmod(0o755)
+            caller = directory / 'caller'
+            caller.mkdir()
+            env = dict(os.environ, XODB_TEST_TMPDIR=str(directory), XDG_CACHE_HOME=str(caller),
+                       XDG_STATE_HOME=str(caller), XDG_CONFIG_HOME=str(caller))
+            env.pop('XODB_TEST_XDG_ROOT', None)
+            source = f'''import os, sys
+from pathlib import Path
+sys.path.insert(0, {str(root / 'tests')!r})
+import client
+from helpers.environment import ensure
+private = Path(os.environ['XODB_TEST_XDG_ROOT'])
+assert private.parent == Path(os.environ['XODB_TEST_TMPDIR'])
+for kind in ('CACHE', 'STATE', 'CONFIG'):
+    path = Path(os.environ[f'XDG_{{kind}}_HOME'])
+    assert path.is_relative_to(private)
+    (path / 'owned-marker').write_text(kind)
+os.environ['XDG_CACHE_HOME'] = str(private / 'explicit-cache-case')
+ensure()
+assert os.environ['XDG_CACHE_HOME'].endswith('/explicit-cache-case')
+os.environ.pop('XDG_CACHE_HOME')
+ensure()
+assert 'XDG_CACHE_HOME' not in os.environ
+'''
+            result = gate.run_step('standalone-xdg', [sys.executable, '-c', source], 5, directory, env, directory)
+            self.assertEqual(result['status'], 'passed', (directory / 'standalone-xdg.log').read_text())
+            self.assertEqual(list(caller.iterdir()), [])
+            self.assertFalse(list(directory.glob('test-xdg-*')), 'standalone temporary state is cleaned after process exit')
+
+    def test_soak_render_node_selection_and_private_override(self):
+        from helpers import display
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sysfs, dri = root / 'sys', root / 'dri'
+            dri.mkdir()
+            for name, vendor in [('renderD128', '0x1002'), ('renderD129', '0x10de')]:
+                device = sysfs / name / 'device'
+                device.mkdir(parents=True)
+                (device / 'vendor').write_text(vendor + '\n')
+                (dri / name).touch()
+            nvidia = str(dri / 'renderD129')
+            self.assertEqual(display.nvidia_render_node(sysfs, dri), nvidia)
+            (dri / 'renderD129').unlink()
+            self.assertIsNone(display.nvidia_render_node(sysfs, dri))
+            (sysfs / 'renderD129/device/vendor').unlink()
+            self.assertIsNone(display.nvidia_render_node(sysfs, dri))
+            self.assertIsNone(display.nvidia_render_node(root / 'absent', dri))
+            # No compositor or compiler is started. Only the child environment
+            # changes, and an ordinary Display keeps its inherited selection.
+            with mock.patch.object(display, 'WORK', str(root / 'work')), \
+                 mock.patch.object(display.subprocess, 'run'), \
+                 mock.patch.object(display.subprocess, 'Popen'), \
+                 mock.patch.object(display.Display, 'wait_ready', lambda self, env: setattr(self, 'env', env)), \
+                 mock.patch.dict(os.environ, {'WLR_RENDER_DRM_DEVICE': 'inherited', 'XODB_VK_DEVICE': 'unchanged'}):
+                ordinary = display.Display('ordinary')
+                pinned = display.Display('pinned', render_node=nvidia)
+                try:
+                    self.assertEqual(ordinary.env['WLR_RENDER_DRM_DEVICE'], 'inherited')
+                    self.assertEqual(pinned.env['WLR_RENDER_DRM_DEVICE'], nvidia)
+                    self.assertEqual(os.environ['WLR_RENDER_DRM_DEVICE'], 'inherited')
+                    self.assertEqual(pinned.env['XODB_VK_DEVICE'], 'unchanged')
+                finally:
+                    ordinary.close()
+                    pinned.close()
+    def test_gui_evidence_first_failure_survives_retry(self):
+        with tempfile.TemporaryDirectory(dir=root / '.work', prefix='ocr-evidence-') as name:
+            directory = Path(name)
+            directory.chmod(0o755)
+            inherited = dict(os.environ, XODB_TEST_LOG_DIR='unused-inherited-directory')
+            source = '''import os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from helpers import gui_evidence
+frame = Path('owned-frame.png')
+frame.write_bytes(b'first failing frame')
+gui_evidence.record(frame, 'original OCR: lnmatched')
+gui_evidence.first_failure()
+frame.write_bytes(b'later frame')
+gui_evidence.record(frame, 'later OCR')
+gui_evidence.first_failure()
+frame.unlink()
+raise SystemExit(int(sys.argv[2]))
+'''
+            for attempt, exit_code in (('gui-owned', 1), ('gui-owned.retry1', 0)):
+                result = gate.run_step(attempt, [sys.executable, '-c', source, str(root / 'tests'), str(exit_code)],
+                                       5, directory, inherited, directory)
+                self.assertEqual(result['status'], 'failed' if exit_code else 'passed')
+                artifacts = directory / (attempt + '.artifacts')
+                self.assertEqual((artifacts / 'ocr-first-failure/frame.png').read_bytes(), b'first failing frame')
+                self.assertEqual((artifacts / 'ocr-first-failure/ocr.txt').read_text(), 'original OCR: lnmatched')
+                self.assertEqual((artifacts / 'ocr-latest/frame.png').read_bytes(), b'later frame')
+            self.assertEqual(inherited['XODB_TEST_LOG_DIR'], 'unused-inherited-directory')
+            self.assertEqual((directory / 'gui-owned.artifacts/ocr-first-failure/ocr.txt').read_text(), 'original OCR: lnmatched')
+
+    def test_gui_ocr_timeout_captures_without_relaxing_predicate(self):
+        from helpers import input as display_input
+        with tempfile.TemporaryDirectory(dir=root / '.work', prefix='ocr-timeout-') as name:
+            directory = Path(name)
+            directory.chmod(0o755)
+            frame = directory / 'owned.png'
+            frame.write_bytes(b'owned synthetic frame')
+            artifacts = directory / 'artifacts'
+            display = mock.Mock()
+            display.shot.return_value = str(frame)
+            with mock.patch.dict(os.environ, XODB_TEST_LOG_DIR=str(artifacts)), \
+                 mock.patch.object(display_input.subprocess, 'run', return_value=mock.Mock(stdout='lnmatched\n')), \
+                 mock.patch.object(display_input, 'load_scale', return_value=1):
+                text = display_input.ocr_until(display, 'status', lambda text: 'unmatched' in text, seconds=-1)
+                self.assertEqual(text, 'lnmatched')
+                self.assertEqual((artifacts / 'ocr-first-failure/ocr.txt').read_text(), 'lnmatched\n')
+                self.assertEqual((artifacts / 'ocr-first-failure/frame.png').read_bytes(), frame.read_bytes())
+                text = display_input.ocr_until(display, 'status', lambda text: 'lnmatched' in text)
+                self.assertEqual(text, 'lnmatched')
+                self.assertEqual((artifacts / 'ocr-first-failure/ocr.txt').read_text(), 'lnmatched\n')
+
+    def test_gui_direct_assertion_keeps_evidence_before_successful_retry(self):
+        with tempfile.TemporaryDirectory(dir=root / '.work', prefix='ocr-assert-') as name:
+            directory = Path(name)
+            directory.chmod(0o755)
+            source = '''import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from helpers import gui_evidence
+frame = Path('owned.png')
+frame.write_bytes(sys.argv[2].encode())
+gui_evidence.record(frame, sys.argv[2])
+frame.unlink()
+assert sys.argv[2] == 'pass'
+'''
+            for attempt, text in (('gui-assert', 'first failure'), ('gui-assert.retry1', 'pass')):
+                result = gate.run_step(attempt, [sys.executable, '-c', source, str(root / 'tests'), text],
+                                       5, directory, dict(os.environ), directory)
+                self.assertEqual(result['status'], 'passed' if text == 'pass' else 'failed')
+            first = directory / 'gui-assert.artifacts/ocr-first-failure'
+            self.assertEqual((first / 'frame.png').read_bytes(), b'first failure')
+            self.assertEqual((first / 'ocr.txt').read_text(), 'first failure')
+            self.assertFalse((directory / 'gui-assert.retry1.artifacts/ocr-first-failure').exists())
+
+    def test_gui_evidence_errors_do_not_replace_assertions(self):
+        from helpers import gui_evidence
+        with tempfile.TemporaryDirectory(dir=root / '.work', prefix='ocr-error-') as name:
+            directory = Path(name)
+            directory.chmod(0o755)
+            obstacle = directory / 'not-a-directory'
+            obstacle.write_text('owned obstacle')
+            with mock.patch.dict(os.environ, XODB_TEST_LOG_DIR=str(obstacle)), contextlib.redirect_stderr(io.StringIO()) as errors:
+                gui_evidence.record('missing.png', 'failure')
+                gui_evidence.first_failure()
+            self.assertIn('GUI evidence capture failed', errors.getvalue())
+
     def test_vulkan_filter_retry_requires_its_report(self):
         from helpers.vulkan_outcomes import reported_filter_retry
         rules = 'poison=1;fail=vkCreateInstance@1:oodm'
@@ -324,15 +647,88 @@ class RunnerTests(unittest.TestCase):
     # Fails on the first attempt in a run directory, then passes.
     once = 'import os,sys\nif os.path.exists("m"): sys.exit(0)\nopen("m","w").close(); sys.exit(1)'
 
+    def test_optional_lab_steps_are_skipped_without_configuration(self):
+        names = {'kernel-target-lab', 'kernel-target-lab-core', 'kernel-target-lab-kcore',
+                 'gui-kernel-target-lab', 'gui-kernel-target-lab-core', 'kernel-census-lab'}
+        planned = [step for tier in ('periodic', 'periodic-gui') for step in gate.plan(tier) if step.name in names]
+        self.assertEqual({step.name for step in planned}, names)
+        self.assertEqual(len(planned), len(names))
+        # These optional fixtures are leaves, never a substitute for a build.
+        self.assertFalse(any(names.intersection(step.needs) for tier in self.TIERS for step in gate.plan(tier)))
+        for jobs in (1, 2):
+            for setting in (None, ''):
+                with self.subTest(jobs=jobs, setting=setting), tempfile.TemporaryDirectory(dir=root / '.work', prefix='lab-skip-') as name:
+                    directory = Path(name)
+                    directory.chmod(0o755)
+                    env = dict(os.environ)
+                    env.pop('XODB_KERNEL_LAB', None)
+                    if setting is not None:
+                        env['XODB_KERNEL_LAB'] = setting
+                    report = dict(steps=[])
+                    # An absent fixture is not launched, even as a GUI retry.
+                    with mock.patch.object(gate.subprocess, 'Popen', side_effect=AssertionError('unconfigured lab launched')):
+                        code = gate.run_steps(planned, directory, env, directory, report, retries=2, jobs=jobs)
+                    self.assertEqual(code, 0)
+                    self.assertEqual(report['summary'], dict(planned=6, passed=0, skipped=6, flaky=0, failed=0, not_run=0))
+                    self.assertEqual(report['failures'], [])
+                    for step in report['steps']:
+                        self.assertEqual(step['status'], 'skipped')
+                        self.assertEqual(step['reason'], 'XODB_KERNEL_LAB is not configured')
+                        self.assertNotIn('exit_code', step)
+                        self.assertNotIn('earlier_attempts', step)
+                        self.assertIn(step['reason'], Path(step['log']).read_text())
+                    self.assertEqual(json.loads(json.dumps(report))['summary']['skipped'], 6)
+
+    def test_configured_lab_runs_and_skip_text_is_not_a_skip_contract(self):
+        with tempfile.TemporaryDirectory(dir=root / '.work', prefix='lab-configured-') as name:
+            directory = Path(name)
+            directory.chmod(0o755)
+            (directory / 'tests').mkdir()
+            script = directory / 'tests/kernel-target-lab.py'
+            env = dict(os.environ, XODB_KERNEL_LAB='/fixture/lab')
+            for code in (0, 3):
+                script.write_text(f"print('SKIP is just diagnostic text here')\nraise SystemExit({code})\n")
+                result = gate.run_step('configured-' + str(code), [sys.executable, '-B', 'tests/kernel-target-lab.py'],
+                                       5, directory, env, directory)
+                self.assertEqual(result['status'], 'passed' if code == 0 else 'failed')
+                self.assertEqual(result['exit_code'], code)
+            env.pop('XODB_KERNEL_LAB')
+            result = gate.run_step('ordinary', [sys.executable, '-c', "print('SKIP unrelated diagnostic')"],
+                                   5, directory, env, directory)
+            self.assertEqual(result['status'], 'passed')
+
+    def test_lab_skip_continues_unrelated_work_but_cannot_satisfy_a_dependency(self):
+        for dependent in (False, True):
+            with self.subTest(dependent=dependent), tempfile.TemporaryDirectory(dir=root / '.work', prefix='lab-needs-') as name:
+                directory = Path(name)
+                directory.chmod(0o755)
+                env = dict(os.environ)
+                env.pop('XODB_KERNEL_LAB', None)
+                planned = [gate.Step('optional', [sys.executable, 'tests/kernel-target-lab.py'], 5),
+                           gate.Step('after', [sys.executable, '-c', 'pass'], 5,
+                                     needs=['optional'] if dependent else [])]
+                report = dict(steps=[])
+                code = gate.run_steps(planned, directory, env, directory, report)
+                self.assertEqual(report['summary']['skipped'], 1)
+                if dependent:
+                    self.assertEqual(code, 1)
+                    self.assertEqual(report['not_run'], ['after'])
+                    self.assertEqual(report['summary']['passed'], 0)
+                    self.assertFalse((directory / 'after.log').exists())
+                else:
+                    self.assertEqual(code, 0)
+                    self.assertEqual(report['summary']['passed'], 1)
+                    self.assertEqual(report['steps'][1]['status'], 'passed')
+
     def test_keep_going_runs_every_step_and_summarises(self):
         steps = [('one', 'raise SystemExit(3)'), ('two', 'pass'), ('three', 'import time; time.sleep(9)')]
         code, report = self.sequence(steps)
         self.assertEqual((code, [s['name'] for s in report['steps']]), (1, ['one']))
-        self.assertEqual(report['summary'], dict(planned=3, passed=0, flaky=0, failed=1, not_run=2))
+        self.assertEqual(report['summary'], dict(planned=3, passed=0, skipped=0, flaky=0, failed=1, not_run=2))
         code, report = self.sequence(steps, keep_going=True)
         self.assertEqual((code, [s['name'] for s in report['steps']]), (1, ['one', 'two', 'three']))
         self.assertEqual([(f['name'], f['status']) for f in report['failures']], [('one', 'failed'), ('three', 'timeout')])
-        self.assertEqual(report['summary'], dict(planned=3, passed=1, flaky=0, failed=2, not_run=0))
+        self.assertEqual(report['summary'], dict(planned=3, passed=1, skipped=0, flaky=0, failed=2, not_run=0))
         self.assertEqual(report['reason'], 'one: failed, three: timeout')
         code, report = self.sequence([('build-tests', 'raise SystemExit(1)'), ('two', 'pass')], keep_going=True)
         self.assertEqual((code, report['summary']['not_run']), (1, 1))
@@ -344,7 +740,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual((step['name'], step['status']), ('gui-once', 'flaky'))
         self.assertEqual([s['status'] for s in step['earlier_attempts']], ['failed'])
         self.assertEqual(report['flaky'], ['gui-once'])
-        self.assertEqual(report['summary'], dict(planned=2, passed=1, flaky=1, failed=0, not_run=0))
+        self.assertEqual(report['summary'], dict(planned=2, passed=1, skipped=0, flaky=1, failed=0, not_run=0))
         self.assertEqual(report['logs'], ['gui-once.log', 'gui-once.retry1.log', 'two.log'])
         code, report = self.sequence([('gui-broken', 'raise SystemExit(1)')], retries=1)
         self.assertEqual((code, report['steps'][0]['status'], report['summary']['flaky']), (1, 'failed', 0))
@@ -762,6 +1158,18 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual([step.name for step in kept], [step.name for step in owners])
         self.assertEqual(owner_notes, [])
 
+    def test_host_census_has_no_fictitious_agent_twin(self):
+        host = gate.plan('host')
+        census = next(step for step in host if step.name == 'kernel-census')
+        fate, reason = gate.agent_fate(census)
+        self.assertEqual(fate, 'ineligible')
+        self.assertIn('host procfs', reason)
+        lane, notes = gate.apply_agent_lane([census])
+        self.assertEqual(lane, [])
+        self.assertEqual(dict(notes)['kernel-census'], reason)
+        self.assertNotIn('kernel-census-agent-lane', {step.name for step in gate.plan('periodic')})
+        self.assertIn('kernel-census', {step.name for step in host})
+
     def test_agent_lane_step_fails_when_the_agent_never_starts(self):
         # The switch points at a wrapper that records a start, then executes the
         # agent. A lane step that exits 0 without that record is not coverage.
@@ -912,7 +1320,7 @@ open(f'.work/{name}.out', 'w').close()
         self.assertFalse(any('beside' in step for step in report['steps']))
         code, report, names = run(4, 'together')
         self.assertEqual((code, [step['name'] for step in report['steps']]), (0, names))  # reported in plan order
-        self.assertEqual(report['summary'], dict(planned=9, passed=9, flaky=0, failed=0, not_run=0))
+        self.assertEqual(report['summary'], dict(planned=9, passed=9, skipped=0, flaky=0, failed=0, not_run=0))
         self.assertEqual([step['name'] for step in report['steps'] if step.get('beside')], [name for name in names if name.startswith('gui-')])
 
     def test_jobs_keep_failures_retries_and_leaks_exact(self):
@@ -922,12 +1330,12 @@ open(f'.work/{name}.out', 'w').close()
         code, report = self.sequence([('gui-bad', bad), ('gui-slow', slow), ('gui-next', 'pass'), ('gui-later', 'pass'), ('last', 'pass')], jobs=2)
         self.assertEqual(code, 1)
         self.assertEqual([(step['name'], step['status']) for step in report['steps']], [('gui-bad', 'failed'), ('gui-slow', 'passed')])
-        self.assertEqual(report['summary'], dict(planned=5, passed=1, flaky=0, failed=1, not_run=3))
+        self.assertEqual(report['summary'], dict(planned=5, passed=1, skipped=0, flaky=0, failed=1, not_run=3))
         # With keep_going everything else runs, except what needed the failed step.
         code, report = self.sequence([('gui-bad', bad), ('gui-slow', slow), ('gui-needs-bad', 'pass'), ('gui-then', 'pass'), ('last', 'pass')],
                                      keep_going=True, jobs=2, fields={'gui-needs-bad': dict(needs=['gui-bad']), 'gui-then': dict(needs=['gui-needs-bad'])})
         self.assertEqual([(step['name'], step['status']) for step in report['steps']], [('gui-bad', 'failed'), ('gui-slow', 'passed'), ('last', 'passed')])
-        self.assertEqual(report['summary'], dict(planned=5, passed=2, flaky=0, failed=1, not_run=2))
+        self.assertEqual(report['summary'], dict(planned=5, passed=2, skipped=0, flaky=0, failed=1, not_run=2))
         # A step waits for what it needs, even when that runs alone and later.
         code, report = self.sequence([('gui-first', 'pass'), ('late', 'open("late","w").close()'), ('gui-needs-late', 'import os; assert os.path.exists("late")')],
                                      jobs=2, fields={'gui-needs-late': dict(needs=['late'])})

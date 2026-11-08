@@ -34,6 +34,9 @@ pub const Facts = struct {
     pt_sp: ?u32 = null,
     /// `task_struct.stack`. The waiter scan covers 16 KiB from this base.
     stack_off: ?u32 = null,
+    /// `rq.curr`. The runqueue's current task, used when the image has no
+    /// per-CPU `current_task` symbol.
+    rq_curr: ?u32 = null,
     mutex_owner: ?u32 = null,
     mutex_wait_list: ?u32 = null,
     mutex_waiter_list: ?u32 = null,
@@ -274,6 +277,23 @@ pub const TaskRow = struct {
     pub_tid: i32 = 0,
 };
 
+/// One task_struct. Secondary idle tasks are not linked from `init_task`,
+/// so a CPU's current pointer is read with this rather than the list walk.
+pub fn readTask(memory: anytype, base: u64, facts: Facts) !TaskRow {
+    if (facts.comm_len == 0 or facts.comm_len > 16) return error.KernelTypeInfoUnavailable;
+    var row = TaskRow{ .address = base, .pid = @bitCast(try readU32(memory, base + facts.pid_off)) };
+    var comm_buf: [16]u8 = undefined;
+    const comm_n: usize = @min(facts.comm_len, comm_buf.len);
+    try readAt(memory, base + facts.comm_off, comm_buf[0..comm_n]);
+    const comm = std.mem.sliceTo(comm_buf[0..comm_n], 0);
+    for (comm) |byte| if (byte < 0x20 or byte > 0x7e) return error.KernelList;
+    @memcpy(row.comm[0..comm.len], comm);
+    row.comm_len = @intCast(comm.len);
+    if (facts.task_state_off) |off| row.state = try readU32(memory, base + off);
+    if (facts.cpu_off) |off| row.cpu = try readU32(memory, base + off);
+    return row;
+}
+
 pub fn walkTasks(memory: anytype, init_task: u64, facts: Facts, out: []TaskRow) !usize {
     if (facts.comm_len == 0 or facts.comm_len > 16) return error.KernelTypeInfoUnavailable;
     var base = init_task;
@@ -282,17 +302,7 @@ pub fn walkTasks(memory: anytype, init_task: u64, facts: Facts, out: []TaskRow) 
     while (n < out.len) : (guard += 1) {
         if (guard == 8192) return error.KernelList;
         for (out[0..n]) |row| if (row.address == base) return n;
-        var row = TaskRow{ .address = base, .pid = @bitCast(try readU32(memory, base + facts.pid_off)) };
-        var comm_buf: [16]u8 = undefined;
-        const comm_n: usize = @min(facts.comm_len, comm_buf.len);
-        try readAt(memory, base + facts.comm_off, comm_buf[0..comm_n]);
-        const comm = std.mem.sliceTo(comm_buf[0..comm_n], 0);
-        for (comm) |byte| if (byte < 0x20 or byte > 0x7e) return error.KernelList;
-        @memcpy(row.comm[0..comm.len], comm);
-        row.comm_len = @intCast(comm.len);
-        if (facts.task_state_off) |off| row.state = try readU32(memory, base + off);
-        if (facts.cpu_off) |off| row.cpu = try readU32(memory, base + off);
-        out[n] = row;
+        out[n] = try readTask(memory, base, facts);
         n += 1;
         const next = try readU64(memory, base + facts.tasks_next);
         if (next < facts.tasks_next) return error.KernelList;
@@ -799,6 +809,9 @@ test "a wait chain keeps every hop the 128-byte label cannot" {
 
 pub fn perCpuAddress(offsets: []const u64, cpu: u32, symbol: u64) !u64 {
     if (cpu >= offsets.len) return error.PerCpuOffsetUnavailable;
+    // A possible CPU that never came up keeps a zero base; adding it would
+    // return the link-time section address, which is not that CPU's data.
+    if (cpu != 0 and offsets[cpu] == 0) return error.PerCpuOffsetUnavailable;
     // per_cpu_ptr() is modular: arm64 offsets are "negative".
     return offsets[cpu] +% symbol;
 }
@@ -820,6 +833,33 @@ pub fn shadowCpuLocal(local: i32) ?u32 {
     const mag: u32 = @intCast(local - base);
     if (mag < 2 or mag > 4096) return null;
     return mag - 2;
+}
+
+/// Kernel stack window used to pair a stopped CPU thread with `task.stack`.
+pub const cpu_stack_span: u64 = 16 * 1024;
+
+/// CPU whose per-CPU base equals `gs_base`, or whose kernel stack contains `sp`.
+/// A zero base is not a match. Two matches are no match. `gs_base` wins when set.
+pub fn cpuForStop(sp: u64, gs_base: ?u64, percpu: []const u64, stacks: []const u64) ?u32 {
+    if (gs_base) |base| if (base != 0) {
+        var found: ?u32 = null;
+        for (percpu, 0..) |off, index| {
+            if (off != base) continue;
+            if (index > std.math.maxInt(u32)) return null;
+            if (found != null) return null;
+            found = @intCast(index);
+        }
+        if (found) |cpu| return cpu;
+    };
+    if (sp == 0) return null;
+    var found: ?u32 = null;
+    for (stacks, 0..) |base, index| {
+        if (base == 0 or sp < base or sp - base >= cpu_stack_span) continue;
+        if (index > std.math.maxInt(u32)) return null;
+        if (found != null) return null;
+        found = @intCast(index);
+    }
+    return found;
 }
 
 pub const Fp = struct { ip: u64, sp: u64, bp: u64 };
@@ -1430,7 +1470,7 @@ test "module and task lists follow the image's field offsets" {
     try std.testing.expect(buildIdMatches(rows[0].build_id[0..4], &[_]u8{ 1, 2, 3, 4 }));
     try std.testing.expect(!buildIdMatches(rows[0].build_id[0..4], &[_]u8{ 9, 9, 9, 9 }));
 
-    var tasks_mem: [128]u8 = @splat(0);
+    var tasks_mem: [256]u8 = @splat(0);
     putU32(&tasks_mem, 0, 1);
     putU32(&tasks_mem, 4, 0);
     @memcpy(tasks_mem[8..][0..4], "init");
@@ -1447,6 +1487,15 @@ test "module and task lists follow the image's field offsets" {
     try std.testing.expectEqual(@as(i32, 42), tasks[1].pid);
     try std.testing.expectEqual(@as(u32, 1), tasks[1].cpu.?);
     try std.testing.expectEqualStrings("kworker", tasks[1].comm[0..tasks[1].comm_len]);
+    // A pid-0 idle task that is not on the list is still readable on its own.
+    putU32(&tasks_mem, 0x70, 0);
+    putU32(&tasks_mem, 0x74, 0);
+    @memcpy(tasks_mem[0x78..][0..6], "swap/1");
+    const idle = try readTask(Flat{ .bytes = &tasks_mem }, 0x70, facts);
+    try std.testing.expectEqual(@as(u64, 0x70), idle.address);
+    try std.testing.expectEqual(@as(i32, 0), idle.pid);
+    try std.testing.expectEqual(@as(u32, 0), idle.state.?);
+    try std.testing.expectEqualStrings("swap/1", idle.comm[0..idle.comm_len]);
 }
 
 test "kallsyms disagreement refuses a shifted symbol and keeps a match" {
@@ -1561,11 +1610,21 @@ test "sleeping x86 state, per-cpu slots, shadow cpus and a frame record" {
     const offsets = [_]u64{ 0x10000, 0x20000 };
     try std.testing.expectEqual(@as(u64, 0x20040), try perCpuAddress(&offsets, 1, 0x40));
     try std.testing.expectError(error.PerCpuOffsetUnavailable, perCpuAddress(&offsets, 2, 0x40));
+    const sparse = [_]u64{ 0x10000, 0 };
+    try std.testing.expectError(error.PerCpuOffsetUnavailable, perCpuAddress(&sparse, 1, 0x40));
     const arm_offsets = [_]u64{0xfff068a4ed992000};
     try std.testing.expectEqual(@as(u64, 0xfff000007fac2c80), try perCpuAddress(&arm_offsets, 0, 0xffff975b92130c80));
     try std.testing.expectEqual(@as(?u32, 0), shadowCpu(0xfffffffe));
     try std.testing.expectEqual(@as(?u32, 1), shadowCpuLocal(0x60000003));
     try std.testing.expectEqual(@as(?u32, null), shadowCpu(1));
+    const bases = [_]u64{ 0x1000, 0x2000, 0 };
+    const stacks = [_]u64{ 0x8000, 0x10000, 0 };
+    try std.testing.expectEqual(@as(?u32, 1), cpuForStop(0x9000, 0x2000, &bases, &stacks));
+    try std.testing.expectEqual(@as(?u32, null), cpuForStop(0, 0x2000, &[_]u64{ 0x2000, 0x2000 }, &stacks));
+    try std.testing.expectEqual(@as(?u32, 0), cpuForStop(0x9000, null, &bases, &stacks));
+    try std.testing.expectEqual(@as(?u32, null), cpuForStop(0x9000, null, &bases, &[_]u64{ 0x8000, 0x8800 }));
+    try std.testing.expectEqual(@as(?u32, null), cpuForStop(0, 0, &bases, &stacks));
+    try std.testing.expectEqual(@as(?u32, 1), cpuForStop(0x10010, 0, &bases, &stacks));
     var stack: [32]u8 = @splat(0);
     putU64(&stack, 16, 32);
     putU64(&stack, 24, 0xabcdef);

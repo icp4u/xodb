@@ -102,7 +102,7 @@ def near(name, xy, expected, slack=4):
         return all(abs(a - b) <= slack for a, b in zip(im.convert('RGB').getpixel(xy), expected))
 
 panels = ['summary', 'performance', 'processes', 'memory', 'disk', 'disk_space', 'network',
-          'connections', 'power', 'system', 'users', 'services', 'apps', 'files', 'memory_map', 'graph', 'galaxy', 'inheritance', 'treemap', 'fetch', 'radio']
+          'connections', 'power', 'system', 'users', 'services', 'apps', 'files', 'memory_map', 'graph', 'galaxy', 'inheritance', 'treemap', 'fetch', 'radio', 'kernel_stacks']
 
 def nav_y(index, height):
     """Centre of a nav button: rows shrink below 29 px to fit every panel

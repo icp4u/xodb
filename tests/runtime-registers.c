@@ -258,7 +258,9 @@ static void contract(void)
     CHECK(xrt_rpc_classify(0) == XRT_RPC_CLASS_PROTOCOL);
     CHECK(xrt_rpc_classify(XRT_RPC_SOURCE_OPEN) == XRT_RPC_CLASS_FILE);
     CHECK(xrt_rpc_classify(XRT_RPC_CLEAR_STOP) == XRT_RPC_CLASS_MUTATION);
-    CHECK(xrt_rpc_classify(57) == XRT_RPC_CLASS_PROTOCOL);
+    CHECK(xrt_rpc_classify(XRT_RPC_INFCALL) == XRT_RPC_CLASS_MUTATION);
+    CHECK(xrt_rpc_classify(XRT_RPC_INFCALL_RESOLVE) == XRT_RPC_CLASS_MUTATION);
+    CHECK(xrt_rpc_classify(59) == XRT_RPC_CLASS_PROTOCOL);
     CHECK(XRT_PARTIAL_REGISTER_WRITE == 71 && XRT_AMBIGUOUS_MATCH == 76);
 
     const struct xrt_arch *x86 = xrt_arch_get(XRT_X86_64);

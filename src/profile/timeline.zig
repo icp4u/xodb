@@ -241,7 +241,9 @@ pub fn reconstruct(a: std.mem.Allocator, transitions: []const Transition, extent
     }
     return spans.toOwnedSlice(a);
 }
-pub const MarkerKind = enum { capture_open_stopped, continued, stop, step_started, step_complete, breakpoint_hit, watchpoint_hit, exit, detach };
+/// `execution`: the debugger ran target code (an inferior call); samples near
+/// it may come from that call.
+pub const MarkerKind = enum { capture_open_stopped, continued, stop, step_started, step_complete, breakpoint_hit, watchpoint_hit, exit, detach, execution };
 pub const Marker = struct { offset_ns: u64, sequence: u64, tid: i32, kind: MarkerKind };
 pub const marker_basis = "debugger event observation/control timestamps, not exact kernel scheduler boundaries; capture_open_stopped applies to all selected threads";
 

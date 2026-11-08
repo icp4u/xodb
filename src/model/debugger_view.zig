@@ -16,6 +16,7 @@ pub const Request = struct {
     browse_address: ?u64 = null,
     browse_assembly: ?u64 = null,
     flow: bool = false,
+    kernel: bool = false,
 };
 pub const Source = struct {
     bytes: []const u8 = "",
@@ -66,6 +67,7 @@ pub const Presentation = struct {
     threads: []const linux.Thread = &.{},
     thread_labels: []const @import("compatibility.zig").Label = &.{},
     compatibility: @import("compatibility.zig").Info = .{ .kind = .unavailable },
+    kernel: @import("kernel_view.zig").View = .{},
     events: []const linux.Event = &.{},
     frames: []const model.Frame = &.{},
     locals: []const LocalRow = &.{},
@@ -194,6 +196,7 @@ pub const Capture = struct {
     pub fn refresh(self: *Capture, session: *model.Session, request: Request) void {
         _ = self.arena.reset(.retain_capacity);
         self.value = .{ .request = request, .snapshot = session.target.snapshot(), .metadata_revision = session.metadata.revision, .architecture = session.target.arch(), .signal_table = session.target.signalTable(), .threads = session.target.threadSlice(), .thread_labels = session.compatibility.labels.items, .compatibility = session.compatibility.info, .events = session.target.eventSlice(), .selected_frame = request.frame };
+        self.value.kernel = @import("kernel_view.zig").capture(self.arena.allocator(), session, request.kernel) catch |err| .{ .enabled = session.modules.measure_kernel_slide, .prepared = true, .generation = self.value.snapshot.generation, .reason = @errorName(err) };
         defer {
             self.value.source = self.source.value;
             self.value.flow = self.flow.value;

@@ -70,6 +70,7 @@ pub const Workspace = struct {
     stop_capture: @import("../model/stop_view.zig").Capture = .{},
     stop_view: @import("../model/stop_view.zig").View = .{},
     process_panel: @import("processes.zig").Panel = .{},
+    kernel_panel: @import("kernel_target.zig").Panel = .{},
     redot_panel: @import("redot.zig").Panel = .{},
     process_capture: @import("../model/process_view.zig").Capture = .{},
     allocation_panel: @import("allocations.zig").Panel = .{},
@@ -305,6 +306,7 @@ pub const Workspace = struct {
         }
     }
     pub fn activeEditor(self: *Workspace, context: anytype) ?*watch_ui.Editor {
+        if (self.kernel_panel.open) return null;
         if (self.redot_panel.open) return null;
         const remote = @TypeOf(context) != *Session;
         const session = if (remote) {} else context;
@@ -362,11 +364,16 @@ pub const Workspace = struct {
         }
         var scroll = w.scroll;
         const decompile_rows = self.static_panel.decompile_rows;
-        if (self.static_panel.decompile_open and scroll != 0 and decompile_rows.count > 0 and
+        if (!self.kernel_panel.open and self.static_panel.decompile_open and scroll != 0 and decompile_rows.count > 0 and
             w.pointer_x >= decompile_rows.x and w.pointer_x < decompile_rows.x + decompile_rows.w and
             w.pointer_y >= decompile_rows.y - 2 and w.pointer_y < decompile_rows.y - 2 + @as(f32, @floatFromInt(decompile_rows.count)) * look.workspace.code_row)
         {
             self.static_panel.wheelDecompile(scroll);
+            scroll = 0;
+            w.dirty = true;
+        }
+        if (self.kernel_panel.open and scroll != 0) {
+            self.kernel_panel.wheel(scroll);
             scroll = 0;
             w.dirty = true;
         }
@@ -424,6 +431,24 @@ pub const Workspace = struct {
             if (self.activeEditor(context)) |editor| if (editor.clipboard(w, event)) continue;
             switch (event.kind) {
                 .press, .repeat => {
+                    if (!remote and self.kernel_panel.open and self.shared_clients == null and event.kind == .press and event.plain() and event.shortcut == keys.sym.f8) {
+                        self.toggleAgentScope(session);
+                        w.dirty = true;
+                        continue;
+                    }
+                    if (self.kernel_panel.key(event)) {
+                        w.dirty = true;
+                        continue;
+                    }
+                    if (self.activeEditor(context) == null and event.kind == .press and event.plain() and event.shortcut == 0xffc4) {
+                        if (if (remote) context.display.kernel.enabled else session.modules.measure_kernel_slide) {
+                            self.kernel_panel.open = true;
+                            self.kernel_panel.first = 0;
+                            self.more_open = false;
+                        } else self.status = "Kernel target view requires --vmlinux";
+                        w.dirty = true;
+                        continue;
+                    }
                     if (self.activeEditor(context) == null and event.kind == .press and event.mods.alt and event.shortcut >= '1' and event.shortcut <= '6') {
                         const p: look.Pane = @enumFromInt(event.shortcut - '1');
                         self.pinned_pane = if (self.pinned_pane == p) null else p;
@@ -611,6 +636,11 @@ pub const Workspace = struct {
                 },
                 .button_press, .button_release => {
                     if (event.code != 272) continue;
+                    if (self.kernel_panel.open) {
+                        if (event.kind == .button_press) self.kernel_panel.press(event.x, event.y);
+                        w.dirty = true;
+                        continue;
+                    }
                     if (remote and self.process_panel.open) {
                         if (event.kind == .button_press) if (self.process_panel.pressView(event.x, event.y)) |intent| context.sendAt(self, intent.stamp, .{ .process = intent.operation });
                         w.dirty = true;
@@ -1867,7 +1897,7 @@ pub const Workspace = struct {
             }
         }
         const tid = if (session.target.snapshot().thread_count > 0) session.target.threadSlice()[self.selected].tid else 0;
-        if (self.last_metadata_revision == session.metadata.revision and self.last_generation == session.target.snapshot().generation and self.last_tid == tid and self.last_frame == self.selected_frame and self.last_browse == self.browse_address and self.last_show_flow == self.show_flow) return;
+        if (self.last_metadata_revision == session.metadata.revision and self.last_generation == session.target.snapshot().generation and self.last_tid == tid and self.last_frame == self.selected_frame and self.last_browse == self.browse_address and self.last_show_flow == self.show_flow and self.prepared.value.request.kernel == self.kernel_panel.open) return;
         if (self.last_generation != session.target.snapshot().generation) {
             self.browse_address = null;
         }
@@ -1879,7 +1909,7 @@ pub const Workspace = struct {
         self.last_metadata_revision = session.metadata.revision;
         self.last_tid = tid;
         self.last_frame = self.selected_frame;
-        self.prepared.refresh(session, .{ .tid = tid, .frame = self.selected_frame, .browse_address = self.browse_address, .browse_assembly = self.browse_assembly, .flow = self.show_flow });
+        self.prepared.refresh(session, .{ .tid = tid, .frame = self.selected_frame, .browse_address = self.browse_address, .browse_assembly = self.browse_assembly, .flow = self.show_flow, .kernel = self.kernel_panel.open });
         self.presentDebugger(self.prepared.value);
         self.last_language_revision = session.language_tabs.revision;
     }
@@ -1890,6 +1920,8 @@ pub const Workspace = struct {
     /// Bind prepared pane values without target reads or ownership changes.
     /// The caller keeps the source preparation/publication alive while drawn.
     pub fn presentDebugger(self: *Workspace, view: debugger_view.Presentation) void {
+        self.kernel_panel.view = view.kernel;
+        if (!view.kernel.enabled) self.kernel_panel.open = false;
         self.frames = view.frames;
         self.locals = view.locals;
         self.local_diagnostic = view.local_diagnostic;
@@ -2214,6 +2246,7 @@ pub const Workspace = struct {
             try r.textFit(font, b.x + 10, b.y + 61, b.w - 20, self.allocation_save_editor.message, theme.warm);
         }
         try self.process_panel.draw(r, font, width, height);
+        try self.kernel_panel.draw(r, font, width, height, &self.layout_report);
         r.clip = all;
         if (self.more_open) {
             // An opaque sheet: pane text must not show between the menu rows.

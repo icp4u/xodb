@@ -194,7 +194,7 @@ test "batch walks equal single walks and hash each ELF once" {
         try std.testing.expectEqual(one.reason, many.reason);
         try std.testing.expectEqual(one.count, many.count);
     }
-    try std.testing.expectEqual(@as(u64, capture.images.loaded.items[0].mapping.len), batch.hashed_bytes);
+    try std.testing.expectEqual(@as(u64, capture.images.loaded.items[0].imageAllowingProjection(.unwind_fingerprint).len), batch.hashed_bytes);
 }
 
 test "identity follows filter and assets; cancellation is an error, not a partial view" {

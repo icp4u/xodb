@@ -139,7 +139,7 @@ const ModeCode = Codes(records.CpuMode, &.{ "unknown", "kernel", "user", "hyperv
 const ContextCode = Codes(records.Context, &.{ "unknown", "kernel", "user", "hypervisor", "guest", "guest_kernel", "guest_user", "user_deferred", "other" });
 const ChainCode = Codes(records.Callchain, &.{ "absent", "complete", "truncated" });
 const KindCode = Codes(intervals.Kind, &.{ "frame", "request", "custom" });
-const MarkerCode = Codes(timeline.MarkerKind, &.{ "capture_open_stopped", "continued", "stop", "step_started", "step_complete", "breakpoint_hit", "watchpoint_hit", "exit", "detach" });
+const MarkerCode = Codes(timeline.MarkerKind, &.{ "capture_open_stopped", "continued", "stop", "step_started", "step_complete", "breakpoint_hit", "watchpoint_hit", "exit", "detach", "execution" });
 
 /// Facts about the saving process, not the capture. Pass fixed values for
 /// deterministic output.
@@ -520,7 +520,7 @@ fn encodeImages(w: Writer, capture: *const Capture) !void {
     for (capture.images.loaded.items) |image| {
         if (!image.immutable) return error.ArchiveMutableImage;
         if (@intFromEnum(image.image.header.machine) != machine_x86_64) return error.ArchiveUnsupportedArchitecture;
-        const identity = identify(image.mapping);
+        const identity = identify(image.imageAllowingProjection(.archive_identity));
         try w.int(u64, image.id);
         if (typed) try w.code(ImageKindCode.encode(.elf));
         try w.text(image.path, max_path);
@@ -613,10 +613,11 @@ fn encodeMemoryImages(w: Writer, capture: *const Capture) !void {
     try w.count(n);
     for (capture.images.loaded.items) |image| {
         if (!isMemoryImage(image)) continue;
-        if (image.mapping.len == 0 or image.mapping.len > snapshot.per_image_limit or image.mapping.len > std.math.maxInt(u32)) return error.ArchiveLimit;
+        const bytes = try image.completeImage();
+        if (bytes.len == 0 or bytes.len > snapshot.per_image_limit or bytes.len > std.math.maxInt(u32)) return error.ArchiveLimit;
         try w.int(u64, image.id);
-        try w.int(u32, @intCast(image.mapping.len));
-        try w.out.appendSlice(w.a, image.mapping);
+        try w.int(u32, @intCast(bytes.len));
+        try w.out.appendSlice(w.a, bytes);
     }
 }
 fn encodeKernel(w: Writer, capture: *const Capture, plan: *const KernelPlan) !void {
@@ -1392,7 +1393,7 @@ fn loadEmbedded(self: *Capture, report: *ImageReport, raw: []const u8) !void {
     const module = try self.images.allocator.create(modules.Module);
     errdefer self.images.allocator.destroy(module);
     const p = report.placement;
-    module.* = .{ .id = report.id, .device_major = p.device_major, .device_minor = p.device_minor, .inode = p.inode, .bias = p.bias, .start = p.start, .end = p.end, .path = name, .image = image, .mapping = bytes, .immutable = true, .file_source = .target_memory };
+    module.* = .{ .id = report.id, .device_major = p.device_major, .device_minor = p.device_minor, .inode = p.inode, .bias = p.bias, .start = p.start, .end = p.end, .path = name, .image = image, .mapping = .{ .full = bytes }, .immutable = true, .file_source = .target_memory };
     try self.images.loaded.append(self.images.allocator, module);
     self.images.snapshot_bytes += bytes.len;
     keep = true;
@@ -1477,7 +1478,7 @@ fn loadImage(self: *Capture, report: *ImageReport, resolver: Resolver, embeds: [
     const module = try self.images.allocator.create(modules.Module);
     errdefer self.images.allocator.destroy(module);
     const p = report.placement;
-    module.* = .{ .id = report.id, .device_major = p.device_major, .device_minor = p.device_minor, .inode = p.inode, .bias = p.bias, .start = p.start, .end = p.end, .path = name, .image = image, .mapping = bytes, .immutable = true };
+    module.* = .{ .id = report.id, .device_major = p.device_major, .device_minor = p.device_minor, .inode = p.inode, .bias = p.bias, .start = p.start, .end = p.end, .path = name, .image = image, .mapping = .{ .full = bytes }, .immutable = true };
     try self.images.loaded.append(self.images.allocator, module);
     self.images.snapshot_bytes += bytes.len;
     keep = true;
@@ -1938,7 +1939,7 @@ test "x86 archives reject ARM64 images even with a matching asset identity" {
     try std.testing.expectError(error.ArchiveUnsupportedArchitecture, encode(a, source, .{}));
     const destination = try fixture.build(a, .empty, null);
     defer destination.deinit();
-    var report = ImageReport{ .id = 1, .path = path, .opened_path = "", .status = .not_requested, .identity = identify(arm.mapping), .placement = .{ .device_major = 0, .device_minor = 0, .inode = 0, .bias = 0, .start = 0, .end = 4096 } };
+    var report = ImageReport{ .id = 1, .path = path, .opened_path = "", .status = .not_requested, .identity = identify(try arm.completeImage()), .placement = .{ .device_major = 0, .device_minor = 0, .inode = 0, .bias = 0, .start = 0, .end = 4096 } };
     try loadImage(destination, &report, .{ .enabled = true }, &.{}, destination.arena.allocator(), null);
     try std.testing.expectEqual(ImageStatus.invalid_elf, report.status);
     try std.testing.expectEqual(@as(usize, 0), destination.images.loaded.items.len);

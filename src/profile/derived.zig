@@ -56,10 +56,11 @@ pub fn assetSet(capture: *const Capture) u64 {
     h.update(version);
     h.update(unwind.algorithmFor(capture.architecture));
     for (capture.images.loaded.items) |image| {
+        const bytes = image.debuggerImage().projectedBytes();
         h.update(std.mem.asBytes(&image.id));
         h.update(std.mem.asBytes(&image.bias));
-        h.update(std.mem.asBytes(&image.mapping.len));
-        h.update(std.mem.asBytes(&@intFromPtr(image.mapping.ptr)));
+        h.update(std.mem.asBytes(&bytes.len));
+        h.update(std.mem.asBytes(&@intFromPtr(bytes.ptr)));
     }
     for (capture.pe_assets.entries.items) |image| {
         h.update("PE");

@@ -76,15 +76,50 @@ def stop_all():
     return left
 
 
-def lsof_json(pids, *extra, samples=2, interval=1):
+def lsof_json(pids, *extra, samples=2, interval=1, timeout=120):
     out = subprocess.run([str(xodb), '--lsof-top', '--json', '--pid', ','.join(map(str, pids)), '--samples', str(samples),
-                          '--interval', str(interval), *extra], capture_output=True, text=True, timeout=120)
+                          '--interval', str(interval), *extra], capture_output=True, text=True, timeout=timeout)
     check(out.returncode == 0, f'--json failed: {out.stderr}')
     return json.loads(out.stdout)
 
 
 def near(value, expected, tolerance):
     return abs(value - expected) <= expected * tolerance
+
+
+def budget_writer_snapshot(pids, writer, timeout=180):
+    # --json returns one final snapshot, not a stream. A fixed number of
+    # polls can cover less than one sweep under load; restarting the same
+    # short run does not accumulate history. Calibrate the run length until
+    # this process has two samples, then require the rate (including zero)
+    # to be correct. Never retry an incorrect measured rate.
+    deadline = time.monotonic() + timeout
+    polls = 16
+    attempts = []
+    while True:
+        remaining = deadline - time.monotonic()
+        check(remaining > polls * 0.25, f'writer did not acquire two budgeted samples: {attempts}')
+        snap = lsof_json(pids, '--budget-ms', '1', samples=polls, interval=0.25,
+                         timeout=min(120, remaining))
+        sc = snap['scan']
+        check(sc['processes'] + sc['hidden'] + sc['kernel_threads'] + sc['unscanned'] + sc['gone'] == len(pids), f'counts {sc}')
+        check(sc['stale'] + sc['unscanned'] > 0, f'budget never bit {sc}')
+        proc = next((p for p in snap['processes'] if p['pid'] == writer), None)
+        samples = proc['samples'] if proc else 0
+        attempts.append(dict(polls=polls, writer_samples=samples, scan=sc))
+        for f in snap['files']:
+            if f['path'].endswith('/written') and f['write_per_s'] > 0:
+                check(near(f['write_per_s'], 1 << 20, 0.1), f'budget rate {f}')
+        if proc and proc['write_per_s'] > 0:
+            check(near(proc['write_per_s'], 1 << 20, 0.1), f'budget process rate {proc}')
+        if samples >= 2:
+            check(near(proc['write_per_s'], 1 << 20, 0.1), f'budget process rate {proc}')
+            files = [f for f in snap['files'] if f['path'].endswith('/written')]
+            check(files and all(near(f['write_per_s'], 1 << 20, 0.1) for f in files),
+                  f'writer rate never shown after two budgeted samples: {files}')
+            results['budget_sampling'] = attempts
+            return snap
+        polls *= 2
 
 
 # ------------------------------------------------------------------ screen
@@ -375,22 +410,9 @@ try:
     check(idle.stdout.readline().startswith('ready'), 'idle fixture')
     kids = [int(x) for x in Path(f'/proc/{idle.pid}/task/{idle.pid}/children').read_text().split()]
     listed = [1, writer, *kids[:150]]
-    seen_rate = 0
-    for _ in range(4):
-        snap = lsof_json(listed, '--budget-ms', '1', samples=16, interval=0.25)
-        sc = snap['scan']
-        check(sc['processes'] + sc['hidden'] + sc['kernel_threads'] + sc['unscanned'] + sc['gone'] == len(listed), f'counts {sc}')
-        check(sc['stale'] + sc['unscanned'] > 0, f'budget never bit {sc}')
-        for f in snap['files']:
-            if f['path'].endswith('/written') and f['write_per_s'] > 0:
-                check(near(f['write_per_s'], 1 << 20, 0.1), f'budget rate {f}')
-                seen_rate += 1
-        for p in snap['processes']:
-            if p['pid'] == writer and p['write_per_s'] > 0:
-                check(near(p['write_per_s'], 1 << 20, 0.1), f'budget process rate {p}')
-    check(seen_rate, 'writer rate never shown under the budget')
+    snap = budget_writer_snapshot(listed, writer)
     if Path('/proc/1').stat().st_uid != os.geteuid():
-        check(snap['scan']['hidden'] + sc['unscanned'] >= 1, 'pid 1 counted')
+        check(snap['scan']['hidden'] + snap['scan']['unscanned'] >= 1, 'pid 1 counted')
     # D7: an option after "--" belongs to the launched program.
     if xodb.name == 'xodb':  # not the standalone build, which has no debugger to fall back to
         out = subprocess.run([str(xodb), '--help', '--', 'prog', '--lsof-top'], capture_output=True, text=True, timeout=30)

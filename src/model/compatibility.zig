@@ -149,7 +149,7 @@ pub const Cache = struct {
             self.pid = snap.pid;
             self.epoch = snap.image_epoch;
         }
-        if (session.target.gdbRemoteInfo()) |gdb| if (gdb.kernel or gdb.os == .darwin or gdb.thread_info == .available) {
+        if (session.target.gdbRemoteInfo()) |gdb| if (gdb.kernel or gdb.os == .darwin or gdb.thread_info == .available or session.modules.measure_kernel_slide) {
             self.info = .{ .kind = .unavailable };
             if (snap.state != .stopped) return;
             if (session.modules.measure_kernel_slide) session.refreshMaps() catch {};
@@ -170,18 +170,19 @@ pub const Cache = struct {
             self.labels.resize(std.heap.page_allocator, threads.len) catch return;
             for (threads, self.labels.items) |thread, *row| {
                 row.* = .{ .id = thread.id, .tid = thread.tid, .source = .gdb_thread_info };
-                const detail = session.target.gdbThreadInfo(thread.tid) catch continue;
-                if (detail.has_name) {
-                    safeName(&row.name, std.mem.sliceTo(&detail.name, 0));
-                    row.readable = true;
-                    row.possibly_truncated = detail.name_truncated;
-                }
+                if (session.target.gdbThreadInfo(thread.tid)) |detail| {
+                    if (detail.has_name) {
+                        safeName(&row.name, std.mem.sliceTo(&detail.name, 0));
+                        row.readable = true;
+                        row.possibly_truncated = detail.name_truncated;
+                    }
+                    if (detail.has_dispatch_queue) row.dispatch_queue = detail.dispatch_queue;
+                } else |_| {}
                 if (session.modules.measure_kernel_slide and session.modules.kernelThreadName(thread.tid, &row.name)) {
                     row.readable = true;
                     row.possibly_truncated = false;
                     row.wait_chain_len = @intCast(session.modules.kernelWaitChain(thread.tid, &row.wait_chain, &row.wait_chain_end));
                 }
-                if (detail.has_dispatch_queue) row.dispatch_queue = detail.dispatch_queue;
             }
             self.remote_generation = snap.generation;
             self.revision +%= 1;

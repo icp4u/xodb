@@ -10,6 +10,7 @@ pub const c = @cImport({
     @cInclude("xrt_files.h");
     @cInclude("xrt_source.h");
     @cInclude("xrt_loader.h");
+    @cInclude("xrt_infcall.h");
     if (@import("builtin").os.tag == .macos) {
         @cInclude("xrt_debugserver.h");
         @cInclude("gdbremote.h");
@@ -150,6 +151,7 @@ pub fn check(status: c.enum_xrt_status) !void {
         c.XRT_UNSUPPORTED_CONTROL => return error.UnsupportedControl,
         c.XRT_UNSUPPORTED_MODE => return error.UnsupportedMode,
         c.XRT_AMBIGUOUS_MATCH => return error.AmbiguousMatch,
+        c.XRT_CALL_FRAME_ACTIVE => return error.CallFrameActive,
         else => unreachable,
     }
 }

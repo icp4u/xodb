@@ -19,6 +19,7 @@ pub const Inspection = struct {
     browse_address: ?u64 = null,
     browse_assembly: ?u64 = null,
     show_flow: bool = false,
+    show_kernel: bool = false,
     show_stop: bool = false,
     show_processes: bool = false,
     show_probes: bool = false,
@@ -467,6 +468,34 @@ test "debugger publication retains source inline frames and target rows" {
     var title: [192]u8 = undefined;
     try std.testing.expectEqualStrings("Windows process under Wine", view.compatibility.title(&title));
     try std.testing.expect(publication.value.matchesInspection(publication.value.stamp, 3));
+}
+test "kernel publication owns task names module reasons and wait hops" {
+    var name = "owned-task".*;
+    var reason = "KernelModuleUnverified".*;
+    var hops = [_]@import("kernel_aware.zig").WaitHop{.{ .lock = 0x1234, .unknown_owner = true }};
+    const publication = try Publication.create(std.testing.allocator, .{
+        .stamp = .{ .connection = 1, .session = 1, .process = 1, .pid = 7, .image_epoch = 1, .generation = 2 },
+        .revision = 1,
+        .taken_ns = 1,
+        .status = .ready,
+        .debugger = .{ .kernel = .{
+            .enabled = true,
+            .prepared = true,
+            .tasks = &.{.{ .pid = 7, .tid = 7, .name = &name, .state = 2, .cpu = null, .address = "0x1000" }},
+            .modules = &.{.{ .name = "owned.ko", .start = "0x2000", .end = "0x3000", .status = .load_failure, .reason = &reason }},
+            .waits = &.{.{ .pid = 7, .name = &name, .hops = &hops, .end = .complete }},
+        } },
+    });
+    defer publication.destroy();
+    @memset(&name, 'x');
+    @memset(&reason, 'x');
+    hops[0].lock = 0;
+    const view = publication.value.debugger.?.kernel;
+    try std.testing.expectEqualStrings("owned-task", view.tasks[0].name);
+    try std.testing.expectEqualStrings("KernelModuleUnverified", view.modules[0].reason.?);
+    try std.testing.expectEqualStrings("owned-task", view.waits[0].name);
+    try std.testing.expectEqual(@as(u64, 0x1234), view.waits[0].hops[0].lock);
+    try std.testing.expect(view.waits[0].hops[0].unknown_owner);
 }
 /// Transfer, not a shared mutable cache. The presenter keeps at most its current
 /// view; a successful take transfers the pending one and it retires the old.

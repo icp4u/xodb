@@ -17,8 +17,13 @@ pub fn check(result: c.enum_xsvc_result) !void {
         else => return error.SessionServiceFailed,
     }
 }
-pub fn authorize(service: *c.struct_xsvc, client: u64, mutate: bool, now: u64) !void {
-    const result = c.xsvc_authorize(service, client, if (mutate) c.XSVC_MUTATE else c.XSVC_CONTROL, now);
+pub const Required = enum { control, mutate, execute };
+pub fn authorize(service: *c.struct_xsvc, client: u64, required: Required, now: u64) !void {
+    const result = c.xsvc_authorize(service, client, switch (required) {
+        .control => c.XSVC_CONTROL,
+        .mutate => c.XSVC_MUTATE,
+        .execute => c.XSVC_EXECUTE,
+    }, now);
     if (result == c.XSVC_SCOPE_DENIED) return error.AgentScopeDenied;
     try check(result);
 }

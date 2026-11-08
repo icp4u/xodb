@@ -11,6 +11,9 @@ import select
 import signal
 import subprocess
 import time
+from helpers.environment import ensure as ensure_test_environment
+ensure_test_environment()
+from helpers import gui_evidence
 # Tests never adopt or start the user's Ghidra sidecar; the sidecar tests set their own.
 os.environ.setdefault('XODB_GHIDRA_SIDECAR', 'off')
 
@@ -36,6 +39,8 @@ def complete_lines(path):
             for line in data.split(b'\n')[:-1]]
 
 def check(name, ok, detail=""):
+    if not ok:
+        gui_evidence.first_failure()
     results.append({"check": name, "ok": bool(ok), "detail": str(detail)})
     print(f"{'ok  ' if ok else 'FAIL'} {name}" + (f": {detail}" if detail else ""), flush=True)
     return ok
@@ -254,6 +259,7 @@ def ocr(path, *options):
     text = subprocess.run(["tesseract", path, "stdout", *options], env=env, capture_output=True, text=True, check=True, timeout=60 * load_scale()).stdout
     with open(path + ".txt", "w") as f:
         f.write(text)
+    gui_evidence.record(path, text)
     return text
 
 def ocr_until(d, name, check, *options, seconds=20):
@@ -267,7 +273,10 @@ def ocr_until(d, name, check, *options, seconds=20):
     attempt = 0
     while True:
         text = " ".join(ocr(d.shot(name if attempt == 0 else f"{name}-retry{attempt}"), *options).lower().split())
-        if check(text) or time.monotonic() > deadline:
+        if check(text):
+            return text
+        if time.monotonic() > deadline:
+            gui_evidence.first_failure()
             return text
         attempt += 1
         time.sleep(0.1)

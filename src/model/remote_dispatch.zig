@@ -167,7 +167,7 @@ pub const Executor = struct {
     pub fn captureDebugger(self: *Executor, session: *model.Session, inspection: boundary.Inspection) @import("debugger_view.zig").Presentation {
         self.prepareViewProcess(session);
         const selected = nativeSelection(session, inspection.selection);
-        self.debugger.refresh(session, .{ .tid = selected.tid, .frame = selected.frame, .browse_address = inspection.browse_address, .browse_assembly = inspection.browse_assembly, .flow = inspection.show_flow });
+        self.debugger.refresh(session, .{ .tid = selected.tid, .frame = selected.frame, .browse_address = inspection.browse_address, .browse_assembly = inspection.browse_assembly, .flow = inspection.show_flow, .kernel = inspection.show_kernel });
         return self.debugger.value;
     }
     pub fn captureLanguage(self: *Executor, session: *model.Session, inspection: boundary.Inspection) !@import("language_view.zig").Presentation {
@@ -327,7 +327,11 @@ pub const Executor = struct {
                     try context.check(context.c.xsvc_tick(service, linux.now(), @intFromEnum(self.executor.tree.root().agent_scope)));
                     try context.check(context.c.xsvc_authorize(service, agent.client, context.c.XSVC_OBSERVE, linux.now()));
                     if (effect(request.action)) |required| {
-                        try context.authorize(service, agent.client, required == .mutation, linux.now());
+                        try context.authorize(service, agent.client, switch (required) {
+                            .mutation => .mutate,
+                            .inferior_call => .execute,
+                            .execution => .control,
+                        }, linux.now());
                         const live = lease_model.Lease.capture(service, agent.client) orelse return error.ControlLeaseRequired;
                         if (agent.lease != live.id) return error.ControlLeaseRequired;
                         self.lease = live;

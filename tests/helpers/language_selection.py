@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from PIL import Image, ImageOps
 from .input import complete_lines
+from . import gui_evidence
 
 
 def check_layout(display, language, reason=None):
@@ -59,13 +60,17 @@ def check_native_values(display, tid, language, label):
             pane.resize((pane.width * 3, pane.height * 3)).save(crop)
         run = subprocess.run(['tesseract', crop, 'stdout', '--psm', '6'], env=dict(display.env, OMP_THREAD_LIMIT='1'), capture_output=True, text=True, timeout=30, check=True)
         text = run.stdout
+        gui_evidence.record(crop, text)
         # Match the native section and a reader-derived name/value prefix, not
         # source-pane text. Value identity itself is checked by each fixture.
         normalize = lambda v: re.sub(r'[^a-z0-9]', '', v.lower())
         wanted = normalize(values[0]['value']['display'].split()[0])
         expected = 'CONTEXT STORAGE' if language == 'javascript' else 'NAMED LOCALS' if language in ('lua', 'perl', 'python', 'ruby') else 'Variables by name'
         if 'Native frame' in text and expected in text and wanted in normalize(text): break
-        assert time.monotonic()<deadline, (values[0], text)
+        within_deadline = time.monotonic() < deadline
+        if not within_deadline:
+            gui_evidence.first_failure()
+        assert within_deadline, (values[0], text)
         time.sleep(.1)
     Path(screenshot+'.native-ocr.txt').write_text(text)
     check_layout(display, language)
@@ -106,6 +111,7 @@ def check(display, tid, language, label):
                                    env=dict(display.env, OMP_THREAD_LIMIT='1'), capture_output=True,
                                    text=True, timeout=60, check=True)
         Path(screenshot+'.tsv').write_text(completed.stdout)
+        gui_evidence.record(screenshot, completed.stdout)
         # OCR may split an underscore-qualified name into several words.
         # Match the whole rendered line, retaining its actual click bounds.
         lines = {}
@@ -131,7 +137,10 @@ def check(display, tid, language, label):
             actual = display.tool('get_language_tabs')['view']['logical_selection']
             if actual and actual['language'] == language and actual['segment'] == segment_index and actual['frame'] == 0:
                 break
-        assert time.monotonic() < deadline, (expected_name, matches, display.tool('get_language_tabs'))
+        within_deadline = time.monotonic() < deadline
+        if not within_deadline:
+            gui_evidence.first_failure()
+        assert within_deadline, (expected_name, matches, display.tool('get_language_tabs'))
     display.shot(label+'-clicked')
     layout = check_layout(display, language, segment['frames'][0].get('reason'))
     assert display.tool('get_registers', tid=tid) == registers

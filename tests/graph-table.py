@@ -71,14 +71,33 @@ try:
     d = h.Display.__new__(h.Display)
     h.Display.__init__(d, str(root), ['--overview', '--galaxy-demo', '24:idle', '--session-socket', str(work / 'observer.sock')], trace=False, binary=a.binary)
     until(lambda: rows('galaxy-pick'))
+    # Idle rates still carry a render-clock timestamp. Compare two clients at
+    # the same paused scene, not two samples separated by a possible redraw.
+    pause_frames = len(rows('galaxy-frame'))
+    d.keys('tap', 25)  # P, after the first scene exists
+    # Idle frames also arrive on their own, so a new frame alone does not prove
+    # the pause took effect: wait until a frame keeps the previous render clock.
+    def paused():
+        frames = rows('galaxy-frame')
+        if len(frames) > pause_frames + 1 and frames[-1]['clock'] == frames[-2]['clock']:
+            return True
+        return False
+    until(paused)
     measurements['galaxy_rss_bytes'] = rss()
     graph = d.tool('get_graph', kind='descriptors', scope='current')
     nodes = [n for n in graph['nodes'] if n['entity'] == 'node']
     ids = {n['id'] for n in graph['nodes']}
     check('observer gets the visible bounded synthetic model', graph['synthetic'] and graph['source'] == 'visible_gui_model' and len(nodes) == 24)
     check('every exported edge resolves to exact model endpoints', graph['edges'] and all(e['source'] in ids and e['target'] in ids for e in graph['edges']))
+    frames_before = len(rows('galaxy-frame'))
+    d.keys('m', 640, 360)  # force a redraw between the two clients
+    until(lambda: len(rows('galaxy-frame')) > frames_before)
     peer_graph = shared_graph(work / 'observer.sock')
+    evidence = Path(os.environ.get('XODB_TEST_LOG_DIR', work))
+    evidence.mkdir(parents=True, exist_ok=True)
+    (evidence / 'graph-observer.json').write_text(json.dumps({'stdio': graph, 'shared': peer_graph}, indent=2) + '\n')
     check('shared observer sees the identical graph without a control lease', peer_graph == graph)
+    d.keys('tap', 25)  # resume before exercising navigation
     star = rows('galaxy-pick')[-1]
     click(star)
     d.keys('tap', 47)  # V table
@@ -117,7 +136,8 @@ try:
     check('copied TSV preserves every edge ID and both endpoint IDs',
           {r['id'] for r in exported_rows} == {e['id'] for e in graph['edges']} and
           {(r['source_id'], r['target_id']) for r in exported_rows} == {(e['source'], e['target']) for e in graph['edges']})
-    h.ocr_until(d, 'table-edges', lambda text: 'edges' in text and 'source' in text)
+    text = h.ocr_until(d, 'table-edges', lambda text: 'edges' in text and 'source' in text)
+    check('edge table headers are readable', 'edges' in text and 'source' in text)
 finally:
     if d:
         d.close()

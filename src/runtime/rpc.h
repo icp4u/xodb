@@ -38,6 +38,9 @@
  * Old agents drop the bit. A host that does not see it still captures and
  * leaves kernel frames unnamed. */
 #define XRT_RPC_CAP_KALLSYMS UINT64_C(32)
+/* HELLO arg[1] opts into inferior calls (INFCALL, INFCALL_RESOLVE). An agent
+ * that does not echo it never receives them: the host refuses first. */
+#define XRT_RPC_CAP_INFCALL UINT64_C(64)
 /* One registry of the HELLO capability word. A new bit is added to
  * XRT_RPC_CAP_DEFINED and to one row list below, not as a second mask at a
  * call site. Always-on bits are advertised on every capable HELLO.
@@ -49,7 +52,8 @@
     X(XRT_RPC_CAP_ADDRESS_SPACE) \
     X(XRT_RPC_CAP_FILE_SLOTS) \
     X(XRT_RPC_CAP_PAC_MASK) \
-    X(XRT_RPC_CAP_KALLSYMS)
+    X(XRT_RPC_CAP_KALLSYMS) \
+    X(XRT_RPC_CAP_INFCALL)
 #define XRT_RPC_CAP_ALL_ROWS(X) \
     XRT_RPC_CAP_ALWAYS_ROWS(X) \
     XRT_RPC_CAP_NEGOTIATED_ROWS(X)
@@ -60,7 +64,8 @@
     X(XRT_RPC_CAP_LARGE_IMAGES) \
     X(XRT_RPC_CAP_FILE_SLOTS) \
     X(XRT_RPC_CAP_PAC_MASK) \
-    X(XRT_RPC_CAP_KALLSYMS)
+    X(XRT_RPC_CAP_KALLSYMS) \
+    X(XRT_RPC_CAP_INFCALL)
 #define XRT_RPC_CAP_OR_BIT(bit) |(bit)
 #define XRT_RPC_CAP_ADD_BIT(bit) +(bit)
 #define XRT_RPC_CAP_ONE_BIT(bit) && ((bit) > 0) && (((bit) & ((bit) - 1)) == 0)
@@ -128,7 +133,12 @@ enum xrt_rpc_op {
     XRT_RPC_FUNCTION_START,
     XRT_RPC_CONTROL_WRITE,
     XRT_RPC_SOURCE_OPEN,
-    XRT_RPC_CLEAR_STOP
+    XRT_RPC_CLEAR_STOP,
+    /* data: an encoded xrt_infcall_request; arg[0]: its timeout in ms.
+     * Reply extra: an encoded xrt_infcall_result. */
+    XRT_RPC_INFCALL,
+    /* arg[0]: 1 restore, 0 abandon. Reply extra: an encoded result. */
+    XRT_RPC_INFCALL_RESOLVE
 };
 
 enum xrt_rpc_class {
@@ -203,6 +213,8 @@ static inline enum xrt_rpc_class xrt_rpc_classify(uint16_t op)
     case XRT_RPC_EVENT:
     case XRT_RPC_CONTROL_WRITE:
     case XRT_RPC_CLEAR_STOP:
+    case XRT_RPC_INFCALL:
+    case XRT_RPC_INFCALL_RESOLVE:
         return XRT_RPC_CLASS_MUTATION;
     default:
         return XRT_RPC_CLASS_PROTOCOL;
@@ -217,4 +229,7 @@ _Static_assert(XRT_RPC_FUNCTION_START == 53, "function start stays 53");
 _Static_assert(XRT_RPC_CONTROL_WRITE == 54, "control write is opcode 54");
 _Static_assert(XRT_RPC_SOURCE_OPEN == 55, "source open is opcode 55");
 _Static_assert(XRT_RPC_CLEAR_STOP == 56, "clear stop is opcode 56");
+_Static_assert(XRT_RPC_INFCALL == 57 && XRT_RPC_INFCALL_RESOLVE == 58, "inferior call opcodes stay 57 and 58");
+_Static_assert(XRT_CALL_FRAME_ACTIVE == 85, "call-frame refusal stays appended");
+_Static_assert(XRT_RPC_CAP_INFCALL == UINT64_C(64), "inferior call bit stays 64");
 #endif

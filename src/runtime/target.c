@@ -72,6 +72,7 @@ enum xrt_status xrt_target_destroy(struct xrt_target *t)
     if (!t)
         return XRT_OK;
     TRY(xrt_target_close(t));
+    xrt_infcall_release(t);
     xrt_follow_subreaper_release(t);
     xodb_maps_free(&t->maps);
     free(t);

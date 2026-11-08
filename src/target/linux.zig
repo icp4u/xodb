@@ -178,7 +178,7 @@ pub const Event = struct {
     sequence: u64,
     time_ns: u64,
     tid: c.pid_t,
-    kind: enum { launch, attach, thread_start, thread_exiting, stop, continued, exit, detach, breakpoint_set, breakpoint_removed, breakpoint_hit, watchpoint_set, watchpoint_removed, watchpoint_hit, step_started, step_complete, memory_written, register_written, agent_action, image_replaced, process_birth, process_separated, process_released },
+    kind: enum { launch, attach, thread_start, thread_exiting, stop, continued, exit, detach, breakpoint_set, breakpoint_removed, breakpoint_hit, watchpoint_set, watchpoint_removed, watchpoint_hit, step_started, step_complete, memory_written, register_written, agent_action, image_replaced, process_birth, process_separated, process_released, execution },
     detail: i64 = 0,
     pc: u64 = 0,
     pc_known: bool = false,
@@ -199,6 +199,9 @@ pub const Event = struct {
 pub const BirthKind = enum { fork, vfork, clone_unknown };
 pub const Birth = struct { pid: i32, parent_tid: i32, kind: BirthKind, stopped: bool = false, exited: bool = false, status: i32 = 0, unpatched_probe: ?u64 = null, saved_debug: ?bp.DebugRegisters = null, vm_errno: i32 = 0 };
 const rt = runtime.c;
+/// The C runtime declarations, for callers that build typed runtime
+/// requests (inferior calls) through this facade.
+pub const runtime_c = rt;
 pub fn now() u64 {
     return rt.xrt_now();
 }
@@ -651,6 +654,18 @@ pub const Target = struct {
         try runtime.check(rt.xrt_target_registers(self.handle, tid, &regs));
         return .{ .raw = regs };
     }
+    /// One inferior call on a stopped thread (see xrt_infcall.h). A refusal
+    /// is a result with outcome REFUSED, not an error.
+    pub fn infcall(self: *Target, request: *const rt.struct_xrt_infcall_request, out: *rt.struct_xrt_infcall_result) !void {
+        if (comptime @import("builtin").os.tag != .linux) return error.ExecutionBackendUnavailable;
+        if (self.core != null) return error.ReadOnlyCore;
+        try runtime.check(rt.xrt_target_infcall(try self.get(), request, out));
+    }
+    pub fn infcallResolve(self: *Target, restore: bool, out: *rt.struct_xrt_infcall_result) !void {
+        if (comptime @import("builtin").os.tag != .linux) return error.ExecutionBackendUnavailable;
+        if (self.core != null) return error.ReadOnlyCore;
+        try runtime.check(rt.xrt_target_infcall_resolve(try self.get(), restore, out));
+    }
     pub fn writeRegister(self: *Target, tid: i32, name: []const u8, value: u64) !void {
         try runtime.check(rt.xrt_target_register_write(try self.get(), tid, name.ptr, name.len, value));
     }
@@ -680,6 +695,11 @@ pub const Target = struct {
         errdefer _ = core.threads.pop();
         var one = std.mem.zeroInit(rt.struct_xrt_thread, .{ .tid = tid, .state = rt.XRT_STOPPED, .reason = rt.XRT_STOP_SIGNAL });
         try runtime.check(rt.xrt_target_core_extend(try self.get(), &one, 1));
+    }
+    /// A sleeping kernel task on a described stub. Continue and step refuse it.
+    pub fn addMemoryTask(self: *Target, tid: i32) !void {
+        if (tid <= 0 or self.core != null) return error.InvalidState;
+        try runtime.check(rt.xrt_target_add_memory_thread(try self.get(), tid));
     }
     pub fn stopInfo(self: *const Target, tid: i32) !StopInfo {
         const index_ = self.index(tid) orelse return error.UnknownThread;

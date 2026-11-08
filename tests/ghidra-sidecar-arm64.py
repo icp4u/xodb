@@ -115,6 +115,7 @@ if not ghidra or not (Path(ghidra) / "support/analyzeHeadless").exists():
 # The detached starter remains our descendant until it is stopped below.
 ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0)
 work = Path(tempfile.mkdtemp(prefix="xodb-gha-", dir=os.environ.get("XODB_TEST_TMPDIR")))
+os.environ["XDG_STATE_HOME"] = str(work / "state-home")
 atexit.register(shutil.rmtree, work, True)
 starter = ROOT / "scripts/ghidra-sidecar"
 os.environ.update(

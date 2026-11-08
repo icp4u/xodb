@@ -856,6 +856,32 @@ static void real_agent(const char *agent, const char *self, int threads)
     EXPECT(xrt_target_destroy(t) == XRT_OK);
 }
 
+/* An agent that did not echo the inferior-call HELLO bit is never sent an
+ * INFCALL: the host refuses first. The scripted agent answers every later
+ * request with a hostile snapshot, so a sent request would break health. */
+static void infcall_without_capability(const char *self)
+{
+    const char *argv[] = {self, "--scripted-agent", "duplicate-tid", NULL};
+    struct xrt_target *t = NULL;
+    EXPECT(xrt_target_remote(argv, &t) == XRT_OK && t);
+    if (!t)
+        return;
+    struct xrt_target_view before, after;
+    xrt_target_view(t, &before);
+    struct xrt_infcall_request request;
+    memset(&request, 0, sizeof(request));
+    request.tid = PID;
+    request.function = 0x401000;
+    request.timeout_ms = 100;
+    struct xrt_infcall_result result;
+    EXPECT(xrt_target_infcall(t, &request, &result) == XRT_UNSUPPORTED_CONTROL);
+    EXPECT(xrt_target_infcall_resolve(t, true, &result) == XRT_UNSUPPORTED_CONTROL);
+    EXPECT(xrt_remote_health(t) == XRT_OK);
+    xrt_target_view(t, &after);
+    EXPECT(after.generation == before.generation);
+    EXPECT(xrt_target_destroy(t) == XRT_OK);
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 3 && strcmp(argv[1], "--scripted-agent") == 0) {
@@ -874,6 +900,7 @@ int main(int argc, char **argv)
     self[length] = 0;
     canonical_unavailable();
     const int mismatched = crafted_replies(self);
+    infcall_without_capability(self);
     int threads = XRT_MAX_THREADS - 1;
     if (argc > 2)
         threads = atoi(argv[2]);

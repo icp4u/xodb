@@ -38,6 +38,7 @@ public:
     enum Kind { NONE, FIRST, SEVENTH = 7 };
 };
 struct Holder { int tag; Name::Data inner; Engine *engine; struct { char skip[3]; short at; } pair; };
+struct Runqueue { int nr_running; union { void *donor; void *curr; }; void *idle; };
 namespace outer { namespace inner { struct Deep { short a; long long b; }; } }
 int use(Engine *);
 ''')
@@ -53,6 +54,8 @@ int main() {
     std::printf("ORACLE %zu %zu %zu %zu %zu %zu %zu %zu %zu %zu %zu\\n", sizeof(Engine), offsetof(Engine, limit), offsetof(Engine, tracking), offsetof(Engine, name),
         sizeof(Engine::Level), offsetof(Engine::Level, function), offsetof(Engine::Level, line), offsetof(Engine::Level, prev),
         sizeof(Name::Data), offsetof(Name::Data, name), offsetof(outer::inner::Deep, b));
+    Runqueue runqueue = {}; runqueue.nr_running = 1;
+    std::printf("RQ %zu %zu %zu\\n", offsetof(Runqueue, curr), offsetof(Runqueue, idle), sizeof(Runqueue) + (runqueue.curr ? 0 : 0));
     return use(&engine) + (int)deep.a;
 }
 ''')
@@ -84,6 +87,7 @@ for compiler in ('g++', 'clang++'):
         subprocess.run([compiler, '-O1', '-Wno-invalid-offsetof', f'-gdwarf-{version}', str(w / 'engine.cc'), str(w / 'user.cc'), '-o', str(image)], check=True, timeout=120)
         printed = subprocess.run([str(image)], capture_output=True, text=True, timeout=30, check=True).stdout.splitlines()
         nested, oracle = [int(n) for n in printed[0].split()[1:]], [int(n) for n in printed[1].split()[1:]]
+        rq = [int(n) for n in printed[2].split()[1:]]
         text = run(tag, image)
         got, size = offsets(text), sizes(text)
         assert [size['Engine'][0], got['Engine.limit'][0], got['Engine.tracking'][0], got['Engine.name'][0], size['Engine::Level'][0], got['Engine::Level.function'][0],
@@ -91,6 +95,11 @@ for compiler in ('g++', 'clang++'):
         # Two units define Level and Name; only the key function's defines Engine.
         assert size['Engine'][1] == 1 and size['Engine::Level'][1] >= 1 and size['Name'][1] == 2 and size['Text'][0] == 8, (tag, text)
         assert got['Engine.missing'] == (0, 0, 0) and got['Engine.limit'][1:] == (4, 1), (tag, text)
+        # An anonymous union member is at the union's location. A direct member beside it is unchanged.
+        text_rq = run(tag + '-rq', image, types=['Runqueue'], fields=['0:curr:pointer:8', '0:idle:pointer:8'])
+        got_rq, size_rq = offsets(text_rq), sizes(text_rq)
+        assert got_rq['Runqueue.curr'][0] == rq[0] and got_rq['Runqueue.idle'][0] == rq[1] and size_rq['Runqueue'][0] == rq[2], (tag, text_rq, rq)
+        assert got_rq['Runqueue.curr'][2] == 1 and got_rq['Runqueue.idle'][2] == 1, (tag, text_rq)
         # A path through members held by value adds the offsets up; an
         # enumerator answers with its value; a type marked "?" may be absent.
         text2 = run(tag + '-nested', image, types=['Holder', 'Engine::Kind', '?Nowhere', '?Engine::Level'],

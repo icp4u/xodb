@@ -213,6 +213,8 @@ ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0)  # PR_SET_CHILD_SUBREAPE
 # expect a typed sidecar failure; the fallback case passes its own explicitly.
 os.environ.pop("XODB_STATIC_ANALYSIS", None)
 work = Path(tempfile.mkdtemp(prefix="xodb-ghs-", dir=os.environ.get("XODB_TEST_TMPDIR")))
+os.environ["XDG_STATE_HOME"] = str(work / "state-home")
+os.environ.pop("XODB_GHIDRA_STATE", None)
 atexit.register(shutil.rmtree, work, True)
 fixture_dir = work / "qx"
 subprocess.run(["sh", "tests/fixtures/semq/build_fixtures.sh", str(fixture_dir)], check=True, timeout=60)
@@ -409,31 +411,36 @@ record("outer stack frames cannot bypass the eager library bound",
 close(value)
 stop_server()
 
-# Stops produced by a tight instruction-step loop do not start background work.
-# The final stop remains eligible once it has been stable for the debounce.
+# The exact fast-step/no-warm-work property is exercised with controlled clock
+# values in semq/warm_stop.zig. Real debugger calls can exceed the debounce on
+# a busy host, so this integration check waits for actual fixture work and
+# preserves the request ledger instead of truncating a concurrent writer.
 case = configure("warm-step-delay")
 value = client(scope="control")
 value.action("set_breakpoint", symbol="qx_alloc")
 value.continue_initial_stop()
 value.stopped("breakpoint")
-time.sleep(.3)
-(case / "requests").write_text("")
 for _ in range(3):
     state = tool(value, "get_session")
     tid = next(thread["tid"] for thread in state["threads"] if thread["state"] == "stopped")
     value.action("step_instruction", tid=tid)
     value.stopped("single_step")
-fast_requests = [json.loads(line) for line in (case / "requests").read_text().splitlines()]
-fast_background = [request for request in fast_requests if request.get("background") is True]
-record("fast instruction steps do not start warm-ahead", not fast_background, fast_background)
-deadline = time.monotonic() + 2
+final = tool(value, "get_session")
+deadline = time.monotonic() + 30  # service ceiling, not an eligibility assertion
+logged = []
+warm_fixture = []
 while time.monotonic() < deadline:
-    tool(value, "get_session")
-    logged = [json.loads(line) for line in (case / "requests").read_text().splitlines()]
-    if any(request.get("background") is True for request in logged): break
+    state = tool(value, "get_session")
+    assert state['state'] == 'stopped' and state['generation'] == final['generation'], state
+    text = (case / "requests").read_text() if (case / "requests").exists() else ''
+    # A concurrent append may end in an incomplete line; consume it next poll.
+    logged = [json.loads(line) for line in text.splitlines(keepends=True) if line.endswith('\n')]
+    warm_fixture = [request for request in logged if request.get('verb') == 'decompile' and
+                    request.get('background') is True and fixture_request(request)]
+    if warm_fixture: break
     time.sleep(.02)
 record("a stable stop becomes eligible for warm-ahead after the delay",
-       any(request.get("background") is True for request in logged), logged)
+       bool(warm_fixture), logged)
 close(value)
 stop_server()
 
@@ -661,6 +668,17 @@ try:
            failure.get("code") == "sidecar_died", result)
     record("xodb remains usable after sidecar death", tool(value, "get_session").get("state") == "stopped")
 finally: close(value)
+
+# Exercise the real starter's failure-log fallback without starting a JVM.
+# Its stderr is discarded by xodb too; a missing installation must leave the
+# diagnostic under this test's state home, not the caller's state directory.
+case = configure("state-isolation")
+environment = dict(os.environ, XODB_GHIDRA_HOME=str(work / "missing-ghidra"),
+                   XODB_GHIDRA_CACHE=str(work / "starter-cache"))
+starter = subprocess.run([str(ROOT / "scripts/ghidra-sidecar"), "start"], env=environment,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+record("sidecar startup log stays in the test state directory", starter.returncode == 4 and
+       (work / "state-home/xodb/ghidra-sidecar/sidecar.log").is_file())
 
 manager_stop.set(); manager_thread.join(2); manager_socket.close()
 for process in managed_processes:

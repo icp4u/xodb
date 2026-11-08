@@ -1,0 +1,7 @@
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"kernel-target-demo","version":"1"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_kernel_target","arguments":{"section":"tasks","limit":128}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_kernel_target","arguments":{"section":"cpus","limit":128}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_kernel_target","arguments":{"section":"modules","limit":128}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"get_kernel_target","arguments":{"section":"waits","limit":128}}}
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"get_session","arguments":{}}}

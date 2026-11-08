@@ -252,8 +252,12 @@ static enum xrt_status dispatch(struct agent *a, struct xrt_wire_frame *frame, u
     }
     if (size && frame->op != XRT_RPC_LAUNCH && frame->op != XRT_RPC_WRITE &&
         frame->op != XRT_RPC_REGISTER_WRITE && frame->op != XRT_RPC_FILE_OPEN &&
-        frame->op != XRT_RPC_CONTROL_WRITE && frame->op != XRT_RPC_SOURCE_OPEN)
+        frame->op != XRT_RPC_CONTROL_WRITE && frame->op != XRT_RPC_SOURCE_OPEN &&
+        frame->op != XRT_RPC_INFCALL)
         return XRT_INVALID_ARGUMENT;
+    if ((frame->op == XRT_RPC_INFCALL || frame->op == XRT_RPC_INFCALL_RESOLVE) &&
+        !(a->negotiated & XRT_RPC_CAP_INFCALL))
+        return XRT_UNSUPPORTED_CONTROL;
     enum xrt_status status = XRT_OK;
     switch (frame->op) {
     case XRT_RPC_HELLO:
@@ -395,6 +399,31 @@ static enum xrt_status dispatch(struct agent *a, struct xrt_wire_frame *frame, u
         status = xrt_target_register_write(t, (int32_t)args[0], (const char *)data, size, args[1]);
         *value = mutation_flags(t);
         return status;
+    case XRT_RPC_INFCALL:
+    case XRT_RPC_INFCALL_RESOLVE: {
+        struct xrt_infcall_result result;
+        if (frame->op == XRT_RPC_INFCALL) {
+            struct xrt_infcall_request request;
+            memset(&request, 0, sizeof(request));
+            struct xrt_codec body = xrt_codec(data, size, true);
+            xrt_infcall_wire_request(&body, &request);
+            if (!body.ok || body.at != body.size || request.timeout_ms != args[0])
+                return XRT_INVALID_ARGUMENT;
+            status = xrt_target_infcall(t, &request, &result);
+        } else {
+            if (args[0] > 1)
+                return XRT_INVALID_ARGUMENT;
+            status = xrt_target_infcall_resolve(t, args[0] != 0, &result);
+        }
+        if (status == XRT_OK) {
+            struct xrt_codec extra = xrt_codec(a->extra, XRT_RPC_DATA_MAX, false);
+            xrt_infcall_wire_result(&extra, &result);
+            if (!extra.ok)
+                return XRT_BUFFER_TOO_SMALL;
+            *extra_size = extra.at;
+        }
+        return status;
+    }
     case XRT_RPC_CONTROL_WRITE: {
         *value = 0;
         if (args[0] > INT32_MAX || args[1] < 1 || args[1] > 2 || args[2] != 0 ||

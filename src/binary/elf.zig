@@ -273,9 +273,20 @@ pub const SymbolTable = struct {
     }
 };
 
+pub const ParsedImageBytes = struct {
+    projection: []const u8,
+
+    fn init(bytes: []const u8) ParsedImageBytes {
+        return .{ .projection = bytes };
+    }
+    fn projectedBytes(self: ParsedImageBytes) []const u8 {
+        return self.projection;
+    }
+};
+
 pub const Image = struct {
     format: Format = .{},
-    bytes: []const u8,
+    bytes: ParsedImageBytes,
     header: Header,
     segment_table: []const u8,
     section_table: []const u8,
@@ -358,7 +369,7 @@ pub const Image = struct {
         }
         return .{
             .format = f,
-            .bytes = bytes,
+            .bytes = .init(bytes),
             .header = .{
                 .type = file_type,
                 .machine = machine,
@@ -386,7 +397,7 @@ pub const Image = struct {
     }
     /// The file-backed part of a segment.
     pub fn segmentData(self: *const Image, s: Segment) Error![]const u8 {
-        return span(self.bytes, s.offset, s.file_size);
+        return span(self.bytes.projectedBytes(), s.offset, s.file_size);
     }
 
     fn sectionHeader(self: *const Image, index: u32) []const u8 {
@@ -411,7 +422,7 @@ pub const Image = struct {
     }
     pub fn sectionData(self: *const Image, s: Section) Error![]const u8 {
         if (s.type == .nobits) return error.NoFileData;
-        return span(self.bytes, s.offset, s.size);
+        return span(self.bytes.projectedBytes(), s.offset, s.size);
     }
 
     /// The first SHT_SYMTAB or SHT_DYNSYM section, found by type rather than
@@ -427,19 +438,19 @@ pub const Image = struct {
             const h = self.sectionHeader(i);
             if (self.format.read(u32, h, 4) != want) continue;
             if (self.format.word(h, 56, 36) != self.format.symSize()) return error.BadSection;
-            const entries = try span(self.bytes, self.format.word(h, 24, 16), self.format.word(h, 32, 20));
+            const entries = try span(self.bytes.projectedBytes(), self.format.word(h, 24, 16), self.format.word(h, 32, 20));
             if (entries.len % self.format.symSize() != 0 or entries.len / self.format.symSize() > std.math.maxInt(u32)) return error.BadSection;
             const link = self.format.read(u32, h, if (self.format.is64) 40 else 24);
             if (link >= n) return error.BadSection;
             const sh = self.sectionHeader(link);
             if (self.format.read(u32, sh, 4) != @intFromEnum(SectionType.strtab)) return error.BadSection;
-            const strings = try span(self.bytes, self.format.word(sh, 24, 16), self.format.word(sh, 32, 20));
+            const strings = try span(self.bytes.projectedBytes(), self.format.word(sh, 24, 16), self.format.word(sh, 32, 20));
             var extended: []const u8 = &.{};
             var j: u32 = 0;
             while (j < n) : (j += 1) {
                 const x = self.sectionHeader(j);
                 if (self.format.read(u32, x, 4) != @intFromEnum(SectionType.symtab_shndx) or self.format.read(u32, x, if (self.format.is64) 40 else 24) != i) continue;
-                extended = try span(self.bytes, self.format.word(x, 24, 16), self.format.word(x, 32, 20));
+                extended = try span(self.bytes.projectedBytes(), self.format.word(x, 24, 16), self.format.word(x, 32, 20));
                 if (extended.len != entries.len / self.format.symSize() * 4) return error.BadSection;
                 break;
             }
@@ -532,7 +543,7 @@ pub const Image = struct {
             const s = self.segment(i) catch unreachable;
             if (s.type != .load or address < s.vaddr or address - s.vaddr >= s.file_size) continue;
             const offset = std.math.add(u64, s.offset, address - s.vaddr) catch return null;
-            return if (offset < self.bytes.len) offset else null;
+            return if (offset < self.bytes.projectedBytes().len) offset else null;
         }
         return null;
     }
@@ -544,7 +555,7 @@ pub const Image = struct {
         for (0..self.header.segment_count) |i| {
             const segment_ = self.segment(@intCast(i)) catch return null;
             if (segment_.type != .note) continue;
-            const notes = span(self.bytes, segment_.offset, segment_.file_size) catch return null;
+            const notes = span(self.bytes.projectedBytes(), segment_.offset, segment_.file_size) catch return null;
             mergeBuildId(self.format, notes, &found) catch return null;
         }
         for (0..self.header.section_count) |i| {

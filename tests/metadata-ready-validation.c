@@ -84,6 +84,10 @@ int main(int argc, char **argv) {
     struct xrt_file_view view = {.target = &target, .background = 1, .remote_id = 1};
     struct xmd_job job = {.view = &view, .joined = 1,
         .mutex = PTHREAD_MUTEX_INITIALIZER, .working = {.state = XMD_READY}};
+    CHECK(dwarf_section_name(".debug_gnu_pubnames"));
+    CHECK(dwarf_section_name(".zdebug_gnu_pubtypes"));
+    CHECK(dwarf_section_name(".debug_gnu_pubnames.dwo"));
+    CHECK(!dwarf_section_name(".debug_gnu_pubpayload"));
     /* A cached slice must not sleep for another slice's refused source RPC.
      * A refusal made during the new slice still records real contention. */
     job.working.runtime_status = XRT_DISCOVERY_PENDING;

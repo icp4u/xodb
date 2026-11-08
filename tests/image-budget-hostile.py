@@ -493,7 +493,7 @@ def sections(w, a, result):
                 assert any(f['diagnostic'] == 'TableLimit' for f in found['frames']), found
             assert not named(found, 'probe_wait'), found
             # Unbounded, this walk is 20,000 scans of 64 MiB: minutes. Reading the file is the honest cost.
-            assert seconds < max(2.0 if a.remote else 1.0, 10 * honest), (seconds, honest)
+            assert seconds < max((2.0 if a.remote else 1.0) * load_scale(), 10 * honest), (seconds, honest)
             _, leave = r.close()
             result['sections'] = {'refused_seconds': round(seconds, 3), 'honest_seconds': round(honest, 3), 'exit_seconds': round(leave, 3)}
         finally:

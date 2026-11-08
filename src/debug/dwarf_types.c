@@ -126,6 +126,63 @@ static int nested(struct scan *s, Dwarf_Die *type, const char *path, uint64_t *a
     s->error = "DwarfFieldMismatch";
     return -1;
 }
+/* One unnamed struct or union. Returns 1, or 0 with s->error set. */
+static int anonymous_field(struct scan *s, Dwarf_Die *type, const struct xdt_field *field, struct xdt_slot *slot, uint64_t total) {
+    size_t len = strlen(field->name);
+    Dwarf_Die child;
+    int rc = dwarf_child(type, &child);
+    if (rc < 0) { s->error = "DwarfTypesMalformed"; return 0; }
+    if (rc != 0) return 1;
+    int found = 0;
+    uint32_t off = 0, bytes_out = 0;
+    do {
+        if (!tick(s)) return 0;
+        if (dwarf_tag(&child) != DW_TAG_member || dwarf_diename(&child)) continue;
+        uint64_t base;
+        if (dwarf_hasattr(&child, DW_AT_bit_size) || dwarf_hasattr(&child, DW_AT_data_bit_offset)) continue;
+        if (!ud(&child, DW_AT_data_member_location, &base)) continue;
+        Dwarf_Die inner;
+        if (!type_of(&child, &inner) || !resolve(&inner, s)) continue;
+        if (!aggregate(dwarf_tag(&inner)) || flag(&inner, DW_AT_declaration)) continue;
+        Dwarf_Die grand;
+        int gr = dwarf_child(&inner, &grand);
+        if (gr < 0) { s->error = "DwarfTypesMalformed"; return 0; }
+        if (gr != 0) continue;
+        do {
+            if (!tick(s)) return 0;
+            if (dwarf_tag(&grand) != DW_TAG_member) continue;
+            const char *gname = dwarf_diename(&grand);
+            if (!gname || strncmp(gname, field->name, len) || gname[len]) continue;
+            uint64_t inner_at, bytes;
+            Dwarf_Die member;
+            if (dwarf_hasattr(&grand, DW_AT_bit_size) || dwarf_hasattr(&grand, DW_AT_data_bit_offset)) {
+                s->error = "DwarfFieldMismatch"; return 0;
+            }
+            /* A union member at the start often omits its location. A static
+             * member also has none, and is not this field. */
+            if (flag(&grand, DW_AT_declaration) || flag(&grand, DW_AT_external)) continue;
+            if (!ud(&grand, DW_AT_data_member_location, &inner_at)) {
+                if (dwarf_tag(&inner) != DW_TAG_union_type) continue;
+                inner_at = 0;
+            }
+            if (!type_of(&grand, &member) || !resolve(&member, s)) {
+                if (!s->error) s->error = "DwarfFieldMismatch";
+                return 0;
+            }
+            uint64_t at = base + inner_at;
+            if (dwarf_tag(&member) == DW_TAG_pointer_type || dwarf_tag(&member) == DW_TAG_reference_type) bytes = 8;
+            else if (!byte_size(&member, &bytes)) { s->error = "DwarfFieldMismatch"; return 0; }
+            if (at > total || bytes > total - at || !kind_matches(&member, field->kind) ||
+                (field->width && bytes != field->width)) { s->error = "DwarfFieldMismatch"; return 0; }
+            if (found && (off != (uint32_t)at || bytes_out != (uint32_t)bytes)) { s->error = "DwarfTypeAmbiguous"; return 0; }
+            off = (uint32_t)at; bytes_out = (uint32_t)bytes; found = 1;
+        } while ((gr = dwarf_siblingof(&grand, &grand)) == 0);
+        if (gr < 0) { s->error = "DwarfTypesMalformed"; return 0; }
+    } while ((rc = dwarf_siblingof(&child, &child)) == 0);
+    if (rc < 0) { s->error = "DwarfTypesMalformed"; return 0; }
+    if (found) *slot = (struct xdt_slot){off, bytes_out, 1};
+    return 1;
+}
 /* One complete definition of types[t]: every requested member, checked. */
 static void definition(struct scan *s, unsigned t, Dwarf_Die *die) {
     const struct xdt_schema *schema = s->schema;
@@ -169,6 +226,15 @@ static void definition(struct scan *s, unsigned t, Dwarf_Die *die) {
         }
     } while ((rc = dwarf_siblingof(&child, &child)) == 0);
     if (rc < 0) { s->error = "DwarfTypesMalformed"; return; }
+    /* A field that is not a direct member may be a member of an anonymous
+     * struct or union, which the language promotes into the enclosing type.
+     * The kernel runqueue stores its current task that way. A name already
+     * present as a direct member is not looked up again. */
+    for (unsigned f = 0; f < schema->field_count; ++f) {
+        const struct xdt_field *field = &schema->fields[f];
+        if (field->owner != t || got[f].present || strchr(field->name, '.')) continue;
+        if (!anonymous_field(s, die, field, &got[f], total)) return;
+    }
     merge(s, t, got, total);
 }
 /* One complete enumeration types[t]: each requested enumerator's value. */

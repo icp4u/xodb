@@ -367,6 +367,7 @@ pub const Frontend = struct {
             .browse_address = workspace.browse_address,
             .browse_assembly = workspace.browse_assembly,
             .show_flow = workspace.show_flow,
+            .show_kernel = workspace.kernel_panel.open,
             .show_stop = workspace.stop_panel.open,
             .show_processes = workspace.process_panel.open,
             .show_probes = workspace.probes_panel.open,

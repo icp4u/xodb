@@ -24,6 +24,7 @@ pub const Policy = struct {
         return switch (self.required) {
             .controller => scope != .observe,
             .mutator => scope == .mutate,
+            .executor => scope == .execute,
             .observer => self.read_only,
             .requester => true, // Capture-specific confirmation/policy, never general control.
             .lease => false,
@@ -59,15 +60,16 @@ pub const Context = struct {
     pub fn tick(self: Context, root: *Session) !void {
         try check(c.xsvc_tick(self.service, linux.now(), @intFromEnum(root.agent_scope)));
     }
-    pub fn authorize(self: Context, mutate: bool) !void {
+    pub fn authorize(self: Context, required: @import("../service/authority.zig").Required) !void {
         // The C service is authoritative for both lease ownership and scope.
-        try @import("../service/authority.zig").authorize(self.service, self.client_id, mutate, linux.now());
+        try @import("../service/authority.zig").authorize(self.service, self.client_id, required, linux.now());
     }
     pub fn visible(self: Context, required: Access) !bool {
         if (required == .observer or required == .requester or required == .lease) return true;
         const s = try self.state();
-        return s.controller == self.client_id and s.scope >= c.XSVC_CONTROL and
-            (required != .mutator or s.scope == c.XSVC_MUTATE);
+        return s.controller == self.client_id and c.xsvc_scope_grants(s.scope, c.XSVC_CONTROL) and
+            (required != .mutator or s.scope == c.XSVC_MUTATE) and
+            (required != .executor or s.scope == c.XSVC_EXECUTE);
     }
     fn clients(self: Context, a: Allocator) !Value {
         const s = try self.state();
@@ -164,4 +166,33 @@ test "local scope comes from policy and invalid state-changing observers fail cl
         try std.testing.expectError(error.InvalidToolSessionAccess, access(invalid.value));
         try std.testing.expectError(error.InvalidToolSessionAccess, localAllowed(.mutate, false, invalid.value));
     }
+}
+
+test "execute is parallel to mutate: neither scope implies the other" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(Value, a, "{\"name\":\"execute_call\",\"annotations\":{\"readOnlyHint\":false,\"xodbSessionAccess\":\"executor\"}}", .{});
+    defer parsed.deinit();
+    try std.testing.expect(!try localAllowed(.observe, false, parsed.value));
+    try std.testing.expect(!try localAllowed(.control, false, parsed.value));
+    try std.testing.expect(!try localAllowed(.mutate, false, parsed.value));
+    try std.testing.expect(try localAllowed(.execute, false, parsed.value));
+    const mutator = try std.json.parseFromSlice(Value, a, "{\"name\":\"write_memory\",\"annotations\":{\"readOnlyHint\":false,\"xodbSessionAccess\":\"mutator\"}}", .{});
+    defer mutator.deinit();
+    try std.testing.expect(!try localAllowed(.execute, false, mutator.value));
+    const controller = try std.json.parseFromSlice(Value, a, "{\"name\":\"continue\",\"annotations\":{\"readOnlyHint\":false,\"xodbSessionAccess\":\"controller\"}}", .{});
+    defer controller.deinit();
+    try std.testing.expect(try localAllowed(.execute, false, controller.value));
+    // The C service is the shared authority; the ceiling is not an ordinal.
+    const Grant = struct { scope: c_uint, required: c_uint, granted: bool };
+    for ([_]Grant{
+        .{ .scope = c.XSVC_EXECUTE, .required = c.XSVC_CONTROL, .granted = true },
+        .{ .scope = c.XSVC_EXECUTE, .required = c.XSVC_MUTATE, .granted = false },
+        .{ .scope = c.XSVC_EXECUTE, .required = c.XSVC_EXECUTE, .granted = true },
+        .{ .scope = c.XSVC_MUTATE, .required = c.XSVC_EXECUTE, .granted = false },
+        .{ .scope = c.XSVC_MUTATE, .required = c.XSVC_MUTATE, .granted = true },
+        .{ .scope = c.XSVC_CONTROL, .required = c.XSVC_EXECUTE, .granted = false },
+        .{ .scope = c.XSVC_OBSERVE, .required = c.XSVC_CONTROL, .granted = false },
+        .{ .scope = c.XSVC_OBSERVE, .required = c.XSVC_OBSERVE, .granted = true },
+    }) |row| try std.testing.expectEqual(row.granted, c.xsvc_scope_grants(row.scope, row.required));
+    try std.testing.expectEqual(@as(c_uint, c.XSVC_EXECUTE), @intFromEnum(@import("../model/session.zig").AgentScope.execute));
 }

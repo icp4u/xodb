@@ -94,7 +94,10 @@ enum xrt_status {
     /* Appended so earlier values stay stable. A current agent sends this when
      * its shared file table is full. An older agent still reports that case
      * as XRT_FILE_UNAVAILABLE. */
-    XRT_FILE_SLOT_LIMIT
+    XRT_FILE_SLOT_LIMIT,
+    /* Appended. Continue, step and detach while an inferior call frame is
+     * active on this target; resolve it first. */
+    XRT_CALL_FRAME_ACTIVE
 };
 
 #endif

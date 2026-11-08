@@ -30,7 +30,11 @@ spec = importlib.util.spec_from_file_location('display', root/'tests/helpers/dis
 display = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(display)
 display.WORK = str(root/'.work'/('vkx-'+str(time.time_ns())[-9:]))
-d = display.Display('soak')
+# Pin only this amplifier's private compositor: the rest of periodic-gui keeps
+# automatic GPU selection. The exit race is much easier to observe on NVIDIA.
+render_node = display.nvidia_render_node()
+d = display.Display('soak', render_node=render_node)
+print(f'vulkan-exit-soak: compositor render node {render_node or "automatic (no NVIDIA render node found)"}', flush=True)
 rows = []
 started = time.monotonic()
 try:
@@ -72,6 +76,7 @@ try:
         print(json.dumps(row), flush=True)
     assert not any(row['problems'] for row in rows), [row for row in rows if row['problems']]
 finally:
-    (Path(d.dir)/'results.json').write_text(json.dumps(dict(seconds=time.monotonic()-started, runs=rows), indent=2)+'\n')
+    (Path(d.dir)/'results.json').write_text(json.dumps(dict(seconds=time.monotonic()-started,
+        compositor_render_node=render_node, runs=rows), indent=2)+'\n')
     d.close()
     print(d.dir, flush=True)

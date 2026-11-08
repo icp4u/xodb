@@ -177,6 +177,7 @@ pub const State = struct {
                 return entry;
             }
         };
+        if (kind == .image and modules.metadataNotElf(region)) return error.NotElf;
         if (kind == .image) for (self.image_refusals) |slot| if (slot) |old| {
             const r = old.region;
             if (old.epoch != self.epoch or r.start != region.start or r.end != region.end or r.offset != region.offset or
@@ -227,14 +228,20 @@ pub const State = struct {
         if (kind == .image) {
             const image_budget = @import("../binary/snapshot.zig");
             const limit = runtime.c.xrt_target_remote_image_limit(modules.target);
-            if (identity.size < 4) return error.NotElf;
+            if (identity.size < 4) {
+                modules.rememberMetadataNotElf(region, @bitCast(identity));
+                return error.NotElf;
+            }
             const size: u64 = @intCast(identity.size);
             var magic: [4]u8 = undefined;
             try runtime.check(@intCast(c.xrt_file_view_read(view, 0, &magic, magic.len)));
             const elf = std.mem.eql(u8, &magic, "\x7fELF");
             const container = std.mem.eql(u8, &magic, "PK\x03\x04");
             image_container = container;
-            if (!elf and !container) return error.NotElf;
+            if (!elf and !container) {
+                modules.rememberMetadataNotElf(region, @bitCast(identity));
+                return error.NotElf;
+            }
             // Only a complete-file worker feeds the APK/container parser.
             // Ordinary ELF images use the ranged debugger projection below.
             if (container and !complete_file) return if (coverage == .sections) error.DebugMetadataContainer else error.NotElf;

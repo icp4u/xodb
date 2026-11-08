@@ -20,6 +20,8 @@ bool xrt_gdb_detach_holds_link(const struct xrt_gdb *);
 bool xrt_gdb_detach_confirmed(const struct xrt_gdb *);
 void xrt_gdb_info(const struct xrt_gdb *, struct xrt_gdb_info *);
 enum xrt_status xrt_gdb_thread_info(const struct xrt_gdb *, int32_t, struct xrt_gdb_thread_info *);
+/* Stopped thread that is not in the stub's thread list. Resume will not select it. */
+enum xrt_status xrt_gdb_add_memory_thread(struct xrt_gdb *, struct xrt_target *, int32_t tid);
 enum xrt_status xrt_gdb_regions(struct xrt_gdb *, struct xrt_target *, struct xrt_gdb_region *,
                                 size_t, size_t *);
 enum xrt_status xrt_gdb_images(struct xrt_gdb *, struct xrt_target *, struct xrt_gdb_image *,

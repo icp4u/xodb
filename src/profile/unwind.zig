@@ -136,14 +136,21 @@ pub const Batch = struct {
     fn fingerprint(self: *Batch, module: anytype) ![32]u8 {
         if (self.fingerprints.get(module.id)) |digest| return digest;
         var asset_hash = std.crypto.hash.sha2.Sha256.init(.{});
+        // Like the archive identity, a remote capture may hold a debugger
+        // projection; the fingerprint then describes those bytes.
+        const Asset = switch (@typeInfo(@TypeOf(module))) {
+            .pointer => |p| p.child,
+            else => @TypeOf(module),
+        };
+        const bytes = if (@hasDecl(Asset, "imageAllowingProjection")) module.imageAllowingProjection(.unwind_fingerprint) else module.mapping;
         var offset: usize = 0;
-        while (offset < module.mapping.len) {
+        while (offset < bytes.len) {
             try cancelled(self.cancel);
-            const end = @min(module.mapping.len, offset + 1024 * 1024);
-            asset_hash.update(module.mapping[offset..end]);
+            const end = @min(bytes.len, offset + 1024 * 1024);
+            asset_hash.update(bytes[offset..end]);
             offset = end;
         }
-        self.hashed_bytes += module.mapping.len;
+        self.hashed_bytes += bytes.len;
         const digest = asset_hash.finalResult();
         try self.fingerprints.put(self.allocator, module.id, digest);
         return digest;
@@ -154,7 +161,7 @@ pub const Batch = struct {
         if (slot.*) |*old| old.image.deinit();
         slot.* = null;
         // Private libdw handle: no cache shared with the UI/event loop.
-        slot.* = .{ .id = module.id, .image = try info.Image.initWithAllocator(module.image, module.mapping, self.allocator) };
+        slot.* = .{ .id = module.id, .image = try info.Image.initWithAllocator(module.image, module.debuggerImage().projectedBytes(), self.allocator) };
         self.debug_next = (self.debug_next + 1) % max_debug;
         return &slot.*.?.image;
     }

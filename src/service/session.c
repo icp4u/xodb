@@ -270,9 +270,19 @@ bool xsvc_disconnected(const struct xsvc *s, uint64_t id)
     return (result < 0 && errno != EINTR) ||
         (result > 0 && (fd.revents & (POLLHUP | POLLERR | POLLNVAL)) != 0);
 }
+bool xsvc_scope_grants(unsigned scope, unsigned required)
+{
+    switch (required) {
+    case XSVC_OBSERVE: return scope <= XSVC_EXECUTE;
+    case XSVC_CONTROL: return scope == XSVC_CONTROL || scope == XSVC_MUTATE || scope == XSVC_EXECUTE;
+    case XSVC_MUTATE: return scope == XSVC_MUTATE;
+    case XSVC_EXECUTE: return scope == XSVC_EXECUTE;
+    default: return false;
+    }
+}
 enum xsvc_result xsvc_tick(struct xsvc *s, uint64_t now, unsigned scope)
 {
-    if (!owned(s) || now < s->now_ns || scope > XSVC_MUTATE)
+    if (!owned(s) || now < s->now_ns || scope > XSVC_EXECUTE)
         return XSVC_BAD_REQUEST;
     const bool changed = scope != s->scope;
     if (!room(s, (unsigned)due(s, now) + (unsigned)changed))
@@ -341,7 +351,7 @@ enum xsvc_result xsvc_revoke(struct xsvc *s, uint64_t now)
 enum xsvc_result xsvc_authorize(struct xsvc *s, uint64_t id, unsigned required, uint64_t now)
 {
     enum xsvc_result result = valid(s, id, now);
-    if (required > XSVC_MUTATE)
+    if (required > XSVC_EXECUTE)
         return XSVC_BAD_REQUEST;
     if (result != XSVC_OK)
         return result;
@@ -349,7 +359,7 @@ enum xsvc_result xsvc_authorize(struct xsvc *s, uint64_t id, unsigned required, 
     if (!room(s, due(s, now) || required != XSVC_OBSERVE ? 1 : 0))
         return XSVC_LIMIT;
     advance(s, now);
-    if (required > s->scope)
+    if (!xsvc_scope_grants(s->scope, required))
         return XSVC_SCOPE_DENIED;
     return required == XSVC_OBSERVE || s->controller == id ? XSVC_OK : XSVC_CONTROL_REQUIRED;
 }

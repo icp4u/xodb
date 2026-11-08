@@ -523,3 +523,9 @@ function discovery, PE/Mach-O input, or arm64 input yet. Parameters are the deco
 matched by ABI storage, and a parameter with no input varnode is not listed. The
 cache does not outlive the session. Source citations need DWARF line tables in
 the session.
+
+For a module read through a runtime agent, Ghidra receives the bounded debugger
+section projection: mapped bytes and allowlisted metadata retain their file
+offsets, while other non-allocated sections are zero-filled. Ghidra's cache key
+and a profile archive's image identity deliberately hash that projection when
+it is the available snapshot; those hashes do not identify the complete file.

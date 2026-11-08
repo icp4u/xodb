@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from helpers.exact import assert_reply_exact
 from helpers.tasks import children as task_children
+from helpers.environment import ensure as ensure_test_environment
+ensure_test_environment()
 # Tests never adopt or start the user's Ghidra sidecar; the sidecar tests set their own.
 os.environ.setdefault('XODB_GHIDRA_SIDECAR', 'off')
 

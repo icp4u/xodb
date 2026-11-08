@@ -41,7 +41,9 @@ test "enroll held newborn transactionally, reject budget and reuse, retire drain
     target.new_thread_observer = .{ .context = &probe, .before_resume = Probe.born };
     defer target.new_thread_observer = null;
     try target.continueExecution();
-    const deadline = linux.now() + 2_000_000_000;
+    // The fixture consumes thread CPU time, not wall time. Wait for each
+    // lifecycle phase with a hang ceiling rather than a throughput budget.
+    var deadline = linux.now() + 60 * std.time.ns_per_s;
     while (probe.calls == 0 and linux.now() < deadline) {
         try target.poll();
         _ = c.usleep(1000);
@@ -55,6 +57,7 @@ test "enroll held newborn transactionally, reject budget and reuse, retire drain
     const enrolled_tid = collector.thread(1).?.tid;
     var new_samples: usize = 0;
     var new_mappings: usize = 0;
+    deadline = linux.now() + 60 * std.time.ns_per_s;
     while (target.snapshot().state != .exited and linux.now() < deadline) {
         try target.poll();
         const batch = collector.drain();

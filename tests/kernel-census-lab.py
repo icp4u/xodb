@@ -37,7 +37,11 @@ subprocess.run(['zig', 'build-exe', '-OReleaseSafe', '-lc', '-target', 'x86_64-l
                check=True, timeout=120)
 manifest = work / 'initramfs.list'
 manifest.write_text('dir /dev 0755 0 0\nnod /dev/console 0600 0 0 c 5 1\n'
-                    'dir /proc 0555 0 0\nfile /init ' + str(probe) + ' 0755 0 0\n')
+                    'dir /proc 0555 0 0\nfile /init ' + str(probe) + ' 0755 0 0\n'
+                    # kl-run requires the image's kg0_test.ko to match the kit's
+                    # module; the probe never loads it.
+                    'dir /lib 0755 0 0\ndir /lib/modules 0755 0 0\n'
+                    'file /lib/modules/kg0_test.ko ' + str(kernel / 'kg0-module/kg0_test.ko') + ' 0644 0 0\n')
 cpio = subprocess.check_output([str(kernel / 'usr/gen_init_cpio'), str(manifest)], timeout=10)
 with gzip.open(work / 'initramfs/x86_64-orc.cpio.gz', 'wb') as stream:
     stream.write(cpio)
@@ -57,7 +61,8 @@ with (work / 'lease.lock').open('w') as lease:
         result = None
         while result is None:
             text = console.read_text(errors='replace') if console.exists() else ''
-            for line in text.splitlines():
+            # Only finished lines: the probe's JSON may still be arriving.
+            for line in text.split('\n')[:-1]:
                 if line.startswith('{"tasks":'):
                     result = json.loads(line)
                     break
@@ -76,4 +81,5 @@ with (work / 'lease.lock').open('w') as lease:
         print('Evidence:', work.relative_to(root))
     finally:
         if run is not None:
-            subprocess.run([str(lab / 'kit/kl-stop'), str(run)], check=True, timeout=15)
+            # kl-stop itself may take 10 s for TERM plus 5 s for KILL.
+            subprocess.run([str(lab / 'kit/kl-stop'), str(run)], check=True, timeout=30)

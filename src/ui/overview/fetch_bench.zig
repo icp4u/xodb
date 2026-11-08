@@ -206,8 +206,14 @@ test "a tiny bench run measures every phase, saves and reloads" {
     var dir_buf: [256]u8 = undefined;
     const tmp = if (c.getenv("TMPDIR")) |t| std.mem.span(t) else "/tmp";
     const dir = try std.fmt.bufPrintZ(&dir_buf, "{s}/xodb-fetch-bench-{d}", .{ tmp, c.getpid() });
+    const saved_state = if (c.getenv("XDG_STATE_HOME")) |value| try a.dupeZ(u8, std.mem.span(value)) else null;
+    defer if (saved_state) |value| a.free(value);
     _ = c.setenv("XDG_STATE_HOME", dir.ptr, 1);
-    defer _ = c.unsetenv("XDG_STATE_HOME");
+    defer {
+        if (saved_state) |value| {
+            _ = c.setenv("XDG_STATE_HOME", value.ptr, 1);
+        } else _ = c.unsetenv("XDG_STATE_HOME");
+    }
     var progress = Progress{};
     const r = try run(a, 1, &progress);
     try std.testing.expect(r.sha_one_mbs > 0 and r.sha_all_mbs > 0 and r.memcpy_gbs > 0 and r.latency_ns > 0);

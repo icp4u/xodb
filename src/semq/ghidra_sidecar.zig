@@ -407,7 +407,22 @@ fn fail(a: Allocator, out: *Failure, code: []const u8, comptime format: []const 
     return error.SidecarFailed;
 }
 
+/// One start or replacement at a time. The startup prestart and a first
+/// request would otherwise both see an incompatible sidecar, and the second
+/// starter would shut down the replacement the first one is about to greet.
+var ensure_gate: std.atomic.Mutex = .unlocked;
+
 fn ensure(a: Allocator, endpoint: Endpoint, cancel: *const std.atomic.Value(bool), deadline: u64, stage: *std.atomic.Value(Stage), failure: *Failure) !void {
+    while (!ensure_gate.tryLock()) {
+        if (cancel.load(.acquire)) return fail(a, failure, "cancelled", "sidecar request cancelled", .{});
+        if (nowNs() >= deadline) return fail(a, failure, "sidecar_timeout", "another Ghidra sidecar start did not finish before this request's deadline", .{});
+        _ = c.poll(null, 0, 10);
+    }
+    defer ensure_gate.unlock();
+    return ensureLocked(a, endpoint, cancel, deadline, stage, failure);
+}
+
+fn ensureLocked(a: Allocator, endpoint: Endpoint, cancel: *const std.atomic.Value(bool), deadline: u64, stage: *std.atomic.Value(Stage), failure: *Failure) !void {
     var seen: []const u8 = "no answering socket";
     var observed_producer: ?[]const u8 = null;
     if (hello(a, endpoint.socket_path, cancel, @min(deadline, nowNs() + 2 * std.time.ns_per_s))) |reply| {

@@ -214,6 +214,8 @@ pub const Source = struct {
                         if (marker.offset_ns > start) try stopSpan(a, &out, omitted, .{ .from_ns = start, .to_ns = marker.offset_ns, .kind = .debugger_stop, .tid = @intCast(thread.perf.tid) });
                         from = null;
                     },
+                    // A debugger-started call is marked, not a stop boundary.
+                    .execution => {},
                 }
             }
             if (from) |start| if (capture.debugger_marker_dropped == 0 and extent > start) try stopSpan(a, &out, omitted, .{ .from_ns = start, .to_ns = extent, .kind = .debugger_stop, .tid = @intCast(thread.perf.tid) });

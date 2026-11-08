@@ -98,6 +98,88 @@ fn concreteScopesAt(a: std.mem.Allocator, die: *c.Dwarf_Die, pc: u64) ![]c.Dwarf
     };
     return lexical;
 }
+/// Strip typedefs and qualifiers to the defining type DIE.
+fn underlying(die: *c.Dwarf_Die) void {
+    var depth: usize = 0;
+    while (depth < 64) : (depth += 1) {
+        switch (c.dwarf_tag(die)) {
+            std.dwarf.TAG.typedef, std.dwarf.TAG.const_type, std.dwarf.TAG.volatile_type, std.dwarf.TAG.restrict_type, std.dwarf.TAG.atomic_type => die.* = reference(die, std.dwarf.AT.type) orelse return,
+            else => return,
+        }
+    }
+}
+/// A C++ class that must not be copied as bytes for a by-value argument or
+/// return: DW_CC_pass_by_reference (DWARF 5), or, when the producer omits
+/// that, a user-declared copy/move constructor or destructor on the class,
+/// a base or a member (Itanium ABI "non-trivial for the purposes of calls").
+/// Compiler-generated members are DW_AT_artificial and do not count.
+fn byReference(type_die: *c.Dwarf_Die) bool {
+    return nontrivial(type_die, 0);
+}
+fn nontrivial(type_die: *c.Dwarf_Die, depth: usize) bool {
+    if (depth > 8) return true;
+    var die = type_die.*;
+    underlying(&die);
+    const tag = c.dwarf_tag(&die);
+    if (tag == std.dwarf.TAG.array_type) {
+        var element = reference(&die, std.dwarf.AT.type) orelse return false;
+        return nontrivial(&element, depth + 1);
+    }
+    if (tag != std.dwarf.TAG.structure_type and tag != std.dwarf.TAG.class_type and tag != std.dwarf.TAG.union_type) return false;
+    if (unsigned(&die, std.dwarf.AT.calling_convention)) |convention| return convention == 4;
+    const class_name = name(&die);
+    var child: c.Dwarf_Die = undefined;
+    if (c.dwarf_child(&die, &child) != 0) return false;
+    var scanned: usize = 0;
+    while (scanned < 4096) : (scanned += 1) {
+        switch (c.dwarf_tag(&child)) {
+            std.dwarf.TAG.inheritance, std.dwarf.TAG.member => if (c.dwarf_hasattr(&child, std.dwarf.AT.external) == 0) {
+                if (reference(&child, std.dwarf.AT.type)) |ref| {
+                    var t = ref;
+                    if (nontrivial(&t, depth + 1)) return true;
+                }
+            },
+            std.dwarf.TAG.subprogram => if (c.dwarf_hasattr(&child, std.dwarf.AT.artificial) == 0) {
+                const member = name(&child);
+                if (member.len == class_name.len + 1 and member[0] == '~' and std.mem.eql(u8, member[1..], class_name)) return true;
+                if (class_name.len > 0 and std.mem.eql(u8, member, class_name) and copiesSelf(&child, &die)) return true;
+            },
+            else => {},
+        }
+        if (c.dwarf_siblingof(&child, &child) != 0) return false;
+    }
+    return true;
+}
+/// A constructor whose first explicit parameter is a reference to its class.
+fn copiesSelf(constructor: *c.Dwarf_Die, class: *c.Dwarf_Die) bool {
+    var parameter: c.Dwarf_Die = undefined;
+    if (c.dwarf_child(constructor, &parameter) != 0) return false;
+    var scanned: usize = 0;
+    while (scanned < 64) : (scanned += 1) {
+        if (c.dwarf_tag(&parameter) == std.dwarf.TAG.formal_parameter and c.dwarf_hasattr(&parameter, std.dwarf.AT.artificial) == 0) {
+            var t = reference(&parameter, std.dwarf.AT.type) orelse return false;
+            const tag = c.dwarf_tag(&t);
+            if (tag != std.dwarf.TAG.reference_type and tag != std.dwarf.TAG.rvalue_reference_type) return false;
+            var pointee = reference(&t, std.dwarf.AT.type) orelse return false;
+            underlying(&pointee);
+            return c.dwarf_dieoffset(&pointee) == c.dwarf_dieoffset(class);
+        }
+        if (c.dwarf_siblingof(&parameter, &parameter) != 0) return false;
+    }
+    return false;
+}
+fn hasInheritance(type_die: *c.Dwarf_Die) bool {
+    var die = type_die.*;
+    underlying(&die);
+    var child: c.Dwarf_Die = undefined;
+    if (c.dwarf_child(&die, &child) != 0) return false;
+    var scanned: usize = 0;
+    while (scanned < 4096) : (scanned += 1) {
+        if (c.dwarf_tag(&child) == std.dwarf.TAG.inheritance) return true;
+        if (c.dwarf_siblingof(&child, &child) != 0) return false;
+    }
+    return true;
+}
 /// Go's linker (and DWARF 2/3 producers) encode exprloc-class attributes as
 /// DW_FORM_block1, which libdw rejects in DWARF 5 units. A block1 length below
 /// 0x80 is byte-identical to exprloc's ULEB128 length, so relabel only that case.
@@ -543,6 +625,89 @@ pub const Image = struct {
             return result;
         }
         return error.NoFunctionRange;
+    }
+    pub const Parameter = struct { name: []const u8, type: *const eval.Type, artificial: bool, nontrivial_class: bool };
+    /// The compiler-declared signature of the concrete function entered at
+    /// `entry`. A class whose DW_AT_calling_convention is pass-by-reference
+    /// (a non-trivial copy constructor or destructor) is flagged, never
+    /// guessed from its fields.
+    pub const Prototype = struct {
+        name: []const u8,
+        return_type: ?*const eval.Type,
+        return_nontrivial_class: bool,
+        parameters: []const Parameter,
+        variadic: bool,
+        member: bool,
+        virtual: bool,
+        vtable_index: ?u64,
+        template: bool,
+        inheritance: bool,
+    };
+    pub fn prototypeAt(self: *Image, a: std.mem.Allocator, entry: u64) !Prototype {
+        const unit = try self.unitAt(entry);
+        const scopes = try concreteScopesAt(a, try self.scopeDie(unit), entry);
+        defer a.free(scopes);
+        for (scopes) |*die| {
+            if (c.dwarf_tag(die) != std.dwarf.TAG.subprogram) continue;
+            var low: c.Dwarf_Addr = 0;
+            if (c.dwarf_lowpc(die, &low) != 0 or low != entry) return error.NotFunctionEntry;
+            var result = Prototype{ .name = try a.dupe(u8, name(die)), .return_type = null, .return_nontrivial_class = false, .parameters = &.{}, .variadic = false, .member = false, .virtual = false, .vtable_index = null, .template = false, .inheritance = false };
+            if (reference(die, std.dwarf.AT.type)) |ref| {
+                var t = ref;
+                result.return_type = try self.typeOf(t, 0);
+                result.return_nontrivial_class = byReference(&t);
+            }
+            result.virtual = (unsigned(die, std.dwarf.AT.virtuality) orelse 0) != 0;
+            var attr: c.Dwarf_Attribute = undefined;
+            if (c.dwarf_attr_integrate(die, std.dwarf.AT.vtable_elem_location, &attr) != null) {
+                exprloc(&attr);
+                var ops: [*c]c.Dwarf_Op = null;
+                var len: usize = 0;
+                if (c.dwarf_getlocation(&attr, &ops, &len) == 0 and len == 1 and ops[0].atom == std.dwarf.OP.constu) result.vtable_index = ops[0].number;
+                if (result.vtable_index == null) return error.VtableLayoutUnsupported;
+            }
+            var parameters: std.ArrayList(Parameter) = .empty;
+            // Template parameters live on the definition or its declaration.
+            var holders: [2]c.Dwarf_Die = undefined;
+            var holder_count: usize = 1;
+            holders[0] = die.*;
+            if (reference(die, std.dwarf.AT.specification)) |spec| {
+                holders[1] = spec;
+                holder_count = 2;
+            }
+            for (holders[0..holder_count], 0..) |*holder, h| {
+                var child: c.Dwarf_Die = undefined;
+                if (c.dwarf_child(holder, &child) != 0) continue;
+                var scanned: usize = 0;
+                while (scanned < 4096) : (scanned += 1) {
+                    switch (c.dwarf_tag(&child)) {
+                        std.dwarf.TAG.template_type_param, std.dwarf.TAG.template_value_param => result.template = true,
+                        std.dwarf.TAG.unspecified_parameters => result.variadic = true,
+                        std.dwarf.TAG.formal_parameter => if (h == 0) {
+                            var t = reference(&child, std.dwarf.AT.type) orelse return error.ParameterTypeUnavailable;
+                            const artificial = c.dwarf_hasattr(&child, std.dwarf.AT.artificial) != 0;
+                            if (artificial and parameters.items.len == 0) {
+                                result.member = true;
+                                var pointee = t;
+                                if (reference(&pointee, std.dwarf.AT.type)) |class_die| {
+                                    var class = class_die;
+                                    result.inheritance = hasInheritance(&class);
+                                }
+                            }
+                            try parameters.append(a, .{ .name = try a.dupe(u8, name(&child)), .type = try self.typeOf(t, 0), .artificial = artificial, .nontrivial_class = byReference(&t) });
+                            if (parameters.items.len == 64) return error.TooManyParameters;
+                        },
+                        else => {},
+                    }
+                    const next = c.dwarf_siblingof(&child, &child);
+                    if (next == 1) break;
+                    if (next < 0) return error.MalformedDebugInfo;
+                }
+            }
+            result.parameters = try parameters.toOwnedSlice(a);
+            return result;
+        }
+        return error.NoFunctionPrototype;
     }
     pub fn rowsForLine(self: *Image, a: std.mem.Allocator, path: []const u8, line: u32) ![]Site {
         try self.loadUnits();

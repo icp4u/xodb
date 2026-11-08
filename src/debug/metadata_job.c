@@ -202,7 +202,7 @@ static int dwarf_section_name(const char *name) {
     static const char *const known[] = {
         "abbrev", "addr", "aranges", "cu_index", "frame", "info", "line",
         "line_str", "loc", "loclists", "macro", "macinfo", "names",
-        "pubnames", "pubtypes", "ranges", "rnglists", "str", "str_offsets",
+        "gnu_pubnames", "gnu_pubtypes", "pubnames", "pubtypes", "ranges", "rnglists", "str", "str_offsets",
         "sup", "tu_index", "types",
     };
     for (size_t i = 0; i < sizeof known / sizeof *known; ++i)
