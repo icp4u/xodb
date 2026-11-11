@@ -749,13 +749,9 @@ pub const Session = struct {
         var tids: [perf.max_threads]i32 = undefined;
         var identities: [perf.max_threads]u64 = undefined;
         var count: usize = 0;
-        var unselected: usize = 0;
         for (self.target.threadSlice()) |thread| {
             if (thread.state == .exited) continue;
-            if (request.tids.len > 0 and std.mem.indexOfScalar(i32, request.tids, thread.tid) == null) {
-                unselected += 1;
-                continue;
-            }
+            if (request.tids.len > 0 and std.mem.indexOfScalar(i32, request.tids, thread.tid) == null) continue;
             if (thread.state != .stopped) return error.NotStopped;
             if (count == tids.len) return error.ProfileThreadLimit;
             tids[count] = thread.tid;
@@ -794,10 +790,16 @@ pub const Session = struct {
                 capture.debugger_sequence = self.target.snapshot().sequence;
                 capture.addMarker(.{ .offset_ns = 0, .sequence = self.target.snapshot().sequence, .tid = self.target.snapshot().pid, .kind = .capture_open_stopped });
                 self.profile_failure = null;
-                capture.unselected_threads = unselected;
-                if (unselected > 0) {
+                // One count for every live task the capture did not open.
+                // Poll uses the same count, so a thread omitted here is not a
+                // later scope change. A task that appears after this still is.
+                const omitted = self.omittedProfileThreads(capture);
+                capture.unselected_threads = omitted;
+                if (omitted > 0) {
                     capture.trusted_before_ns = 0;
-                    capture.diagnostic = "unselected threads may change mappings; addresses retained without symbols";
+                    // A capped ring already explains the missing threads.
+                    const capped = if (capture.ring_limit) |limit| limit.kind == .capped else false;
+                    if (!capped) capture.diagnostic = "unselected threads may change mappings; addresses retained without symbols";
                 }
                 self.next_profile_id += 1;
                 return capture.id;
@@ -878,6 +880,17 @@ pub const Session = struct {
         self.retireProfileThreads(capture);
         capture.enroll(thread.tid, thread.id, now);
     }
+    /// Live tasks this capture does not include. Newborns stay out while
+    /// follow is on, the same threads enroll will attach. Open and poll
+    /// share the count.
+    fn omittedProfileThreads(self: *Session, capture: *const profile.Capture) usize {
+        var count: usize = 0;
+        for (self.target.threadSlice()) |thread| {
+            if (capture.config.follow_threads and thread.newborn) continue;
+            if (thread.state != .exited and !capture.includesThread(thread.tid)) count += 1;
+        }
+        return count;
+    }
     fn pollProfile(self: *Session) void {
         const capture = self.profile orelse return;
         if (capture.collector == null) return;
@@ -894,11 +907,7 @@ pub const Session = struct {
         } else if (self.target.snapshot().state == .idle or self.target.snapshot().state == .exited) {
             capture.stop(.target_ended, now);
         } else {
-            var unselected: usize = 0;
-            for (self.target.threadSlice()) |thread| {
-                if (capture.config.follow_threads and thread.newborn) continue;
-                if (thread.state != .exited and !capture.includesThread(thread.tid)) unselected += 1;
-            }
+            const unselected = self.omittedProfileThreads(capture);
             if (unselected != capture.unselected_threads) {
                 capture.unselected_threads = unselected;
                 capture.revision += 1;
@@ -2374,8 +2383,17 @@ pub const Session = struct {
             error.AgentFileSlotLimit => {},
             else => return err,
         };
-        const raw_registers = try self.target.registers(tid);
-        var registers = loc.registers(raw_registers);
+        const raw_registers = self.target.registers(tid) catch |err| switch (err) {
+            // No CPU bank. A zero PC is the walker's cue to use saved thread state.
+            error.KernelTaskNotCpu => null,
+            else => return err,
+        };
+        var registers = if (raw_registers) |raw| loc.registers(raw) else blank: {
+            var set: loc.RegisterSet = @splat(null);
+            const slot = self.target.arch().pc();
+            if (slot < set.len) set[slot] = 0;
+            break :blank set;
+        };
         var frames: std.ArrayList(Frame) = .empty;
         self.metadata.beginQuery();
         // Set when the caller PC is an interrupted instruction, not a return address.
@@ -2388,7 +2406,7 @@ pub const Session = struct {
             var pc = if (slot < registers.len)
                 registers[slot] orelse break
             else if (frames.items.len == 0)
-                linux.programCounter(raw_registers) catch break
+                if (raw_registers) |raw| linux.programCounter(raw) catch break else break
             else
                 registers[arch_.ra()] orelse break;
             var kernel_return = false;

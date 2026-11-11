@@ -198,12 +198,13 @@ for subset in (False,True):
         tids=[t['tid'] for t in stop['threads'] if t['state']!='exited']
         assert len(tids)==2,stop
         selected=tids[:1] if subset else tids
-        opened=client.action('start_profile',tids=selected,frequency_hz=199,duration_ms=5000)['capture']
+        # No wall deadline. A 5 s duration expired under load before stop_profile.
+        # The wait is a hang ceiling: each selected thread must record 10 user
+        # ticks (~20 samples at 199 Hz), or the test fails at 60 s.
+        opened=client.action('start_profile',tids=selected,frequency_hz=199,duration_ms=0)['capture']
         assert len(perf_fds(client))==len(selected)
         client.action('continue')
-        # 10 ticks of user CPU per selected thread is ~20 samples at 199 Hz.
-        began=time.monotonic()
-        for tid in selected: run_until(stop['pid'],lambda d:d[0]>=10,max(0,.45-(time.monotonic()-began)),tids={tid})
+        for tid in selected: run_until(stop['pid'],lambda d:d[0]>=10,0,tids={tid},seconds=60)
         capture=client.action('stop_profile',capture_id=opened['id'])['capture']
         data=graph(client,capture)
         counts=[graph(client,capture,tid=tid)['samples'] for tid in selected]
@@ -236,7 +237,26 @@ for mode in ('kernel', 'sleep', 'many'):
         before=cpu_ticks(pid)  # all tasks are stopped: equals xodb's start snapshot
         # The stop below is manual; the duration only bounds a failed run.
         opened=client.action('start_profile',duration_ms=30000,frequency_hz=199)['capture']
-        assert len(perf_fds(client))==count
+        # A pinned-page ceiling may keep a prefix. Full coverage stays required
+        # when every requested ring mapped (no ring_limit, or a shrunk ring).
+        capped=mode=='many' and opened.get('ring_limit') and opened['ring_limit']['kind']=='capped'
+        if capped:
+            limit=opened['ring_limit']
+            assert 'perf_event_mlock_kb' in limit['limit'] and 'RLIMIT_MEMLOCK' in limit['limit'],limit
+            fds=perf_fds(client)
+            brief={k:v for k,v in limit.items() if k!='unsampled_tids'}
+            assert limit['opened_threads']==len(fds)<count,(len(fds),brief,sorted(set(fds))[:4])
+            assert limit['requested_threads']==count and limit['opened_threads']==len(opened['threads']),limit
+            sampled={t['perf']['tid'] for t in opened['threads']}
+            unsampled=set(limit['unsampled_tids'])
+            assert len(unsampled)==count-limit['opened_threads'] and not unsampled&sampled,limit
+            assert unsampled|sampled=={t['tid'] for t in stop['threads'] if t['state']!='exited'},limit
+            # Unsampled threads are known at open: the capture keeps collecting.
+            assert opened['unselected_threads']==len(unsampled),(opened['unselected_threads'],len(unsampled))
+            state=client.inspect('get_profile')['capture']
+            assert state['status']=='collecting' and len(perf_fds(client))==limit['opened_threads'],(state['status'],state['stop_reasons'],len(perf_fds(client)))
+        else:
+            assert len(perf_fds(client))==count
         client.action('continue')
         # Kernel and many: the busy thread must have spent >300 ms of CPU
         # (31+ ticks; 40 leaves margin) before the stop, whatever the load.
@@ -250,7 +270,10 @@ for mode in ('kernel', 'sleep', 'many'):
         # between what had run when we stopped waiting and what had run after.
         low=(ms(ran[0]),ms(ran[1]));high=(ms(after[0]-before[0]),ms(after[1]-before[1]))
         assert low[0]<=cpu['user_ms']<=high[0] and low[1]<=cpu['kernel_ms']<=high[1],(cpu,low,high)
-        assert cpu['complete'] and cpu['available_threads']==count,cpu
+        if capped:
+            assert cpu['complete'] and cpu['available_threads']==opened['ring_limit']['opened_threads'],cpu
+        else:
+            assert cpu['complete'] and cpu['available_threads']==count,cpu
         assert capture['status']=='manual' and not perf_fds(client),capture
         if mode=='kernel':
             assert cpu['kernel_ms']>300 and cpu['kernel_ms']>5*cpu['user_ms'],cpu
@@ -266,6 +289,38 @@ for mode in ('kernel', 'sleep', 'many'):
     finally:
         (run/(mode+'.rpc.json')).write_text(json.dumps(client.transcript,indent=2)+'\n')
         client.close()
+
+# Two live threads and a two-page pin cannot both map a ring. The open must
+# sample one, report the other as omitted, and still be collecting after the
+# owner has polled. A read of the open reply alone hides that.
+os.environ['XODB_TEST_PIN_PAGES']='2'
+client=None
+try:
+    client=Client('control',fixture,args=['30','threads'])
+finally:
+    os.environ.pop('XODB_TEST_PIN_PAGES',None)
+try:
+    stop=checkpoint(client)
+    tids=[t['tid'] for t in stop['threads'] if t['state']!='exited']
+    assert len(tids)==2,stop
+    opened=client.action('start_profile',tids=tids,frequency_hz=199,duration_ms=0)['capture']
+    limit=opened.get('ring_limit') or {}
+    assert limit.get('kind')=='capped',limit
+    assert limit.get('data_pages')==1,limit
+    assert limit.get('opened_threads')==1 and opened['unselected_threads']==1,(limit,opened['unselected_threads'])
+    assert limit.get('unsampled_tids')==[tids[1]],limit
+    assert len(perf_fds(client))==1
+    for _ in range(2):
+        state=client.inspect('get_profile')['capture']
+        assert state['status']=='collecting' and state['unselected_threads']==1,(state['status'],state.get('stop_reasons'),state['unselected_threads'])
+        assert state['ring_limit']['data_pages']==1 and state['ring_limit']['unsampled_tids']==[tids[1]],state['ring_limit']
+        assert len(perf_fds(client))==1
+    stopped=client.action('stop_profile',capture_id=opened['id'])['capture']
+    assert stopped['status']=='manual' and not perf_fds(client),stopped
+    print('capped pin: one of two threads, still collecting after two polls',flush=True)
+finally:
+    (run/'capped-pin.rpc.json').write_text(json.dumps(client.transcript,indent=2)+'\n')
+    client.close()
 
 client=Client('observe',fixture,args=['1'])
 try:

@@ -61,3 +61,5 @@ else:
         results['old_agent_diagnostic'] = 'pass'
 (work / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
 print('Source fetch checks:', results, work)
+if os.environ.get('XODB_TEST_NO_LIVE'):
+    raise SystemExit(77)

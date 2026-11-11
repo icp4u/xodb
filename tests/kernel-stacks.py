@@ -15,7 +15,7 @@ os.chdir(root)
 
 def skip(reason):
     print('SKIP kernel stacks: ' + reason)
-    raise SystemExit(0)
+    raise SystemExit(77)
 
 
 def read_sysctl(name):

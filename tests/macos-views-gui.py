@@ -43,7 +43,7 @@ def main():
                 region.resize((region.width*2,region.height*2)).save(crop)
             shot=crop
         text=subprocess.run(['tesseract',shot,'stdout'],capture_output=True,text=True,check=True,
-                            env={**os.environ,'OMP_THREAD_LIMIT':'1'},timeout=10*scale).stdout
+                            env={**os.environ,'OMP_THREAD_LIMIT':'1'},timeout=max(30,10*scale)).stdout
         assert display.alive(),Path(display.log).read_text()
         (work/(name+'-ocr.txt')).write_text(text)
         return text

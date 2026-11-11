@@ -97,7 +97,10 @@ enum xrt_status {
     XRT_FILE_SLOT_LIMIT,
     /* Appended. Continue, step and detach while an inferior call frame is
      * active on this target; resolve it first. */
-    XRT_CALL_FRAME_ACTIVE
+    XRT_CALL_FRAME_ACTIVE,
+    /* A kernel task published from memory is not a CPU thread. The agent
+     * does not host that stub, so this value stays off the wire. */
+    XRT_KERNEL_TASK_NOT_CPU
 };
 
 #endif

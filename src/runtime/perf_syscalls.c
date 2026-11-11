@@ -162,7 +162,7 @@ static struct xrt_perf *start(int32_t pid, const int32_t *tids, size_t count, ui
         if (!i)
             attrs[i].flags |= (UINT64_C(1) << 9) | (UINT64_C(1) << 13) | (UINT64_C(1) << 24);
     }
-    struct xrt_perf *p = xrt_perf_create(16, 32, UINT64_MAX);
+    struct xrt_perf *p = xrt_perf_create(xrt_perf_fit_pages(16, count), 32, UINT64_MAX);
     if (!p) {
         xrt_perf_fail(f, "alloc", errno, -1, "syscall collector");
         return NULL;

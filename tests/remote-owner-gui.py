@@ -125,7 +125,7 @@ def retry_failure(display, work, result, scale):
     first = wait(lambda: row if (row := frame()) and row[3] > initial[3] else None, 'injected preparation was not attempted', timeout=10*scale)
     result['failure_observed'] = True
     shot = display.shot('persistent-failure')
-    visible = subprocess.run(['tesseract', shot, 'stdout'], capture_output=True, text=True, check=True, env={**os.environ, 'OMP_THREAD_LIMIT': '1'}, timeout=10*scale).stdout
+    visible = subprocess.run(['tesseract', shot, 'stdout'], capture_output=True, text=True, check=True, env={**os.environ, 'OMP_THREAD_LIMIT': '1'}, timeout=max(30,10*scale)).stdout
     (work/'failure-ocr.txt').write_text(visible)
     assert 'OutOfMemory' in visible and 'last confirmed' in visible, visible
     started = time.monotonic()

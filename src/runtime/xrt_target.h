@@ -216,8 +216,9 @@ enum xrt_status xrt_target_core(struct xrt_target *target, int32_t pid,
 /* Append stopped threads to a core target. The ids are assigned here. */
 enum xrt_status xrt_target_core_extend(struct xrt_target *target, const struct xrt_thread *threads,
                                        size_t count);
-/* A stopped task read from kernel memory. It is not a stub thread: continue
- * and step refuse it, and a register read is an empty bank for the walker. */
+/* A stopped task read from kernel memory. It is not a stub thread: continue,
+ * step, and register reads refuse it. A stack walk treats that refusal as a
+ * zero program counter and uses saved thread state. */
 enum xrt_status xrt_target_add_memory_thread(struct xrt_target *target, int32_t tid);
 typedef void (*xrt_new_thread_observer)(void *context, const struct xrt_thread *thread,
                                         bool same_group);

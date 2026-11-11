@@ -307,7 +307,7 @@ static void components(void)
     for(size_t n=0;n<sizeof(bytes);++n) {
         size_t size=sizeof(out);
         enum xrt_status status=xrt_agent_perf_dispatch(a,t,XRT_RPC_FUNCTION_START,args,
-                                                       bytes,n,&value,out,&size);
+                                                       bytes,n,&value,out,&size,false,false);
         assert(status==XRT_OK && size>0 && out[0]==0);
     }
     xrt_agent_perf_destroy(a);

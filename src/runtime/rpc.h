@@ -41,6 +41,21 @@
 /* HELLO arg[1] opts into inferior calls (INFCALL, INFCALL_RESOLVE). An agent
  * that does not echo it never receives them: the host refuses first. */
 #define XRT_RPC_CAP_INFCALL UINT64_C(64)
+/* HELLO arg[1] asks for a ring-limit suffix after each successful perf info:
+ * kind, fitted data pages, whether the size was planned, the opened count,
+ * and the unsampled thread ids. The bit is returned only when the host asked.
+ * It does not change the HELLO reply size. Old agents drop the bit. A host
+ * that does not see it still infers a capped prefix from a short opened count.
+ * A new agent appends the suffix only when the host asked. Failure replies
+ * do not grow. */
+#define XRT_RPC_CAP_PERF_LIMIT UINT64_C(128)
+/* With PERF_LIMIT, a successful perf info is followed by one byte. A 1 means
+ * the ring-limit suffix follows because the facts differ from the last suffix
+ * this collector sent. A 0 means those facts are unchanged and the suffix is
+ * omitted. Hosts that do not ask still receive the suffix on every successful
+ * info. The bit does not change the HELLO reply size. Failure replies do not
+ * grow. */
+#define XRT_RPC_CAP_PERF_LIMIT_QUIET UINT64_C(256)
 /* One registry of the HELLO capability word. A new bit is added to
  * XRT_RPC_CAP_DEFINED and to one row list below, not as a second mask at a
  * call site. Always-on bits are advertised on every capable HELLO.
@@ -53,7 +68,9 @@
     X(XRT_RPC_CAP_FILE_SLOTS) \
     X(XRT_RPC_CAP_PAC_MASK) \
     X(XRT_RPC_CAP_KALLSYMS) \
-    X(XRT_RPC_CAP_INFCALL)
+    X(XRT_RPC_CAP_INFCALL) \
+    X(XRT_RPC_CAP_PERF_LIMIT) \
+    X(XRT_RPC_CAP_PERF_LIMIT_QUIET)
 #define XRT_RPC_CAP_ALL_ROWS(X) \
     XRT_RPC_CAP_ALWAYS_ROWS(X) \
     XRT_RPC_CAP_NEGOTIATED_ROWS(X)
@@ -65,7 +82,9 @@
     X(XRT_RPC_CAP_FILE_SLOTS) \
     X(XRT_RPC_CAP_PAC_MASK) \
     X(XRT_RPC_CAP_KALLSYMS) \
-    X(XRT_RPC_CAP_INFCALL)
+    X(XRT_RPC_CAP_INFCALL) \
+    X(XRT_RPC_CAP_PERF_LIMIT) \
+    X(XRT_RPC_CAP_PERF_LIMIT_QUIET)
 #define XRT_RPC_CAP_OR_BIT(bit) |(bit)
 #define XRT_RPC_CAP_ADD_BIT(bit) +(bit)
 #define XRT_RPC_CAP_ONE_BIT(bit) && ((bit) > 0) && (((bit) & ((bit) - 1)) == 0)
@@ -76,7 +95,11 @@ _Static_assert((0 XRT_RPC_CAP_ALL_ROWS(XRT_RPC_CAP_ADD_BIT)) == (0 XRT_RPC_CAP_A
 _Static_assert((1 XRT_RPC_CAP_ALL_ROWS(XRT_RPC_CAP_ONE_BIT)), "HELLO capability is not one bit");
 _Static_assert(XRT_RPC_CAP_PAC_MASK == UINT64_C(16), "PAC mask bit stays 16");
 _Static_assert(XRT_RPC_CAP_KALLSYMS == UINT64_C(32), "kallsyms bit stays 32");
+_Static_assert(XRT_RPC_CAP_PERF_LIMIT == UINT64_C(128), "perf limit bit stays 128");
+_Static_assert(XRT_RPC_CAP_PERF_LIMIT_QUIET == UINT64_C(256), "perf limit quiet bit stays 256");
 _Static_assert((XRT_RPC_CAP_PAC_MASK & XRT_RPC_CAP_KALLSYMS) == 0, "PAC mask and kallsyms share a bit");
+_Static_assert((XRT_RPC_CAP_INFCALL & XRT_RPC_CAP_PERF_LIMIT) == 0, "inferior call and perf limit share a bit");
+_Static_assert((XRT_RPC_CAP_PERF_LIMIT & XRT_RPC_CAP_PERF_LIMIT_QUIET) == 0, "perf limit bits overlap");
 enum xrt_rpc_op {
     XRT_RPC_HELLO = 1,
     XRT_RPC_CREATE,
@@ -224,6 +247,7 @@ static inline enum xrt_rpc_class xrt_rpc_classify(uint16_t op)
 _Static_assert(XRT_FILE_LIMIT == 70, "status 70 is the file limit");
 _Static_assert(XRT_AMBIGUOUS_MATCH == 76, "status 76 is ambiguous probe match");
 _Static_assert(XRT_FILE_SLOT_LIMIT == 84, "file-slot exhaustion stays appended");
+_Static_assert(XRT_KERNEL_TASK_NOT_CPU == 86, "kernel task refusal stays appended");
 _Static_assert(XRT_RPC_ALLOCATIONS_START == 52, "allocation start stays 52");
 _Static_assert(XRT_RPC_FUNCTION_START == 53, "function start stays 53");
 _Static_assert(XRT_RPC_CONTROL_WRITE == 54, "control write is opcode 54");

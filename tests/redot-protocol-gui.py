@@ -51,7 +51,7 @@ try:
             with Image.open(shot) as image:
                 pane = ImageOps.invert(image.crop((16, 92, 1264, 770)).convert('L'))
                 pane.resize((pane.width * 2, pane.height * 2)).save(crop)
-            text = subprocess.run(['tesseract', crop, 'stdout', '--psm', '6'], env=dict(d.env, OMP_THREAD_LIMIT='1'), capture_output=True, text=True, check=True, timeout=20).stdout
+            text = subprocess.run(['tesseract', crop, 'stdout', '--psm', '6'], env=dict(d.env, OMP_THREAD_LIMIT='1'), capture_output=True, text=True, check=True, timeout=30).stdout
             normalized = ''.join(c for c in text.lower() if c.isalnum())
             if all(word in normalized for word in words):
                 return text

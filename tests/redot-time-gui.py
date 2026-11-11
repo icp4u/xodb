@@ -48,7 +48,7 @@ try:
         deadline = time.monotonic() + 10
         while True:
             shot = d.shot(label)
-            text = subprocess.run(['tesseract', shot, 'stdout', '--psm', '11'], env=dict(d.env, OMP_THREAD_LIMIT='1'), capture_output=True, text=True, check=True, timeout=20).stdout
+            text = subprocess.run(['tesseract', shot, 'stdout', '--psm', '11'], env=dict(d.env, OMP_THREAD_LIMIT='1'), capture_output=True, text=True, check=True, timeout=30).stdout
             compact = ''.join(c for c in text.lower() if c.isalnum())
             if all(word in compact for word in words):
                 return text

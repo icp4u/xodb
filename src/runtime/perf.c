@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
@@ -42,6 +43,107 @@ size_t xrt_perf_page_size(void)
 {
     long size = sysconf(_SC_PAGESIZE);
     return size > 0 ? (size_t)size : 4096;
+}
+static unsigned long page_shift_of(size_t page)
+{
+    unsigned long shift = 0;
+    if (page < 4096 || (page & (page - 1)))
+        return 0;
+    while (shift < 32 && (1ul << shift) < page)
+        shift++;
+    return shift >= 10 && shift < 32 && (1ul << shift) == page ? shift : 0;
+}
+/* The kernel enforces the pinned-page ceiling only when perf_event_paranoid
+ * is above -1 and the caller lacks CAP_IPC_LOCK (root has it). */
+static bool pinned_limit_enforced(void)
+{
+    char bytes[32];
+    size_t size;
+    if (xrt_perf_read_file("/proc/sys/kernel/perf_event_paranoid", bytes, sizeof(bytes), &size) &&
+        size >= 2 && bytes[0] == '-' && bytes[1] == '1')
+        return false;
+    char status[4096];
+    if (!xrt_perf_read_file("/proc/self/status", status, sizeof(status) - 1, &size))
+        return true;
+    status[size] = 0;
+    const char *cap = strstr(status, "\nCapEff:");
+    if (!cap)
+        return true;
+    unsigned long long eff = strtoull(cap + 8, NULL, 16);
+    return !(eff & (1ull << 14)); /* CAP_IPC_LOCK */
+}
+unsigned long xrt_perf_pinned_allowance(void)
+{
+    const char *hook = getenv("XODB_TEST_PIN_PAGES");
+    if (hook && *hook) {
+        char *end = NULL;
+        unsigned long forced = strtoul(hook, &end, 10);
+        if (end && *end == '\0')
+            return forced;
+    }
+    if (!pinned_limit_enforced())
+        return 0;
+    size_t page = xrt_perf_page_size();
+    unsigned long shift = page_shift_of(page);
+    if (!shift)
+        return 0;
+    long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    if (cpus < 1)
+        return 0;
+    char bytes[32];
+    size_t size;
+    uint64_t mlock_kb = 0;
+    unsigned long gift = 0;
+    if (xrt_perf_read_file("/proc/sys/kernel/perf_event_mlock_kb", bytes, sizeof(bytes), &size) &&
+        xrt_perf_unsigned(bytes, size, &mlock_kb) && mlock_kb <= UINT32_MAX)
+        gift = ((unsigned long)mlock_kb >> (shift - 10)) * (unsigned long)cpus;
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_MEMLOCK, &rl) != 0)
+        return gift;
+    if (rl.rlim_cur == RLIM_INFINITY)
+        return 0;
+    return gift + (unsigned long)(rl.rlim_cur / page);
+}
+static _Atomic unsigned long pinned_reserved;
+bool xrt_perf_pinned_remaining(unsigned long *remaining)
+{
+    unsigned long allowance;
+    unsigned long held;
+    if (!remaining)
+        return false;
+    allowance = xrt_perf_pinned_allowance();
+    if (!allowance)
+        return false;
+    held = atomic_load_explicit(&pinned_reserved, memory_order_relaxed);
+    *remaining = held >= allowance ? 0 : allowance - held;
+    return true;
+}
+void xrt_perf_pin_reserve(unsigned long pages)
+{
+    if (pages)
+        atomic_fetch_add_explicit(&pinned_reserved, pages, memory_order_relaxed);
+}
+void xrt_perf_pin_release(unsigned long pages)
+{
+    unsigned long held = atomic_load_explicit(&pinned_reserved, memory_order_relaxed);
+    for (;;) {
+        unsigned long drop = pages > held ? held : pages;
+        if (atomic_compare_exchange_weak_explicit(&pinned_reserved, &held, held - drop,
+                                                  memory_order_relaxed, memory_order_relaxed))
+            return;
+    }
+}
+unsigned xrt_perf_fit_pages(unsigned requested, size_t threads)
+{
+    unsigned pages = requested;
+    unsigned long remaining = 0;
+    if (!xrt_perf_pinned_remaining(&remaining) || !pages || !threads)
+        return requested;
+    if (!remaining)
+        return 1;
+    while (pages > 1 && (uint64_t)threads * (1u + pages) > remaining)
+        pages /= 2;
+    return pages;
 }
 struct xrt_perf *xrt_perf_create(unsigned pages, size_t threads, uint64_t budget)
 {
@@ -103,6 +205,7 @@ static void release(struct xrt_perf *p, struct xrt_perf_slot *s)
     if (s->owns_map) {
         munmap(s->map, s->map_size);
         p->allocated -= (uint64_t)p->data_pages * p->page_size;
+        xrt_perf_pin_release(1ul + p->data_pages);
     }
     s->map = NULL;
     s->map_size = 0;
@@ -124,6 +227,27 @@ void xrt_perf_destroy(struct xrt_perf *p)
             release(p, &p->slots[i]);
         free(p);
     }
+}
+unsigned xrt_perf_ring_pages(const struct xrt_perf *p)
+{
+    if (!p)
+        return 0;
+    if (p->remote_target && !p->limit_known)
+        return 0;
+    return p->data_pages;
+}
+/* Test hook. "shrink" rejects a per-thread mmap above one data page.
+ * "eperm" rejects a mmap once another thread already owns a ring. */
+static bool test_ring_denied(const struct xrt_perf *p)
+{
+    const char *hook = getenv("XODB_TEST_RING_MMAP");
+    if (!hook)
+        return false;
+    if (!strcmp(hook, "eperm"))
+        return p->count >= 1;
+    if (!strcmp(hook, "shrink"))
+        return p->data_pages > 1;
+    return false;
 }
 size_t xrt_perf_fd_count(const struct xrt_perf *p)
 {
@@ -267,6 +391,12 @@ static bool add(struct xrt_perf *p, int32_t tid, int32_t cpu, const struct xrt_p
         if (ioctl(fd, PERF_EVENT_IOC_ID, &s->thread.event_ids[i]))
             goto fail;
         if (!i) {
+            if (test_ring_denied(p)) {
+                errno = EPERM;
+                call = "mmap";
+                detail = "ring mmap failed";
+                goto fail;
+            }
             s->map_size = (1 + p->data_pages) * p->page_size;
             void *map = mmap(NULL, s->map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
             if (map == MAP_FAILED) {
@@ -278,6 +408,7 @@ static bool add(struct xrt_perf *p, int32_t tid, int32_t cpu, const struct xrt_p
             s->map = map;
             s->owns_map = true;
             p->allocated += bytes;
+            xrt_perf_pin_reserve(1ul + p->data_pages);
         } else if (ioctl(fd, PERF_EVENT_IOC_SET_OUTPUT, s->fds[0])) {
             detail = "PERF_EVENT_IOC_SET_OUTPUT";
             goto fail;

@@ -82,6 +82,18 @@ pub const Config = struct {
 };
 
 pub const FailureKind = enum { unavailable, permission, configuration, thread_gone, resource, other };
+/// A successful open that did not map one full ring per thread.
+pub const RingLimit = struct {
+    kind: enum { shrunk, capped },
+    data_pages: u8,
+    opened_threads: usize,
+    requested_threads: usize,
+    /// Kernel ceilings that forced the degrade.
+    limit: []const u8,
+    notice: []const u8,
+    /// Capped only: the requested threads that have no ring and are not sampled.
+    unsampled_tids: []const i32 = &.{},
+};
 
 pub const Failure = struct {
     kind: FailureKind,
@@ -202,6 +214,41 @@ pub const Collector = struct {
 
     pub fn allocatedRingBytes(self: *const Collector) u64 {
         return runtime.info(self.handle).allocated_ring_bytes;
+    }
+    pub fn ringLimit(self: *const Collector, requested: usize) ?RingLimit {
+        // Refresh before reading the suffix cache. A negotiated agent sends
+        // the kind, the fitted page count and the unsampled tids. An older
+        // agent leaves the page count at zero; a short opened count is then
+        // reported as capped so the capture never indexes a thread the agent
+        // did not open. The negotiated path does not infer.
+        const opened = runtime.info(self.handle).threads;
+        const carried = rt.xrt_cpu_limit_carried(self.handle);
+        const kind = rt.xrt_cpu_ring_limit(self.handle);
+        const pages_raw = rt.xrt_perf_ring_pages(self.handle);
+        const limit = "perf_event_mlock_kb times online CPUs plus RLIMIT_MEMLOCK";
+        if (!carried) {
+            if (pages_raw == 0) {
+                if (@as(usize, opened) < requested) return .{ .kind = .capped, .data_pages = 0, .opened_threads = opened, .requested_threads = requested, .limit = limit, .notice = "the remote agent opened a prefix of threads; the limit on the target is perf_event_mlock_kb times online CPUs plus RLIMIT_MEMLOCK" };
+                return null;
+            }
+        } else if (kind == rt.XRT_RING_LIMIT_NONE) {
+            return null;
+        }
+        if (pages_raw == 0 or pages_raw > @as(@TypeOf(pages_raw), max_data_pages)) return null;
+        const pages: u8 = @intCast(pages_raw);
+        const notice_ptr = rt.xrt_cpu_ring_notice(self.handle) orelse return null;
+        const notice = std.mem.span(notice_ptr);
+        if (kind == rt.XRT_RING_LIMIT_SHRUNK) return .{ .kind = .shrunk, .data_pages = pages, .opened_threads = opened, .requested_threads = requested, .limit = limit, .notice = notice };
+        if (kind == rt.XRT_RING_LIMIT_CAPPED) return .{ .kind = .capped, .data_pages = pages, .opened_threads = opened, .requested_threads = requested, .limit = limit, .notice = notice };
+        return null;
+    }
+    /// Unsampled tids from a negotiated perf-info suffix. Null when that
+    /// suffix was not read, so the caller keeps the request prefix.
+    pub fn carriedUnsampled(self: *const Collector, out: []i32) ?[]const i32 {
+        if (!rt.xrt_cpu_limit_carried(self.handle)) return null;
+        const n = rt.xrt_cpu_unsampled(self.handle, out.ptr, out.len);
+        if (n > out.len) return null;
+        return out[0..n];
     }
     pub fn thread(self: *const Collector, index: usize) ?ThreadInfo {
         var value: rt.struct_xrt_perf_thread = undefined;

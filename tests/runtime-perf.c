@@ -6,6 +6,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/perf_event.h>
+#include <sched.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -154,6 +156,65 @@ static void live(void)
     assert(!xrt_cpu_start(&cfg, &accepted, &f));
     assert(f.kind == XRT_PERF_THREAD_GONE && f.opened_then_closed == 1);
 }
+static void perf_limit_suffix(void)
+{
+    uint8_t bytes[8192];
+    struct xrt_perf_info source = {.threads = 2, .page_size = 4096, .running = true};
+    int32_t dropped[] = {40, 41};
+    struct xrt_codec bare = xrt_codec(bytes, sizeof(bytes), false);
+    xrt_wire_perf_info(&bare, &source);
+    assert(bare.ok);
+    const size_t info_size = bare.at;
+    struct xrt_perf_limit_suffix suffix = {.kind = XRT_RING_LIMIT_CAPPED,
+                                           .data_pages = 1,
+                                           .planned = 1,
+                                           .opened = 2,
+                                           .unsampled_count = 2,
+                                           .unsampled = dropped};
+    struct xrt_codec out = xrt_codec(bytes, sizeof(bytes), false);
+    xrt_wire_perf_info(&out, &source);
+    xrt_wire_perf_limit(&out, &suffix);
+    assert(out.ok && out.at > info_size);
+    struct xrt_perf_info decoded = {0};
+    int32_t got[4] = {0};
+    struct xrt_perf_limit_suffix in_suffix = {.unsampled = got};
+    struct xrt_codec in = xrt_codec(bytes, out.at, true);
+    xrt_wire_perf_info(&in, &decoded);
+    assert(in.ok && in.at == info_size && decoded.threads == 2 && decoded.running && !decoded.failed);
+    xrt_wire_perf_limit(&in, &in_suffix);
+    assert(in.ok && in.at == in.size);
+    assert(in_suffix.kind == XRT_RING_LIMIT_CAPPED && in_suffix.data_pages == 1 && in_suffix.planned == 1);
+    assert(in_suffix.opened == 2 && in_suffix.unsampled_count == 2 && got[0] == 40 && got[1] == 41);
+    /* An unchanged suffix is one zero byte after the info. A change is that
+     * byte set, then the same suffix. */
+    uint8_t mark = 0;
+    out = xrt_codec(bytes, sizeof(bytes), false);
+    xrt_wire_perf_info(&out, &source);
+    xrt_codec_u8(&out, &mark);
+    assert(out.ok && out.at == info_size + 1);
+    in = xrt_codec(bytes, out.at, true);
+    xrt_wire_perf_info(&in, &decoded);
+    xrt_codec_u8(&in, &mark);
+    assert(in.ok && in.at == in.size && mark == 0 && decoded.threads == 2);
+    mark = 1;
+    out = xrt_codec(bytes, sizeof(bytes), false);
+    xrt_wire_perf_info(&out, &source);
+    xrt_codec_u8(&out, &mark);
+    xrt_wire_perf_limit(&out, &suffix);
+    assert(out.ok);
+    memset(got, 0, sizeof(got));
+    in = xrt_codec(bytes, out.at, true);
+    xrt_wire_perf_info(&in, &decoded);
+    xrt_codec_u8(&in, &mark);
+    in_suffix = (struct xrt_perf_limit_suffix){.unsampled = got};
+    xrt_wire_perf_limit(&in, &in_suffix);
+    assert(in.ok && in.at == in.size && mark == 1 && got[0] == 40 && got[1] == 41);
+    suffix.kind = XRT_RING_LIMIT_NONE;
+    out = xrt_codec(bytes, sizeof(bytes), false);
+    xrt_wire_perf_info(&out, &source);
+    xrt_wire_perf_limit(&out, &suffix);
+    assert(!out.ok);
+}
 static void asynchronous_failure(void)
 {
     uint8_t bytes[256];
@@ -221,6 +282,165 @@ static void kernel_stack_denial(void)
     unsetenv("XODB_TEST_KERNEL_STACKS");
 }
 
+static int ring_hold(void *arg)
+{
+    (void)arg;
+    for (;;)
+        pause();
+    return 0;
+}
+static int spawn_hold(void *stack, size_t bytes)
+{
+    int tid = clone(ring_hold, (char *)stack + bytes,
+                    CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM, NULL);
+    assert(tid > 0);
+    return tid;
+}
+static void ring_limit_degrade(void)
+{
+    static char stacks[2][8192] __attribute__((aligned(16)));
+    int32_t self = (int32_t)gettid();
+    struct xrt_cpu_acceptance accepted;
+    struct xrt_perf_failure failure = {0};
+    struct xrt_cpu_config cfg = {
+        .tids = &self, .thread_count = 1, .frequency_hz = 99, .data_pages = 4,
+        .ring_budget_bytes = 262144, .exclude_kernel = true,
+    };
+    assert(!setenv("XODB_TEST_RING_MMAP", "shrink", 1));
+    struct xrt_perf *shrunk = xrt_cpu_start(&cfg, &accepted, &failure);
+    assert(shrunk);
+    assert(xrt_cpu_ring_limit(shrunk) == XRT_RING_LIMIT_SHRUNK);
+    assert(xrt_perf_ring_pages(shrunk) == 1);
+    assert(xrt_perf_fd_count(shrunk) == 1 && shrunk->slots[0].owns_map);
+    const char *notice = xrt_cpu_ring_notice(shrunk);
+    assert(notice && strstr(notice, "perf_event_mlock_kb") && strstr(notice, "RLIMIT_MEMLOCK"));
+    xrt_perf_destroy(shrunk);
+    unsetenv("XODB_TEST_RING_MMAP");
+
+    int32_t tids[2] = {self, spawn_hold(stacks[0], sizeof stacks[0])};
+    cfg.tids = tids;
+    cfg.thread_count = 2;
+    failure = (struct xrt_perf_failure){0};
+    assert(!setenv("XODB_TEST_RING_MMAP", "eperm", 1));
+    struct xrt_perf *capped = xrt_cpu_start(&cfg, &accepted, &failure);
+    if (!capped) {
+        fprintf(stderr, "capped open failed: %s errno=%d %s\n", failure.syscall ? failure.syscall : "?",
+                failure.error, failure.detail ? failure.detail : "");
+    }
+    assert(capped);
+    assert(xrt_cpu_ring_limit(capped) == XRT_RING_LIMIT_CAPPED);
+    assert(xrt_perf_ring_pages(capped) == 1);
+    assert(xrt_perf_fd_count(capped) == 1 && capped->count == 1 && capped->slots[0].owns_map);
+    notice = xrt_cpu_ring_notice(capped);
+    assert(notice && strstr(notice, "perf_event_mlock_kb") && strstr(notice, "RLIMIT_MEMLOCK"));
+    failure = (struct xrt_perf_failure){0};
+    assert(!xrt_cpu_enroll(capped, tids[1], &accepted, &failure));
+    assert(failure.error == EPERM && failure.detail && strstr(failure.detail, "perf_event_mlock_kb") &&
+           strstr(failure.detail, "RLIMIT_MEMLOCK"));
+    assert(xrt_perf_fd_count(capped) == 1);
+    xrt_perf_destroy(capped);
+    unsetenv("XODB_TEST_RING_MMAP");
+
+    /* Three pages cannot hold a four-page data ring plus its metadata page.
+     * Two data pages need three, so the open shrinks before mmap. */
+    assert(!setenv("XODB_TEST_PIN_PAGES", "3", 1));
+    cfg.tids = &self;
+    cfg.thread_count = 1;
+    cfg.data_pages = 4;
+    failure = (struct xrt_perf_failure){0};
+    struct xrt_perf *sized = xrt_cpu_start(&cfg, &accepted, &failure);
+    assert(sized);
+    assert(xrt_cpu_ring_limit(sized) == XRT_RING_LIMIT_SHRUNK);
+    assert(xrt_perf_ring_pages(sized) == 2);
+    notice = xrt_cpu_ring_notice(sized);
+    assert(notice && strstr(notice, "sized in bytes") && strstr(notice, "perf_event_mlock_kb") &&
+           strstr(notice, "RLIMIT_MEMLOCK") && !strstr(notice, "EPERM"));
+    xrt_perf_destroy(sized);
+
+    /* Two pages hold one one-page ring and not two, so the second thread is unopened. */
+    assert(!setenv("XODB_TEST_PIN_PAGES", "2", 1));
+    cfg.tids = tids;
+    cfg.thread_count = 2;
+    cfg.data_pages = 4;
+    failure = (struct xrt_perf_failure){0};
+    struct xrt_perf *prefix = xrt_cpu_start(&cfg, &accepted, &failure);
+    assert(prefix);
+    assert(xrt_cpu_ring_limit(prefix) == XRT_RING_LIMIT_CAPPED);
+    assert(xrt_perf_ring_pages(prefix) == 1 && prefix->count == 1);
+    notice = xrt_cpu_ring_notice(prefix);
+    assert(notice && strstr(notice, "sized in bytes") && strstr(notice, "perf_event_mlock_kb") &&
+           strstr(notice, "RLIMIT_MEMLOCK"));
+    xrt_perf_destroy(prefix);
+    unsetenv("XODB_TEST_PIN_PAGES");
+}
+static void pinned_fit_shared(void)
+{
+    assert(!setenv("XODB_TEST_PIN_PAGES", "3", 1));
+    assert(xrt_perf_pinned_allowance() == 3);
+    assert(xrt_perf_fit_pages(4, 1) == 2);
+    assert(xrt_perf_fit_pages(16, 1) == 2);
+    assert(xrt_perf_fit_pages(4, 2) == 1);
+    assert(!setenv("XODB_TEST_PIN_PAGES", "1000", 1));
+    assert(xrt_perf_fit_pages(16, 2) == 16);
+    assert(xrt_perf_fit_pages(4, 0) == 4);
+    /* Eight of ten pages are already mapped. One four-page ring needs five,
+     * so two remain and the fit is one data page. A full reservation still
+     * asks for one data page. A zero allowance ignores the reservation. */
+    unsigned long left = 99;
+    assert(!setenv("XODB_TEST_PIN_PAGES", "10", 1));
+    assert(xrt_perf_pinned_remaining(&left) && left == 10);
+    xrt_perf_pin_reserve(8);
+    assert(xrt_perf_pinned_remaining(&left) && left == 2);
+    assert(xrt_perf_fit_pages(4, 1) == 1);
+    assert(xrt_perf_fit_pages(16, 1) == 1);
+    xrt_perf_pin_reserve(2);
+    assert(xrt_perf_pinned_remaining(&left) && left == 0);
+    assert(xrt_perf_fit_pages(4, 1) == 1);
+    xrt_perf_pin_release(10);
+    assert(xrt_perf_pinned_remaining(&left) && left == 10);
+    assert(!setenv("XODB_TEST_PIN_PAGES", "0", 1));
+    xrt_perf_pin_reserve(8);
+    assert(!xrt_perf_pinned_remaining(&left));
+    assert(xrt_perf_fit_pages(16, 2) == 16);
+    xrt_perf_pin_release(8);
+    /* A mapped ring holds its metadata page plus its data pages. The next
+     * collector, including a 16-page syscall ring, sizes against the rest.
+     * Two one-page rings need four pages and only three remain, so the CPU
+     * open keeps one thread. Destroying the rings returns the allowance. */
+    assert(!setenv("XODB_TEST_PIN_PAGES", "8", 1));
+    int32_t self = (int32_t)gettid();
+    struct xrt_cpu_acceptance accepted;
+    struct xrt_perf_failure failure = {0};
+    struct xrt_cpu_config cfg = {
+        .tids = &self, .thread_count = 1, .frequency_hz = 99, .data_pages = 4,
+        .ring_budget_bytes = 262144, .exclude_kernel = true,
+    };
+    struct xrt_perf *held = xrt_cpu_start(&cfg, &accepted, &failure);
+    assert(held);
+    assert(xrt_cpu_ring_limit(held) == XRT_RING_LIMIT_NONE);
+    assert(xrt_perf_ring_pages(held) == 4);
+    assert(xrt_perf_pinned_remaining(&left) && left == 3);
+    assert(xrt_perf_fit_pages(16, 1) == 2);
+    assert(xrt_perf_fit_pages(4, 1) == 2);
+    static char stack[8192] __attribute__((aligned(16)));
+    int32_t tids[2] = {self, spawn_hold(stack, sizeof stack)};
+    cfg.tids = tids;
+    cfg.thread_count = 2;
+    cfg.data_pages = 1;
+    failure = (struct xrt_perf_failure){0};
+    struct xrt_perf *prefix = xrt_cpu_start(&cfg, &accepted, &failure);
+    assert(prefix);
+    assert(xrt_cpu_ring_limit(prefix) == XRT_RING_LIMIT_CAPPED);
+    assert(xrt_perf_ring_pages(prefix) == 1 && prefix->count == 1);
+    const char *notice = xrt_cpu_ring_notice(prefix);
+    assert(notice && strstr(notice, "sized in bytes") && strstr(notice, "perf_event_mlock_kb") &&
+           strstr(notice, "RLIMIT_MEMLOCK"));
+    xrt_perf_destroy(prefix);
+    xrt_perf_destroy(held);
+    assert(xrt_perf_pinned_remaining(&left) && left == 8);
+    assert(xrt_perf_fit_pages(4, 1) == 4);
+    unsetenv("XODB_TEST_PIN_PAGES");
+}
 static void offcpu_format(void)
 {
     const char *text =
@@ -256,13 +476,16 @@ int main(void)
     offcpu_format();
     offcpu_denial();
     kernel_stack_denial();
+    pinned_fit_shared();
+    ring_limit_degrade();
     loss_counter_reads();
     asynchronous_failure();
+    perf_limit_suffix();
     rings();
     metadata();
     rollback();
     live();
-    puts("C perf: wrapped rings, hostile headers, tail validation, metadata bounds, rollback and "
-         "live collection passed");
+    puts("C perf: wrapped rings, hostile headers, tail validation, metadata bounds, rollback, "
+         "limit suffix and live collection passed");
     return 0;
 }

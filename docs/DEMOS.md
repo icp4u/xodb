@@ -1,5 +1,53 @@
 # Short demo walkthroughs
 
+## Agent work-log flame graph
+
+With a built xodb and Python 3, open a local transcript read-only:
+
+```sh
+xodb --agent-time --agent-kind codex --agent-log session.jsonl --redact
+```
+
+Click a command frame and press **Z** to focus it. Press **W** to compare token
+burn with elapsed activity; **/** searches command summaries. Claude uses
+`--agent-kind claude`; Grok uses `--agent-kind grok --agent-log events.jsonl`.
+No debugger target is started. Missing token usage is labelled unavailable.
+For the synthetic, private-display regression/demo run:
+
+```sh
+python3 tests/agent-time-gui.py
+python3 tests/agent-time-browser-gui.py
+python3 tests/agent-time-extras-gui.py
+python3 tests/agent-time-oracle.py
+python3 tests/agent-time-live.py
+python3 tests/agent-time-delta.py
+python3 tests/agent-time-equivalence.py
+python3 tests/agent-time-child-gui.py
+python3 tests/agent-time-initial-gui.py
+python3 tests/agent-time-focus-gui.py
+```
+
+The browser regression also reopens the same synthetic sessions to verify
+cached totals, then appends usage and checks that only that entry is reindexed.
+The extras demo filters a two-session fleet to one UTC day, groups inferred
+tasks, checks exact cache-read share, then tails an appended single log.
+Its periodic `--recovery` variant also removes and restores that owned log,
+checking that the last complete view survives a failed refresh.
+The delta regression compares reconstructed snapshots with full documents and
+checks that a small insertion before model spans does not resend their suffix.
+The child GUI check adds a subagent during live mode, checks its token totals
+and proves the same helper remains alive until the view closes.
+The initial-live check holds the first helper, verifies the loading view and
+search input, cancels back to an offline view, then completes a live load.
+Its periodic `--recovery` variant also checks an initial read failure and
+browser cancellation without a redundant offline reload.
+The focus check uses structured frame logs (no OCR) to retain the selected flame
+frame and the chart's exact zoom interval across first-live and appended updates,
+then deliberately returns to the full time range.
+
+See [timing semantics and archives](AGENT_TIME.md); merged widths are not a
+chronological timeline, and model gaps include overhead.
+
 ## Calling a function in the target
 
 x86-64 Linux with gdb and a C++ compiler. From the xodb source directory, with

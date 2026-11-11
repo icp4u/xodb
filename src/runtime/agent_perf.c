@@ -18,6 +18,12 @@ struct collector {
     bool is_cpu, pending, follow;
     struct xrt_perf_ring offered;
     uint64_t offered_bytes;
+    int32_t requested[XRT_PERF_MAX_THREADS];
+    size_t requested_count;
+    bool limit_sent;
+    uint8_t sent_kind, sent_pages, sent_planned;
+    uint32_t sent_opened, sent_tail;
+    int32_t sent_tids[XRT_PERF_MAX_THREADS];
 };
 struct xrt_agent_perf {
     struct collector slots[32];
@@ -60,9 +66,30 @@ static bool held(struct xrt_target *t, const int32_t *tids, size_t count)
     }
     return true;
 }
-static void result(struct xrt_codec *out, bool ok, struct xrt_perf *p,
-                   struct xrt_perf_failure *failure)
+static bool same_limit(const struct collector *slot, uint8_t kind, uint8_t pages, uint8_t planned,
+                       uint32_t opened, uint32_t tail, const int32_t *tids)
 {
+    if (!slot->limit_sent || slot->sent_kind != kind || slot->sent_pages != pages ||
+        slot->sent_planned != planned || slot->sent_opened != opened || slot->sent_tail != tail)
+        return false;
+    return tail == 0 || (tids && memcmp(slot->sent_tids, tids, tail * sizeof(int32_t)) == 0);
+}
+static void remember_limit(struct collector *slot, uint8_t kind, uint8_t pages, uint8_t planned,
+                           uint32_t opened, uint32_t tail, const int32_t *tids)
+{
+    slot->limit_sent = true;
+    slot->sent_kind = kind;
+    slot->sent_pages = pages;
+    slot->sent_planned = planned;
+    slot->sent_opened = opened;
+    slot->sent_tail = tail;
+    if (tail && tids)
+        memcpy(slot->sent_tids, tids, tail * sizeof(int32_t));
+}
+static void result(struct xrt_codec *out, bool ok, struct collector *slot, bool perf_limit,
+                   bool limit_quiet, struct xrt_perf_failure *failure)
+{
+    struct xrt_perf *p = slot ? slot->perf : NULL;
     xrt_codec_bool(out, &ok);
     if (!ok) {
         xrt_wire_perf_failure(out, failure);
@@ -72,6 +99,47 @@ static void result(struct xrt_codec *out, bool ok, struct xrt_perf *p,
     if (p)
         xrt_perf_info(p, &info);
     xrt_wire_perf_info(out, &info);
+    if (!perf_limit || !out->ok)
+        return;
+    uint8_t kind = XRT_RING_LIMIT_NONE;
+    uint8_t pages = 0;
+    uint8_t planned = 0;
+    uint32_t tail = 0;
+    int32_t *tids = NULL;
+    if (p && slot->is_cpu) {
+        if (p->ring_limit <= XRT_RING_LIMIT_CAPPED)
+            kind = (uint8_t)p->ring_limit;
+        if (p->data_pages <= 64)
+            pages = (uint8_t)p->data_pages;
+        planned = p->ring_planned ? 1 : 0;
+        /* A kept prefix is capped even if the local open left the kind unset.
+         * The list is the untouched tail of the request while fewer of those
+         * threads are open. Newborns enrolled later are not part of it. */
+        if (slot->requested_count > p->count && kind != XRT_RING_LIMIT_CAPPED)
+            kind = XRT_RING_LIMIT_CAPPED;
+        if (kind == XRT_RING_LIMIT_CAPPED && slot->requested_count > p->count) {
+            tail = (uint32_t)(slot->requested_count - p->count);
+            tids = slot->requested + p->count;
+        }
+    }
+    uint32_t opened = (uint32_t)info.threads;
+    if (limit_quiet) {
+        uint8_t present = slot && same_limit(slot, kind, pages, planned, opened, tail, tids) ? 0 : 1;
+        xrt_codec_u8(out, &present);
+        if (!present || !out->ok)
+            return;
+    }
+    struct xrt_perf_limit_suffix suffix = {
+        .kind = kind,
+        .data_pages = pages,
+        .planned = planned,
+        .opened = opened,
+        .unsampled_count = tail,
+        .unsampled = tids,
+    };
+    xrt_wire_perf_limit(out, &suffix);
+    if (slot && out->ok)
+        remember_limit(slot, kind, pages, planned, opened, tail, tids);
 }
 static struct xrt_allocations *allocations_open(struct xrt_agent_perf *a, struct xrt_target *t,
                                                 struct xrt_codec *in, bool functions, struct xrt_perf_failure *f)
@@ -121,7 +189,8 @@ static struct xrt_allocations *allocations_open(struct xrt_agent_perf *a, struct
 }
 enum xrt_status xrt_agent_perf_dispatch(struct xrt_agent_perf *a, struct xrt_target *t, uint16_t op,
                                         const uint64_t *args, void *bytes, size_t size,
-                                        uint64_t *value, void *extra, size_t *extra_size)
+                                        uint64_t *value, void *extra, size_t *extra_size,
+                                        bool perf_limit, bool limit_quiet)
 {
     struct xrt_codec in = xrt_codec(bytes, size, true),
                      out = xrt_codec(extra, XRT_RPC_DATA_MAX, false);
@@ -163,6 +232,9 @@ enum xrt_status xrt_agent_perf_dispatch(struct xrt_agent_perf *a, struct xrt_tar
             xrt_wire_cpu_config(&in, &config, a->tids);
             if (!in.ok || in.at != in.size || !held(t, config.tids, config.thread_count))
                 goto reply;
+            slot->requested_count = config.thread_count;
+            if (config.thread_count)
+                memcpy(slot->requested, config.tids, config.thread_count * sizeof(int32_t));
             slot->perf = xrt_cpu_start(&config, &slot->cpu, &failure);
             slot->is_cpu = true;
             slot->follow = config.follow_threads;
@@ -239,7 +311,7 @@ enum xrt_status xrt_agent_perf_dispatch(struct xrt_agent_perf *a, struct xrt_tar
         case XRT_RPC_PERF_THREAD: {
             struct xrt_perf_thread thread = {0};
             ok = args[1] <= SIZE_MAX && xrt_perf_thread(slot->perf, (size_t)args[1], &thread);
-            result(&out, ok, slot->perf, &failure);
+            result(&out, ok, slot, perf_limit, limit_quiet, &failure);
             if (ok)
                 xrt_wire_perf_thread(&out, &thread);
             goto done;
@@ -254,7 +326,7 @@ enum xrt_status xrt_agent_perf_dispatch(struct xrt_agent_perf *a, struct xrt_tar
                 failure.error = EPROTO;
                 break;
             }
-            result(&out, true, slot->perf, &failure);
+            result(&out, true, slot, perf_limit, limit_quiet, &failure);
             bool present = ring.size != 0;
             xrt_codec_bool(&out, &present);
             if (present) {
@@ -326,7 +398,7 @@ enum xrt_status xrt_agent_perf_dispatch(struct xrt_agent_perf *a, struct xrt_tar
         }
     }
 reply:
-    result(&out, ok, slot ? slot->perf : NULL, &failure);
+    result(&out, ok, slot, perf_limit, limit_quiet, &failure);
     if (ok && opening) {
         uint64_t id = slot->id;
         xrt_codec_u64(&out, &id);

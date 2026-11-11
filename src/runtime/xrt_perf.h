@@ -101,6 +101,22 @@ enum xrt_perf_drain_status xrt_perf_drain(struct xrt_perf *, xrt_perf_decoder, v
 /* Wrap-copy for host record decoders; false for invalid lengths or ring sizes. */
 bool xrt_perf_copy(const uint8_t *ring, size_t size, uint64_t tail, void *out, size_t length);
 size_t xrt_perf_page_size(void);
+/* Pages this user may pin when nothing else is pinned. Zero means the caller
+ * must not size ahead of mmap: the kernel is not enforcing the ceiling, or
+ * the memlock limit is infinite. */
+unsigned long xrt_perf_pinned_allowance(void);
+/* False when the caller must not size ahead. Otherwise *remaining is the
+ * allowance minus pages this process has already mapped, saturated at zero.
+ * A zero remainder still means the ceiling is in force. */
+bool xrt_perf_pinned_remaining(unsigned long *remaining);
+/* Power-of-two data pages that fit `threads` rings in the pages still
+ * unmapped. Returns `requested` when the allowance is zero. Returns one
+ * data page when the allowance is enforced and nothing remains. */
+unsigned xrt_perf_fit_pages(unsigned requested, size_t threads);
+/* Count pages a mapped ring holds, including its metadata page. Release the
+ * same count when that mapping goes away. */
+void xrt_perf_pin_reserve(unsigned long pages);
+void xrt_perf_pin_release(unsigned long pages);
 uint64_t xrt_perf_timestamp(const struct xrt_perf *, uint64_t producer_ns);
 struct xrt_cpu_config {
     const int32_t *tids;
@@ -120,6 +136,22 @@ struct xrt_perf *xrt_cpu_start(const struct xrt_cpu_config *, struct xrt_cpu_acc
                                struct xrt_perf_failure *);
 bool xrt_cpu_enroll(struct xrt_perf *, int32_t tid, const struct xrt_cpu_acceptance *,
                     struct xrt_perf_failure *);
+/* Why a successful open did not give every thread its requested ring.
+ * None means each requested thread owns that ring. The notice is static. */
+enum xrt_ring_limit {
+    XRT_RING_LIMIT_NONE = 0,
+    XRT_RING_LIMIT_SHRUNK = 1,
+    XRT_RING_LIMIT_CAPPED = 2
+};
+enum xrt_ring_limit xrt_cpu_ring_limit(const struct xrt_perf *);
+const char *xrt_cpu_ring_notice(const struct xrt_perf *);
+unsigned xrt_perf_ring_pages(const struct xrt_perf *);
+/* True when a remote perf info carried the negotiated ring-limit suffix.
+ * Local handles and older agents are false. */
+bool xrt_cpu_limit_carried(const struct xrt_perf *);
+/* Copies the carried unsampled tids into `out` (up to `cap`) and returns the
+ * full count. Returns zero when the suffix was not read. */
+size_t xrt_cpu_unsampled(const struct xrt_perf *, int32_t *out, size_t cap);
 /* Shared error/metadata helpers for the syscall and allocation collectors. */
 void xrt_perf_fail(struct xrt_perf_failure *, const char *call, int error, int32_t tid,
                    const char *detail);

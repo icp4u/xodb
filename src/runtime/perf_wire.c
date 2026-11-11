@@ -68,6 +68,73 @@ void xrt_wire_perf_info(struct xrt_codec *c, struct xrt_perf_info *v)
     if (v->failed)
         xrt_wire_perf_failure(c, &v->failure);
 }
+static bool limit_fields_ok(uint8_t kind, uint8_t pages, uint8_t planned, uint32_t opened,
+                            uint32_t tail)
+{
+    if (kind > XRT_RING_LIMIT_CAPPED || planned > 1 || opened > XRT_PERF_MAX_THREADS ||
+        tail > XRT_PERF_MAX_THREADS)
+        return false;
+    if (pages != 0 && (pages > 64 || (pages & (pages - 1)) != 0))
+        return false;
+    if (kind == XRT_RING_LIMIT_NONE && tail != 0)
+        return false;
+    if (kind != XRT_RING_LIMIT_NONE && pages == 0)
+        return false;
+    if (kind == XRT_RING_LIMIT_SHRUNK && tail != 0)
+        return false;
+    return true;
+}
+void xrt_wire_perf_limit(struct xrt_codec *c, struct xrt_perf_limit_suffix *v)
+{
+    uint8_t kind = 0, pages = 0, planned = 0;
+    uint32_t opened = 0, tail = 0;
+    if (!c->read) {
+        if (!v || !limit_fields_ok(v->kind, v->data_pages, v->planned, v->opened, v->unsampled_count) ||
+            (v->unsampled_count && !v->unsampled)) {
+            c->ok = false;
+            return;
+        }
+        kind = v->kind;
+        pages = v->data_pages;
+        planned = v->planned;
+        opened = v->opened;
+        tail = v->unsampled_count;
+    }
+    U8(kind);
+    U8(pages);
+    U8(planned);
+    U32(opened);
+    U32(tail);
+    if (!c->ok)
+        return;
+    if (c->read && !limit_fields_ok(kind, pages, planned, opened, tail)) {
+        c->ok = false;
+        return;
+    }
+    if (c->read) {
+        if (!v || (tail && !v->unsampled)) {
+            c->ok = false;
+            return;
+        }
+        v->kind = kind;
+        v->data_pages = pages;
+        v->planned = planned;
+        v->opened = opened;
+        v->unsampled_count = tail;
+    }
+    for (uint32_t i = 0; i < tail; ++i) {
+        int32_t tid = c->read ? 0 : v->unsampled[i];
+        signed32(c, &tid);
+        if (!c->ok)
+            return;
+        if (tid <= 0) {
+            c->ok = false;
+            return;
+        }
+        if (c->read)
+            v->unsampled[i] = tid;
+    }
+}
 void xrt_wire_perf_thread(struct xrt_codec *c, struct xrt_perf_thread *t)
 {
     signed32(c, &t->tid);

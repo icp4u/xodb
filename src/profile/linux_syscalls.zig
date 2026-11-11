@@ -23,6 +23,9 @@ pub const Collector = struct {
         rt.xrt_perf_destroy(self.handle);
         self.allocator.destroy(self);
     }
+    pub fn allocatedRingBytes(self: *const Collector) u64 {
+        return runtime.info(self.handle).allocated_ring_bytes;
+    }
     pub fn stop(self: *Collector) ?perf.Failure {
         var f: rt.struct_xrt_perf_failure = undefined;
         return if (rt.xrt_perf_stop(self.handle, &f)) null else runtime.failure(f);

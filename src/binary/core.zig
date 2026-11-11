@@ -25,6 +25,9 @@ pub const Core = struct {
     note_bytes: usize = 0,
     /// Set when a VMCOREINFO note is present. User cores leave it false.
     kernel: bool = false,
+    /// VMCOREINFO was read from memory, not a note: QEMU's prstatus ids count
+    /// CPUs, so a note's position is its CPU.
+    notes_by_position: bool = false,
     /// The note body. A malformed key is ignored; it does not fail open.
     vmcore: []const u8 = "",
     /// First positive crash-note pid, used when the core has no process note.
@@ -41,6 +44,12 @@ pub const Core = struct {
     va_bits: u8 = 0,
     /// Kernel virtual address minus its physical address, when the note has it.
     kimage_voffset: ?u64 = null,
+    /// Virtual range of a kernel image whose bytes live at `image_phys`.
+    /// A dump that records physical addresses has no note; the image itself
+    /// names the slide, and reads of this range use those physical bytes.
+    image_va: u64 = 0,
+    image_phys: u64 = 0,
+    image_len: u64 = 0,
     /// Segment indices ordered by physical address. Empty means scan.
     phys_order: []u32 = &.{},
     /// For each prefix of `phys_order`, the segment whose physical end reaches farthest.
@@ -154,7 +163,7 @@ pub const Core = struct {
                 },
                 .hole => break,
                 .miss => {
-                    const phys = self.translate(at) orelse break;
+                    const phys = self.imagePhys(at) orelse self.translate(at) orelse break;
                     const hit = self.physBytes(phys) orelse break;
                     const page_left = @as(usize, 4096) - @as(usize, @intCast(phys & 0xfff));
                     const n: usize = @min(out.len - done, @min(hit.n, page_left));
@@ -637,6 +646,155 @@ fn parseHexKey(raw: []const u8) ?u64 {
     const digits = if (std.mem.startsWith(u8, body, "0x") or std.mem.startsWith(u8, body, "0X")) body[2..] else body;
     if (digits.len == 0) return null;
     return std.fmt.parseInt(u64, digits, 16) catch null;
+}
+
+fn imagePhys(self: *const Core, va: u64) ?u64 {
+    if (self.image_len == 0 or va < self.image_va) return null;
+    const off = va - self.image_va;
+    if (off >= self.image_len) return null;
+    return std.math.add(u64, self.image_phys, off) catch null;
+}
+
+/// Map a kernel image whose dump records physical addresses. The banner is
+/// searched in stored bytes. A hit counts only when it and the image base
+/// sit in a segment whose virtual and physical addresses are the same, the
+/// leading bytes match `head`, and the image's own `kimage_voffset` (the
+/// u64 at `voffset_off`, virtual minus physical) puts it at a slide that is zero or
+/// a multiple of `step`. Two such images are refused and nothing is mapped.
+pub fn placePhysicalImage(self: *Core, link_lo: u64, span: u64, banner_link: u64, banner: []const u8, head: []const u8, voffset_off: u64, step: u64) !void {
+    if (self.image_len != 0 or self.vmcore.len != 0) return error.PhysicalImageNotFound;
+    if (banner.len < 24 or banner.len > 128 or head.len < 16 or span == 0 or step == 0) return error.PhysicalImageNotFound;
+    if (banner_link < link_lo) return error.PhysicalImageNotFound;
+    const delta = banner_link - link_lo;
+    if (delta >= span or span < 8 or voffset_off > span - 8) return error.PhysicalImageNotFound;
+    try self.unchanged();
+    const window = try self.arena.allocator().alloc(u8, 65536);
+    const Hit = struct { va: u64, phys: u64 };
+    var chosen: ?Hit = null;
+    var note_copy: []const u8 = "";
+    var cursor: u64 = 0;
+    while (try self.findBytes(banner, cursor, window)) |hit| {
+        cursor = std.math.add(u64, hit, 1) catch break;
+        if (hit < delta) continue;
+        const base = hit - delta;
+        if (!self.identityHolds(hit) or !self.identityHolds(base)) continue;
+        const want: usize = @min(head.len, 32);
+        var got: [32]u8 = undefined;
+        const head_n = self.readMapped(base, got[0..want]) catch |err| switch (err) {
+            error.CoreMemoryOmitted => continue,
+            else => return err,
+        };
+        if (head_n != want) continue;
+        if (!std.mem.eql(u8, got[0..want], head[0..want])) continue;
+        // The running image stores its own virtual-minus-physical offset;
+        // vmcoreinfo_data is only a pointer into the linear map.
+        const voffset_at = std.math.add(u64, base, voffset_off) catch continue;
+        var voffset_buf: [8]u8 = undefined;
+        const voffset_n = self.readMapped(voffset_at, &voffset_buf) catch |err| switch (err) {
+            error.CoreMemoryOmitted => continue,
+            else => return err,
+        };
+        if (voffset_n != voffset_buf.len) continue;
+        const virtual = base +% std.mem.readInt(u64, &voffset_buf, .little);
+        if (virtual < link_lo) continue;
+        const slide = virtual - link_lo;
+        if (slide >= (@as(u64, 1) << 47) or slide % step != 0) continue;
+        const image_va = std.math.add(u64, link_lo, slide) catch continue;
+        if (chosen) |old| {
+            if (old.va != image_va or old.phys != base) return error.PhysicalImageAmbiguous;
+            continue;
+        }
+        chosen = .{ .va = image_va, .phys = base };
+        note_copy = try std.fmt.allocPrint(self.arena.allocator(), "KERNELOFFSET={x}\n", .{slide});
+    }
+    const picked = chosen orelse return error.PhysicalImageNotFound;
+    // The kernel's own VMCOREINFO page names the page tables; take the copy
+    // whose offset line agrees with the image, else only that offset.
+    if (try self.findVmcoreinfo(note_copy, window)) |text| note_copy = text;
+    try self.unchanged();
+    self.image_va = picked.va;
+    self.image_phys = picked.phys;
+    self.image_len = span;
+    self.takeVmcore(note_copy);
+    self.notes_by_position = true;
+    if (self.page_levels == 0) self.page_levels = if (self.machine == 183) armLevels(if (self.va_bits == 0) 48 else self.va_bits) else 4;
+}
+
+/// A stored VMCOREINFO page (page-aligned, starting `OSRELEASE=`) that holds
+/// `offset_line`. Null when none does.
+fn findVmcoreinfo(self: *Core, offset_line: []const u8, window: []u8) !?[]const u8 {
+    var cursor: u64 = 0;
+    while (try self.findBytes(offset_line, cursor, window)) |hit| {
+        cursor = std.math.add(u64, hit, 1) catch break;
+        const page = hit & ~@as(u64, 0xfff);
+        var buf: [4096]u8 = undefined;
+        const n = self.readMapped(page, &buf) catch |err| switch (err) {
+            error.CoreMemoryOmitted => continue,
+            else => return err,
+        };
+        const text = std.mem.sliceTo(buf[0..n], 0);
+        if (!std.mem.startsWith(u8, text, "OSRELEASE=")) continue;
+        if (hit - page + offset_line.len > text.len) continue;
+        return try self.arena.allocator().dupe(u8, text);
+    }
+    return null;
+}
+
+fn identityHolds(self: *const Core, addr: u64) bool {
+    for (self.segments.items) |seg| {
+        if (seg.start != seg.phys or seg.stored == 0) continue;
+        const end = std.math.add(u64, seg.start, seg.stored) catch continue;
+        if (addr >= seg.start and addr < end) return true;
+    }
+    return false;
+}
+
+/// Next stored address at or after `start_at` whose bytes equal `needle`.
+/// A match stays inside one segment.
+fn findBytes(self: *const Core, needle: []const u8, start_at: u64, window: []u8) !?u64 {
+    if (needle.len == 0 or needle.len > window.len) return null;
+    const overlap = needle.len - 1;
+    const needle_len: u64 = needle.len;
+    for (self.segments.items) |seg| {
+        if (seg.stored < needle_len) continue;
+        const stored_end = std.math.add(u64, seg.start, seg.stored) catch continue;
+        if (start_at >= stored_end) continue;
+        var addr: u64 = if (start_at > seg.start) start_at else seg.start;
+        while (true) {
+            const remain = stored_end - addr;
+            if (remain < needle_len) break;
+            const chunk: usize = @intCast(@min(@as(u64, window.len), remain));
+            const file_off = std.math.add(u64, seg.offset, addr - seg.start) catch return error.TruncatedCore;
+            try self.exact(file_off, window[0..chunk]);
+            var i: usize = 0;
+            while (i + needle.len <= chunk) : (i += 1) {
+                if (!std.mem.eql(u8, window[i..][0..needle.len], needle)) continue;
+                return std.math.add(u64, addr, @as(u64, i)) catch continue;
+            }
+            if (@as(u64, chunk) == remain) break;
+            addr = std.math.add(u64, addr, @as(u64, chunk - overlap)) catch break;
+        }
+    }
+    return null;
+}
+
+fn readMapped(self: *const Core, addr: u64, out: []u8) !usize {
+    if (out.len == 0) return 0;
+    var done: usize = 0;
+    while (done < out.len) {
+        const at = std.math.add(u64, addr, @as(u64, done)) catch return error.TruncatedCore;
+        switch (self.locate(at)) {
+            .bytes => |hit| {
+                const n: usize = @min(out.len - done, hit.n);
+                if (n == 0) break;
+                try self.exact(hit.file, out[done..][0..n]);
+                done += n;
+            },
+            else => break,
+        }
+    }
+    if (done == 0) return error.CoreMemoryOmitted;
+    return done;
 }
 
 };
@@ -1124,4 +1282,95 @@ test "KGHANG a kernel image note may name no process" {
     defer only.deinit(a);
     try pushNote(&only, a, "CORE", 3, &desc);
     try std.testing.expectError(error.InvalidCoreProcessInfo, user.notes(only.items));
+}
+
+test "physical kernel image is addressed by its kimage_voffset" {
+    const a = std.testing.allocator;
+    const banner = "Linux version synthetic banner!!";
+    const head = "vmlinux-head.16B";
+    const bad = "decoy-head-bad!!";
+    const link_lo: u64 = 0xffff800080000000;
+    const span: u64 = 0x3000;
+    const banner_delta: u64 = 0x1000;
+    const voffset_delta: u64 = 0x2000;
+    const slide: u64 = 0x200000;
+    const phys_base: u64 = 0x40200000;
+    try std.testing.expectEqual(@as(usize, 32), banner.len);
+    try std.testing.expectEqual(@as(usize, 16), head.len);
+    try std.testing.expectEqual(@as(usize, 16), bad.len);
+    const Fill = struct {
+        /// An image at `phys` whose kimage_voffset places it at `virt`.
+        fn image(head_bytes: []const u8, banner_bytes: []const u8, phys: u64, virt: u64) [0x3000]u8 {
+            var buf: [0x3000]u8 = @splat(0);
+            @memcpy(buf[0..head_bytes.len], head_bytes);
+            @memcpy(buf[0x1000..][0..banner_bytes.len], banner_bytes);
+            std.mem.writeInt(u64, buf[0x2000..][0..8], virt -% phys, .little);
+            return buf;
+        }
+    };
+    const decoy = Fill.image(bad, banner, 0x20000000, link_lo + 0x600000);
+    const real = Fill.image(head, banner, phys_base, link_lo + slide);
+    const virt = Fill.image(head, banner, 0x111000, link_lo + 0x400000);
+    const Load = struct { vaddr: u64, paddr: u64, bytes: []const u8 };
+    const Builder = struct {
+        fn open(alloc: std.mem.Allocator, dir: anytype, name: [:0]const u8, loads: []const Load) !Core {
+            var note: std.ArrayList(u8) = .empty;
+            defer note.deinit(alloc);
+            const one = prstatus(1);
+            try pushNote(&note, alloc, "CORE\x00", 1, &one);
+            const phnum: u16 = @intCast(loads.len + 1);
+            const note_off: u64 = 64 + @as(u64, phnum) * 56;
+            var bytes: std.ArrayList(u8) = .empty;
+            defer bytes.deinit(alloc);
+            const header = elfHeader(64, phnum, 0, 0, 0);
+            try bytes.appendSlice(alloc, &header);
+            try pushPhdr(&bytes, alloc, 4, 0, note_off, 0, 0, note.items.len, note.items.len);
+            var data_off = note_off + note.items.len;
+            for (loads) |load| {
+                try pushPhdr(&bytes, alloc, 1, 5, data_off, load.vaddr, load.paddr, load.bytes.len, load.bytes.len);
+                data_off += load.bytes.len;
+            }
+            try bytes.appendSlice(alloc, note.items);
+            for (loads) |load| try bytes.appendSlice(alloc, load.bytes);
+            const file = try dir.createFile(std.testing.io, name, .{ .read = true });
+            defer file.close(std.testing.io);
+            try file.writeStreamingAll(std.testing.io, bytes.items);
+            const path = try dir.realPathFileAlloc(std.testing.io, name, alloc);
+            defer alloc.free(path);
+            return Core.open(alloc, path);
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var core = try Builder.open(a, tmp.dir, "physical-image", &.{
+        .{ .vaddr = 0x20000000, .paddr = 0x20000000, .bytes = &decoy },
+        .{ .vaddr = phys_base, .paddr = phys_base, .bytes = &real },
+        .{ .vaddr = link_lo, .paddr = 0x111000, .bytes = &virt },
+    });
+    defer core.deinit();
+    try std.testing.expect(!core.kernel);
+    try std.testing.expectEqual(@as(usize, 0), core.vmcore.len);
+    try core.placePhysicalImage(link_lo, span, link_lo + banner_delta, banner, head, voffset_delta, slide);
+    try std.testing.expectEqual(link_lo + slide, core.image_va);
+    try std.testing.expectEqual(phys_base, core.image_phys);
+    try std.testing.expectEqual(span, core.image_len);
+    try std.testing.expect(core.notes_by_position);
+    try std.testing.expect(std.mem.indexOf(u8, core.vmcore, "KERNELOFFSET=200000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, core.vmcore, "400000") == null);
+    try std.testing.expect(std.mem.indexOf(u8, core.vmcore, "600000") == null);
+    var got: [banner.len]u8 = undefined;
+    try std.testing.expectEqual(banner.len, try core.read(link_lo + slide + banner_delta, &got));
+    try std.testing.expect(std.mem.eql(u8, &got, banner));
+    var one: [1]u8 = undefined;
+    try std.testing.expectError(error.CoreMemoryOmitted, core.read(link_lo + slide - 1, &one));
+    try std.testing.expectError(error.CoreMemoryOmitted, core.read(link_lo + slide + span, &one));
+    const other = Fill.image(head, banner, 0x50000000, link_lo + 0x400000);
+    var ambiguous = try Builder.open(a, tmp.dir, "two-images", &.{
+        .{ .vaddr = phys_base, .paddr = phys_base, .bytes = &real },
+        .{ .vaddr = 0x50000000, .paddr = 0x50000000, .bytes = &other },
+    });
+    defer ambiguous.deinit();
+    try std.testing.expectError(error.PhysicalImageAmbiguous, ambiguous.placePhysicalImage(link_lo, span, link_lo + banner_delta, banner, head, voffset_delta, slide));
+    try std.testing.expectEqual(@as(u64, 0), ambiguous.image_len);
+    try std.testing.expectEqual(@as(usize, 0), ambiguous.vmcore.len);
 }

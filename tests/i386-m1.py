@@ -216,7 +216,7 @@ def check(name, ok, detail=''):
 probe = subprocess.run(['gcc', '-m32', '-x', 'c', '-o', str(work / 'probe32'), '-'], input=b'int main(void){return 0;}\n', capture_output=True)
 if probe.returncode != 0:
     print('SKIP i386-m1: gcc -m32 is not available: ' + probe.stderr.decode(errors='replace').strip())
-    sys.exit(0)
+    sys.exit(77)
 
 def section_names(path):
     names = set()

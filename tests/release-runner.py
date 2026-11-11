@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise environment isolation, deadlines and owned descendant cleanup."""
 import contextlib
+import ast
 import ctypes
 from importlib.machinery import SourceFileLoader
 import fnmatch
@@ -317,6 +318,35 @@ raise SystemExit(int(sys.argv[2]))
                 self.assertEqual((artifacts / 'ocr-latest/frame.png').read_bytes(), b'later frame')
             self.assertEqual(inherited['XODB_TEST_LOG_DIR'], 'unused-inherited-directory')
             self.assertEqual((directory / 'gui-owned.artifacts/ocr-first-failure/ocr.txt').read_text(), 'original OCR: lnmatched')
+
+    def test_ocr_budget_floor_and_single_thread(self):
+        # Inspect actual subprocess arguments without importing executable GUI
+        # scripts (which would start displays and fixtures on import).
+        from types import SimpleNamespace
+        scaled = {'deepmap-gui.py', 'macos-views-gui.py', 'remote-owner-gui.py'}
+        names = sorted(scaled | {'jai-writes-gui.py', 'jai-runtime-gui.py',
+                                'jai-browser-gui.py', 'redot-protocol-gui.py',
+                                'redot-time-gui.py'})
+        for name in names:
+            syntax = ast.parse((root / 'tests' / name).read_text())
+            calls = [node for node in ast.walk(syntax) if isinstance(node, ast.Call)
+                     and node.args and isinstance(node.args[0], ast.List)
+                     and node.args[0].elts and isinstance(node.args[0].elts[0], ast.Constant)
+                     and node.args[0].elts[0].value == 'tesseract']
+            self.assertEqual(len(calls), 1, name)
+            kwargs = {item.arg: item.value for item in calls[0].keywords}
+            for scale in (1, 5):
+                with self.subTest(caller=name, scale=scale):
+                    env = {'OCR_SENTINEL': 'kept', 'OMP_THREAD_LIMIT': '99'}
+                    context = dict(scale=scale, h=SimpleNamespace(load_scale=lambda: scale),
+                                   os=SimpleNamespace(environ=env), d=SimpleNamespace(env=env))
+                    def argument(key):
+                        expression = ast.Expression(body=kwargs[key])
+                        return eval(compile(expression, name, 'eval'),
+                                    {'__builtins__': {}, 'max': max, 'dict': dict}, context)
+                    self.assertEqual(argument('timeout'), max(30, 10 * scale) if name in scaled else 30)
+                    self.assertEqual(argument('env')['OMP_THREAD_LIMIT'], '1')
+                    self.assertEqual(argument('env')['OCR_SENTINEL'], 'kept')
 
     def test_gui_ocr_timeout_captures_without_relaxing_predicate(self):
         from helpers import input as display_input
@@ -649,7 +679,9 @@ assert sys.argv[2] == 'pass'
 
     def test_optional_lab_steps_are_skipped_without_configuration(self):
         names = {'kernel-target-lab', 'kernel-target-lab-core', 'kernel-target-lab-kcore',
-                 'gui-kernel-target-lab', 'gui-kernel-target-lab-core', 'kernel-census-lab'}
+                 'kernel-target-lab-gdbstub', 'kernel-target-lab-arm64-core',
+                 'gui-kernel-target-lab', 'gui-kernel-target-lab-core', 'gui-kernel-target-lab-gdbstub',
+                 'kernel-census-lab'}
         planned = [step for tier in ('periodic', 'periodic-gui') for step in gate.plan(tier) if step.name in names]
         self.assertEqual({step.name for step in planned}, names)
         self.assertEqual(len(planned), len(names))
@@ -665,19 +697,19 @@ assert sys.argv[2] == 'pass'
                     if setting is not None:
                         env['XODB_KERNEL_LAB'] = setting
                     report = dict(steps=[])
-                    # An absent fixture is not launched, even as a GUI retry.
-                    with mock.patch.object(gate.subprocess, 'Popen', side_effect=AssertionError('unconfigured lab launched')):
-                        code = gate.run_steps(planned, directory, env, directory, report, retries=2, jobs=jobs)
+                    # The real scripts report unavailable fixtures themselves;
+                    # their early exits must not start a guest or compositor.
+                    code = gate.run_steps(planned, root, env, directory, report, retries=2, jobs=jobs)
                     self.assertEqual(code, 0)
-                    self.assertEqual(report['summary'], dict(planned=6, passed=0, skipped=6, flaky=0, failed=0, not_run=0))
+                    self.assertEqual(report['summary'], dict(planned=9, passed=0, skipped=9, flaky=0, failed=0, not_run=0))
                     self.assertEqual(report['failures'], [])
                     for step in report['steps']:
                         self.assertEqual(step['status'], 'skipped')
-                        self.assertEqual(step['reason'], 'XODB_KERNEL_LAB is not configured')
-                        self.assertNotIn('exit_code', step)
+                        self.assertIn('exit 77', step['reason'])
+                        self.assertEqual(step['exit_code'], 77)
                         self.assertNotIn('earlier_attempts', step)
-                        self.assertIn(step['reason'], Path(step['log']).read_text())
-                    self.assertEqual(json.loads(json.dumps(report))['summary']['skipped'], 6)
+                        self.assertIn('XODB_KERNEL_LAB is not configured', Path(step['log']).read_text())
+                    self.assertEqual(json.loads(json.dumps(report))['summary']['skipped'], 9)
 
     def test_configured_lab_runs_and_skip_text_is_not_a_skip_contract(self):
         with tempfile.TemporaryDirectory(dir=root / '.work', prefix='lab-configured-') as name:
@@ -704,7 +736,7 @@ assert sys.argv[2] == 'pass'
                 directory.chmod(0o755)
                 env = dict(os.environ)
                 env.pop('XODB_KERNEL_LAB', None)
-                planned = [gate.Step('optional', [sys.executable, 'tests/kernel-target-lab.py'], 5),
+                planned = [gate.Step('optional', [sys.executable, '-c', 'raise SystemExit(77)'], 5),
                            gate.Step('after', [sys.executable, '-c', 'pass'], 5,
                                      needs=['optional'] if dependent else [])]
                 report = dict(steps=[])
@@ -719,6 +751,69 @@ assert sys.argv[2] == 'pass'
                     self.assertEqual(code, 0)
                     self.assertEqual(report['summary']['passed'], 1)
                     self.assertEqual(report['steps'][1]['status'], 'passed')
+
+    def test_exit77_is_explicit_generic_and_not_retried(self):
+        for jobs in (1, 2):
+            for source in ('raise SystemExit(77)', "print('SKIP owned optional fixture'); raise SystemExit(77)"):
+                with self.subTest(jobs=jobs, source=source):
+                    code, report = self.sequence([('gui-optional', source), ('after', 'pass')], retries=2, jobs=jobs)
+                    self.assertEqual(code, 0)
+                    self.assertEqual(report['summary'], dict(planned=2, passed=1, skipped=1, flaky=0, failed=0, not_run=0))
+                    optional = report['steps'][0]
+                    self.assertEqual((optional['status'], optional['exit_code']), ('skipped', 77))
+                    self.assertIn('exit 77', optional['reason'])
+                    self.assertNotIn('earlier_attempts', optional)
+        for source in ("print('SKIP diagnostic'); raise SystemExit(1)", 'raise SystemExit(78)'):
+            code, report = self.sequence([('broken', source)])
+            self.assertEqual(code, 1)
+            self.assertEqual(report['summary']['skipped'], 0)
+            self.assertEqual(report['steps'][0]['status'], 'failed')
+
+    def test_exit77_does_not_hide_leaked_children(self):
+        for escaped in (False, True):
+            with self.subTest(escaped=escaped):
+                source = ('import os,time\nr,w=os.pipe()\n'
+                          'if os.fork(): os.close(w); os.read(r,1); os._exit(77)\n'
+                          'os.close(r)\n' + ('os.setsid()\n' if escaped else '') +
+                          'os.write(w,b"1")\ntime.sleep(60)')
+                result = self.exercise(source)
+                self.assertEqual(result['exit_code'], 77)
+                self.assertEqual(result['status'], 'leaked_processes')
+
+    def test_missing_multilib_and_kernel_sample_capability_exit77(self):
+        with tempfile.TemporaryDirectory(dir=root / '.work', prefix='capability-skip-') as name:
+            directory = Path(name)
+            directory.chmod(0o755)
+            probes = {
+                'i386-m1': '''import runpy, subprocess, sys
+from unittest import mock
+sys.argv = ['tests/i386-m1.py', '--work', sys.argv[1]]
+def no_multilib(argv, **kwargs):
+    assert argv[:2] == ['gcc', '-m32'], argv
+    return subprocess.CompletedProcess(argv, 1, b'', b'owned unavailable compiler')
+with mock.patch.object(subprocess, 'run', no_multilib):
+    runpy.run_path('tests/i386-m1.py', run_name='__main__')
+''',
+                'kernel-stacks': '''import os, runpy
+from pathlib import Path
+from unittest import mock
+original = Path.read_text
+def unavailable(path, *args, **kwargs):
+    if str(path) == '/proc/sys/kernel/perf_event_paranoid': return '2'
+    return original(path, *args, **kwargs)
+with mock.patch.object(Path, 'read_text', unavailable), mock.patch.object(os, 'geteuid', return_value=1000):
+    runpy.run_path('tests/kernel-stacks.py', run_name='__main__')
+'''}
+            for script, source in probes.items():
+                with self.subTest(script=script):
+                    # The scripts import their helpers from tests, just as when
+                    # invoked directly; only capability discovery is replaced.
+                    source = 'import sys; sys.path.insert(0, "tests")\n' + source
+                    result = gate.run_step(script, [sys.executable, '-c', source, str(directory / 'fixture')],
+                                           5, root, dict(os.environ), directory)
+                    self.assertEqual((result['status'], result['exit_code']), ('skipped', 77),
+                                     Path(result['log']).read_text())
+                    self.assertIn('SKIP', Path(result['log']).read_text())
 
     def test_keep_going_runs_every_step_and_summarises(self):
         steps = [('one', 'raise SystemExit(3)'), ('two', 'pass'), ('three', 'import time; time.sleep(9)')]
@@ -791,12 +886,12 @@ assert sys.argv[2] == 'pass'
 
     RUNTIMES = (['--perl', 'P', '--padwalker', 'W'], ['--python', 'Y'], ['--emacs', 'E'], ['--ruby', 'R'], ['--node', 'N'],
                 ['--node', 'N', '--node-refusal', 'NR'], ['--go', 'G'], ['--redot', 'RD'], ['--macos-ssh', 'MAC'], ['--macos', 'MAC'],
-                ['--arm64-sidecar', 'SSH', 'AGENT', 'FIXTURE'], ['--riscv64-guest', 'SSH', 'AGENT', 'FIXTURE'], ['--aarch64-pac', 'SSH'], ['--wine', 'WINE'], ['--uprobes'], ['--headless'],
+                ['--arm64-sidecar', 'SSH', 'AGENT', 'FIXTURE'], ['--riscv64-guest', 'SSH', 'AGENT', 'FIXTURE'], ['--aarch64-pac', 'SSH'], ['--profile-script', 'SCRIPT'], ['--wine', 'WINE'], ['--uprobes'], ['--headless'],
                 ['--lua', 'l', 's', 'b', '--lua', 'l2', 's2', 'b2'])
     EVERYTHING = dict(uprobes=True, perl='P', node='N', lua=[('l', 's', 'b'), ('l2', 's2', 'b2')], python='Y', padwalker='W',
                       ruby='R', node_refusal='NR', go='G', wine='WINE', emacs='E', redot='RD', macos_ssh='MAC',
                       arm64_sidecar=('SSH', 'AGENT', 'FIXTURE'), macos='MAC',
-                      riscv64_guest=('SSH', 'AGENT', 'FIXTURE'), aarch64_pac='SSH')
+                      riscv64_guest=('SSH', 'AGENT', 'FIXTURE'), aarch64_pac='SSH', profile_script='SCRIPT')
     TIERS = ('portable', 'host', 'gui', 'all', 'periodic', 'periodic-gui', 'perf')
 
     def listed(self, *argv):
@@ -918,6 +1013,15 @@ assert sys.argv[2] == 'pass'
             script = next((arg for arg in step.argv if str(arg).startswith('tests/') and str(arg).endswith('.py')), None)
             for entry in step.work if script and '.' in step.argv and entry.startswith('input-') else ():
                 self.assertIn(f"'.work/{entry}'", (root / script).read_text().replace('"', "'"), step.name)
+
+    def test_profile_script_is_periodic_only(self):
+        self.assertIsNone(self.listed('all', '--profile-script', 'script.sh'))
+        self.assertIsNone(self.listed('host', '--profile-script', 'script.sh'))
+        self.assertNotIn('profile-script', {name for name, _, _ in gate.plan('periodic')})
+        armed = {name: argv for name, argv, _ in gate.plan('periodic', profile_script='script.sh')}
+        self.assertEqual(armed['profile-script'], ['sh', 'script.sh'])
+        self.assertNotIn('profile-script', {name for name, _, _ in gate.plan('all', profile_script='script.sh')})
+        self.assertNotIn('profile-script', {name for name, _, _ in gate.plan('periodic-gui', profile_script='script.sh')})
 
     def test_every_registered_step_is_reachable(self):
         reachable = self.reachable()
@@ -1132,12 +1236,26 @@ assert sys.argv[2] == 'pass'
         self.assertNotIn('memory-search-speed-agent-lane', names)
         variant = next(step for step in replaced if step.name == 'run-control-agent-lane')
         self.assertEqual(variant.argv[:2], ['env', 'XODB_TEST_RUNTIME_AGENT=./zig-out/bin/xodb-agent'])
-        # `all` stays one copy. The periodic tier carries the host variants.
-        self.assertFalse(any(step.name.endswith(gate.AGENT_LANE_SUFFIX) for step in gate.plan('all')))
+        # `all` runs the profile step through the local C agent. The other
+        # host variants stay on the periodic tier, and host and gui stay without them.
+        all_steps = gate.plan('all')
+        all_lane = [step.name for step in all_steps if step.name.endswith(gate.AGENT_LANE_SUFFIX)]
+        self.assertEqual(all_lane, ['m2-profile-agent-lane'])
+        self.assertFalse(any(step.name.endswith(gate.AGENT_LANE_SUFFIX) for step in gate.plan('host')))
+        self.assertFalse(any(step.name.endswith(gate.AGENT_LANE_SUFFIX) for step in gate.plan('gui')))
+        plain = next(step for step in all_steps if step.name == 'm2-profile')
+        profile_lane = next(step for step in all_steps if step.name == 'm2-profile-agent-lane')
+        self.assertEqual(profile_lane.argv[:2], ['env', 'XODB_TEST_RUNTIME_AGENT=./zig-out/bin/xodb-agent'])
+        self.assertEqual(list(profile_lane.argv[2:]), list(plain.argv))
+        self.assertEqual(profile_lane.timeout, plain.timeout)
+        self.assertEqual(profile_lane.needs, plain.needs)
         periodic = gate.plan('periodic')
         periodic_names = [step.name for step in periodic]
         self.assertEqual(len(periodic_names), len(set(periodic_names)))
         self.assertIn('run-control-agent-lane', periodic_names)
+        self.assertEqual(periodic_names.count('m2-profile-agent-lane'), 1)
+        periodic_profile = next(step for step in periodic if step.name == 'm2-profile-agent-lane')
+        self.assertEqual(list(periodic_profile.argv), list(profile_lane.argv))
         self.assertNotIn('core-debugging-agent-lane', periodic_names)
         self.assertNotIn('runtime-host-agent-lane', periodic_names)
         self.assertNotIn('macos-names-matrix-agent-lane', periodic_names)
@@ -1193,6 +1311,10 @@ assert sys.argv[2] == 'pass'
                                     30, cwd, os.environ.copy(), logs)
             self.assertEqual(skipped['status'], 'agent_not_started')
             self.assertIs(skipped['agent_started'], False)
+            optional = gate.run_step('optional-agent-lane', switch + ['sh', '-c', 'exit 77'],
+                                     30, cwd, os.environ.copy(), logs)
+            self.assertEqual((optional['status'], optional['exit_code']), ('skipped', 77))
+            self.assertIs(optional['agent_started'], False)
             plain = gate.run_step('plain', ['sh', '-c', 'exit 0'], 30, cwd, os.environ.copy(), logs)
             self.assertEqual(plain['status'], 'passed')
             self.assertNotIn('agent_started', plain)

@@ -241,7 +241,9 @@ static enum xrt_status dispatch(struct agent *a, struct xrt_wire_frame *frame, u
     if (rpc_class == XRT_RPC_CLASS_PERF) {
         *snapshot = NULL;
         return xrt_agent_perf_dispatch(a->collectors, t, frame->op, args, data, size, value,
-                                       a->extra, extra_size);
+                                       a->extra, extra_size,
+                                       (a->negotiated & XRT_RPC_CAP_PERF_LIMIT) != 0,
+                                       (a->negotiated & XRT_RPC_CAP_PERF_LIMIT_QUIET) != 0);
     }
     if (rpc_class == XRT_RPC_CLASS_FILE)
         *snapshot = NULL;

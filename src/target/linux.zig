@@ -706,7 +706,13 @@ pub const Target = struct {
         const t = self.threadSlice()[index_];
         if (t.state != .stopped) return error.NotStopped;
         var result = StopInfo{ .tid = tid, .reason = t.reason, .signal = t.signal, .signal_name = signalNameIn(self.signalTable(), t.signal), .read_only = self.core != null, .pending_delivery = self.core == null and t.signal != 0 };
-        result.pc = try programCounter(try self.registers(tid));
+        result.pc = if (self.registers(tid)) |regs|
+            programCounter(regs) catch null
+        else |err| switch (err) {
+            // A memory task has no CPU registers. The stop itself still stands.
+            error.KernelTaskNotCpu => null,
+            else => return err,
+        };
         if (self.core) |*core| {
             // Linux supplies signal info for the dumping thread; GDB may
             // also emit per-thread records. Keep the note's thread association.

@@ -189,8 +189,26 @@ limits total live data-ring memory to **64 MiB by default** (configurable from
 4 KiB to 256 MiB), plus one metadata page per open thread. A budget too small
 for the opening set rejects the start; exhausted headroom ends collection.
 Opening allocations retain the previous 4,096-data-page bound; additional memory
-is allocated only as new threads arrive. OS perf limits can reject an open first.
-No limits are changed automatically. Restart xodb after rebuilding.
+is allocated only as new threads arrive. Before the first mapping, the open
+sizes each ring in bytes against `perf_event_mlock_kb` times online CPUs plus
+`RLIMIT_MEMLOCK`, so a larger page does not pin a wider ring than that allowance.
+If a mapping still returns EPERM, the open retries with fewer data pages. If
+one data page still cannot be mapped for every thread, the open keeps the
+prefix that mapped and reports `ring_limit` (kind `shrunk` or `capped`),
+including `unsampled_tids` when capped. A later enroll that hits the same
+ceiling fails and the capture stops with `collector_error`; it does not keep
+running. Syscall, off-CPU, and allocation rings call that same pinned-page
+helper. They keep every requested thread and use fewer data pages when the
+allowance is smaller than the request. A running count of pages already mapped
+makes the next collector size against what remains, and `ring_allocated_bytes`
+reports the data bytes the syscall and off-CPU rings actually mapped. No limits
+are changed automatically. A remote collector that negotiated the perf-limit
+capability reports that kind, the fitted data-page count, and the unsampled
+tids on each successful perf info. An older agent omits them; the host then
+treats a short opened count as capped and names the unopened suffix of the
+request. When the collector also negotiated the quieter form, a later info
+repeats those facts only when they change.
+Restart xodb after rebuilding.
 
 Bounded drains rotate through retained rings so busy threads cannot starve later
 ones. [Burst checks](research/capture-robustness.md) and
@@ -316,7 +334,7 @@ always stop collection with P, including after revoking agent control with F8.
 | `start_profile` | Required current `generation`; optional `tids`, `frequency_hz` (1–1000), `duration_ms` (0–4294967295; 0 disables the deadline), `context_switch`, `follow_threads` (booleans), `ring_budget_bytes` (4096–268435456). Defaults: all live and newly created same-process threads and current session preferences (initially 99 Hz, 60000 ms, scheduling off). Returns capture and session. |
 | `stop_profile` | Required `generation` and `capture_id`. Disables, drains and closes perf events. |
 | `release_profile` | Required `generation`, `capture_id` and `revision`. Releases a stopped live capture and its retained images. Export first to preserve it. A collecting capture refuses; a cancelled reader returns `ProfileViewPending` until it finishes. |
-| `get_profile` | Optional `capture_id`. Returns capture metadata and scheduling status/budgets, `displayed_view` (last GUI frame’s basis/capture/revision/filter, view identity, sample count and visibility, or null headlessly), `cpu_activity` on completed captures, `scope_change` (triggering task IDs/time when reported by perf), `last_start_error`, `requested_threads`, `thread_limit`, and `last_open_failure` (syscall/errno). |
+| `get_profile` | Optional `capture_id`. Returns capture metadata and scheduling status/budgets, `displayed_view` (last GUI frame’s basis/capture/revision/filter, view identity, sample count and visibility, or null headlessly), `cpu_activity` on completed captures, `scope_change` (triggering task IDs/time when reported by perf), `last_start_error`, `requested_threads`, `thread_limit`, `last_open_failure` (syscall/errno), and `ring_limit` (null, or `shrunk`/`capped` after the pinned allowance is read, with `unsampled_tids` when capped). |
 | `get_profile_mappings` | Required `capture_id` and `revision`; optional `start`, `limit` (1–64). Pages opening ranges and observed changes in stable mapping-ID order, with timestamps, image identity, execute permission, reason and coverage. |
 | `get_flamegraph` | Required `capture_id`; omit `revision` on the first live page to bind current data. Poll a pending response with its exact `revision`/`view_id` and filters. Pages require `view_id`; optional `tid` or `tids`, `from_ns`, `to_ns`, `start`, `limit` (1–64), `retry`. Ready results include snapshot/current revisions, worker metrics, nodes/counts and `next`. Offline queries still require `revision`. Optional `basis:"reconstructed"` selects completed-capture saved-stack analysis with separate identity, coverage and sample citations; see [sampled stacks](M2_SAMPLED_UNWIND.md#reconstructed-flames-over-mcp). |
 | `get_profile_timeline` | Required `capture_id` and `revision`; optional `tid` or `tids`, `from_ns`, `to_ns`, `bins` (1–512, default 128), `start`, `limit` (1–64). Returns CPU bins, paged thread counts, loss diagnostics and debugger markers. Includes scheduling status; use `get_profile_schedule` for intervals. |
@@ -507,6 +525,10 @@ current [host permissions](research/uprobe-permissions.md).
 - One perf fd and a 4–64-page data ring plus a metadata page per sampled thread.
   The largest power of two that fits 4,096 total data pages is used: on 4 KiB
   pages, 256 KiB for up to 64 threads, 128 KiB for 100, and 16 KiB for 640–1,024.
+  Rings are sized in bytes against the pinned allowance before mmap. A later
+  EPERM retries smaller rings, then keeps the prefix that mapped, and reports
+  `ring_limit`. An enroll that hits the ceiling stops the capture. Settings
+  are not changed.
   Total ring mappings stay at most 20 MiB. Polling/final draining are bounded;
   live graph rebuilds are throttled to at most four per second. The view
   draws at most 512 visible rectangles; zooming reveals small frames. Raw

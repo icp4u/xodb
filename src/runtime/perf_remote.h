@@ -37,5 +37,5 @@ void xrt_agent_perf_observe(struct xrt_agent_perf *, struct xrt_target *, const 
 bool xrt_agent_perf_uses(struct xrt_agent_perf *, const struct xrt_target *);
 enum xrt_status xrt_agent_perf_dispatch(struct xrt_agent_perf *, struct xrt_target *, uint16_t,
                                         const uint64_t *, void *, size_t, uint64_t *, void *,
-                                        size_t *);
+                                        size_t *, bool perf_limit, bool limit_quiet);
 #endif

@@ -28,6 +28,7 @@ fn named(names: []const []const u8, arg: []const u8) bool {
 /// Every parser xodb dispatches to after log.init: the debugger, the overview
 /// and the scene3d probe ("--instances"; its "--frames" is in the other two).
 fn takesValue(arg: []const u8) bool {
+    if (named(&@import("ui/agent_time.zig").takes, arg)) return true;
     return named(&value_options, arg) or named(&@import("ui/overview/options.zig").takes, arg) or named(&@import("ui/overview/fetch.zig").takes, arg) or named(&@import("radio/burrito.zig").takes, arg) or std.mem.eql(u8, arg, "--instances");
 }
 fn parseUiScale(value: []const u8) !f32 {
@@ -92,6 +93,13 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
         if (std.mem.eql(u8, arg, "--")) break;
         if (std.mem.eql(u8, arg, "--fetch")) return @import("ui/overview/fetch.zig").main(args);
         if (std.mem.eql(u8, arg, "--burrito")) return @import("radio/burrito.zig").main(args);
+    }
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--")) break;
+        if (std.mem.eql(u8, arg, "--agent-time")) {
+            if (comptime build_options.gui) return @import("ui/agent_time.zig").main(args, init.io);
+            return error.GuiDisabled;
+        }
     }
     // The overview is its own window and session with no debug target;
     // headless, it is the collector and MCP alone (no window code runs).
@@ -266,6 +274,7 @@ noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
                 \\  overlays such as MangoHud, OBS capture): slightly faster startup; layer variables you set win.
                 \\--lsof-top runs the terminal open-file and fd activity view (--lsof-top --help; docs/LSOF_TOP.md).
                 \\--overview opens the system overview (no target); xodb --overview --help lists its options.
+                \\--agent-time opens agent work-log flames (no target); --agent-time --help lists its options.
                 \\--kernel-pid PID scopes get_kernel_stacks to this host process, independently of the debug target.
                 \\--fetch prints a fastfetch-style card of this machine and exits (--fetch --help; docs/FETCH.md).
                 \\--burrito listens to 2.4 GHz and the Wi-Fi link, receive-only: is it the microwave? (--burrito --help; docs/RADIO.md).

@@ -14,14 +14,16 @@ import subprocess
 import sys
 import tempfile
 import time
+from helpers.orphans import adopt, reap
 
 root = Path(__file__).resolve().parents[1]
 os.chdir(root)
 lab_setting = os.environ.get('XODB_KERNEL_LAB')
 if not lab_setting:
     print('SKIP kernel-census-lab: XODB_KERNEL_LAB is not configured')
-    sys.exit(0)
+    sys.exit(77)
 lab = Path(lab_setting).resolve()
+adopt()  # kl-run daemonizes QEMU and its console broker; keep them ours to reap.
 kernel = lab / 'out/x86_64-orc'
 if not (kernel / 'arch/x86/boot/bzImage').is_file():
     raise RuntimeError('configured kernel lab has no x86_64 ORC image')
@@ -83,3 +85,5 @@ with (work / 'lease.lock').open('w') as lease:
         if run is not None:
             # kl-stop itself may take 10 s for TERM plus 5 s for KILL.
             subprocess.run([str(lab / 'kit/kl-stop'), str(run)], check=True, timeout=30)
+            # The daemonized guest and its console broker are ours to reap.
+            assert reap(30), 'owned guest helpers did not exit'

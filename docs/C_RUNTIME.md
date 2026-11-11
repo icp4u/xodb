@@ -237,6 +237,17 @@ distinct file-slot status; an older agent still reports that case as file
 unavailable. Running out of file ids reports file unavailable even when the
 slot status was negotiated. A status this host does not know refuses that
 call (a mutation reports an unknown outcome) and leaves the connection up.
+A host that asks also receives a ring-limit suffix on each successful perf
+info: kind, fitted data pages, whether the size was planned, the opened
+count, and the unsampled thread ids. An older agent omits the suffix. The
+host then infers a capped prefix only from a short opened count. A newer
+agent sends the suffix whenever the bit was asked, including an empty list
+when every requested thread was opened. A second bit asks for those facts
+only when they differ from the last suffix on that collector. A zero byte
+then stands in for the suffix, and the host keeps the facts it already has.
+A host that does not ask for the second bit still receives the suffix every
+time. Failure replies stay the old shape.
+The handshake size does not change.
 The 32-byte big-endian header contains `XRT1`, u16 version/opcode, u64 request ID,
 and u32 target/status/body length/flags. Requests use flags 0; replies use flags 1.
 IDs must increase by one. Frames have a 1 MiB ceiling and a 10-second deadline;

@@ -322,9 +322,10 @@ pub const Modules = struct {
     lookup_cpu: ?u32 = null,
     kernel_stop_tid: i32 = 0,
     /// Described-stub CPU threads, local tid to CPU. Not a shadow id.
-    stub_tid: [64]i32 = @splat(0),
-    stub_cpu: [64]u32 = @splat(0),
-    stub_n: u8 = 0,
+    /// Same bound as the per-CPU current table: a wider guest still maps.
+    stub_tid: [256]i32 = @splat(0),
+    stub_cpu: [256]u32 = @splat(0),
+    stub_n: u16 = 0,
     /// Thread ids from a described stub are not kernel pids.
     live_stub_tasks: bool = false,
     kernel_generation: ?u64 = null,
@@ -557,6 +558,22 @@ pub const Modules = struct {
         const n = memory.read(address, buf[0..banner.len]) catch return false;
         return n == banner.len and std.mem.eql(u8, buf[0..banner.len], banner);
     }
+    fn imageHead(mapped: []const u8, image: *const elf.Image, link_lo: u64) []const u8 {
+        const off = image.fileOffset(link_lo) orelse return &.{};
+        if (off >= @as(u64, mapped.len)) return &.{};
+        const file_at: usize = @intCast(off);
+        const n = @min(@as(usize, 32), mapped.len - file_at);
+        return mapped[file_at..][0..n];
+    }
+    /// arm64's `kimage_voffset`: the running image's virtual minus physical
+    /// address, stored in its own data. (`vmcoreinfo_data` is a pointer.)
+    fn voffsetOffset(image: *const elf.Image, link_lo: u64, span: u64) ?u64 {
+        const sym = image.findSymbol("kimage_voffset") orelse return null;
+        if (!sym.hasAddress() or sym.value < link_lo) return null;
+        const off = sym.value - link_lo;
+        if (off >= span) return null;
+        return off;
+    }
     /// Slide such that `linux_banner` in target memory matches the image.
     /// Zero is the link address. Any other slide is a multiple of `step` that
     /// puts one stopped program counter inside the image, or the VMCOREINFO
@@ -709,6 +726,19 @@ pub const Modules = struct {
                 fn read(reader: @This(), address: u64, dest: []u8) !usize {
                     return reader.target.readMemory(address, dest);
                 }
+            };
+            // A physically addressed image has no program note. Its stored
+            // bytes still carry kimage_voffset. Map that image before the
+            // banner check so a virtual program counter can name the slide.
+            if (target.core) |*core| if (core.vmcore.len == 0 and !bannerAt(Reader{ .target = target }, banner_sym.value, banner)) {
+                const head = imageHead(mapped, &image, link_lo);
+                if (head.len >= 16) if (voffsetOffset(&image, link_lo, link_hi - link_lo)) |off| {
+                    core.placePhysicalImage(link_lo, link_hi - link_lo, banner_sym.value, banner, head, off, kernelSlideStep(image.header.machine)) catch |err| switch (err) {
+                        error.PhysicalImageNotFound => {},
+                        error.PhysicalImageAmbiguous => return error.KernelSlideAmbiguous,
+                        else => return err,
+                    };
+                };
             };
             var note_offset: ?u64 = null;
             if (target.core) |*core| if (core.vmcore.len != 0) {
@@ -1034,7 +1064,7 @@ pub const Modules = struct {
         self.currentStacks(target, &stacks);
         const x86 = target.arch() == .x86_64;
         for (target.threadSlice()) |thread| {
-            if (self.stub_n == self.stub_tid.len) break;
+            if (@as(usize, self.stub_n) == self.stub_tid.len) break;
             if (self.publishedTid(thread.tid)) continue;
             const regs = target.registers(thread.tid) catch continue;
             const sp = registerSp(regs.raw) orelse 0;
@@ -1044,7 +1074,7 @@ pub const Modules = struct {
             self.stub_cpu[self.stub_n] = cpu;
             self.stub_n += 1;
         }
-        var drop: [64]bool = @splat(false);
+        var drop: [256]bool = @splat(false);
         var index: usize = 0;
         while (index < self.stub_n) : (index += 1) {
             var other: usize = 0;
@@ -1053,7 +1083,7 @@ pub const Modules = struct {
                 drop[index] = true;
             };
         }
-        var kept: u8 = 0;
+        var kept: u16 = 0;
         index = 0;
         while (index < self.stub_n) : (index += 1) {
             if (drop[index]) continue;
@@ -1100,6 +1130,7 @@ pub const Modules = struct {
         if (self.taskIsCurrent(task.address)) if (self.currentCpu(task)) |cpu| {
             var index: usize = 0;
             while (index < self.stub_n) : (index += 1) if (self.stub_cpu[index] == cpu) return self.stub_tid[index];
+            if (self.noteThread(cpu)) |tid| return tid;
         };
         if (self.live_stub_tasks or task.pid <= 0) return null;
         for (threads) |thread| if (thread.tid == task.pid) return task.pid;
@@ -1109,12 +1140,23 @@ pub const Modules = struct {
         for (self.kernel_current, 0..) |current, cpu| if (current == task.address) return @intCast(cpu);
         return task.cpu;
     }
+    /// A core's note thread for `cpu`: a shadow CPU id, or, when note ids
+    /// count CPUs, the note at that position.
+    fn noteThread(self: *const Modules, cpu: u32) ?i32 {
+        const core = self.core_source orelse return null;
+        for (core.threads.items, 0..) |thread, index| {
+            if (kernel_aware.shadowCpuLocal(thread.tid)) |noted| {
+                if (noted == cpu) return thread.tid;
+            } else if ((!core.kernel or core.notes_by_position) and index == cpu) return thread.tid;
+        }
+        return null;
+    }
     fn cpuHasNote(self: *const Modules, cpu: u32) bool {
         const core = self.core_source orelse return true;
         for (core.threads.items, 0..) |thread, index| {
             if (kernel_aware.shadowCpuLocal(thread.tid)) |noted| {
                 if (noted == cpu) return true;
-            } else if (!core.kernel and index == cpu) return true;
+            } else if ((!core.kernel or core.notes_by_position) and index == cpu) return true;
         }
         return false;
     }
@@ -1660,8 +1702,9 @@ pub const Modules = struct {
         if (self.stubCpuOf(tid)) |cpu| return self.cpuTask(cpu);
         // A guest dump without VMCOREINFO keeps its note ids, which count CPUs,
         // not pids: the note's position is its CPU.
-        if (self.core_source) |core| if (!core.kernel) for (core.threads.items, 0..) |thread, index| {
-            if (thread.tid == tid) return self.cpuTask(@intCast(index));
+        if (self.core_source) |core| if (!core.kernel or core.notes_by_position) for (core.threads.items, 0..) |thread, index| {
+            // Tasks published later are appended past the notes.
+            if (thread.tid == tid) if (self.cpuTask(@intCast(index))) |task| return task;
         };
         for (self.kernel_tasks) |task| if (task.pub_tid != 0 and task.pub_tid == tid) return task;
         // A described stub numbers CPU threads from 1. That id is not a pid.
@@ -1696,6 +1739,27 @@ pub const Modules = struct {
         try std.testing.expectEqual(@as(?i32, null), modules.taskTid(.{ .address = 0x3000, .pid = 7 }, &threads));
         modules.live_stub_tasks = false;
         try std.testing.expectEqual(@as(?i32, 7), modules.taskTid(.{ .address = 0x3000, .pid = 7 }, &threads));
+    }
+    test "described stub map holds a CPU past sixty-four" {
+        const a = std.testing.allocator;
+        var modules = Modules.init(a);
+        defer modules.deinit();
+        modules.live_stub_tasks = true;
+        const tasks = try a.alloc(kernel_aware.TaskRow, 1);
+        tasks[0] = .{ .address = 0x4000, .pid = 0 };
+        modules.kernel_tasks = tasks;
+        const current = try a.alloc(u64, 65);
+        @memset(current, 0);
+        current[64] = 0x4000;
+        modules.kernel_current = current;
+        modules.stub_n = 65;
+        modules.stub_tid[64] = 70;
+        modules.stub_cpu[64] = 64;
+        try std.testing.expectEqual(@as(?u32, 64), modules.stubCpuOf(70));
+        const Thread = struct { tid: i32 };
+        const threads = [_]Thread{.{ .tid = 70 }};
+        try std.testing.expectEqual(@as(?i32, 70), modules.taskTid(tasks[0], &threads));
+        try std.testing.expect(modules.stub_tid.len >= 65);
     }
     pub fn kernelThreadName(self: *Modules, tid: i32, buf: *[128]u8) bool {
         self.ensureTasks();

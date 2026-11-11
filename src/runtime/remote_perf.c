@@ -49,6 +49,38 @@ static bool request(struct xrt_perf *p, uint16_t op, uint64_t a, uint64_t b, con
     } else {
         struct xrt_perf_info info = {0};
         xrt_wire_perf_info(extra, &info);
+        if (extra->ok && xrt_remote_supports(p->remote_target, XRT_RPC_CAP_PERF_LIMIT)) {
+            bool include = true;
+            if (xrt_remote_supports(p->remote_target, XRT_RPC_CAP_PERF_LIMIT_QUIET)) {
+                uint8_t present = 0;
+                xrt_codec_u8(extra, &present);
+                if (!extra->ok || present > 1)
+                    extra->ok = false;
+                include = present == 1;
+                /* A zero byte keeps the facts from the last suffix. The first
+                 * reply has to carry them. */
+                if (extra->ok && !include && !p->limit_known)
+                    extra->ok = false;
+            }
+            if (extra->ok && include) {
+                int32_t tids[XRT_PERF_MAX_THREADS];
+                struct xrt_perf_limit_suffix suffix = {.unsampled = tids};
+                xrt_wire_perf_limit(extra, &suffix);
+                if (!extra->ok || suffix.opened != info.threads)
+                    extra->ok = false;
+                else {
+                    p->limit_known = true;
+                    p->ring_limit = (enum xrt_ring_limit)suffix.kind;
+                    p->data_pages = suffix.data_pages;
+                    p->ring_planned = suffix.planned != 0;
+                    p->unsampled_count = suffix.unsampled_count;
+                    if (suffix.unsampled_count)
+                        memcpy(p->unsampled, tids, suffix.unsampled_count * sizeof(int32_t));
+                }
+            }
+        } else if (extra->ok) {
+            p->limit_known = false;
+        }
         if (extra->ok) {
             p->remote_info = info;
             p->count = info.threads;
@@ -70,7 +102,7 @@ static struct xrt_perf *start(const struct xrt_target *t, uint16_t op, const voi
         return NULL;
     }
     p->remote_target = t;
-    uint8_t bytes[1024];
+    uint8_t bytes[8192];
     struct xrt_codec extra;
     uint64_t value = 0;
     if (!request(p, op, 0, 0, data, size, bytes, sizeof(bytes), &extra, &value, f)) {
@@ -135,7 +167,7 @@ bool xrt_remote_perf_op(struct xrt_perf *p, uint16_t op, uint64_t arg, struct xr
      * do not send another request for every exited thread on every host poll. */
     if (op == XRT_RPC_PERF_RETIRE && arg < XRT_PERF_MAX_THREADS && p->remote_retired[arg])
         return true;
-    uint8_t bytes[256];
+    uint8_t bytes[8192];
     struct xrt_codec extra;
     if (!request(p, op, arg, 0, NULL, 0, bytes, sizeof(bytes), &extra, NULL, f))
         return false;
@@ -160,7 +192,7 @@ bool xrt_remote_perf_thread(const struct xrt_perf *p, size_t index, struct xrt_p
 {
     if (!out)
         return false;
-    uint8_t bytes[512];
+    uint8_t bytes[8192];
     struct xrt_codec extra;
     if (!request((struct xrt_perf *)p, XRT_RPC_PERF_THREAD, index, 0, NULL, 0, bytes, sizeof(bytes),
                  &extra, NULL, NULL))

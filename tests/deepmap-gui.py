@@ -81,7 +81,7 @@ def close():
 def ocr(name, box):
     path = Path(d.shot(name))
     with Image.open(path) as im: im.crop(box).resize(((box[2]-box[0])*2,(box[3]-box[1])*2)).save(path)
-    return subprocess.check_output(['tesseract',str(path),'stdout','--psm','6'],stderr=subprocess.DEVNULL,text=True,timeout=10 * h.load_scale())
+    return subprocess.check_output(['tesseract',str(path),'stdout','--psm','6'],env=dict(os.environ,OMP_THREAD_LIMIT='1'),stderr=subprocess.DEVNULL,text=True,timeout=max(30,10 * h.load_scale()))
 
 base, replay = work/'base.jsonl', work/'replay.jsonl'
 subprocess.run(['python3','-B','tests/fixtures/overview-synth.py',str(base),'--frames','3'],check=True)

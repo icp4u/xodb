@@ -22,7 +22,7 @@ def shot(name,predicate):
     path=Path(d.dir)/(name+'.png');deadline=time.monotonic()+20
     while True:
         subprocess.run(['grim','-g','616,584 664x180',str(path)],env=d.env,check=True,timeout=10)
-        raw=subprocess.run(['tesseract',str(path),'stdout','--psm','6'],capture_output=True,text=True,check=True,timeout=10).stdout
+        raw=subprocess.run(['tesseract',str(path),'stdout','--psm','6'],env=dict(os.environ,OMP_THREAD_LIMIT='1'),capture_output=True,text=True,check=True,timeout=30).stdout
         path.with_suffix('.txt').write_text(raw)
         result=' '.join(raw.lower().split())
         if predicate(result):return result

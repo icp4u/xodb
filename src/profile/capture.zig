@@ -42,12 +42,27 @@ pub const max_samples = 16384;
 pub const max_sample_limit = 65536;
 pub const sample_budget_bytes = sample_store.default_budget_bytes;
 pub const max_frames_cached = 8192;
-// Keep the previous maximum total data-page budget, but give smaller thread
-// sets more room for bursts of mapping metadata. Metadata adds one page/tid.
-fn ringPages(thread_count: usize) u8 {
+// Keep the previous total ring budget in bytes (the 4 KiB-page design: at most
+// 256 KiB per thread and 16 MiB in all), but give smaller thread sets more room
+// for bursts of mapping metadata. Metadata adds one page/tid. A 16 KiB page
+// gets a quarter of the pages, not four times the bytes.
+fn ringPages(thread_count: usize, page_size: u64) u8 {
+    const page = @max(page_size, 4096);
     var pages: u8 = perf.max_data_pages;
-    while (@as(usize, pages) * thread_count > @as(usize, perf.max_threads) * 4) pages /= 2;
+    while (pages > 1 and (@as(u64, pages) * page > @as(u64, perf.max_data_pages) * 4096 or
+        @as(u64, pages) * page * thread_count > @as(u64, perf.max_threads) * 4 * 4096)) pages /= 2;
     return pages;
+}
+/// Capped captures sample a prefix. Side collectors must use that prefix.
+fn sampledTids(tids: []const i32, capped: bool, opened: usize) []const i32 {
+    if (!capped) return tids;
+    return tids[0..@min(opened, tids.len)];
+}
+test "capped side collectors see only the sampled prefix" {
+    const tids = [_]i32{ 7, 8, 9 };
+    try std.testing.expectEqualSlices(i32, &tids, sampledTids(&tids, false, 1));
+    try std.testing.expectEqualSlices(i32, &[_]i32{7}, sampledTids(&tids, true, 1));
+    try std.testing.expectEqualSlices(i32, &[_]i32{}, sampledTids(&tids, true, 0));
 }
 pub const Config = struct {
     sample_limit: u32 = max_samples,
@@ -236,6 +251,10 @@ pub const Capture = struct {
     kernel_symbolizable: bool = false,
     /// Why kernel frames could not be named. Empty when they could.
     kernel_symbol_reason: []const u8 = "",
+    /// Set when the open could not give every requested thread its ring.
+    /// The notice names the pinned-page ceilings. A later enroll that hits
+    /// them stops the capture with collector_error.
+    ring_limit: ?perf.RingLimit = null,
     /// Borrowed by a recorded-view snapshot. Freed only when owned.
     kallsyms: kallsyms.Table = .{},
     kallsyms_owned: bool = false,
@@ -296,7 +315,7 @@ pub const Capture = struct {
         if (syscall_ring_bytes >= config.ring_budget_bytes) return error.SyscallRingBudget;
         const offcpu_ring_bytes = if (config.off_cpu) offcpu_live.ringBytes(config.tids.len) else 0;
         if (offcpu_ring_bytes != 0 and syscall_ring_bytes + offcpu_ring_bytes >= config.ring_budget_bytes) return error.OffCpuRingBudget;
-        const opened = try perf.start(a, .{ .target = @ptrCast(target), .follow_threads = config.follow_threads, .tids = config.tids, .frequency_hz = config.frequency_hz, .max_frames = 64, .mmap_data = true, .data_pages = ringPages(config.tids.len), .ring_budget_bytes = config.ring_budget_bytes - syscall_ring_bytes - offcpu_ring_bytes, .max_sides = perf.max_sides_cap, .exclude_kernel = !config.kernel_stacks, .context_switch = config.context_switch, .user_regs_mask = if (config.user_stack_bytes != 0) perf_regs.mask else 0, .user_stack_bytes = config.user_stack_bytes });
+        const opened = try perf.start(a, .{ .target = @ptrCast(target), .follow_threads = config.follow_threads, .tids = config.tids, .frequency_hz = config.frequency_hz, .max_frames = 64, .mmap_data = true, .data_pages = ringPages(config.tids.len, @import("../target/runtime.zig").c.xrt_target_page_size(target)), .ring_budget_bytes = config.ring_budget_bytes - syscall_ring_bytes - offcpu_ring_bytes, .max_sides = perf.max_sides_cap, .exclude_kernel = !config.kernel_stacks, .context_switch = config.context_switch, .user_regs_mask = if (config.user_stack_bytes != 0) perf_regs.mask else 0, .user_stack_bytes = config.user_stack_bytes });
         switch (opened) {
             .failed => |failure| {
                 user_state.deinit(a);
@@ -307,12 +326,17 @@ pub const Capture = struct {
             },
             .collector => |collector| {
                 errdefer collector.close();
+                const ring_limit = collector.ringLimit(config.tids.len);
+                const opened_threads = if (ring_limit) |limit| limit.opened_threads else config.tids.len;
+                // A capped open samples a prefix. Syscall and off-CPU collectors
+                // follow that prefix, not the threads that have no ring.
+                const sampled = sampledTids(config.tids, if (ring_limit) |limit| limit.kind == .capped else false, opened_threads);
                 var syscall_collector: ?*syscall_perf.Collector = null;
-                if (config.syscall_timing) switch (try syscall_perf.startTarget(a, @ptrCast(target), pid, config.tids)) {
+                if (config.syscall_timing) switch (try syscall_perf.startTarget(a, @ptrCast(target), pid, sampled)) {
                     .collector => |opened_syscalls| syscall_collector = opened_syscalls,
                     .failed => |failure| {
                         var full = failure;
-                        full.opened_then_closed += @intCast(config.tids.len);
+                        full.opened_then_closed += @intCast(opened_threads);
                         collector.close();
                         user_state.deinit(a);
                         images.deinit();
@@ -325,7 +349,7 @@ pub const Capture = struct {
                 errdefer if (syscall_collector) |opened_syscalls| opened_syscalls.close();
                 var offcpu_collector: ?*offcpu_live.Collector = null;
                 errdefer if (offcpu_collector) |opened_off| opened_off.close();
-                if (config.off_cpu) switch (try offcpu_live.start(a, config.tids, offcpu_ring_bytes)) {
+                if (config.off_cpu) switch (try offcpu_live.start(a, sampled, offcpu_ring_bytes)) {
                     .collector => |opened_off| offcpu_collector = opened_off,
                     .failed => |failure| {
                         if (syscall_collector) |opened_syscalls| opened_syscalls.close();
@@ -337,8 +361,8 @@ pub const Capture = struct {
                         return .{ .failed = failure };
                     },
                 };
-                self.* = .{ .allocator = a, .arena = std.heap.ArenaAllocator.init(a), .id = id, .session_id = session_id, .generation = generation, .image_epoch = image_epoch, .pid = pid, .architecture = arch, .boot_id = @import("../binary/snapshot.zig").bootId(), .producer = @import("producer.zig").describe(target), .started_ns = started_ns, .config = .{ .sample_limit = config.sample_limit, .follow_threads = config.follow_threads, .ring_budget_bytes = config.ring_budget_bytes, .frequency_hz = config.frequency_hz, .duration_ms = config.duration_ms, .context_switch = config.context_switch, .kernel_stacks = config.kernel_stacks, .off_cpu = config.off_cpu, .syscall_timing = config.syscall_timing, .syscall_limit = config.syscall_limit, .user_stack_bytes = config.user_stack_bytes, .user_stack_budget_bytes = if (config.user_stack_bytes == 0) 0 else config.user_stack_budget_bytes }, .samples = .{ .max_samples = config.sample_limit }, .user_state = user_state, .accepted = collector.acceptance(), .kernel_stacks_requested = config.kernel_stacks, .kernel_stacks_granted = config.kernel_stacks and !collector.exclude_kernel, .off_cpu_granted = offcpu_collector != null, .thread_count = config.tids.len, .collector = collector, .syscall_collector = syscall_collector, .offcpu_collector = offcpu_collector, .syscalls = .{ .enabled = config.syscall_timing, .limit = config.syscall_limit }, .images = images, .history = history, .missing_images = missing };
-                for (debugger_ids, 0..) |debugger_id, i| {
+                self.* = .{ .allocator = a, .arena = std.heap.ArenaAllocator.init(a), .id = id, .session_id = session_id, .generation = generation, .image_epoch = image_epoch, .pid = pid, .architecture = arch, .boot_id = @import("../binary/snapshot.zig").bootId(), .producer = @import("producer.zig").describe(target), .started_ns = started_ns, .config = .{ .sample_limit = config.sample_limit, .follow_threads = config.follow_threads, .ring_budget_bytes = config.ring_budget_bytes, .frequency_hz = config.frequency_hz, .duration_ms = config.duration_ms, .context_switch = config.context_switch, .kernel_stacks = config.kernel_stacks, .off_cpu = config.off_cpu, .syscall_timing = config.syscall_timing, .syscall_limit = config.syscall_limit, .user_stack_bytes = config.user_stack_bytes, .user_stack_budget_bytes = if (config.user_stack_bytes == 0) 0 else config.user_stack_budget_bytes }, .samples = .{ .max_samples = config.sample_limit }, .user_state = user_state, .accepted = collector.acceptance(), .kernel_stacks_requested = config.kernel_stacks, .kernel_stacks_granted = config.kernel_stacks and !collector.exclude_kernel, .off_cpu_granted = offcpu_collector != null, .thread_count = opened_threads, .collector = collector, .syscall_collector = syscall_collector, .offcpu_collector = offcpu_collector, .syscalls = .{ .enabled = config.syscall_timing, .limit = config.syscall_limit }, .images = images, .history = history, .missing_images = missing, .ring_limit = ring_limit };
+                for (debugger_ids[0..opened_threads], 0..) |debugger_id, i| {
                     self.threads[i] = .{ .debugger_id = debugger_id, .perf = collector.thread(i).? };
                     self.cpu_before[i] = activity.readTarget(@ptrCast(target), pid, config.tids[i]);
                     _ = std.fmt.bufPrintZ(&self.thread_names[i], "Thread {d}", .{config.tids[i]}) catch unreachable;
@@ -348,6 +372,19 @@ pub const Capture = struct {
                 const net_context = @import("net_context.zig").Recorder;
                 self.net = if (self.producer == null) net_context.begin(a, pid, started_ns) else net_context.beginRemote(a, pid, started_ns);
                 self.loadKallsyms();
+                if (self.ring_limit) |*limit| {
+                    self.diagnostic = limit.notice;
+                    // Name the requested threads that got no ring, so a capped
+                    // capture never silently drops them.
+                    if (limit.kind == .capped) {
+                        var wire_tids: [perf.max_threads]i32 = undefined;
+                        if (collector.carriedUnsampled(&wire_tids)) |tids| {
+                            limit.unsampled_tids = self.arena.allocator().dupe(i32, tids) catch &.{};
+                        } else {
+                            limit.unsampled_tids = self.arena.allocator().dupe(i32, config.tids[opened_threads..]) catch &.{};
+                        }
+                    }
+                }
                 return .{ .capture = self };
             },
         }
@@ -387,6 +424,7 @@ pub const Capture = struct {
             return;
         }
         if (collector.addThread(tid)) |failure| {
+            // A pinned-page enroll failure stops the capture. It does not keep running.
             self.enrollmentFailed(failure, now);
             return;
         }
@@ -498,7 +536,7 @@ pub const Capture = struct {
         return null;
     }
     pub fn summary(self: *const Capture) Summary {
-        return .{ .producer = self.producer, .follow_threads = self.config.follow_threads, .ring_budget_bytes = if (self.config.ring_budget_bytes == 0) null else self.config.ring_budget_bytes, .ring_allocated_bytes = (if (self.collector) |collector| collector.allocatedRingBytes() else 0) + (if (self.syscall_collector != null) syscall_perf.ringBytes(self.thread_count) else 0) + (if (self.offcpu_collector != null) offcpu_live.ringBytes(self.thread_count) else 0), .opening_threads = self.openingThreads(), .scope = if (self.config.follow_threads and self.kernel_stacks_granted) "all threads in this process, including held newborns; user and kernel CPU; child processes remain outside scope" else if (self.config.follow_threads) "all threads in this process, including held newborns; user CPU only; child processes remain outside scope" else if (self.kernel_stacks_granted) "fixed selected threads, user and kernel CPU; new tasks stop collection; a subset leaves mappings unverified" else "fixed selected threads, user CPU only; new tasks stop collection; a subset leaves mappings unverified", .id = self.id, .session_id = self.session_id, .opening_generation = self.generation, .image_epoch = self.image_epoch, .pid = self.pid, .revision = self.revision, .status = summaryStatus(self.status, self.syscalls.lost), .stop_reasons = self.stop_reasons[0..self.stop_reason_count], .started_ns = self.started_ns, .collection_enabled_ns = self.collection_enabled_ns, .ended_ns = self.ended_ns, .duration_ms = self.config.duration_ms, .accepted = self.accepted, .threads = self.threads[0..self.thread_count], .sampled_state = .{ .requested_bytes = self.config.user_stack_bytes, .budget_bytes = self.config.user_stack_budget_bytes, .retained_bytes = self.user_state.used, .records = self.user_state.count, .skipped_stacks = self.user_state.skipped, .first_skipped_sample = self.firstSkippedSample(), .allocated_bytes = self.user_state.allocationBytes() }, .stored_samples = self.samples.len(), .sample_limit = self.config.sample_limit, .discarded_samples = self.discarded_samples, .lost_records = self.lost_records, .lost_samples = self.lost_samples, .throttles = self.throttles, .unthrottles = self.unthrottles, .mapping_events = self.mapping_events, .exec_events = self.exec_events, .exit_events = self.exit_events, .fork_events = self.fork_events, .scope_change = self.scope_change, .unknown_records = self.unknown_records, .unselected_threads = self.unselected_threads, .missing_images = self.missing_images, .trusted_before_ns = if (self.trusted_before_ns == std.math.maxInt(u64)) null else self.trusted_before_ns, .failure = self.failure, .diagnostic = summaryDiagnostic(self.status, self.syscalls.lost, self.diagnostic), .kernel_stacks_requested = self.kernel_stacks_requested, .kernel_stacks_granted = self.kernel_stacks_granted, .kernel_symbolizable = self.kernel_symbolizable, .kernel_symbol_reason = self.kernel_symbol_reason, .off_cpu = self.offCpuSummary(), .cpu_activity = self.cpu_activity, .scheduling = self.schedulingSummary(), .syscalls = self.syscallSummary(), .application_intervals = self.application_intervals.items.items.len, .mapping_revision = self.mapping_revision, .mapping_history = .{ .per_image_bytes_limit = @import("../binary/snapshot.zig").per_image_limit, .total_image_bytes_limit = @import("../binary/snapshot.zig").total_limit, .opening_regions = self.history.opening_count, .recorded_changes = self.history.changes.items.len, .unresolved_executable_mappings = self.unresolvedMappings(), .opened_images = self.images.loaded.items.len + self.pe_assets.entries.items.len, .pe_images = self.pe_assets.entries.items.len, .pe_metadata_bytes = self.pe_assets.metadata_bytes, .pe_failed = self.pe_assets_failed, .pe_pending = self.pe_assets_pending, .snapshot_bytes = self.images.snapshot_bytes, .images_not_searched = self.images.skipped().count, .image_budget = self.images.skipped().first } };
+        return .{ .producer = self.producer, .follow_threads = self.config.follow_threads, .ring_budget_bytes = if (self.config.ring_budget_bytes == 0) null else self.config.ring_budget_bytes, .ring_allocated_bytes = (if (self.collector) |collector| collector.allocatedRingBytes() else 0) + (if (self.syscall_collector) |collector| collector.allocatedRingBytes() else 0) + (if (self.offcpu_collector) |collector| collector.allocatedRingBytes() else 0), .opening_threads = self.openingThreads(), .scope = if (self.config.follow_threads and self.kernel_stacks_granted) "all threads in this process, including held newborns; user and kernel CPU; child processes remain outside scope" else if (self.config.follow_threads) "all threads in this process, including held newborns; user CPU only; child processes remain outside scope" else if (self.kernel_stacks_granted) "fixed selected threads, user and kernel CPU; new tasks stop collection; a subset leaves mappings unverified" else "fixed selected threads, user CPU only; new tasks stop collection; a subset leaves mappings unverified", .id = self.id, .session_id = self.session_id, .opening_generation = self.generation, .image_epoch = self.image_epoch, .pid = self.pid, .revision = self.revision, .status = summaryStatus(self.status, self.syscalls.lost), .stop_reasons = self.stop_reasons[0..self.stop_reason_count], .started_ns = self.started_ns, .collection_enabled_ns = self.collection_enabled_ns, .ended_ns = self.ended_ns, .duration_ms = self.config.duration_ms, .accepted = self.accepted, .threads = self.threads[0..self.thread_count], .sampled_state = .{ .requested_bytes = self.config.user_stack_bytes, .budget_bytes = self.config.user_stack_budget_bytes, .retained_bytes = self.user_state.used, .records = self.user_state.count, .skipped_stacks = self.user_state.skipped, .first_skipped_sample = self.firstSkippedSample(), .allocated_bytes = self.user_state.allocationBytes() }, .stored_samples = self.samples.len(), .sample_limit = self.config.sample_limit, .discarded_samples = self.discarded_samples, .lost_records = self.lost_records, .lost_samples = self.lost_samples, .throttles = self.throttles, .unthrottles = self.unthrottles, .mapping_events = self.mapping_events, .exec_events = self.exec_events, .exit_events = self.exit_events, .fork_events = self.fork_events, .scope_change = self.scope_change, .unknown_records = self.unknown_records, .unselected_threads = self.unselected_threads, .missing_images = self.missing_images, .trusted_before_ns = if (self.trusted_before_ns == std.math.maxInt(u64)) null else self.trusted_before_ns, .failure = self.failure, .diagnostic = summaryDiagnostic(self.status, self.syscalls.lost, self.diagnostic), .kernel_stacks_requested = self.kernel_stacks_requested, .kernel_stacks_granted = self.kernel_stacks_granted, .kernel_symbolizable = self.kernel_symbolizable, .kernel_symbol_reason = self.kernel_symbol_reason, .ring_limit = self.ring_limit, .off_cpu = self.offCpuSummary(), .cpu_activity = self.cpu_activity, .scheduling = self.schedulingSummary(), .syscalls = self.syscallSummary(), .application_intervals = self.application_intervals.items.items.len, .mapping_revision = self.mapping_revision, .mapping_history = .{ .per_image_bytes_limit = @import("../binary/snapshot.zig").per_image_limit, .total_image_bytes_limit = @import("../binary/snapshot.zig").total_limit, .opening_regions = self.history.opening_count, .recorded_changes = self.history.changes.items.len, .unresolved_executable_mappings = self.unresolvedMappings(), .opened_images = self.images.loaded.items.len + self.pe_assets.entries.items.len, .pe_images = self.pe_assets.entries.items.len, .pe_metadata_bytes = self.pe_assets.metadata_bytes, .pe_failed = self.pe_assets_failed, .pe_pending = self.pe_assets_pending, .snapshot_bytes = self.images.snapshot_bytes, .images_not_searched = self.images.skipped().count, .image_budget = self.images.skipped().first } };
     }
     pub fn poll(self: *Capture, now: u64) void {
         if (self.collector == null) return;
@@ -1507,6 +1545,7 @@ pub const Summary = struct {
     kernel_stacks_granted: bool = false,
     kernel_symbolizable: bool = false,
     kernel_symbol_reason: []const u8 = "",
+    ring_limit: ?perf.RingLimit = null,
     off_cpu: OffCpuSummary = .{ .requested = false, .granted = false, .intervals = 0, .truncated = 0, .blocked_ns = 0, .dropped = 0, .open = 0 },
     cpu_activity: ?activity.Summary,
     scheduling: Capture.SchedulingSummary,
@@ -1919,13 +1958,20 @@ test "maximum capture and mapping budgets preserve counts and bound identity sto
 
 test "ring sizing preserves the total budget for every supported thread count" {
     for (1..perf.max_threads + 1) |threads| {
-        const pages = ringPages(threads);
+        const pages = ringPages(threads, 4096);
         try std.testing.expect(pages >= 4 and pages <= perf.max_data_pages);
         try std.testing.expect(std.math.isPowerOfTwo(pages));
         try std.testing.expect(threads * pages <= @as(usize, perf.max_threads) * 4);
+        // A 16 KiB page keeps the same byte budget, with at least one page.
+        const wide = ringPages(threads, 16384);
+        try std.testing.expect(std.math.isPowerOfTwo(wide));
+        try std.testing.expect(@as(u64, wide) * 16384 <= @as(u64, @max(pages, 4)) * 4096 or wide == 1);
     }
-    try std.testing.expectEqual(@as(u8, 32), ringPages(100));
-    try std.testing.expectEqual(@as(u8, 4), ringPages(640));
+    try std.testing.expectEqual(@as(u8, 32), ringPages(100, 4096));
+    try std.testing.expectEqual(@as(u8, 4), ringPages(640, 4096));
+    try std.testing.expectEqual(@as(u8, 16), ringPages(1, 16384));
+    try std.testing.expectEqual(@as(u8, 1), ringPages(640, 16384));
+    try std.testing.expectEqual(@as(u8, 4), ringPages(640, 0));
 }
 
 test "CPU timeline and flames share filters, invalid sample handling, and final-drain extent" {

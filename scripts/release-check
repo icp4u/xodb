@@ -30,6 +30,8 @@ from helpers.environment import isolated as isolated_test_environment
 # `affected` also follows scripts/deps' import graph: see affected().
 LANGUAGE_PANES = ('language-*', 'gui-language-tabs', 'gui-language-thread-tabs', 'gui-live-display')
 COVERS = (
+    (('src/profile/agent_time*', 'src/ui/agent_time*', 'src/agent_time_test.zig'), ('agent-time', 'agent-time-live', 'agent-time-delta', 'agent-time-equivalence', 'agent-time-oracle', 'agent-time-model', 'gui-agent-time', 'gui-agent-time-browser', 'gui-agent-time-extras', 'gui-agent-time-child', 'gui-agent-time-initial', 'gui-agent-time-focus', 'gui-agent-time-initial-recovery', 'gui-agent-time-recovery')),
+    (('tests/helpers/agent_time_wire.py',), ('agent-time-live', 'agent-time-delta')),
     (('src/runtime/macos_debugserver.c', 'src/runtime/xrt_debugserver.h', 'src/runtime/gdb_link.c',
       'src/runtime/gdb_link.h', 'tests/runtime-debugserver.c', 'tests/macos-bootstrap.c'),
      ('build-tests', 'macos-bootstrap', 'release-runner')),
@@ -227,6 +229,8 @@ ALWAYS = ALWAYS + ('spawn-lint', 'macos-link-probe')
 # of the rest. host/gui/all keep a quicker check of each area. `affected`
 # still selects one of these when a test script it runs changes.
 PERIODIC = (
+    'gui-agent-time-recovery',
+    'gui-agent-time-initial-recovery',
     'kernel-target-lab*', 'gui-kernel-target-lab*',
     'vulkan-exit-soak',
     'kernel-census-lab',
@@ -324,8 +328,11 @@ AGENT_INELIGIBLE = {
     'kernel-target-lab': 'owned KGDB peer, not the C agent',
     'kernel-target-lab-core': 'owned ELF kernel core, not the C agent',
     'kernel-target-lab-kcore': 'live kcore inside an owned guest, not the C agent',
+    'kernel-target-lab-gdbstub': 'owned described stub, not the C agent',
+    'kernel-target-lab-arm64-core': 'owned arm64 paging dump, not the C agent',
     'gui-kernel-target-lab': 'owned KGDB peer, not the C agent',
     'gui-kernel-target-lab-core': 'owned ELF kernel core, not the C agent',
+    'gui-kernel-target-lab-gdbstub': 'owned described stub, not the C agent',
     'core-debugging': 'reads an ELF core in-process; the C agent is not a core reader',
     'python-core': 'reads an ELF core in-process; the C agent is not a core reader',
     'runtime-cores': 'reads ELF cores in-process; the C agent is not a core reader',
@@ -631,7 +638,7 @@ def agent_source(path):
         'tests/shared-sessions.py')
 
 
-def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=(), python=None, padwalker=None, ruby=None, node_refusal=None, go=None, wine=None, emacs=None, moved=False, redot=None, macos_ssh=None, arm64_sidecar=None, macos=None, riscv64_guest=None, aarch64_pac=None):
+def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=(), python=None, padwalker=None, ruby=None, node_refusal=None, go=None, wine=None, emacs=None, moved=False, redot=None, macos_ssh=None, arm64_sidecar=None, macos=None, riscv64_guest=None, aarch64_pac=None, profile_script=None):
     # moved: return the PERIODIC steps of this tier's host and gui lanes instead of the others.
     runtimes = (headless, optimize, uprobes, perl, node, node_include, lua, python, padwalker, ruby, node_refusal, go, wine, emacs)
     live = tier in ('host', 'all')
@@ -687,7 +694,15 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
     steps.append(('go-values-component', [sys.executable, '-B', 'tests/go-values-component.py', '--work', '.work/go-values-component'], 60))
     for name in ('cache-pool', 'object-cache', 'symbol-query', 'dwarf-cursor', 'dwarf-index', 'dwarf-names', 'dwarf-types', 'javascript-ranged', 'javascript-image'):
         steps.append((name, [sys.executable, '-B', f'tests/{name}.py', '--work', '.work/' + name], 60))
-    steps.append(('release-runner', [sys.executable, '-B', 'tests/release-runner.py'], 30))
+    steps.append(('release-runner', [sys.executable, '-B', 'tests/release-runner.py'], 90))
+    steps.append(('agent-time', [sys.executable, '-B', 'tests/agent-time.py'], 15))
+    steps.append(('agent-time-live', [sys.executable, '-B', 'tests/agent-time-live.py'], 15))
+    steps.append(('agent-time-delta', [sys.executable, '-B', 'tests/agent-time-delta.py'], 15))
+    # Builds the app's delta State into a small replay tool (about 10 s), then
+    # checks every applied live frame against a full reparse.
+    steps.append(('agent-time-equivalence', [sys.executable, '-B', 'tests/agent-time-equivalence.py'], 90))
+    steps.append(('agent-time-oracle', [sys.executable, '-B', 'tests/agent-time-oracle.py'], 15))
+    steps.append(('agent-time-model', ['zig', 'test', 'src/agent_time_test.zig', '-lc', '-OReleaseSafe'], 60))
     steps.append(('deps', [sys.executable, '-B', 'scripts/deps', 'check'], 30))
     # Source text only: every tier, no build.
     steps.append(('spawn-lint', [sys.executable, '-B', 'scripts/spawn-lint'], 30, dict(kind='build')))
@@ -824,10 +839,11 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps += plan('gui', *runtimes, moved=True, redot=redot, macos_ssh=macos_ssh)
         elif not headless:
             steps += plan('host', *runtimes, moved=True, redot=redot, macos_ssh=macos_ssh)
-        # Agent variants of the host lane live here, not in `all`. `host
-        # --agent-lane` runs that copy alone. A headless periodic run stays
-        # free of live targets. moved=True is the same plan, so variants are
-        # added once.
+        # Agent variants of the host lane live here. `all` also runs the
+        # profile step's agent form; the other variants stay on this tier.
+        # `host --agent-lane` runs that copy alone. A headless periodic run
+        # stays free of live targets. moved=True is the same plan, so
+        # variants are added once.
         if tier == 'periodic' and not moved and not headless:
             present = {step.name for step in steps}
             host_steps = [*plan('host', *runtimes, redot=redot),
@@ -848,6 +864,9 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                     present.add(variant.name)
         if tier == 'periodic' and aarch64_pac:
             steps.append(('aarch64-pac', ['sh', 'tests/aarch64-pac.sh', aarch64_pac], 3600, dict(kind='live')))
+        # Caller-supplied profile script. Periodic only, and only when named.
+        if tier == 'periodic' and profile_script:
+            steps.append(('profile-script', ['sh', profile_script], 3600, dict(kind='live', paths=('tests/m2-profile.py',))))
         return steps
     if live:
         steps.append(('remote-queued-drop', [sys.executable, '-B', 'tests/remote-queued-drop.py', '--work', '.work/remote-queued-drop'], 60))
@@ -945,6 +964,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('kernel-target', [sys.executable, '-B', 'tests/kernel-target.py'], 30))
         for suffix, options in (('', []), ('-core', ['--core']), ('-kcore', ['--kcore'])):
             steps.append(('kernel-target-lab' + suffix, [sys.executable, '-B', 'tests/kernel-target-lab.py', *options], 360))
+        steps.append(('kernel-target-lab-gdbstub', [sys.executable, '-B', 'tests/kernel-target-lab.py', '--gdbstub'], 360))
+        steps.append(('kernel-target-lab-arm64-core', [sys.executable, '-B', 'tests/kernel-target-lab.py', '--arm64', '--core'], 900))
         steps.append(('kernel-census-lab', [sys.executable, '-B', 'tests/kernel-census-lab.py'], 180))
         steps.append(('system-capture', [sys.executable, '-B', 'tests/system-capture.py'], 60))
         steps.append(('system-capture-flow', [sys.executable, '-B', 'tests/system-capture-flow.py'], 60))
@@ -1237,6 +1258,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('gui-kernel-census', [sys.executable, '-B', 'tests/kernel-census-gui.py'], 30))
         steps.append(('gui-kernel-target-lab', [sys.executable, '-B', 'tests/kernel-target-lab.py', '--gui'], 360))
         steps.append(('gui-kernel-target-lab-core', [sys.executable, '-B', 'tests/kernel-target-lab.py', '--gui', '--core'], 360))
+        steps.append(('gui-kernel-target-lab-gdbstub', [sys.executable, '-B', 'tests/kernel-target-lab.py', '--gui', '--gdbstub'], 360))
         steps.append(('gui-system-capture', [sys.executable, '-B', 'tests/system-capture-gui.py'], 60))
         steps.append(('gui-fetch', [sys.executable, '-B', 'tests/fetch-gui.py'], 120))
         steps.append(('gui-radio', [sys.executable, '-B', 'tests/radio-gui.py'], 180))
@@ -1250,6 +1272,14 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('gui-fdgalaxy', [sys.executable, '-B', 'tests/fdgalaxy-gui.py', '--work-dir', '.work/fx'], 60))
         steps.append(('gui-fdgalaxy-camera', [sys.executable, '-B', 'tests/galaxy-camera.py'], 60))
         steps.append(('gui-graph-table', [sys.executable, '-B', 'tests/graph-table.py'], 60))
+        steps.append(('gui-agent-time', [sys.executable, '-B', 'tests/agent-time-gui.py'], 60))
+        steps.append(('gui-agent-time-browser', [sys.executable, '-B', 'tests/agent-time-browser-gui.py'], 60))
+        steps.append(('gui-agent-time-extras', [sys.executable, '-B', 'tests/agent-time-extras-gui.py'], 60))
+        steps.append(('gui-agent-time-child', [sys.executable, '-B', 'tests/agent-time-child-gui.py'], 60))
+        steps.append(('gui-agent-time-initial', [sys.executable, '-B', 'tests/agent-time-initial-gui.py'], 60))
+        steps.append(('gui-agent-time-focus', [sys.executable, '-B', 'tests/agent-time-focus-gui.py'], 60))
+        steps.append(('gui-agent-time-initial-recovery', [sys.executable, '-B', 'tests/agent-time-initial-gui.py', '--recovery'], 90))
+        steps.append(('gui-agent-time-recovery', [sys.executable, '-B', 'tests/agent-time-extras-gui.py', '--recovery'], 90))
         steps.append(('gui-galaxy-churn', [sys.executable, '-B', 'tests/galaxy-churn-gui.py', '--work-dir', '.work/gc'], 60))
         steps.append(('gui-fdinherit', [sys.executable, '-B', 'tests/fdinherit-gui.py', '--work-dir', '.work/fi'], 120))
         steps.append(('gui-fdtreemap', [sys.executable, '-B', 'tests/fdtreemap-gui.py', '--work-dir', '.work/ft'], 120))
@@ -1333,6 +1363,13 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 steps.append(('gui-owner-' + suffix,
                               ['env', 'XODB_TEST_RUNTIME_AGENT=zig-out/bin/xodb-agent', *step.argv],
                               step.timeout, dict(work=step.work, serial=step.serial)))
+    # The profile step's agent form is part of `all`. The other host variants
+    # stay on the periodic tier. moved=True is that tier's subset, which
+    # already carries this variant from the host plan.
+    if tier == 'all' and not moved:
+        profile = next((step for step in steps if step.name == 'm2-profile'), None)
+        if profile is not None:
+            steps.append(_agent_variant(profile))
     if tier == 'all' and aarch64_pac:
         steps.append(('aarch64-pac', ['sh', 'tests/aarch64-pac.sh', aarch64_pac], 3600, dict(kind='live')))
     return Steps(step for step in steps if periodic(step.name) == moved)
@@ -1462,13 +1499,13 @@ def child_environment(inherited):
     return env
 
 
-def step_skip_reason(argv, env):
-    # Explicit optional fixtures, not a guess based on a child's output. A
-    # configured but broken lab must execute and fail normally.
-    for script in ('tests/kernel-target-lab.py', 'tests/kernel-census-lab.py'):
-        if script in argv and not env.get('XODB_KERNEL_LAB'):
-            return 'XODB_KERNEL_LAB is not configured'
-    return None
+def skip_reason(log):
+    # Informational only: the exit status alone decides the skip.
+    try:
+        said = [line.strip() for line in log.read_text(errors='replace').splitlines() if line.startswith('SKIP')]
+    except OSError:
+        said = []
+    return 'exit 77: ' + (said[-1][:200] if said else 'see step log')
 
 
 def run_step(name, argv, timeout, cwd, env, logs, halt=None):
@@ -1476,13 +1513,6 @@ def run_step(name, argv, timeout, cwd, env, logs, halt=None):
     log = logs / (name + '.log')
     started = time.monotonic()
     outcome = dict(name=name, argv=list(argv), timeout_seconds=timeout, log=str(log), status='failed')
-    reason = step_skip_reason(argv, env)
-    if reason:
-        with log.open('x') as stream:
-            stream.write(f'SKIP {name}: {reason}\n')
-        outcome.update(status='skipped', reason=reason, seconds=round(time.monotonic() - started, 3))
-        print(f"{'skipped':16} {name} ({reason})", flush=True)
-        return outcome
     child = None
     marker = None
     baseline = children()
@@ -1498,7 +1528,9 @@ def run_step(name, argv, timeout, cwd, env, logs, halt=None):
                     left = started + timeout - time.monotonic()
                     try:
                         outcome['exit_code'] = child.wait(timeout=min(left, .1) if halt else timeout)
-                        outcome['status'] = 'passed' if child.returncode == 0 else 'failed'
+                        outcome['status'] = {0: 'passed', 77: 'skipped'}.get(child.returncode, 'failed')
+                        if child.returncode == 77:
+                            outcome['reason'] = skip_reason(log)
                     except subprocess.TimeoutExpired:
                         if halt and halt.is_set():
                             outcome['status'] = 'interrupted'
@@ -1517,7 +1549,7 @@ def run_step(name, argv, timeout, cwd, env, logs, halt=None):
                 if members:
                     outcome['leftover_pids'] = members
                     outcome['remaining_pids'] = stop_group(child.pid)
-                    if outcome['status'] == 'passed':
+                    if outcome['status'] in ('passed', 'skipped'):
                         outcome['status'] = 'leaked_processes'
                 try:
                     child.wait(timeout=1)
@@ -1530,7 +1562,7 @@ def run_step(name, argv, timeout, cwd, env, logs, halt=None):
         outcome['adopted_pids'] = sorted(adopted)
         remaining = stop_adopted(baseline, session)
         outcome['remaining_pids'] = sorted(set(outcome.get('remaining_pids', [])) | set(remaining))
-        if outcome['status'] == 'passed':
+        if outcome['status'] in ('passed', 'skipped'):
             outcome['status'] = 'leaked_processes'
         if remaining:
             outcome['status'] = 'cleanup_failed'
@@ -1550,7 +1582,7 @@ def run_step(name, argv, timeout, cwd, env, logs, halt=None):
             except OSError as exc:
                 outcome['gui_evidence_error'] = str(exc)
     outcome['seconds'] = round(time.monotonic() - started, 3)
-    print(f"{outcome['status']:16} {name} ({outcome['seconds']:.1f}s)", flush=True)
+    print(f"{outcome['status']:16} {name} ({outcome['seconds']:.1f}s)" + (f": {outcome['reason']}" if outcome['status'] == 'skipped' else ''), flush=True)
     return outcome
 
 
@@ -1900,11 +1932,12 @@ def main(argv=None):
     parser.add_argument('--arm64-sidecar', nargs=3, metavar=('SSH', 'AGENT', 'FIXTURE'), help='Include the live arm64 Ghidra-sidecar test using an SSH destination and owned remote agent/fixture paths (periodic tier)')
     parser.add_argument('--riscv64-guest', nargs=3, metavar=('SSH', 'AGENT', 'FIXTURE'), help='Include the riscv64 software-step driver (periodic tier). AGENT and FIXTURE are remote executables; a path that is not executable makes the step build a fresh guest tree. Holds XODB_GUEST_LEASE and uses ssh from PATH.')
     parser.add_argument('--aarch64-pac', metavar='SSH', help='Opt-in: build and run the PAC unwind proof on this Linux aarch64 machine (all and periodic; no default destination)')
+    parser.add_argument('--profile-script', metavar='SCRIPT', help='Opt-in: run this shell script on the periodic tier (no default script)')
     parser.add_argument('--node-refusal', help='Also require completed metadata and an exact frame-proof refusal from this separately selected Node build (gui/all)')
     parser.add_argument('--lua', action='append', nargs=3, default=[], metavar=('EXECUTABLE', 'SOURCE', 'LIBRARY'), help='Include Lua live/component checks; repeat for each debug runtime and matching internal headers/static library')
     parser.add_argument('--node-include', default='/usr/include/node', help='Matching Node development header directory')
     parser.add_argument('--capstone', choices=['system', 'vendored'], default='system', help='Link system Capstone, or the private prefix from scripts/build-capstone')
-    parser.add_argument('--agent-lane', action='store_true', help='Run every eligible target step through the local C agent (zig-out/bin/xodb-agent). Steps that cannot use it are omitted and listed with a reason. The periodic tier adds these variants beside its own steps.')
+    parser.add_argument('--agent-lane', action='store_true', help='Run every eligible target step through the local C agent (zig-out/bin/xodb-agent). Steps that cannot use it are omitted and listed with a reason. The periodic tier adds these variants beside its own steps. The all tier also runs the profile step through that agent.')
     parser.add_argument('--keep-going', action='store_true', help='Run every step after a failure (not after a failed build or probe), then summarise all failures')
     parser.add_argument('--compare-binary', metavar='XODB', help='Opt-in: compare the same MCP command transcript against this reference binary (host/all/affected/periodic)')
     parser.add_argument('--compare-agent', metavar='AGENT', help='Also compare local-agent mode using this reference agent and the built candidate agent; requires --compare-binary')
@@ -1959,6 +1992,8 @@ def main(argv=None):
         parser.error('--riscv64-guest requires the periodic tier')
     if args.aarch64_pac and args.tier not in ('all', 'periodic'):
         parser.error('--aarch64-pac requires the all or periodic tier')
+    if args.profile_script and args.tier != 'periodic':
+        parser.error('--profile-script requires the periodic tier')
     if args.node and args.tier in ('portable', 'perf'):
         parser.error('--node is not for the portable or perf tier')
     if args.node_refusal and args.tier not in ('gui', 'all', 'periodic', 'periodic-gui'):
@@ -1968,7 +2003,7 @@ def main(argv=None):
     if args.agent_lane and args.tier == 'affected':
         parser.error('--agent-lane selects a tier; affected adds the variants when a runtime or agent file changes')
     runtimes = (args.headless, args.optimize, args.uprobes, args.perl, args.node, args.node_include, args.lua, args.python, args.padwalker, args.ruby, args.node_refusal, args.go, args.wine, args.emacs)
-    steps = plan(args.tier, *runtimes, redot=args.redot, macos_ssh=args.macos_ssh, arm64_sidecar=args.arm64_sidecar, macos=args.macos, riscv64_guest=args.riscv64_guest, aarch64_pac=args.aarch64_pac)
+    steps = plan(args.tier, *runtimes, redot=args.redot, macos_ssh=args.macos_ssh, arm64_sidecar=args.arm64_sidecar, macos=args.macos, riscv64_guest=args.riscv64_guest, aarch64_pac=args.aarch64_pac, profile_script=args.profile_script)
     decisions, missing = [], []
     if tier == 'affected':
         base = args.base or 'HEAD'
@@ -2072,7 +2107,8 @@ def main(argv=None):
                     (['Lua live checks (use --lua EXECUTABLE SOURCE LIBRARY)'] if args.tier not in ('portable', 'perf') and not args.lua else []) +
                     (['Perl named-local oracle checks (use --perl PATH --padwalker BUILT_TREE)'] if args.tier not in ('portable', 'perf') and not args.padwalker else []) +
                     (['riscv64 software-step guest (use periodic --riscv64-guest SSH AGENT FIXTURE)'] if not args.riscv64_guest else []) +
-                    (['aarch64 PAC unwind proof (use all or periodic --aarch64-pac SSH)'] if args.tier in ('all', 'periodic') and not args.aarch64_pac else []))
+                    (['aarch64 PAC unwind proof (use all or periodic --aarch64-pac SSH)'] if args.tier in ('all', 'periodic') and not args.aarch64_pac else []) +
+                    (['periodic profile script (use periodic --profile-script SCRIPT)'] if args.tier == 'periodic' and not args.profile_script else []))
     print(f'Release evidence: {run}', flush=True)
     began = time.monotonic()
     # periodic runs the live steps that host leaves out, unless it is headless.

@@ -24,6 +24,13 @@ struct xrt_perf {
     uint64_t budget, allocated;
     bool running;
     bool failed;
+    enum xrt_ring_limit ring_limit;
+    /* True when the kind was chosen from the pinned allowance before mmap. */
+    bool ring_planned;
+    /* Remote perf-info suffix. Set only after that suffix was read. */
+    bool limit_known;
+    uint32_t unsampled_count;
+    int32_t unsampled[XRT_PERF_MAX_THREADS];
     struct xrt_perf_failure failure;
 };
 /* Shared by native drain and the agent: acquire a validated ring view, then

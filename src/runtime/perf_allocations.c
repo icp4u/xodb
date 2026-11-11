@@ -219,7 +219,7 @@ static struct xrt_allocations *uprobes_start(const struct xrt_allocation_config 
     }
     a->pid = c->pid;
     a->functions = functions;
-    a->perf = xrt_perf_create(16, 32, UINT64_MAX);
+    a->perf = xrt_perf_create(xrt_perf_fit_pages(16, c->thread_count), 32, UINT64_MAX);
     if (!a->perf) {
         xrt_perf_fail(f, "alloc", errno, -1, "allocation rings");
         free(a);

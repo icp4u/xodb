@@ -52,12 +52,19 @@ below when those capabilities are intentionally unavailable.
 GUI steps that fail are retried once by default in `gui`, `all` and
 `periodic-gui` (`--retry-flaky N`; `0` turns it off). A step that passes only on
 retry is recorded as `flaky` in the summary line and `results.json`, never as
-passed. The optional kernel-lab steps (`kernel-target-lab*`,
-`gui-kernel-target-lab*`, `kernel-census-lab`) are recorded as `skipped`, with
-a reason, when `XODB_KERNEL_LAB` is unset: counted apart from passed, never a
-failure on their own, but a step that needs one is not run and fails the run.
-Set the variable to run them for real. Other tests that print SKIP and exit 0
-still count as passed. `scripts/build` uses an existing `ZIG_GLOBAL_CACHE_DIR`, so gate
+passed. A test exits **77** when an optional capability is unavailable, and
+prints its reason in the step log. The runner records it as `skipped` in
+results.json and the summary, apart from passed. A skip is not a failure by
+itself, but cannot satisfy a prerequisite: a dependent step stays not run and
+fails the run. Skips are not retried, and leaked processes still fail cleanup.
+Printing SKIP without exit 77 does not request a skip.
+
+The optional kernel-lab steps use this convention when XODB_KERNEL_LAB is
+unset; i386-m1 uses it without gcc -m32 support, and kernel-stacks when kernel
+samples are unavailable. source-fetch with XODB_TEST_NO_LIVE still checks its
+parser and writes those results, but exits 77 because live coverage is missing.
+Set the required capability to run these steps completely. `scripts/build`
+uses an existing `ZIG_GLOBAL_CACHE_DIR`, so gate
 snapshots can share one warm cache; `packaging/build` always uses the in-tree
 cache.
 

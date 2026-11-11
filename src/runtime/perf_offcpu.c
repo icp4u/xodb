@@ -175,7 +175,7 @@ struct xrt_perf *xrt_offcpu_start(const int32_t *tids, size_t count, uint8_t dat
     attr.flags = 1 | (UINT64_C(1) << 18) | (UINT64_C(1) << 25) | (UINT64_C(1) << 26);
     attr.clockid = CLOCK_MONOTONIC;
     attr.sample_max_stack = 64;
-    struct xrt_perf *p = xrt_perf_create(data_pages, 64, ring_budget ? ring_budget : UINT64_MAX);
+    struct xrt_perf *p = xrt_perf_create(xrt_perf_fit_pages(data_pages, count), 64, ring_budget ? ring_budget : UINT64_MAX);
     if (!p) {
         xrt_perf_fail(f, "alloc", errno, -1, "off-CPU collector");
         return NULL;

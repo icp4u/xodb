@@ -469,13 +469,9 @@ static enum xrt_status registers(struct xrt_gdb *g, struct xrt_target *t,
                                   int32_t tid, struct xrt_registers *out)
 {
     if (t->state != XRT_STOPPED) return XRT_NOT_STOPPED;
-    /* Not a stub thread. A zero PC lets the kernel walker supply the frame. */
-    if (thread_index(g, tid) < 0 && xrt_thread_index(t, tid) >= 0) {
-        if (!t->arch) return XRT_UNSUPPORTED_ARCHITECTURE;
-        memset(out, 0, sizeof(*out));
-        out->abi = xrt_arch_abi(t->arch);
-        return XRT_OK;
-    }
+    /* Not a stub thread. The walker treats this refusal as a zero PC. */
+    if (thread_index(g, tid) < 0 && xrt_thread_index(t, tid) >= 0)
+        return problem(g, XRT_KERNEL_TASK_NOT_CPU, "kernel task is not a CPU thread");
     enum xrt_status status = select_thread(g, tid);
     if (status != XRT_OK) return status;
     if (!g->single_registers) {
@@ -835,7 +831,7 @@ static enum xrt_status resume(struct xrt_gdb *g, struct xrt_target *t, int32_t t
     int i = xrt_thread_index(t, tid);
     if (i < 0) return XRT_UNKNOWN_THREAD;
     if (thread_index(g, tid) < 0)
-        return problem(g, XRT_UNKNOWN_THREAD, "kernel task is not a CPU thread");
+        return problem(g, XRT_KERNEL_TASK_NOT_CPU, "kernel task is not a CPU thread");
     if (step && g->kernel && tid != g->info.stop_tid)
         return problem(g, XRT_UNSUPPORTED_CONTROL, "KGDB steps only the CPU that entered the debugger");
     struct xrt_registers regs; uint64_t pc;

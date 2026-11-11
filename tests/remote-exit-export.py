@@ -30,13 +30,19 @@ def samples(body):
     assert len(data) == size and data[0] == 1, 'collector request failed'
     # perf_info: two u32 counts, three u64 sizes, u32 version, two bools.
     assert data[38] == 0, 'collector reports failure'
-    if data[39] == 0:
-        assert len(data) == 40
+    # A zero byte means the ring-limit facts are unchanged. A one is followed
+    # by kind, fitted pages, planned flag, opened count, unsampled count, and
+    # that many thread ids. A drain of an open capture does not repeat them.
+    assert data[39] in (0, 1), data[39]
+    assert data[39] == 0, 'drain repeated the ring-limit suffix'
+    at = 40
+    if data[at] == 0:
+        assert at+1 == len(data)
         return 0
-    assert data[39] == 1
-    events = struct.unpack_from('>I', data, 44)[0]
+    assert data[at] == 1
+    events = struct.unpack_from('>I', data, at+5)[0]
     # perf_thread: tid/count, event IDs, three u64 identities, two bools.
-    at = 40+8+8*events+24+2
+    at = at+1+8+8*events+24+2
     at += 8+1  # tail and more
     length = struct.unpack_from('>I', data, at)[0]
     records = data[at+4:]

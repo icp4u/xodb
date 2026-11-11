@@ -5,6 +5,8 @@ XODB_KERNEL_LAB names the installed lab kit; its built images are read-only.
 Every invocation creates and stops its own guest under a private lease.
 --gui uses only a private headless compositor; --kcore runs inside the guest.
 --gdbstub reads the same guest through QEMU's gdbstub instead of KGDB.
+--arm64 uses the arm64 guest (TCG); with --core its QEMU paging dump has no
+VMCOREINFO note, so the image is found by its own kimage_voffset.
 """
 import argparse
 import fcntl
@@ -17,7 +19,7 @@ import tempfile
 import time
 from types import SimpleNamespace
 from client import Client
-from helpers.orphans import adopt
+from helpers.orphans import adopt, reap
 
 root = Path(__file__).resolve().parents[1]
 os.chdir(root)
@@ -26,11 +28,15 @@ parser.add_argument('--gui', action='store_true')
 parser.add_argument('--kcore', action='store_true')
 parser.add_argument('--core', action='store_true')
 parser.add_argument('--gdbstub', action='store_true')
+parser.add_argument('--arm64', action='store_true')
 args = parser.parse_args()
+if args.arm64 and args.kcore:
+    parser.error('--arm64 does not combine with --kcore')
+boot_seconds = 600 if args.arm64 else 120
 setting = os.environ.get('XODB_KERNEL_LAB')
 if not setting:
     print('SKIP kernel-target-lab: XODB_KERNEL_LAB is not configured')
-    raise SystemExit(0)
+    raise SystemExit(77)
 lab = Path(setting).resolve()
 adopt()  # Keep the daemonized guest ours, including under release-check's reaper.
 binary = Path(os.environ.get('XODB_BIN', root / 'zig-out/bin/xodb')).resolve()
@@ -78,6 +84,8 @@ def stop_guest(run):
             time.sleep(.02)
         (work / 'stop.log').write_text(output)
         assert stop.returncode == 0, ('owned guest stop failed', stop.returncode)
+        # kl-run also leaves its console broker to us; kl-stop ends it.
+        assert reap(10), 'owned guest helpers did not exit'
     finally:
         if stop.poll() is None:
             stop.kill()
@@ -217,14 +225,14 @@ run = None
 with (work / 'lease.lock').open('w') as lease:
     fcntl.flock(lease, fcntl.LOCK_EX)
     try:
-        launch = kit('kl-run', 'x86_64', '--run-id', 'target', '--cpus', '4', '--memory', '1024',
+        launch = kit('kl-run', *(['arm64', '--accel', 'tcg'] if args.arm64 else ['x86_64']), '--run-id', 'target', '--cpus', '4', '--memory', '1024',
                      *(['--kcore', '--xodb', binary] if args.kcore else []),
                      *(['--gdbstub'] if args.gdbstub else []))
         (work / 'launch.log').write_text(launch)
         fields = dict(line.split('=', 1) for line in launch.splitlines() if '=' in line)
         run = Path(fields['KL_RUN_DIR'])
         console = Path(fields['KL_CONSOLE_LOG'])
-        marker(console, 'KG0_KCORE_READY' if args.kcore else 'KG0_INIT_READY')
+        marker(console, 'KG0_KCORE_READY' if args.kcore else 'KG0_INIT_READY', boot_seconds)
         if args.kcore:
             path = root / 'examples/kernel-target.jsonl'
             replies = kit('kl-kcore', run, path, '--timeout', '180', timeout=210)
@@ -236,14 +244,16 @@ with (work / 'lease.lock').open('w') as lease:
             verify(answer)
         else:
             kit('kl-console', run, 'send', 'hang')
-            marker(console, 'KG0_HANG_CHAIN_READY hops=2')
-            if not args.gdbstub:
+            marker(console, 'KG0_HANG_CHAIN_READY hops=2', boot_seconds)
+            if args.arm64 and not args.gdbstub and not args.core:
+                kit('kl-console', run, 'send', 'kgdb')
+            elif not args.gdbstub and not args.arm64:
                 kit('kl-console', run, 'nmi-kgdb')
             stub = fields['KL_GDBSTUB'] if args.gdbstub else fields['KL_KGDB']
             options = ['--gdb-remote', stub, '--vmlinux', fields['KL_VMLINUX'], '--modules', fields['KL_MODULES']]
             if args.core:
                 dump = work / 'owned.core'
-                kit('kl-monitor', run, 'dump-guest-memory', '-p', dump, timeout=120)
+                kit('kl-monitor', run, 'dump-guest-memory', '-p', dump, timeout=300)
                 options = ['--core', str(dump), *options[2:]]
             if args.gui:
                 gui(options)
@@ -253,8 +263,8 @@ with (work / 'lease.lock').open('w') as lease:
                     before = client.session()
                     answer = inventory(client.inspect)
                     (work / 'inventory.json').write_text(json.dumps(answer, indent=2))
-                    if args.gdbstub:
-                        # QEMU stops the spinning vCPU itself: its CPU thread is the spinner.
+                    if args.gdbstub or (args.arm64 and args.core):
+                        # QEMU stops (or dumps) the spinning vCPU itself: its CPU thread is the spinner.
                         labels = [t['name'] for t in before['thread_labels']]
                         assert any(n.startswith('kg0-spinner ') and 'spins on CPU 3' in n for n in labels), labels
                         spinner = next(t for t in answer['tasks']['rows'] if t['name'] == 'kg0-spinner')
@@ -264,7 +274,7 @@ with (work / 'lease.lock').open('w') as lease:
                     assert client.session()['generation'] == before['generation']
                 finally:
                     client.close()
-        print('PASS owned kernel target inventory:', 'kcore' if args.kcore else 'vmcore' if args.core else 'gdbstub' if args.gdbstub else 'KGDB', 'GUI' if args.gui else 'MCP')
+        print('PASS owned kernel target inventory:', 'kcore' if args.kcore else 'vmcore' if args.core else 'gdbstub' if args.gdbstub else 'KGDB', 'arm64' if args.arm64 else 'x86_64', 'GUI' if args.gui else 'MCP')
         print('Evidence:', work.relative_to(root))
     finally:
         if run is not None:
