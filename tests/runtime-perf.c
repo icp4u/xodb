@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 static void put(void *p, uint64_t n)
@@ -458,18 +459,53 @@ static void offcpu_format(void)
     assert(layout.prev_state_off == 32 && layout.prev_state_size == 8);
     assert(!xrt_offcpu_format(text, strlen(text), 1, &layout));
 }
-static void offcpu_denial(void)
+static void expect_cause(const char *hook, int error, const char *syscall, const char *words)
 {
     int32_t tid = (int32_t)gettid();
     struct xrt_offcpu_layout layout = {0};
     struct xrt_perf_failure failure = {0};
-    assert(!setenv("XODB_TEST_OFF_CPU", "deny", 1));
+    assert(!setenv("XODB_TEST_OFF_CPU", hook, 1));
     assert(!xrt_offcpu_start(&tid, 1, 4, 65536, &layout, &failure));
-    assert(failure.kind == XRT_PERF_PERMISSION && failure.error == EPERM);
+    assert(failure.error == error);
+    assert(failure.syscall && strcmp(failure.syscall, syscall) == 0);
+    assert(failure.detail && strstr(failure.detail, words));
+    assert(strstr(failure.detail, "does not change system settings"));
     assert(failure.opened_then_closed == 0);
-    assert(failure.detail && strstr(failure.detail, "perf_event_paranoid"));
-    assert(failure.detail && strstr(failure.detail, "tracepoint"));
     unsetenv("XODB_TEST_OFF_CPU");
+}
+static void offcpu_denial(void)
+{
+    expect_cause("deny", EPERM, "perf_event_open", "perf_event_paranoid");
+    expect_cause("missing", ENOENT, "offcpu.tracefs", "tracepoint is missing");
+    expect_cause("unreadable", EACCES, "offcpu.tracefs", "is not readable");
+    expect_cause("format", 0, "offcpu.format", "not usable");
+    if (geteuid() == 0)
+        return;
+    char dir[] = "offcpu-unreadable.XXXXXX";
+    assert(mkdtemp(dir));
+    char path[256];
+    assert(snprintf(path, sizeof path, "%s/id", dir) < (int)sizeof path);
+    int fd = open(path, O_CREAT | O_WRONLY | O_CLOEXEC, 0000);
+    assert(fd >= 0);
+    assert(close(fd) == 0);
+    assert(chmod(path, 0) == 0);
+    assert(!setenv("XODB_TEST_OFF_CPU", "paths", 1));
+    assert(!setenv("XODB_TEST_OFFCPU_ID", path, 1));
+    assert(!setenv("XODB_TEST_OFFCPU_FORMAT", path, 1));
+    int32_t tid = (int32_t)gettid();
+    struct xrt_offcpu_layout layout = {0};
+    struct xrt_perf_failure failure = {0};
+    assert(!xrt_offcpu_start(&tid, 1, 4, 65536, &layout, &failure));
+    assert(failure.error == EACCES);
+    assert(failure.syscall && strcmp(failure.syscall, "offcpu.tracefs") == 0);
+    assert(failure.detail && strstr(failure.detail, path));
+    assert(strstr(failure.detail, "is not readable") && strstr(failure.detail, "run as root"));
+    assert(strstr(failure.detail, "does not change system settings"));
+    unsetenv("XODB_TEST_OFF_CPU");
+    unsetenv("XODB_TEST_OFFCPU_ID");
+    unsetenv("XODB_TEST_OFFCPU_FORMAT");
+    assert(unlink(path) == 0);
+    assert(rmdir(dir) == 0);
 }
 int main(void)
 {

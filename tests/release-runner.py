@@ -11,6 +11,7 @@ import json
 import itertools
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import time
@@ -318,6 +319,33 @@ raise SystemExit(int(sys.argv[2]))
                 self.assertEqual((artifacts / 'ocr-latest/frame.png').read_bytes(), b'later frame')
             self.assertEqual(inherited['XODB_TEST_LOG_DIR'], 'unused-inherited-directory')
             self.assertEqual((directory / 'gui-owned.artifacts/ocr-first-failure/ocr.txt').read_text(), 'original OCR: lnmatched')
+
+    def test_fetch_ocr_control_and_redacted_coverage(self):
+        # Load only the actual text/detector functions, not the executable GUI
+        # scenario. Synthetic readings model a whole-screen segmentation miss.
+        path = root / 'tests/fetch-gui.py'
+        tree = ast.parse(path.read_text(), filename=str(path))
+        functions = {'panel_text', 'leaks', 'edge', 'is_lower', 'is_upper'}
+        body = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in functions]
+        namespace = dict(re=re, private={'sampleuser', 'samplehost'},
+                         lower_ascii=str.maketrans('ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'))
+        exec(compile(ast.Module(body=body, type_ignores=[]), str(path), 'exec'), namespace)
+        cases = (
+            ('sampleuser@samplehost', 'System ready', {'sampleuser', 'samplehost'}),
+            ('user@host', 'System ready', set()),
+            ('sampleuser@host', 'System ready', {'sampleuser'}),
+            ('user@host', 'System samplehost ready', {'samplehost'}),
+        )
+        for title, screen, expected in cases:
+            with self.subTest(title=title, screen=screen):
+                crop = namespace['title_text'] = mock.Mock(return_value=title)
+                harness = namespace['h'] = mock.Mock()
+                harness.ocr.return_value = screen
+                actual_title, text = namespace['panel_text']('owned.png', (1, 2, 3, 4))
+                self.assertEqual(actual_title, title)
+                self.assertEqual(namespace['leaks'](text), expected)
+                crop.assert_called_once_with('owned.png', (1, 2, 3, 4))
+                harness.ocr.assert_called_once_with('owned.png')
 
     def test_ocr_budget_floor_and_single_thread(self):
         # Inspect actual subprocess arguments without importing executable GUI

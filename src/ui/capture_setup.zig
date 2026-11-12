@@ -448,11 +448,24 @@ pub fn failureLine(buffer: []u8, failure: perf.Failure) []const u8 {
     return std.fmt.bufPrint(buffer, "{s} ({s}, errno {d}{s}{s})", .{ what, failure.syscall, failure.errno, if (failure.detail.len > 0) ": " else "", failure.detail }) catch "";
 }
 /// Readable text for a failed start. These are not capture-stop diagnostics.
+/// One title per failed off-CPU check; the next line carries errno and path.
+fn offCpuTitle(failure: perf.Failure) []const u8 {
+    if (std.mem.eql(u8, failure.syscall, "perf_event_open")) return "Off-CPU stacks: perf_event_open was refused";
+    if (std.mem.eql(u8, failure.syscall, "offcpu.format")) return "Off-CPU stacks: the sched_switch format is not usable";
+    if (std.mem.eql(u8, failure.syscall, "offcpu.tracefs")) {
+        if (failure.errno == 2) return "Off-CPU stacks: the sched_switch tracepoint is missing";
+        if (failure.errno == 13 or failure.errno == 1) return "Off-CPU stacks: tracefs is not readable";
+    }
+    return "Off-CPU stacks were refused";
+}
 pub fn startFailure(buffer: []u8, start_error: []const u8, failure: ?perf.Failure, requested_threads: usize, limits: Limits) Reason {
     if (std.mem.eql(u8, start_error, "KernelStacksDenied"))
         return .{ .title = "Kernel stacks were refused", .next = "perf_event_paranoid must be 1 or less for this process, or run as root. xodb does not change that setting.", .severity = .failure };
-    if (std.mem.eql(u8, start_error, "OffCpuDenied"))
-        return .{ .title = "Off-CPU stacks were refused", .next = "perf_event_paranoid must be -1 (raw tracepoint data), or run as root, and the sched_switch tracepoint must be readable. xodb does not change that setting.", .severity = .failure };
+    if (std.mem.eql(u8, start_error, "OffCpuDenied")) {
+        if (failure) |refused|
+            return .{ .title = offCpuTitle(refused), .next = profile.offCpuAdvice(buffer, refused), .severity = .failure };
+        return .{ .title = "Off-CPU stacks were refused", .next = "The sched_switch check failed before a reason was recorded. xodb does not change system settings.", .severity = .failure };
+    }
     if (std.mem.eql(u8, start_error, "OffCpuRemoteUnsupported"))
         return .{ .title = "Off-CPU stacks are local only", .next = "A remote target is not opened against this host's tracefs.", .severity = .failure };
     if (std.mem.eql(u8, start_error, "OffCpuThreadLimit"))
@@ -661,6 +674,28 @@ test "outcomes use recorded evidence and keep the primary reason" {
     const off_cpu = startFailure(&buffer, "OffCpuDenied", null, 1, .{});
     try testing.expect(std.mem.indexOf(u8, off_cpu.title, "Off-CPU stacks were refused") != null);
     try testing.expect(std.mem.indexOf(u8, off_cpu.next, "sched_switch") != null);
+    try testing.expect(std.mem.indexOf(u8, off_cpu.next, "does not change system settings") != null);
+    const missing = startFailure(&buffer, "OffCpuDenied", .{ .kind = .unavailable, .syscall = "offcpu.tracefs", .errno = 2, .detail = "/sys/kernel/tracing/events/sched/sched_switch/id: the sched_switch tracepoint is missing. xodb does not change system settings." }, 1, .{});
+    try testing.expect(std.mem.indexOf(u8, missing.next, "offcpu.tracefs") != null);
+    try testing.expect(std.mem.indexOf(u8, missing.next, "errno 2") != null);
+    try testing.expect(std.mem.indexOf(u8, missing.next, "tracepoint is missing") != null);
+    try testing.expect(std.mem.indexOf(u8, missing.next, "perf_event_paranoid") == null);
+    try testing.expectEqualStrings("Off-CPU stacks: the sched_switch tracepoint is missing", missing.title);
+    const unreadable = startFailure(&buffer, "OffCpuDenied", .{ .kind = .permission, .syscall = "offcpu.tracefs", .errno = 13, .detail = "/sys/kernel/tracing/events/sched/sched_switch/id: the sched_switch tracepoint is not readable; join the tracing group. xodb does not change system settings." }, 1, .{});
+    try testing.expect(std.mem.indexOf(u8, unreadable.next, "errno 13") != null);
+    try testing.expect(std.mem.indexOf(u8, unreadable.next, "tracing group") != null);
+    try testing.expect(std.mem.indexOf(u8, unreadable.next, "perf_event_paranoid") == null);
+    try testing.expectEqualStrings("Off-CPU stacks: tracefs is not readable", unreadable.title);
+    const layout = startFailure(&buffer, "OffCpuDenied", .{ .kind = .configuration, .syscall = "offcpu.format", .errno = 0, .detail = "/sys/kernel/tracing/events/sched/sched_switch/format: sched_switch field layout is not usable. xodb does not change system settings." }, 1, .{});
+    try testing.expect(std.mem.indexOf(u8, layout.next, "offcpu.format") != null);
+    try testing.expect(std.mem.indexOf(u8, layout.next, "not usable") != null);
+    try testing.expectEqualStrings("Off-CPU stacks: the sched_switch format is not usable", layout.title);
+    const opened = startFailure(&buffer, "OffCpuDenied", .{ .kind = .permission, .syscall = "perf_event_open", .errno = 1, .detail = "perf_event_open refused off-CPU stacks; perf_event_paranoid must be -1, or run as root. xodb does not change system settings." }, 1, .{});
+    try testing.expect(std.mem.indexOf(u8, opened.next, "perf_event_open") != null);
+    try testing.expect(std.mem.indexOf(u8, opened.next, "errno 1") != null);
+    try testing.expect(std.mem.indexOf(u8, opened.next, "perf_event_paranoid") != null);
+    try testing.expect(std.mem.indexOf(u8, opened.next, "tracing group") == null);
+    try testing.expectEqualStrings("Off-CPU stacks: perf_event_open was refused", opened.title);
     try testing.expect(std.mem.indexOf(u8, denied.next, "does not change system settings") != null);
     const limit = startFailure(&buffer, "ProfileThreadLimit", null, 2000, .{});
     try testing.expectEqualStrings("Capture needs 2000 threads; the limit is 1024", limit.title);

@@ -6,8 +6,9 @@ sparkline moves under a synthetic load (owned busy loops, killed by PID), the
 WM line names the private Sway that draws the panel (not the session's
 compositor), and OCR of the redacted screen shows none of this machine's
 private names, matched as src/redact.zig matches them. The title, OCR'd alone,
-reads user@host. A control run without --redact must read the real user@host
-and find a private name, so the check is proven able to see one. Redacted,
+reads user@host. Both runs scan the whole-screen and cropped-title OCR together.
+A control run without --redact must read the real user@host and find a private
+name, so the check is proven able to see one. Redacted,
 the card wears a mad-lib retro system (ASCII logo, OS, kernel) from the
 table in src/ui/overview/fetch.zig; every card has a Network line and no
 Mitigations line. The benchmarks are never started here. Screenshots stay
@@ -89,6 +90,15 @@ def title_text(shot, rect):
     ImageOps.expand(crop, 20, fill=255).save(path)
     return ''.join(h.ocr(path, '--psm', '7').lower().split())
 
+def panel_text(shot, rect):
+    """Use identical OCR coverage for the unredacted control and redacted card.
+
+    Whole-screen segmentation can merge the title with the sidebar and miss
+    its names even when the title crop reads them exactly. Keep both readings
+    so the control proves the same detector used by the negative check."""
+    title = title_text(shot, rect)
+    return title, ' '.join(h.ocr(shot).split()) + '\n' + title
+
 # The names src/redact.zig hides: user (passwd, $USER, $LOGNAME, $HOME's last
 # part) and host (with its first label); "localhost", "root" and one-letter
 # names are no one's. The kernel release, shown as "kernel hidden", is checked
@@ -146,8 +156,8 @@ try:
     check('control: the card has a Network line', fields['network'] == 'true')
     time.sleep(1.5)
     shot = d.shot('control')
-    title = title_text(shot, box(fields, 'title'))
-    seen = leaks(' '.join(h.ocr(shot).split())) & (users | hosts)
+    title, text = panel_text(shot, box(fields, 'title'))
+    seen = leaks(text) & (users | hosts)
     # The unredacted capture and its OCR text hold the real names: keep none.
     for path in (shot, shot + '.txt', shot + '.title.png', shot + '.title.png.txt'):
         Path(path).unlink(missing_ok=True)
@@ -188,9 +198,10 @@ try:
         with Image.open(before) as a, Image.open(after) as b:
             diff = ImageChops.difference(a.convert('RGB').crop(rect), b.convert('RGB').crop(rect)).getbbox()
         check(f'{size[0]}x{size[1]}: the CPU sparkline moves under a synthetic load', diff is not None)
-        check(f'{size[0]}x{size[1]}: the title OCRs as user@host', title_text(after, box(fields, 'title')) == 'user@host')
+        title, text = panel_text(after, box(fields, 'title'))
+        check(f'{size[0]}x{size[1]}: the title OCRs as user@host', title == 'user@host')
         # Names only, never printed: the failure says how many, not which.
-        found = leaks(' '.join(h.ocr(after).split()))
+        found = leaks(text)
         check(f'{size[0]}x{size[1]}: OCR of the redacted panel finds no private name ({len(found)} found)', not found)
         d.close()
         d = None

@@ -31,7 +31,10 @@ def graph(client, capture, **filters):
 
 def assert_denied(response):
     assert response['result']['isError'], response
-    assert response['result']['content'][0]['text'] == 'OffCpuDenied', response
+    content = response['result']['content']
+    assert content[0]['text'] == 'OffCpuDenied', response
+    assert len(content) > 1 and 'does not change system settings' in content[1]['text'], response
+    return content[1]['text']
 
 
 run = root / '.work' / ('off-cpu-' + datetime.now().strftime('%Y%m%dT%H%M%S%f'))
@@ -187,10 +190,42 @@ try:
         frequency_hz=99,
         tids=[tid],
     )
-    assert_denied(response)
+    detail = assert_denied(response)
+    assert 'perf_event_open' in detail and 'perf_event_paranoid' in detail, detail
+    assert 'tracing group' not in detail, detail
+    opened = client.inspect('get_profile')['last_open_failure']
+    assert opened['syscall'] == 'perf_event_open' and opened['errno'] == 1, opened
     assert client.inspect('get_profile')['capture'] is None
 finally:
     client.close()
     os.environ.pop('XODB_TEST_OFF_CPU', None)
 
-print('off-CPU denial keeps the typed name')
+causes = (
+    ('missing', 'offcpu.tracefs', 2, 'tracepoint is missing'),
+    ('unreadable', 'offcpu.tracefs', 13, 'is not readable'),
+    ('format', 'offcpu.format', 0, 'not usable'),
+)
+for hook, syscall, errno, words in causes:
+    os.environ['XODB_TEST_OFF_CPU'] = hook
+    client = Client('control', str(binary), args=[str(run / 'denied.log')])
+    try:
+        stop = client.stopped(seconds=20)
+        tid = stop['threads'][0]['tid']
+        response = client.tool(
+            'start_profile',
+            generation=client.session()['generation'],
+            off_cpu=True,
+            duration_ms=1000,
+            frequency_hz=99,
+            tids=[tid],
+        )
+        detail = assert_denied(response)
+        assert syscall in detail and words in detail, (hook, detail)
+        opened = client.inspect('get_profile')['last_open_failure']
+        assert opened['syscall'] == syscall and opened['errno'] == errno, (hook, opened)
+        assert client.inspect('get_profile')['capture'] is None
+    finally:
+        client.close()
+        os.environ.pop('XODB_TEST_OFF_CPU', None)
+
+print('off-CPU denial keeps the typed name and the failed check')

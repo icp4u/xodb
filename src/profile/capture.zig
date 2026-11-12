@@ -107,12 +107,17 @@ pub fn offCpuFailure(failure: perf.Failure) bool {
     if (std.mem.startsWith(u8, failure.syscall, "offcpu.tracefs") or std.mem.eql(u8, failure.syscall, "offcpu.format")) return true;
     return std.mem.indexOf(u8, failure.detail, "off-CPU stacks") != null;
 }
+/// The UI and MCP keep this line. It names the syscall, the errno, and the
+/// detail (the path and what to do). xodb does not change system settings.
+pub fn offCpuAdvice(buffer: []u8, failure: perf.Failure) []const u8 {
+    return std.fmt.bufPrint(buffer, "{s}, errno {d}: {s}", .{ failure.syscall, failure.errno, failure.detail }) catch failure.detail;
+}
 test "a refused kernel-stack open is not turned into a user-only capture" {
     try std.testing.expectEqual(error.KernelStacksDenied, startError(true, .permission));
     try std.testing.expectEqual(error.PerfOpenFailed, startError(false, .permission));
     try std.testing.expectEqual(error.PerfOpenFailed, startError(true, .configuration));
     try std.testing.expectEqual(error.PerfOpenFailed, startError(true, .unavailable));
-    try std.testing.expect(offCpuFailure(.{ .kind = .permission, .syscall = "perf_event_open", .detail = "off-CPU stacks need perf_event_paranoid -1 (raw tracepoint data), or root, and a readable sched_switch tracepoint; this program does not change that setting" }));
+    try std.testing.expect(offCpuFailure(.{ .kind = .permission, .syscall = "perf_event_open", .detail = "perf_event_open refused off-CPU stacks; perf_event_paranoid must be -1, or run as root. xodb does not change system settings." }));
     try std.testing.expect(offCpuFailure(.{ .kind = .unavailable, .syscall = "offcpu.tracefs", .detail = "tracefs" }));
     try std.testing.expect(!offCpuFailure(.{ .kind = .permission, .syscall = "perf_event_open", .detail = "kernel stacks need perf_event_paranoid at most 1, or root; this program does not change that setting" }));
 }

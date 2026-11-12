@@ -474,7 +474,13 @@ pub const Server = struct {
         const archives = @import("archive.zig");
         if (archives.handles(name)) return archives.call(a, session, name, args);
         const profiles = @import("profile.zig");
-        if (profiles.handles(name)) return profiles.call(a, session, name, args);
+        if (profiles.handles(name)) return profiles.call(a, session, name, args) catch |err| {
+            if (err == error.OffCpuDenied) if (session.profile_failure) |refused| {
+                var reason: [768]u8 = undefined;
+                self.error_detail = try a.dupe(u8, @import("../profile/capture.zig").offCpuAdvice(&reason, refused));
+            };
+            return err;
+        };
         const static_analysis = @import("static_analysis.zig");
         if (static_analysis.handles(name)) return static_analysis.call(a, session, name, args);
         const executions = @import("execution.zig");

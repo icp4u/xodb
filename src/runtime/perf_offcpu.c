@@ -2,8 +2,10 @@
 #include "xrt_perf.h"
 #include <errno.h>
 #include <linux/perf_event.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 /* Off-CPU stacks. One sched_switch tracepoint per target thread, period 1,
  * with the outgoing callchain. The matching switch-in is the later record
@@ -101,20 +103,143 @@ bool xrt_offcpu_format(const char *text, size_t size, uint32_t id, struct xrt_of
     out->prev_state_size = (uint8_t)state_sz;
     return true;
 }
+static char trace_line[512];
+static const char *hook_value(void)
+{
+    const char *hook = getenv("XODB_TEST_OFF_CPU");
+    return hook && hook[0] ? hook : NULL;
+}
+static const char *id_path(void)
+{
+    const char *hook = hook_value();
+    if (hook && !strcmp(hook, "paths")) {
+        const char *path = getenv("XODB_TEST_OFFCPU_ID");
+        if (path && path[0])
+            return path;
+    }
+    return "/sys/kernel/tracing/events/sched/sched_switch/id";
+}
+static const char *format_path(void)
+{
+    const char *hook = hook_value();
+    if (hook && !strcmp(hook, "paths")) {
+        const char *path = getenv("XODB_TEST_OFFCPU_FORMAT");
+        if (path && path[0])
+            return path;
+    }
+    return "/sys/kernel/tracing/events/sched/sched_switch/format";
+}
+/* Group name from /etc/group without NSS: the agent may be a static binary. */
+static bool group_name(unsigned gid, char *out, size_t cap)
+{
+    char text[16384];
+    size_t size = 0;
+    if (!xrt_perf_read_file("/etc/group", text, sizeof(text) - 1, &size))
+        return false;
+    text[size] = 0;
+    for (char *line = text; line && *line;) {
+        char *next = strchr(line, '\n');
+        if (next)
+            *next++ = 0;
+        char *name_end = strchr(line, ':');
+        char *pass_end = name_end ? strchr(name_end + 1, ':') : NULL;
+        if (pass_end && strtoul(pass_end + 1, NULL, 10) == gid && pass_end[1] >= '0' && pass_end[1] <= '9') {
+            *name_end = 0;
+            snprintf(out, cap, "%s", line);
+            return true;
+        }
+        line = next;
+    }
+    return false;
+}
+static void trace_fail(struct xrt_perf_failure *f, const char *path, int error)
+{
+    char why[320] = "the tracefs read failed";
+    struct stat st;
+    if (error == ENOENT) {
+        if (stat("/sys/kernel/tracing/events", &st) != 0)
+            snprintf(why, sizeof why, "the sched_switch tracepoint is missing: tracefs is not mounted at /sys/kernel/tracing, or the kernel has no FTRACE");
+        else
+            snprintf(why, sizeof why, "the sched_switch tracepoint is missing: this kernel has no sched_switch event");
+    } else if (error == EACCES || error == EPERM) {
+        char group[64];
+        if (stat("/sys/kernel/tracing", &st) == 0 && (st.st_mode & 0040) && st.st_gid != 0 &&
+            group_name((unsigned)st.st_gid, group, sizeof group))
+            snprintf(why, sizeof why,
+                     "the sched_switch tracepoint is not readable (/sys/kernel/tracing is group %s, mode %04o); join the %s group and start a new login session, or run as root",
+                     group, (unsigned)(st.st_mode & 07777), group);
+        else if (stat("/sys/kernel/tracing", &st) == 0)
+            snprintf(why, sizeof why, "the sched_switch tracepoint is not readable (/sys/kernel/tracing is mode %04o, gid %u); run as root",
+                     (unsigned)(st.st_mode & 07777), (unsigned)st.st_gid);
+        else
+            snprintf(why, sizeof why, "the sched_switch tracepoint is not readable; run as root");
+    }
+    snprintf(trace_line, sizeof trace_line, "%s: %s. xodb does not change system settings.",
+             path ? path : "tracefs", why);
+    xrt_perf_fail(f, "offcpu.tracefs", error, -1, trace_line);
+}
+/* The refusal names the current paranoid value. At -1 something else refused. */
+static char open_line[320];
+static const char *open_refused(void)
+{
+    char text[32];
+    size_t size = 0;
+    long level = 99;
+    if (xrt_perf_read_file("/proc/sys/kernel/perf_event_paranoid", text, sizeof(text) - 1, &size)) {
+        text[size] = 0;
+        level = strtol(text, NULL, 10);
+    }
+    if (level == -1)
+        snprintf(open_line, sizeof open_line,
+                 "perf_event_open refused off-CPU stacks although perf_event_paranoid is -1 (a security module or container policy may block it); run as root. xodb does not change system settings.");
+    else if (level != 99)
+        snprintf(open_line, sizeof open_line,
+                 "perf_event_open refused off-CPU stacks; perf_event_paranoid is %ld and must be -1, or run as root. xodb does not change system settings.", level);
+    else
+        snprintf(open_line, sizeof open_line,
+                 "perf_event_open refused off-CPU stacks; perf_event_paranoid must be -1, or run as root. xodb does not change system settings.");
+    return open_line;
+}
+static bool test_cause(struct xrt_perf_failure *f)
+{
+    const char *hook = hook_value();
+    if (!hook || !strcmp(hook, "paths"))
+        return false;
+    if (!strcmp(hook, "deny")) {
+        xrt_perf_fail(f, "perf_event_open", EPERM, -1, open_refused());
+        return true;
+    }
+    if (!strcmp(hook, "missing")) {
+        trace_fail(f, "/sys/kernel/tracing/events/sched/sched_switch/id", ENOENT);
+        return true;
+    }
+    if (!strcmp(hook, "unreadable")) {
+        trace_fail(f, "/sys/kernel/tracing/events/sched/sched_switch/id", EACCES);
+        return true;
+    }
+    if (!strcmp(hook, "format")) {
+        snprintf(trace_line, sizeof trace_line,
+                 "/sys/kernel/tracing/events/sched/sched_switch/format: sched_switch field layout is not usable. xodb does not change system settings.");
+        xrt_perf_fail(f, "offcpu.format", 0, -1, trace_line);
+        return true;
+    }
+    return false;
+}
 static bool metadata(struct xrt_offcpu_layout *out, struct xrt_perf_failure *f)
 {
-    const char *id_path = "/sys/kernel/tracing/events/sched/sched_switch/id";
-    const char *fmt_path = "/sys/kernel/tracing/events/sched/sched_switch/format";
+    const char *id = id_path();
+    const char *fmt = format_path();
     char id_text[64];
     size_t size = 0;
-    uint64_t id = 0;
-    if (!xrt_perf_read_file(id_path, id_text, sizeof(id_text), &size)) {
-        xrt_perf_fail(f, "offcpu.tracefs", errno, -1,
-                      "off-CPU stacks need read access to the sched_switch tracepoint id under tracefs; this program does not change that");
+    uint64_t event = 0;
+    if (!xrt_perf_read_file(id, id_text, sizeof(id_text), &size)) {
+        trace_fail(f, id, errno);
         return false;
     }
-    if (!xrt_perf_unsigned(id_text, size, &id) || !id || id > UINT16_MAX) {
-        xrt_perf_fail(f, "offcpu.tracefs", 0, -1, id_path);
+    if (!xrt_perf_unsigned(id_text, size, &event) || !event || event > UINT16_MAX) {
+        snprintf(trace_line, sizeof trace_line,
+                 "%s: sched_switch id is not usable. xodb does not change system settings.", id);
+        xrt_perf_fail(f, "offcpu.tracefs", 0, -1, trace_line);
         return false;
     }
     char *format = malloc(16384);
@@ -122,13 +247,14 @@ static bool metadata(struct xrt_offcpu_layout *out, struct xrt_perf_failure *f)
         xrt_perf_fail(f, "alloc", ENOMEM, -1, "sched_switch format");
         return false;
     }
-    bool ok = xrt_perf_read_file(fmt_path, format, 16384, &size);
+    bool ok = xrt_perf_read_file(fmt, format, 16384, &size);
     if (!ok)
-        xrt_perf_fail(f, "offcpu.tracefs", errno, -1,
-                      "off-CPU stacks need read access to the sched_switch tracepoint format under tracefs; this program does not change that");
-    else if (!xrt_offcpu_format(format, size, (uint32_t)id, out)) {
+        trace_fail(f, fmt, errno);
+    else if (!xrt_offcpu_format(format, size, (uint32_t)event, out)) {
         ok = false;
-        xrt_perf_fail(f, "offcpu.format", 0, -1, "sched_switch field layout is not usable");
+        snprintf(trace_line, sizeof trace_line,
+                 "%s: sched_switch field layout is not usable. xodb does not change system settings.", fmt);
+        xrt_perf_fail(f, "offcpu.format", 0, -1, trace_line);
     }
     free(format);
     return ok;
@@ -152,12 +278,8 @@ struct xrt_perf *xrt_offcpu_start(const int32_t *tids, size_t count, uint8_t dat
                 return NULL;
             }
     }
-    const char *hook = getenv("XODB_TEST_OFF_CPU");
-    if (hook && !strcmp(hook, "deny")) {
-        xrt_perf_fail(f, "perf_event_open", EPERM, -1,
-                      "off-CPU stacks need perf_event_paranoid -1 (raw tracepoint data), or root, and a readable sched_switch tracepoint; this program does not change that setting");
+    if (test_cause(f))
         return NULL;
-    }
     if (!metadata(layout, f))
         return NULL;
     struct xrt_perf_attr attr;
@@ -183,7 +305,7 @@ struct xrt_perf *xrt_offcpu_start(const int32_t *tids, size_t count, uint8_t dat
     for (size_t i = 0; i < count; ++i)
         if (!xrt_perf_add(p, tids[i], &attr, 1, NULL, NULL, f)) {
             if (f && (f->error == EPERM || f->error == EACCES))
-                f->detail = "off-CPU stacks need perf_event_paranoid -1 (raw tracepoint data), or root, and a readable sched_switch tracepoint; this program does not change that setting";
+                f->detail = open_refused();
             goto fail;
         }
     if (!xrt_perf_enable(p, f))

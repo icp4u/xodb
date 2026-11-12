@@ -274,9 +274,11 @@ button or Shift+B; root label `Blocked time`). A selected time range scales
 a merged span and is approximate. The sample flame stays sample-weighted.
 The two are never added into one tree. The tracepoint id is read from
 tracefs. A refusal is
-`OffCpuDenied` and names tracefs, `perf_event_paranoid` -1 (raw tracepoint data), or root.
-xodb does not change that setting, and it does not continue as an on-CPU-only
-capture. This host path does not open a remote target's tracefs. Newborns
+`OffCpuDenied` and names the failed check, its path and its errno: a missing
+sched_switch tracepoint, an unreadable tracefs (join the tracing group), a
+refused perf_event_open (`perf_event_paranoid` -1 or root), or an unusable
+format. xodb does not change system settings, and it does not continue as an
+on-CPU-only capture. This host path does not open a remote target's tracefs. Newborns
 enrolled after the open are outside the off-CPU set. A saved archive
 does not store these intervals, so reopening it does not rebuild the
 blocked-time flame.
